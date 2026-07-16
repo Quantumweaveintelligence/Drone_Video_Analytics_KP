@@ -1,0 +1,50 @@
+# secrets
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.crt
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# node
+node_modules/
+build/
+dist/
+
+# model weights — do NOT commit these to git directly
+*.pt
+*.pth
+weights/
+
+# large video files
+*.mp4
+*.MP4
+*.avi
+*.mkv
+*.mov
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# logs & runtime data
+logs/
+*.log
+postgres_data/
+valkey_data/
+evidence_data/
+headscale_data/
+step_data/
+prometheus_data/
+grafana_data/

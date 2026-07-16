@@ -1,0 +1,27 @@
+# Kerala Police Drone Ingest API — Python dependencies (Redis edition)
+# =========================================================
+
+# Web framework
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+
+# JWT validation (Keycloak RS256)
+python-jose[cryptography]==3.3.0
+
+# Redis async client (replaces aio-pika/RabbitMQ)
+redis[hiredis]==5.0.8
+
+# Multipart file upload support
+python-multipart==0.0.9
+
+# Data validation / serialization
+pydantic==2.7.0
+
+# HTTP client (JWKS fetch, health checks)
+httpx==0.27.0
+
+# Prometheus metrics
+prometheus-client==0.20.0
+
+# CORS / middleware
+starlette==0.37.2

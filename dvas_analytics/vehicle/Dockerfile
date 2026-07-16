@@ -1,0 +1,17 @@
+FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+
+WORKDIR /analytics
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0 libsm6 libxrender1 libxext6 libgl1 libopencv-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY vehicle/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+COPY shared/ /analytics/shared/
+COPY vehicle/ /analytics/vehicle/
+
+EXPOSE 8103
+
+CMD ["uvicorn", "vehicle.main:app", "--host", "0.0.0.0", "--port", "8103", "--workers", "1"]

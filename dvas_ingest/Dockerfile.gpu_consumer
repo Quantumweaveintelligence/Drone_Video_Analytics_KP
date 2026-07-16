@@ -1,0 +1,36 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Dockerfile.gpu_consumer — Kerala Police GPU Batch Frame Consumer
+# Redis Streams edition (redis:7-alpine already cached locally)
+# ══════════════════════════════════════════════════════════════════════════════
+
+FROM python:3.11-slim AS base
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ── Dependencies ───────────────────────────────────────────────────────────────
+RUN pip install --no-cache-dir \
+        "redis[hiredis]>=5.0.8" \
+        "httpx>=0.27.0" \
+        "numpy>=1.24.0" \
+        "opencv-python-headless>=4.8.0" \
+        "prometheus-client>=0.20.0"
+
+# ── Application source ─────────────────────────────────────────────────────────
+COPY ingest/gpu_consumer.py .
+
+# Non-root user
+RUN useradd -r -s /bin/false appuser && chown -R appuser /app
+USER appuser
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=5 \
+    CMD python -c "import redis; redis.Redis.from_url('redis://redis:6379').ping()" || exit 1
+
+CMD ["python", "gpu_consumer.py"]

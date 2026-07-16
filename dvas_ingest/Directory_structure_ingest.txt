@@ -1,0 +1,57 @@
+drone_analytics/
+├─.dockerignore
+├─.env
+├─.gitignore
+├─config/
+│ ├─wireguard/
+│ │ └─wg0-server.conf
+│ └─__pycache__/
+│   └─config.cpython-310.pyc
+├─DJI_0110.MP4
+├─DJI_0111.MP4
+├─docker-compose.yml
+├─Dockerfile.gpu_consumer
+├─headscale/
+│ ├─acl.json
+│ └─config.yaml
+├─ingest/
+│ ├─.env.example
+│ ├─api/
+│ │ ├─auth.py
+│ │ ├─config.py
+│ │ ├─Dockerfile
+│ │ ├─main.py
+│ │ ├─models.py
+│ │ ├─queue_manager.py
+│ │ └─requirements.txt
+│ ├─certs/
+│ │ ├─ingest.crt
+│ │ └─ingest.key
+│ ├─gpu_consumer.py
+│ ├─nginx/
+│ │ └─default.conf
+│ ├─README.md
+│ └─scripts/
+│   ├─setup_keycloak.py
+│   ├─setup_ubuntu.sh
+│   └─verify.py
+├─logs/
+│ ├─edge.log
+│ ├─headless_test.log
+│ └─headless_test2.log
+├─monitoring/
+│ ├─alertmanager.yml
+│ ├─grafana/
+│ │ └─provisioning/
+│ │   ├─dashboards/
+│ │   │ └─dashboard.yml
+│ │   └─datasources/
+│ │     └─prometheus.yml
+│ ├─prometheus.yml
+│ └─rules/
+│   └─dvas_alerts.yml
+├─plan (2).md
+├─proposal-docuement-drone-video-analytics-kerala-police.docx (1).pdf
+├─README.md
+├─root_ca.crt
+└─walkthrough.md

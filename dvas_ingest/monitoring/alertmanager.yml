@@ -1,0 +1,56 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Alertmanager Configuration — DVAS Ingest Server
+# File: monitoring/alertmanager.yml
+#
+# Routes alerts from Prometheus rules to notification channels.
+# Currently configured for email. Add Telegram / Slack / PagerDuty as needed.
+# ══════════════════════════════════════════════════════════════════════════════
+
+global:
+  # SMTP settings for email alerts
+  smtp_smarthost:   "smtp.gmail.com:587"
+  smtp_from:        "dvas-alerts@kerala.police.gov.in"
+  smtp_auth_username: "${ALERT_EMAIL_USER}"
+  smtp_auth_password: "${ALERT_EMAIL_PASSWORD}"
+  smtp_require_tls: true
+
+  # How long to wait before resending the same alert
+  resolve_timeout: 5m
+
+# ── Routing tree ──────────────────────────────────────────────────────────────
+route:
+  group_by:        ["alertname", "severity"]
+  group_wait:      30s
+  group_interval:  5m
+  repeat_interval: 4h
+  receiver:        "ops-team-email"
+
+  routes:
+    # Critical alerts (VPN down, GPU consumer crashed) — immediate
+    - match:
+        severity: critical
+      receiver: "ops-team-email"
+      repeat_interval: 1h
+
+    # Warning alerts (queue growing) — standard cadence
+    - match:
+        severity: warning
+      receiver: "ops-team-email"
+
+# ── Receivers ─────────────────────────────────────────────────────────────────
+receivers:
+  - name: "ops-team-email"
+    email_configs:
+      - to: "${ALERT_EMAIL_TO:-ops@kerala.police.gov.in}"
+        send_resolved: true
+        headers:
+          subject: "[DVAS {{ .Status | toUpper }}] {{ .CommonAnnotations.summary }}"
+
+# ── Inhibition rules ──────────────────────────────────────────────────────────
+# Silence lower-severity alerts when a higher-severity alert is firing.
+inhibit_rules:
+  - source_match:
+      severity: "critical"
+    target_match:
+      severity: "warning"
+    equal: ["alertname"]

@@ -1,0 +1,94 @@
+{
+  "theme_archetype": {
+    "theme": "DARK",
+    "archetype": "4 (Swiss & High-Contrast) + 2 (Performance Pro) Hybrid",
+    "reasoning": "Command-and-control (SOC) environment requires dark mode to reduce eye fatigue for operators working long shifts. High contrast alerts ensure threats and drone telemetry are visible within seconds. The aesthetic is authoritative, technical, and mission-critical."
+  },
+  "typography": {
+    "fonts": {
+      "headings": "IBM Plex Sans",
+      "body": "IBM Plex Sans",
+      "mono": "JetBrains Mono"
+    },
+    "hierarchy": {
+      "h1": "text-2xl sm:text-3xl font-semibold tracking-tight",
+      "h2": "text-xl sm:text-2xl font-medium tracking-tight",
+      "h3": "text-lg sm:text-xl font-medium",
+      "body": "text-sm sm:text-base leading-relaxed",
+      "labels": "text-xs font-mono uppercase tracking-[0.2em] text-slate-400"
+    },
+    "rules": "Never use Inter. Use JetBrains Mono for all telemetry data, coordinates, timestamps, and IDs. Apply tabular-nums to numerical data to prevent shifting."
+  },
+  "colors": {
+    "background": {
+      "root": "#020617",
+      "surface": "#0f172a",
+      "surface_elevated": "#1e293b"
+    },
+    "border": {
+      "default": "#334155",
+      "focus": "#0ea5e9"
+    },
+    "text": {
+      "primary": "#f8fafc",
+      "secondary": "#94a3b8"
+    },
+    "status": {
+      "critical": "#ef4444",
+      "warning": "#f59e0b",
+      "safe": "#10b981",
+      "active_telemetry": "#0ea5e9"
+    },
+    "rules": "Strict adherence to dark theme. Use 'Grid Borders' pattern: borders should be 1px solid slate-800. Signal Red (#ef4444) is strictly reserved for critical alerts and legal hold tags. Use deep slate instead of pure black."
+  },
+  "layout": {
+    "spacing": "Dense 'Control Room' grid. Use gap-4 or gap-6. Minimal internal padding (p-4) to maximize data density.",
+    "border_radius": "Sharp edges. Use rounded-none or max rounded-sm (0.125rem).",
+    "grid_modes": {
+      "dashboard": "grid-cols-1 md:grid-cols-4 lg:grid-cols-12 gap-4",
+      "video_feed": "col-span-12 lg:col-span-8 row-span-2 (Main feed) with col-span-4 (Secondary feeds/Alerts)."
+    }
+  },
+  "components": {
+    "cards": "Flat background (bg-slate-900), 1px border (border-slate-800), no shadows.",
+    "tables": "High density. Hover state: hover:bg-slate-800 hover:text-white. Mono font for data cells.",
+    "buttons": "Square/sharp. Primary: bg-sky-600 hover:bg-sky-500. Secondary: bg-transparent border border-slate-700 hover:border-slate-500.",
+    "badges": "Critical for status indicators. Use bg-opacity-10 with 1px border of the same color (e.g., bg-red-500/10 border-red-500/50 text-red-400)."
+  },
+  "icons": {
+    "library": "@phosphor-icons/react",
+    "install_command": "yarn add @phosphor-icons/react",
+    "rules": "Use Duotone weight for main navigation, Regular or Light for dense telemetry panels to avoid clutter."
+  },
+  "motion": {
+    "rules": "Minimalist. Zero bouncy animations. Use quick, functional fades and color transitions (transition-colors duration-150 ease-in-out). Target micro-interactions on hover/focus."
+  },
+  "accessibility": {
+    "testing": "MANDATORY: All interactive elements must include a kebab-case data-testid (e.g., data-testid='map-pin-drone-1', data-testid='btn-export-evidence').",
+    "contrast": "Ensure 4.5:1 ratio. Maintain high contrast on :focus and :hover states."
+  },
+  "media": {
+    "drone_night_operations": {
+      "url": "https://images.unsplash.com/photo-1768571845597-38f066307f1e?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzOTB8MHwxfHNlYXJjaHwzfHxkcm9uZSUyMGZseWluZyUyMGNpdHklMjBuaWdodHxlbnwwfHx8fDE3ODM0MTk4NDJ8MA&ixlib=rb-4.1.0&q=85",
+      "description": "Drone flying over city at night. Use as background for login screen."
+    },
+    "police_badge_logo": {
+      "url": "https://images.unsplash.com/photo-1576607887261-e3ff5018f3ef?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1MDV8MHwxfHNlYXJjaHwzfHxwb2xpY2UlMjBiYWRnZSUyMGxvZ28lMjBpc29sYXRlZHxlbnwwfHx8fDE3ODM0MTk4NDJ8MA&ixlib=rb-4.1.0&q=85",
+      "description": "Police badge placeholder. Use for Kerala Police DVAS header/logo."
+    },
+    "dark_map_tile": {
+      "url": "https://images.unsplash.com/photo-1612043743114-d19a560b70eb?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NzF8MHwxfHNlYXJjaHwzfHxjaXR5JTIwbWFwJTIwZGFyayUyMG1vZGUlMjBkYXNoYm9hcmR8ZW58MHx8fHwxNzgzNDE5ODQyfDA&ixlib=rb-4.1.0&q=85",
+      "description": "Aerial city view at night. Use as placeholder for live situational map."
+    }
+  },
+  "instructions_to_main_agent": [
+    "Stack: Vite + React (.js files, no TS) + Tailwind CSS + Shadcn UI.",
+    "Implement a role-selection Login screen that routes to one of 4 specific dashboards (Edge Operator, Ingest Operations, Central Command, Admin/Audit).",
+    "Central Command requires a dense 'Bento' or 'Control Room' grid layout for multi-drone video feeds, live map, and alerts.",
+    "Do NOT use raw HTML <select> or <input type='date'>. Use Shadcn Select and Calendar.",
+    "For the situational map, use the `dark_map_tile` image as a background if a real mapping library (like Leaflet/Mapbox) is not integrated, and absolute-position drone/event pins over it.",
+    "Ensure `data-testid` is added to ALL buttons, inputs, tabs, and interactive table rows.",
+    "Use Recharts for Analytics (Crowd/Traffic), customizing charts with the theme's slate and cyan/amber/red colors.",
+    "Apply 'Grid Borders' pattern across dashboards: visible 1px slate-800 borders to delineate zones without using shadows."
+  ]
+}

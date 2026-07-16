@@ -1,0 +1,72 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Prometheus Scrape Configuration — DVAS Ingest Server
+# File: monitoring/prometheus.yml
+#
+# Scrape targets:
+#   - Ingest API (FastAPI /metrics endpoint via NGINX)
+#   - GPU consumer (if it exposes /metrics)
+#   - Valkey exporter (optional — add if redis_exporter is deployed)
+#   - Node exporter (Ubuntu host metrics — install separately)
+#   - WireGuard exporter (VPN peer last-seen)
+# ══════════════════════════════════════════════════════════════════════════════
+
+global:
+  scrape_interval:     15s     # How often to scrape targets
+  evaluation_interval: 15s     # How often to evaluate alerting rules
+  external_labels:
+    environment: "production"
+    system: "dvas-ingest-server"
+
+# Alertmanager integration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+# Alerting rules
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+
+# ── Scrape jobs ───────────────────────────────────────────────────────────────
+scrape_configs:
+
+  # Prometheus self-monitoring
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # ── FastAPI Ingest API ─────────────────────────────────────────────────────
+  # Scrapes the Prometheus metrics endpoint exposed by the ingest API.
+  # The /metrics path is restricted to VPN + Docker subnets in NGINX.
+  - job_name: "ingest-api"
+    static_configs:
+      - targets: ["ingest-api:8000"]   # Direct container access (no NGINX auth needed internally)
+    metrics_path: /metrics
+
+  # ── GPU Consumer ──────────────────────────────────────────────────────────
+  # Uncomment when gpu_consumer.py exposes a /metrics endpoint.
+  # - job_name: "gpu-consumer"
+  #   static_configs:
+  #     - targets: ["gpu-consumer:9091"]
+  #   metrics_path: /metrics
+
+  # ── Valkey (Redis) exporter ────────────────────────────────────────────────
+  # Deploy oliver006/redis_exporter alongside valkey to expose queue depth.
+  # - job_name: "valkey"
+  #   static_configs:
+  #     - targets: ["valkey-exporter:9121"]
+
+  # ── Ubuntu host (Node Exporter) ────────────────────────────────────────────
+  # Install: sudo apt install prometheus-node-exporter
+  # Then uncomment:
+  # - job_name: "node"
+  #   static_configs:
+  #     - targets: ["10.10.20.1:9100"]   # Host network port
+
+  # ── WireGuard peer health ──────────────────────────────────────────────────
+  # Deploy MindFlavor/prometheus_wireguard_exporter on the Ubuntu host.
+  # Shows last-seen timestamp per connected Windows laptop.
+  # - job_name: "wireguard"
+  #   static_configs:
+  #     - targets: ["10.10.20.1:9586"]   # Host network port

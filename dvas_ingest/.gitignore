@@ -1,0 +1,44 @@
+# ── Secrets — NEVER commit these ──────────────────────────────────────────────
+.env
+*.key
+*.pem
+ingest/certs/ingest.crt
+ingest/certs/ingest.key
+/etc/wireguard/
+
+# ── Docker volumes / runtime data ─────────────────────────────────────────────
+postgres_data/
+valkey_data/
+evidence_data/
+headscale_data/
+step_data/
+prometheus_data/
+grafana_data/
+
+# ── Large video files (too big for git) ───────────────────────────────────────
+*.MP4
+*.mp4
+*.avi
+*.mkv
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.coverage
+htmlcov/
+.pytest_cache/
+
+# ── OS / Editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log

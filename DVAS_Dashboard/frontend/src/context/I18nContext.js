@@ -1,0 +1,369 @@
+import { createContext, useContext, useEffect, useState, useCallback } from "react";
+
+/**
+ * DVAS i18n. English source-of-truth; Malayalam for regional deployments.
+ * Missing keys fall back to English or the key itself.
+ */
+
+const en = {
+  /* app chrome */
+  "app.title": "DVAS",
+  "app.subtitle": "Kerala Police",
+
+  /* roles — 4-role model (field_supervisor → CRO, supervisory_officer → SR) */
+  "role.drone_operator": "Drone Operator",
+  "role.control_room_officer": "Control Room Officer",
+  "role.senior_officer": "Senior Officer",
+  "role.system_administrator": "System Administrator",
+
+  /* left nav */
+  "nav.command": "Central Command",
+  "nav.edge": "Edge Operator",
+  "nav.ingest": "Ingest Ops",
+  "nav.admin": "Admin & Audit",
+
+  /* topbar */
+  "topbar.ingest": "INGEST",
+  "topbar.online": "Online",
+  "topbar.healthy": "Healthy",
+  "topbar.degraded": "Degraded",
+  "topbar.offline": "Offline",
+  "topbar.notifications": "Recent Alerts",
+  "topbar.viewAllAlerts": "View all alerts",
+  "topbar.noAlerts": "No unread alerts in your scope.",
+  "topbar.search": "Search drones, evidence, missions…",
+  "auth.signOut": "Sign out",
+
+  /* login */
+  "login.secureAccess": "Secure Access",
+  "login.signIn": "Sign in to DVAS",
+  "login.email": "Email",
+  "login.password": "Password",
+  "login.enter": "Enter DVAS",
+  "login.busy": "Authenticating…",
+  "login.systemName": "Drone Video Analytics System",
+  "login.tagline": "Command · Control · Compliance",
+  "login.accessModel": "Access model",
+  "login.accessNote": "RBAC decides the door, ABAC decides whether it opens today, and the audit log records that you tried the handle.",
+  "login.quickTitle": "Quick role sign-in (demo)",
+  "login.demoNote": "All demo users share password: dvas1234",
+
+  /* Command page titles */
+  "cmd.title": "Central Command & Intelligence",
+  "cmd.subtitle.aggregated": "Aggregated · Cross-jurisdiction",
+  "cmd.subtitle.jurisdiction": "Jurisdiction",
+  "cmd.pages": "Command Pages",
+
+  "cmd.kpi.dronesOnline": "Drones online",
+  "cmd.kpi.activeMissions": "Active missions",
+  "cmd.kpi.alertsScope": "Alerts (scope)",
+  "cmd.kpi.evidenceItems": "Evidence items",
+  "cmd.kpi.exportsPending": "Exports pending",
+
+  "cmd.page.map": "Live Situational Map",
+  "cmd.page.alerts": "Live Alerts Feed",
+  "cmd.page.multidrone": "Multi-Drone View",
+  "cmd.page.evidence": "Evidence Review",
+  "cmd.page.forensic": "Forensic Log Viewer",
+  "cmd.page.analytics": "Crowd / Traffic",
+  "cmd.page.missions": "Case / Mission Mgmt",
+  "cmd.page.models": "Detection Models",
+  "cmd.page.exports": "Export Requests",
+  "cmd.page.aggregated": "District / State View",
+  "cmd.page.reports": "Reports",
+
+  "cmd.multiDroneGrid": "Multi-Drone Grid",
+  "cmd.dronesInScope": "drones in scope",
+  "cmd.wsLive": "WS LIVE",
+  "cmd.connecting": "connecting…",
+  "cmd.noAlertsInScope": "No alerts in scope",
+
+  /* Ingest */
+  "ingest.title": "Ingest & Streaming Operations",
+  "ingest.subtitle": "System Administrator · NOC · Infrastructure Only",
+  "ingest.pages": "Ingest Pages",
+  "ingest.infraOnly": "Infrastructure only — no video content or analytics.",
+  "ingest.page.overview": "Overview",
+  "ingest.page.feeds": "Feed Overview",
+  "ingest.page.queue": "Queue & Throughput",
+  "ingest.page.gpu": "GPU Cluster Load",
+  "ingest.page.alerts": "System Alerts",
+  "ingest.page.audit": "Audit (Own Actions)",
+  "ingest.page.users": "User & Role Management",
+  "ingest.alertsTitle": "System Alerts (infrastructure only)",
+  "ingest.allAcked": "All infrastructure alerts acknowledged.",
+
+  /* Admin */
+  "admin.title": "Administrative & Audit",
+  "admin.subtitle": "HQ Restricted Zone · Separation of powers enforced",
+  "admin.pages": "Admin Pages",
+  "admin.page.users": "User & Role Management",
+  "admin.page.policy": "Policy Configuration",
+  "admin.page.tokens": "Token & Sessions",
+  "admin.page.audit": "Audit Log Explorer",
+  "admin.page.holds": "Legal Hold Tracker",
+  "admin.page.sysconf": "System Configuration",
+  "admin.page.compl": "Compliance Reports",
+  "admin.auditHeader": "Audit Log · append-only · hash-chained",
+  "admin.chainOk": "Chain OK",
+  "admin.tamper": "Tamper",
+  "admin.rows": "rows",
+  "admin.sepPowers": "System Administrators configure the platform; Supervisory and Senior Officers review their configuration changes. Nobody self-certifies.",
+
+  /* Edge */
+  "edge.title": "Edge Operator Console",
+  "edge.subtitle": "Local · Flight & Stream Safety Only · No Intelligence Content",
+  "edge.restrictBanner": "You are on the Edge Operator Dashboard. This device is limited to live video feed status and buffer/stream health only. Analytics, alerts, evidence playback, and forensic logs are not available at the edge — by design.",
+  "edge.sec01": "Home / Live View",
+  "edge.sec02": "Buffer Health",
+  "edge.sec03": "Change Detection / Frame Selection",
+  "edge.sec04": "Evidence Clip Creation",
+  "edge.sec05": "Connectivity & System Health",
+  "edge.sec06": "Local Controls",
+  "edge.bufferFill": "Fill",
+  "edge.overwriteCycle": "Overwrite cycle",
+  "edge.streamBuffer": "Stream & buffer",
+  "edge.reportMalfunction": "Report Malfunction / Anomaly",
+  "edge.endOfShift": "End of shift",
+  "edge.downloadShiftPdf": "Download End-of-Shift PDF",
+
+  /* Common table headers */
+  "table.timestamp": "Timestamp",
+  "table.drone": "Drone",
+  "table.type": "Type",
+  "table.confidence": "Confidence",
+  "table.zone": "Zone",
+  "table.systemAction": "System action",
+  "table.actor": "Actor",
+  "table.role": "Role",
+  "table.action": "Action",
+  "table.target": "Target",
+  "table.ip": "IP",
+  "table.name": "Name",
+  "table.email": "Email",
+  "table.jurisdiction": "Jurisdiction",
+  "table.missionScope": "Mission Scope",
+  "table.status": "Status",
+
+  /* Common labels */
+  "common.acknowledge": "Acknowledge",
+  "common.approve": "Approve",
+  "common.reject": "Reject",
+  "common.cancel": "Cancel",
+  "common.save": "Save",
+  "common.download": "Download",
+  "common.exportCsv": "Export CSV",
+  "common.filter": "Filter…",
+  "common.generate": "Generate",
+  "common.revoke": "Revoke",
+  "common.release": "Release",
+  "common.suspend": "Suspend",
+  "common.active": "active",
+  "common.suspended": "suspended",
+  "common.live": "live",
+  "common.degraded": "degraded",
+  "common.offline": "offline",
+  "common.logged": "logged",
+  "common.acked": "acked",
+  "common.pending": "pending",
+  "common.approved": "approved",
+  "common.rejected": "rejected",
+
+  /* Notification severities */
+  "sev.critical": "critical",
+  "sev.warning": "warning",
+  "sev.info": "info",
+};
+
+const ml = {
+  "app.title": "ഡിവിഎഎസ്",
+  "app.subtitle": "കേരള പോലീസ്",
+
+  "role.drone_operator": "ഡ്രോൺ ഓപ്പറേറ്റർ",
+  "role.control_room_officer": "കൺട്രോൾ റൂം ഓഫീസർ",
+  "role.senior_officer": "മുതിർന്ന ഉദ്യോഗസ്ഥൻ",
+  "role.system_administrator": "സിസ്റ്റം അഡ്മിനിസ്ട്രേറ്റർ",
+
+  "nav.command": "കേന്ദ്ര കമാൻഡ്",
+  "nav.edge": "എഡ്ജ് ഓപ്പറേറ്റർ",
+  "nav.ingest": "ഇൻജസ്റ്റ്",
+  "nav.admin": "അഡ്മിൻ & ഓഡിറ്റ്",
+
+  "topbar.ingest": "ഇൻജസ്റ്റ്",
+  "topbar.online": "ഓൺലൈൻ",
+  "topbar.healthy": "ആരോഗ്യകരം",
+  "topbar.degraded": "ഭാഗിക തകരാർ",
+  "topbar.offline": "ഓഫ്‌ലൈൻ",
+  "topbar.notifications": "സമീപ അലേർട്ടുകൾ",
+  "topbar.viewAllAlerts": "എല്ലാ അലേർട്ടുകളും കാണുക",
+  "topbar.noAlerts": "നിങ്ങളുടെ പരിധിയിൽ വായിക്കാത്ത അലേർട്ടുകൾ ഇല്ല.",
+  "topbar.search": "ഡ്രോൺ, തെളിവ്, മിഷൻ തിരയുക…",
+  "auth.signOut": "സൈൻ ഔട്ട്",
+
+  "login.secureAccess": "സുരക്ഷിത പ്രവേശനം",
+  "login.signIn": "ഡിവിഎഎസിലേക്ക് പ്രവേശിക്കുക",
+  "login.email": "ഇമെയിൽ",
+  "login.password": "പാസ്‌വേഡ്",
+  "login.enter": "ഡിവിഎഎസിലേക്ക് കയറുക",
+  "login.busy": "പ്രാമാണീകരിക്കുന്നു…",
+  "login.systemName": "ഡ്രോൺ വീഡിയോ അനലിറ്റിക്സ് സിസ്റ്റം",
+  "login.tagline": "കമാൻഡ് · കൺട്രോൾ · കംപ്ലയൻസ്",
+  "login.accessModel": "പ്രവേശന മാതൃക",
+  "login.accessNote": "RBAC വാതിൽ തീരുമാനിക്കുന്നു, ABAC ഇന്ന് അത് തുറക്കണോ എന്ന് തീരുമാനിക്കുന്നു, ഓഡിറ്റ് ലോഗ് നിങ്ങൾ ഹാൻഡിൽ പിടിച്ചത് രേഖപ്പെടുത്തുന്നു.",
+  "login.quickTitle": "ദ്രുത റോൾ സൈൻ-ഇൻ (ഡെമോ)",
+  "login.demoNote": "എല്ലാ ഡെമോ ഉപയോക്താക്കൾക്കും പാസ്‌വേഡ്: dvas1234",
+
+  "cmd.title": "കേന്ദ്ര കമാൻഡ് & ഇന്റലിജൻസ്",
+  "cmd.subtitle.aggregated": "സമാഹൃതം · സംസ്ഥാനവ്യാപകം",
+  "cmd.subtitle.jurisdiction": "അധികാരപരിധി",
+  "cmd.pages": "കമാൻഡ് പേജുകൾ",
+
+  "cmd.kpi.dronesOnline": "ഓൺലൈൻ ഡ്രോണുകൾ",
+  "cmd.kpi.activeMissions": "സജീവ മിഷനുകൾ",
+  "cmd.kpi.alertsScope": "അലേർട്ടുകൾ (പരിധി)",
+  "cmd.kpi.evidenceItems": "തെളിവുകൾ",
+  "cmd.kpi.exportsPending": "കാത്തിരിക്കുന്ന കയറ്റുമതികൾ",
+
+  "cmd.page.map": "തത്സമയ സ്ഥാന ഭൂപടം",
+  "cmd.page.alerts": "തത്സമയ അലേർട്ട് ഫീഡ്",
+  "cmd.page.multidrone": "മൾട്ടി-ഡ്രോൺ കാഴ്ച",
+  "cmd.page.evidence": "തെളിവ് അവലോകനം",
+  "cmd.page.forensic": "ഫോറൻസിക് ലോഗ് വ്യൂവർ",
+  "cmd.page.analytics": "ജനക്കൂട്ടം / ഗതാഗതം",
+  "cmd.page.missions": "കേസ് / മിഷൻ മാനേജ്‌മെന്റ്",
+  "cmd.page.models": "ഡിറ്റക്ഷൻ മോഡലുകൾ",
+  "cmd.page.exports": "എക്സ്പോർട്ട് അഭ്യർത്ഥനകൾ",
+  "cmd.page.aggregated": "ജില്ല / സംസ്ഥാന കാഴ്ച",
+  "cmd.page.reports": "റിപ്പോർട്ടുകൾ",
+
+  "cmd.multiDroneGrid": "മൾട്ടി-ഡ്രോൺ ഗ്രിഡ്",
+  "cmd.dronesInScope": "പരിധിയിലുള്ള ഡ്രോണുകൾ",
+  "cmd.wsLive": "തത്സമയം",
+  "cmd.connecting": "ബന്ധിക്കുന്നു…",
+  "cmd.noAlertsInScope": "പരിധിയിൽ അലേർട്ടുകളില്ല",
+
+  "ingest.title": "ഇൻജസ്റ്റ് & സ്ട്രീമിംഗ് ഓപ്പറേഷൻസ്",
+  "ingest.subtitle": "സിസ്റ്റം അഡ്മിനിസ്ട്രേറ്റർ · NOC · അടിസ്ഥാനസൗകര്യം മാത്രം",
+  "ingest.pages": "ഇൻജസ്റ്റ് പേജുകൾ",
+  "ingest.infraOnly": "അടിസ്ഥാനസൗകര്യം മാത്രം — വീഡിയോയോ അനലിറ്റിക്സോ ഇല്ല.",
+  "ingest.page.overview": "അവലോകനം",
+  "ingest.page.feeds": "ഫീഡ് അവലോകനം",
+  "ingest.page.queue": "ക്യൂ & ത്രൂപുട്ട്",
+  "ingest.page.gpu": "GPU ക്ലസ്റ്റർ ലോഡ്",
+  "ingest.page.alerts": "സിസ്റ്റം അലേർട്ടുകൾ",
+  "ingest.page.audit": "ഓഡിറ്റ് (സ്വന്തം പ്രവർത്തനങ്ങൾ)",
+  "ingest.page.users": "ഉപയോക്തൃ & റോൾ മാനേജ്‌മെന്റ്",
+  "ingest.alertsTitle": "സിസ്റ്റം അലേർട്ടുകൾ (അടിസ്ഥാനസൗകര്യം മാത്രം)",
+  "ingest.allAcked": "എല്ലാ അടിസ്ഥാനസൗകര്യ അലേർട്ടുകളും അംഗീകരിച്ചു.",
+
+  "admin.title": "അഡ്മിനിസ്ട്രേറ്റീവ് & ഓഡിറ്റ്",
+  "admin.subtitle": "HQ നിയന്ത്രിത മേഖല · അധികാര വേർതിരിവ്",
+  "admin.pages": "അഡ്മിൻ പേജുകൾ",
+  "admin.page.users": "ഉപയോക്തൃ & റോൾ മാനേജ്‌മെന്റ്",
+  "admin.page.policy": "പോളിസി കോൺഫിഗറേഷൻ",
+  "admin.page.tokens": "ടോക്കൺ & സെഷനുകൾ",
+  "admin.page.audit": "ഓഡിറ്റ് ലോഗ് എക്സ്‌പ്ലോറർ",
+  "admin.page.holds": "നിയമപരമായ ഹോൾഡ്",
+  "admin.page.sysconf": "സിസ്റ്റം കോൺഫിഗറേഷൻ",
+  "admin.page.compl": "കംപ്ലയൻസ് റിപ്പോർട്ടുകൾ",
+  "admin.auditHeader": "ഓഡിറ്റ് ലോഗ് · ചേർക്കൽ മാത്രം · ഹാഷ്-ചെയിൻ",
+  "admin.chainOk": "ചെയിൻ ശരി",
+  "admin.tamper": "കൃത്രിമം",
+  "admin.rows": "വരികൾ",
+  "admin.sepPowers": "സിസ്റ്റം അഡ്മിനുകൾ പ്ലാറ്റ്ഫോം കോൺഫിഗർ ചെയ്യുന്നു; സൂപ്പർവൈസറി/സീനിയർ ഓഫീസർമാർ അവ അവലോകനം ചെയ്യുന്നു. ആരും സ്വയം സാക്ഷ്യപ്പെടുത്തുന്നില്ല.",
+
+  "edge.title": "എഡ്ജ് ഓപ്പറേറ്റർ കൺസോൾ",
+  "edge.subtitle": "പ്രാദേശികം · ഫ്ലൈറ്റ് & സ്ട്രീം സുരക്ഷ മാത്രം · ഇന്റലിജൻസ് ഇല്ല",
+  "edge.restrictBanner": "നിങ്ങൾ എഡ്ജ് ഓപ്പറേറ്റർ ഡാഷ്‌ബോർഡിലാണ്. തത്സമയ വീഡിയോ ഫീഡ് സ്ഥിതിയും ബഫർ/സ്ട്രീം ആരോഗ്യവും മാത്രമേ ഇവിടെ ലഭിക്കൂ. അനലിറ്റിക്സ്, തെളിവുകൾ, ഫോറൻസിക് ലോഗുകൾ ഇവിടെ ലഭ്യമല്ല — രൂപകൽപ്പന പ്രകാരം.",
+  "edge.sec01": "ഹോം / തത്സമയ ദൃശ്യം",
+  "edge.sec02": "ബഫർ ആരോഗ്യം",
+  "edge.sec03": "മാറ്റം കണ്ടെത്തൽ / ഫ്രെയിം തിരഞ്ഞെടുപ്പ്",
+  "edge.sec04": "തെളിവ് ക്ലിപ്പ് സൃഷ്ടിക്കൽ",
+  "edge.sec05": "കണക്റ്റിവിറ്റി & സിസ്റ്റം ആരോഗ്യം",
+  "edge.sec06": "പ്രാദേശിക നിയന്ത്രണങ്ങൾ",
+  "edge.bufferFill": "പൂരണം",
+  "edge.overwriteCycle": "ഓവർറൈറ്റ് സൈക്കിൾ",
+  "edge.streamBuffer": "സ്ട്രീം & ബഫർ",
+  "edge.reportMalfunction": "തകരാർ / അസാധാരണത റിപ്പോർട്ട്",
+  "edge.endOfShift": "ഷിഫ്റ്റ് അവസാനം",
+  "edge.downloadShiftPdf": "എൻഡ്-ഓഫ്-ഷിഫ്റ്റ് PDF ഡൗൺലോഡ്",
+
+  "table.timestamp": "സമയമുദ്ര",
+  "table.drone": "ഡ്രോൺ",
+  "table.type": "തരം",
+  "table.confidence": "വിശ്വാസ്യത",
+  "table.zone": "മേഖല",
+  "table.systemAction": "സിസ്റ്റം നടപടി",
+  "table.actor": "കർത്താവ്",
+  "table.role": "റോൾ",
+  "table.action": "പ്രവർത്തി",
+  "table.target": "ലക്ഷ്യം",
+  "table.ip": "ഐപി",
+  "table.name": "പേര്",
+  "table.email": "ഇമെയിൽ",
+  "table.jurisdiction": "അധികാരപരിധി",
+  "table.missionScope": "മിഷൻ പരിധി",
+  "table.status": "സ്ഥിതി",
+
+  "common.acknowledge": "അംഗീകരിക്കുക",
+  "common.approve": "അംഗീകരിക്കുക",
+  "common.reject": "നിരസിക്കുക",
+  "common.cancel": "റദ്ദാക്കുക",
+  "common.save": "സേവ്",
+  "common.download": "ഡൗൺലോഡ്",
+  "common.exportCsv": "CSV കയറ്റുമതി",
+  "common.filter": "അരിപ്പ…",
+  "common.generate": "സൃഷ്ടിക്കുക",
+  "common.revoke": "പിൻവലിക്കുക",
+  "common.release": "വിട്ടയക്കുക",
+  "common.suspend": "സസ്പെൻഡ്",
+  "common.active": "സജീവം",
+  "common.suspended": "സസ്പെൻഡ് ചെയ്തു",
+  "common.live": "തത്സമയം",
+  "common.degraded": "തരംതാഴ്ന്നു",
+  "common.offline": "ഓഫ്‌ലൈൻ",
+  "common.logged": "രേഖപ്പെടുത്തി",
+  "common.acked": "അംഗീകരിച്ചു",
+  "common.pending": "കാത്തിരിക്കുന്നു",
+  "common.approved": "അംഗീകരിച്ചു",
+  "common.rejected": "നിരസിച്ചു",
+
+  "sev.critical": "ഗുരുതരം",
+  "sev.warning": "മുന്നറിയിപ്പ്",
+  "sev.info": "വിവരം",
+};
+
+const DICTS = { en, ml };
+
+const I18nCtx = createContext({
+  lang: "en",
+  setLang: () => {},
+  t: (k) => k,
+});
+
+export function I18nProvider({ children }) {
+  const [lang, setLangState] = useState(() => {
+    try {
+      const s = localStorage.getItem("dvas_lang");
+      if (s === "en" || s === "ml") return s;
+    } catch (e) { /* noop */ }
+    return "en";
+  });
+
+  useEffect(() => {
+    try { localStorage.setItem("dvas_lang", lang); } catch (e) { /* noop */ }
+    document.documentElement.setAttribute("lang", lang === "ml" ? "ml" : "en");
+  }, [lang]);
+
+  const setLang = useCallback((l) => setLangState(l), []);
+  const t = useCallback(
+    (key) => (DICTS[lang] && DICTS[lang][key]) || DICTS.en[key] || key,
+    [lang]
+  );
+
+  return (
+    <I18nCtx.Provider value={{ lang, setLang, t }}>{children}</I18nCtx.Provider>
+  );
+}
+
+export const useI18n = () => useContext(I18nCtx);

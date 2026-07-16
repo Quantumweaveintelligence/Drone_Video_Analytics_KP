@@ -1,0 +1,52 @@
+# Prometheus alerting rules for DVAS Ingest Server
+# File: monitoring/rules/dvas_alerts.yml
+
+groups:
+  - name: dvas_ingest
+    rules:
+
+      # ── Ingest API down ───────────────────────────────────────────────────
+      - alert: IngestAPIDown
+        expr: up{job="ingest-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ingest API is down"
+          description: "The FastAPI ingest container has been unreachable for > 1 minute."
+
+      # ── Valkey queue depth growing unbounded ──────────────────────────────
+      # Fires when GPU consumer is falling behind intake rate.
+      # Requires valkey-exporter to be deployed and scraped.
+      # - alert: IngestQueueOverload
+      #   expr: redis_stream_length{stream=~"drone:frames:.*"} > 800
+      #   for: 2m
+      #   labels:
+      #     severity: warning
+      #   annotations:
+      #     summary: "Ingest queue depth exceeding 800"
+      #     description: "Queue {{ $labels.stream }} depth is {{ $value }} — GPU consumer may be falling behind."
+
+      # ── GPU consumer container restarting ─────────────────────────────────
+      - alert: GPUConsumerRestarting
+        expr: rate(kube_pod_container_status_restarts_total{container="gpu-consumer"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "GPU consumer is restarting"
+          description: "The gpu-consumer container has restarted more than once in the last 5 minutes."
+
+  - name: dvas_vpn
+    rules:
+
+      # ── WireGuard peer last-seen > 5 minutes ──────────────────────────────
+      # Requires prometheus_wireguard_exporter deployed on the Ubuntu host.
+      # - alert: VPNPeerDisconnected
+      #   expr: (time() - wireguard_peer_last_handshake_seconds) > 300
+      #   for: 5m
+      #   labels:
+      #     severity: warning
+      #   annotations:
+      #     summary: "VPN peer disconnected: {{ $labels.public_key }}"
+      #     description: "WireGuard peer {{ $labels.public_key }} has not had a handshake for > 5 minutes — laptop may be offline."

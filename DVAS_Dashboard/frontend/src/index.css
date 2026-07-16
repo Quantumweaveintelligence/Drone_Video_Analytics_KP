@@ -1,0 +1,355 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+Malayalam:wght@400;500;600;700&display=swap');
+
+/* =========================================================
+   DVAS Design System v2 — "Soft SaaS"
+   Default = LIGHT.  Dark = elegant slate.
+   ========================================================= */
+
+:root, html.light {
+  /* Canvas / surfaces */
+  --dvas-root: #F3F4F6;            /* app canvas (soft gray-blue) */
+  --dvas-surface: #FFFFFF;         /* card / panel / topbar / sidebar */
+  --dvas-surface-2: #F8FAFC;       /* inset areas (video/grid bg) */
+  --dvas-elev: #F1F5F9;            /* hover / active nav highlight */
+  --dvas-border: #E2E8F0;          /* faint dividers */
+  --dvas-border-strong: #CBD5E1;
+
+  --dvas-text: #0F172A;            /* charcoal */
+  --dvas-text-muted: #64748B;      /* cool gray */
+  --dvas-text-dim: #94A3B8;
+  --dvas-topbar: #FFFFFF;
+
+  /* Accents */
+  --dvas-blue: #2563EB;            /* Royal Blue — primary */
+  --dvas-cyan: #2563EB;            /* legacy token remapped */
+  --dvas-safe: #10B981;
+  --dvas-warn: #F59E0B;
+  --dvas-crit: #EF4444;
+
+  /* Soft-badge backgrounds */
+  --dvas-safe-bg: #D1FAE5;
+  --dvas-warn-bg: #FEF3C7;
+  --dvas-crit-bg: #FEE2E2;
+  --dvas-info-bg: #DBEAFE;
+
+  /* Radius & shadows */
+  --dvas-radius: 14px;
+  --dvas-radius-sm: 10px;
+  --dvas-shadow: 0 4px 20px rgba(15, 23, 42, 0.05);
+  --dvas-shadow-lg: 0 12px 40px rgba(15, 23, 42, 0.08);
+
+  /* Shadcn HSL sync */
+  --background: 220 25% 96%;
+  --foreground: 222 47% 11%;
+  --card: 0 0% 100%;
+  --card-foreground: 222 47% 11%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 222 47% 11%;
+  --primary: 217 91% 54%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 220 15% 94%;
+  --secondary-foreground: 222 47% 11%;
+  --muted: 220 15% 94%;
+  --muted-foreground: 215 20% 45%;
+  --accent: 220 15% 94%;
+  --accent-foreground: 222 47% 11%;
+  --destructive: 0 74% 55%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 220 15% 90%;
+  --input: 220 15% 90%;
+  --ring: 217 91% 54%;
+  --radius: 12px;
+}
+
+html.dark {
+  --dvas-root: #0F172A;
+  --dvas-surface: #1E293B;
+  --dvas-surface-2: #172033;
+  --dvas-elev: #263449;
+  --dvas-border: #334155;
+  --dvas-border-strong: #475569;
+
+  --dvas-text: #E2E8F0;
+  --dvas-text-muted: #94A3B8;
+  --dvas-text-dim: #64748B;
+  --dvas-topbar: #1E293B;
+
+  --dvas-blue: #3B82F6;
+  --dvas-cyan: #3B82F6;
+  --dvas-safe: #10B981;
+  --dvas-warn: #F59E0B;
+  --dvas-crit: #EF4444;
+
+  --dvas-safe-bg: rgba(16, 185, 129, 0.15);
+  --dvas-warn-bg: rgba(245, 158, 11, 0.15);
+  --dvas-crit-bg: rgba(239, 68, 68, 0.15);
+  --dvas-info-bg: rgba(59, 130, 246, 0.15);
+
+  --dvas-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+  --dvas-shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.45);
+
+  --background: 222 47% 11%;
+  --foreground: 210 40% 96%;
+  --card: 217 33% 17%;
+  --card-foreground: 210 40% 96%;
+  --popover: 217 33% 17%;
+  --popover-foreground: 210 40% 96%;
+  --primary: 217 91% 60%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 217 33% 20%;
+  --secondary-foreground: 210 40% 96%;
+  --muted: 217 33% 20%;
+  --muted-foreground: 215 20% 65%;
+  --accent: 217 33% 20%;
+  --accent-foreground: 210 40% 96%;
+  --destructive: 0 74% 55%;
+  --destructive-foreground: 210 40% 96%;
+  --border: 217 33% 25%;
+  --input: 217 33% 25%;
+  --ring: 217 91% 60%;
+}
+
+/* --------- Base --------- */
+html, body, #root {
+  background: var(--dvas-root);
+  color: var(--dvas-text);
+  font-family: 'Plus Jakarta Sans', 'Noto Sans Malayalam', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  letter-spacing: -0.005em;
+}
+
+.font-mono, .mono {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum", "zero";
+}
+
+/* --------- Utility classes --------- */
+.dvas-label {
+  font-family: 'Plus Jakarta Sans', sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dvas-text-muted);
+}
+
+.dvas-panel {
+  background: var(--dvas-surface);
+  border: 1px solid transparent;
+  border-radius: var(--dvas-radius);
+  box-shadow: var(--dvas-shadow);
+}
+
+.dvas-grid-bg {
+  background-image:
+    linear-gradient(rgba(148, 163, 184, 0.15) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148, 163, 184, 0.15) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+/* =========================================================
+   SLATE PALETTE REMAP — bridges legacy tactical classes
+   to the new "soft SaaS" language, in BOTH themes.
+   Applies to every dashboard without touching JSX.
+   ========================================================= */
+
+/* ---- Backgrounds ---- */
+.bg-slate-950 { background-color: var(--dvas-surface-2) !important; }
+.bg-slate-900 { background-color: var(--dvas-surface) !important; }
+.bg-slate-800 { background-color: var(--dvas-elev) !important; }
+.bg-slate-800\/40 { background-color: color-mix(in srgb, var(--dvas-elev) 60%, transparent) !important; }
+.bg-slate-800\/60 { background-color: color-mix(in srgb, var(--dvas-elev) 80%, transparent) !important; }
+.bg-slate-900\/70 { background-color: color-mix(in srgb, var(--dvas-surface) 90%, transparent) !important; }
+.bg-slate-950\/50,
+.bg-slate-950\/60,
+.bg-slate-950\/90 { background-color: var(--dvas-surface-2) !important; }
+.bg-\[\#020617\] { background-color: var(--dvas-root) !important; }
+.bg-\[\#0b1220\] { background-color: var(--dvas-topbar) !important; }
+
+/* ---- Borders — soften to token ---- */
+.border-slate-950,
+.border-slate-900,
+.border-slate-800,
+.border-slate-800\/60,
+.border-slate-700 { border-color: var(--dvas-border) !important; }
+.border-slate-600 { border-color: var(--dvas-border-strong) !important; }
+.divide-slate-800 > * + * { border-color: var(--dvas-border) !important; }
+
+/* ---- Text ---- */
+.text-slate-100,
+.text-white { color: var(--dvas-text) !important; }
+.text-slate-300,
+.text-slate-200 { color: var(--dvas-text) !important; }
+.text-slate-400 { color: var(--dvas-text-muted) !important; }
+.text-slate-500 { color: var(--dvas-text-muted) !important; }
+.text-slate-600,
+.text-slate-700 { color: var(--dvas-text-dim) !important; }
+
+/* ---- Status tints — soft SaaS badges ---- */
+.bg-sky-500\/10,
+.bg-blue-500\/10 { background-color: var(--dvas-info-bg) !important; }
+.bg-emerald-500\/10 { background-color: var(--dvas-safe-bg) !important; }
+.bg-amber-500\/10,
+.bg-amber-500\/5 { background-color: var(--dvas-warn-bg) !important; }
+.bg-red-500\/10 { background-color: var(--dvas-crit-bg) !important; }
+
+.text-sky-300,
+.text-sky-400,
+.text-blue-300,
+.text-blue-400 { color: var(--dvas-blue) !important; }
+.text-emerald-300,
+.text-emerald-400 { color: #059669 !important; }
+.text-amber-300,
+.text-amber-400 { color: #B45309 !important; }
+.text-red-300,
+.text-red-400 { color: #DC2626 !important; }
+
+/* dark-mode text tweaks so status labels remain legible on dark backgrounds */
+html.dark .text-emerald-300,
+html.dark .text-emerald-400 { color: #34D399 !important; }
+html.dark .text-amber-300,
+html.dark .text-amber-400 { color: #FBBF24 !important; }
+html.dark .text-red-300,
+html.dark .text-red-400 { color: #F87171 !important; }
+html.dark .text-sky-300,
+html.dark .text-sky-400,
+html.dark .text-blue-300,
+html.dark .text-blue-400 { color: #60A5FA !important; }
+
+/* Border color swaps for badges */
+.border-sky-500\/40,
+.border-sky-600\/60,
+.border-blue-500\/40,
+.border-blue-600\/60 { border-color: transparent !important; }
+.border-emerald-500\/40 { border-color: transparent !important; }
+.border-amber-500\/40 { border-color: transparent !important; }
+.border-red-500\/40,
+.border-red-500\/50 { border-color: transparent !important; }
+
+/* ---- Hover overrides ---- */
+.hover\:bg-slate-800\/40:hover,
+.hover\:bg-slate-800\/60:hover { background-color: var(--dvas-elev) !important; }
+.hover\:bg-sky-500\/10:hover,
+.hover\:bg-blue-500\/10:hover { background-color: var(--dvas-info-bg) !important; }
+
+/* ---- Modal backdrops ---- */
+.bg-black\/80 { background-color: rgba(15, 23, 42, 0.55) !important; }
+.bg-black\/70,
+.bg-black\/60,
+.bg-black\/40 { background-color: rgba(15, 23, 42, 0.5) !important; }
+
+/* =========================================================
+   ROUND-EVERYTHING pass — soft SaaS radii on all cards,
+   panels, badges, inputs, buttons — without JSX changes.
+   ========================================================= */
+
+/* Cards & panel containers (Tailwind "border ...900/800/700 bg-...900/800") */
+.border.border-slate-800.bg-slate-900,
+.border.border-slate-700.bg-slate-900,
+.border.border-slate-800.bg-slate-950,
+.border.border-slate-800\/60.bg-slate-900,
+.border.bg-slate-900,
+.border.border-slate-800 {
+  border-radius: var(--dvas-radius);
+  box-shadow: var(--dvas-shadow);
+  border-color: transparent !important;
+}
+
+html.dark .border.border-slate-800.bg-slate-900,
+html.dark .border.border-slate-700.bg-slate-900,
+html.dark .border.border-slate-800.bg-slate-950,
+html.dark .border.border-slate-800\/60.bg-slate-900,
+html.dark .border.bg-slate-900,
+html.dark .border.border-slate-800 {
+  border-color: var(--dvas-border) !important;
+  box-shadow: none;
+}
+
+/* Small pill-like badges (px-1.5 border tag) */
+.px-1\.5.py-0\.5.border,
+.px-2.py-1.border {
+  border-radius: 999px;
+  padding-inline: 0.6rem;
+}
+
+/* Buttons: primary CTA styling */
+button.border-sky-600\/60,
+button.border-blue-600\/60,
+a.border-sky-600\/60,
+a.border-blue-600\/60 {
+  border-radius: 8px;
+  transition: transform 120ms ease, background-color 120ms ease, box-shadow 120ms ease;
+}
+button.border-sky-600\/60:hover,
+button.border-blue-600\/60:hover,
+a.border-sky-600\/60:hover,
+a.border-blue-600\/60:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.15);
+}
+
+button.border-emerald-600\/60 { border-radius: 8px; }
+button.border-red-600\/60 { border-radius: 8px; }
+button.border-slate-700 { border-radius: 8px; }
+
+/* Inputs — rounded + soft focus */
+input, select, textarea {
+  border-radius: 10px !important;
+}
+
+/* Tables — remove striped/hard rows, use faint bottom border */
+table.mono td, table.mono th,
+table.w-full td, table.w-full th {
+  border-color: var(--dvas-border) !important;
+}
+table tbody tr:hover {
+  background: var(--dvas-elev) !important;
+}
+
+/* =========================================================
+   Animations
+   ========================================================= */
+@keyframes dvas-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.dvas-live-dot { animation: dvas-blink 1.4s ease-in-out infinite; }
+
+@keyframes dvas-fade-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.dvas-fade-in { animation: dvas-fade-in 180ms ease-out; }
+
+/* --------- Scrollbar --------- */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb {
+  background: var(--dvas-border-strong);
+  border-radius: 8px;
+}
+::-webkit-scrollbar-track { background: transparent; }
+
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { scrollbar-width: none; }
+
+/* --------- Leaflet --------- */
+.leaflet-container {
+  background: var(--dvas-surface-2) !important;
+  border-radius: var(--dvas-radius);
+}
+
+/* --------- Focus ring --------- */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--dvas-blue);
+  outline-offset: 2px;
+  border-radius: 8px;
+}

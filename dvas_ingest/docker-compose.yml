@@ -1,0 +1,550 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Kerala Police Drone Video Analytics System — Ubuntu Ingest Server
+# docker-compose.yml
+#
+# Machine: Ubuntu 22.04 LTS + NVIDIA GPU
+# This file runs ONLY on the Ubuntu ingest server.
+# The Windows edge laptop runs its pipeline natively (no Docker).
+#
+# Services (19 total):
+#   Infrastructure  : postgres (keycloak + dvas DBs), keycloak, valkey
+#   VPN / PKI       : headscale, step-ca
+#   Ingest Layer    : ingest-api, nginx
+#   Analytics Layer : gpu-consumer (legacy stub), crowd-analyzer, person-analyzer,
+#                     vehicle-analyzer, anpr-analyzer
+#   Evidence Storage: seaweedfs-master, seaweedfs-volume, seaweedfs-filer
+#   Monitoring      : prometheus, grafana, alertmanager
+#   Setup (one-time): setup
+#
+# AI Analytics code lives in the separate folder:
+#   ../dvas_analytics/   (crowd/, person/, vehicle/, anpr/, shared/, db/)
+#
+# The 4 analytics services build from ../dvas_analytics/ but are declared here
+# so they share the same Docker network, Postgres, and Valkey as the ingest
+# services without any cross-stack networking complexity.
+#
+# Startup order (enforced via depends_on + healthchecks):
+#   postgres → keycloak ─────────────────────────────────────┐
+#   valkey ──────────────────────────────────────────────────┼→ ingest-api → nginx
+#                                                             └→ gpu-consumer
+#
+# Usage:
+#   docker compose up -d                      # Start everything
+#   docker compose ps                         # Health status
+#   docker compose logs -f ingest-api         # Ingest API logs
+#   docker compose logs -f crowd-analyzer     # Analytics logs
+#   docker compose down -v                    # Full reset (WARNING: deletes volumes)
+# ══════════════════════════════════════════════════════════════════════════════
+
+networks:
+  drone-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  postgres_data:
+    driver: local
+  valkey_data:
+    driver: local
+  evidence_data:
+    driver: local
+  headscale_data:
+    driver: local
+  step_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  analytics_evidence:
+    driver: local     # evidence crops saved by analytics services (../dvas_analytics/)
+
+services:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # INFRASTRUCTURE LAYER
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── Postgres — single instance, two databases ──────────────────────────────
+  # Database 1: keycloak  (Keycloak IAM backend — this folder)
+  # Database 2: dvas      (DVAS analytics — tracks, events, plates, embeddings)
+  # The init.sh script in ../dvas_analytics/db/ creates the 'dvas' database
+  # and runs the SQL migrations on first Postgres container start.
+  postgres:
+    image: postgres:16-alpine
+    container_name: drone_postgres
+    networks: [drone-net]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:         keycloak
+      POSTGRES_USER:       keycloak
+      POSTGRES_PASSWORD:   ${POSTGRES_PASSWORD:-keycloak_secret}
+      DVAS_DB_PASSWORD:    ${DVAS_DB_PASSWORD:-dvas_secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # DVAS analytics DB init — schema lives in ../dvas_analytics/db/
+      - ../dvas_analytics/db/init.sh:/docker-entrypoint-initdb.d/00_dvas_init.sh:ro
+      - ../dvas_analytics/db/migrations:/docker-entrypoint-initdb.d/migrations:ro
+    healthcheck:
+      test:     ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+
+  # ── Identity & Access Management ─────────────────────────────────────────────
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    container_name: drone_keycloak
+    command: start-dev
+    networks: [drone-net]
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8080:8080"   # Keycloak admin + JWT endpoint (restrict to VPN after WireGuard is up)
+    environment:
+      KC_DB:                   postgres
+      KC_DB_URL:               jdbc:postgresql://postgres/keycloak
+      KC_DB_USERNAME:          keycloak
+      KC_DB_PASSWORD:          ${POSTGRES_PASSWORD:-keycloak_secret}
+      KEYCLOAK_ADMIN:          admin
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-Admin@KP2025!}
+      KC_HTTP_ENABLED:         "true"
+      KC_HOSTNAME_STRICT:      "false"
+      KC_HOSTNAME:             ingest.dvas.internal   # Issuer URL for JWT validation
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:         ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 || exit 1"]
+      interval:     20s
+      timeout:      10s
+      retries:      15
+      start_period: 90s
+
+  # ── Valkey — BSD-3-Clause drop-in Redis replacement ───────────────────────────
+  # Wire-protocol compatible: no client code changes needed.
+  valkey:
+    image: valkey/valkey:7-alpine
+    container_name: drone_valkey
+    networks: [drone-net]
+    restart: unless-stopped
+    command: valkey-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test:         ["CMD", "valkey-cli", "ping"]
+      interval:     5s
+      timeout:      3s
+      retries:      10
+      start_period: 5s
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # VPN CONTROL PLANE + INTERNAL CA
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── Headscale — open source Tailscale control plane (BSD-3-Clause) ───────────
+  # Manages which Windows laptops are enrolled in the VPN.
+  # Admin UI: http://localhost:8081 (bind only to loopback + VPN)
+  headscale:
+    image: headscale/headscale:0.23.0   # Pinned — latest has breaking config changes
+    container_name: drone_headscale
+    networks: [drone-net]
+    restart: unless-stopped
+    volumes:
+      - ./headscale/config.yaml:/etc/headscale/config.yaml:ro
+      - ./headscale/acl.json:/etc/headscale/acl.json:ro
+      - headscale_data:/var/lib/headscale
+    ports:
+      - "0.0.0.0:8081:8080"   # Headscale gRPC + HTTP (VPN-only recommended in prod)
+    command: serve
+
+  # ── step-ca — Smallstep internal certificate authority (Apache-2.0) ──────────
+  # Replaces manual gen_certs.ps1 one-off certificates.
+  # On first run prints the root CA fingerprint — save it for Windows laptops.
+  step-ca:
+    image: smallstep/step-ca:latest
+    container_name: drone_step_ca
+    networks: [drone-net]
+    restart: unless-stopped
+    volumes:
+      - step_data:/home/step
+    ports:
+      - "127.0.0.1:9000:9000"   # Only accessible locally (admin use)
+    environment:
+      DOCKER_STEPCA_INIT_NAME:      "DVAS Internal CA"
+      DOCKER_STEPCA_INIT_DNS_NAMES: "ingest.dvas.internal,localhost"
+      DOCKER_STEPCA_INIT_ADDRESS:   ":9000"
+      DOCKER_STEPCA_INIT_PASSWORD:  ${STEPCA_PASSWORD:-dvas-ca-password}
+    healthcheck:
+      test:     ["CMD-SHELL", "curl -sk https://localhost:9000/health | grep -q ok || exit 1"]
+      interval: 15s
+      timeout:  5s
+      retries:  5
+      start_period: 20s
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # INGEST LAYER
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── FastAPI Ingest API ────────────────────────────────────────────────────────
+  ingest-api:
+    build:
+      context:    ./ingest/api
+      dockerfile: Dockerfile
+    container_name: drone_ingest_api
+    networks: [drone-net]
+    restart: unless-stopped
+    environment:
+      # Keycloak
+      KEYCLOAK_URL:      http://keycloak:8080
+      KC_REALM:          kerala-police-drone
+      KC_CLIENT_ID:      drone-ingest-client
+      # Valkey queue (was Redis — wire-protocol identical)
+      REDIS_URL:         redis://valkey:6379/0
+      # Frame settings
+      MAX_FRAME_MB:      "5"
+      QUEUE_MAX_LENGTH:  "1000"
+      QUEUE_MSG_TTL_MS:  "30000"
+      JWKS_CACHE_TTL_S:  "300"
+      # Drone registry
+      KNOWN_DRONES: "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
+      # Logging
+      LOG_LEVEL: "INFO"
+      LOG_JSON:  "true"
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    expose:
+      - "8000"
+    healthcheck:
+      test:         ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval:     10s
+      timeout:      5s
+      retries:      5
+      start_period: 10s
+
+  # ── NGINX Reverse Proxy ───────────────────────────────────────────────────────
+  # Only public-facing port on the VPN — Windows laptops connect here on :443.
+  nginx:
+    image: nginx:alpine
+    container_name: drone_nginx
+    networks: [drone-net]
+    restart: unless-stopped
+    ports:
+      - "80:80"     # HTTP → redirects to HTTPS
+      - "443:443"   # HTTPS — Windows laptops POST frames here over WireGuard VPN
+    volumes:
+      - ./ingest/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      # TLS certs issued by step-ca (replace self-signed after Phase 4)
+      - ./ingest/certs/ingest.crt:/etc/ssl/certs/ingest.crt:ro
+      - ./ingest/certs/ingest.key:/etc/ssl/private/ingest.key:ro
+    depends_on:
+      ingest-api:
+        condition: service_healthy
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # ANALYTICS LAYER
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── GPU Batch Consumer ────────────────────────────────────────────────────────
+  # Reads frames from Valkey streams, runs GPU inference, emits confirmed events.
+  # Replace run_gpu_inference() stub with YOLOv8 / DeepSORT when ready.
+  gpu-consumer:
+    build:
+      context:    .
+      dockerfile: Dockerfile.gpu_consumer
+    container_name: drone_gpu_consumer
+    networks: [drone-net]
+    restart: unless-stopped
+    # GPU access requires Docker Engine + nvidia-container-toolkit.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      REDIS_URL:  redis://valkey:6379/0
+      DRONE_IDS:  "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
+      BATCH_SIZE: "16"
+    depends_on:
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test:     ["CMD-SHELL", "pgrep -f gpu_consumer.py || exit 1"]
+      interval: 30s
+      timeout:  5s
+      retries:  3
+      start_period: 10s
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # EVIDENCE STORAGE — SeaweedFS (Apache-2.0)
+  # Immutable evidence clips uploaded by Windows laptops after GPU confirmation.
+  # For large deployments (district phase), migrate to Ceph.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  seaweedfs-master:
+    image: chrislusf/seaweedfs:latest
+    container_name: drone_seaweed_master
+    networks: [drone-net]
+    restart: unless-stopped
+    command: master -volumeSizeLimitMB=1024
+    ports:
+      - "127.0.0.1:9333:9333"
+
+  seaweedfs-volume:
+    image: chrislusf/seaweedfs:latest
+    container_name: drone_seaweed_volume
+    networks: [drone-net]
+    restart: unless-stopped
+    command: volume -mserver=seaweedfs-master:9333 -dir=/data -port=8080
+    volumes:
+      - evidence_data:/data
+    depends_on:
+      - seaweedfs-master
+
+  seaweedfs-filer:
+    image: chrislusf/seaweedfs:latest
+    container_name: drone_seaweed_filer
+    networks: [drone-net]
+    restart: unless-stopped
+    command: filer -master=seaweedfs-master:9333
+    ports:
+      - "127.0.0.1:8888:8888"
+    depends_on:
+      - seaweedfs-master
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # MONITORING — Prometheus + Grafana + Alertmanager (all Apache-2.0 / AGPLv3)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: drone_prometheus
+    networks: [drone-net]
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    ports:
+      - "127.0.0.1:9090:9090"   # Internal only — accessed via Grafana
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: drone_grafana
+    networks: [drone-net]
+    restart: unless-stopped
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "0.0.0.0:3000:3000"   # Dashboard UI — bind to VPN IP in production
+    environment:
+      GF_SECURITY_ADMIN_USER:     admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-Grafana@KP2025!}
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+    depends_on:
+      - prometheus
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: drone_alertmanager
+    networks: [drone-net]
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+    ports:
+      - "127.0.0.1:9093:9093"   # Internal only
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # ONE-TIME SETUP (runs once, then exits — restarts on failure until success)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  setup:
+    image: python:3.11-slim
+    container_name: drone_setup
+    networks: [drone-net]
+    restart: on-failure
+    entrypoint: >
+      sh -c "
+        pip install httpx --quiet &&
+        python /scripts/setup_keycloak.py --url http://keycloak:8080 --no-wait
+      "
+    volumes:
+      - ./ingest/scripts:/scripts:ro
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # AI ANALYTICS LAYER — Four containerised microservices
+  # Code lives in: ../dvas_analytics/  (separate folder, same machine)
+  # Each service reads frames from Valkey, runs GPU inference, writes to Postgres
+  # Build context points to ../dvas_analytics so Dockerfiles can COPY shared/
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── Crowd Density & Counting (FourColumnMDNN) ─────────────────────────────
+  crowd-analyzer:
+    build:
+      context:    ../dvas_analytics
+      dockerfile: crowd/Dockerfile
+    container_name: drone_crowd_analyzer
+    networks: [drone-net]
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8101:8101"   # REST API — crowd analysis
+    environment:
+      DATABASE_URL:          postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas
+      REDIS_URL:             redis://valkey:6379/0
+      DRONE_IDS:             "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
+      MODEL_PATH:            /analytics/crowd/models/crowd_counting.pth
+      CROWD_ALERT_THRESHOLD: "${CROWD_ALERT_THRESHOLD:-50}"
+      LOG_LEVEL:             INFO
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver:       nvidia
+              count:        1
+              capabilities: [gpu]
+    volumes:
+      - analytics_evidence:/data/evidence
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test:         ["CMD", "curl", "-f", "http://localhost:8101/health"]
+      interval:     30s
+      timeout:      10s
+      retries:      3
+      start_period: 60s   # model load time
+
+  # ── Person Tracking & Face Re-ID (YOLOv8m + YOLOv8n-face + ResNet50) ──────
+  person-analyzer:
+    build:
+      context:    ../dvas_analytics
+      dockerfile: person/Dockerfile
+    container_name: drone_person_analyzer
+    networks: [drone-net]
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8102:8102"   # REST API — person/face analysis
+    environment:
+      DATABASE_URL: postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas
+      REDIS_URL:    redis://valkey:6379/0
+      DRONE_IDS:    "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
+      PERSON_MODEL: /analytics/person/models/yolov8m.pt
+      FACE_MODEL:   /analytics/person/models/yolov8n-face.pt
+      LOG_LEVEL:    INFO
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver:       nvidia
+              count:        1
+              capabilities: [gpu]
+    volumes:
+      - analytics_evidence:/data/evidence
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test:         ["CMD", "curl", "-f", "http://localhost:8102/health"]
+      interval:     30s
+      timeout:      10s
+      retries:      3
+      start_period: 90s   # YOLOv8m + ResNet50 load time
+
+  # ── Vehicle Detection & Tracking (VisDrone YOLOv8) ─────────────────────────
+  vehicle-analyzer:
+    build:
+      context:    ../dvas_analytics
+      dockerfile: vehicle/Dockerfile
+    container_name: drone_vehicle_analyzer
+    networks: [drone-net]
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8103:8103"   # REST API — vehicle detection
+    environment:
+      DATABASE_URL:  postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas
+      REDIS_URL:     redis://valkey:6379/0
+      DRONE_IDS:     "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
+      VEHICLE_MODEL: /analytics/vehicle/models/visdrone.pt
+      LOG_LEVEL:     INFO
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver:       nvidia
+              count:        1
+              capabilities: [gpu]
+    volumes:
+      - analytics_evidence:/data/evidence
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test:         ["CMD", "curl", "-f", "http://localhost:8103/health"]
+      interval:     30s
+      timeout:      10s
+      retries:      3
+      start_period: 60s
+
+  # ── ANPR — License Plate Recognition (YOLOv8m + LP detector + PaddleOCR) ──
+  # NOTE: First run downloads PaddleOCR models (~500 MB). start_period is generous.
+  anpr-analyzer:
+    build:
+      context:    ../dvas_analytics
+      dockerfile: anpr/Dockerfile
+    container_name: drone_anpr_analyzer
+    networks: [drone-net]
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8104:8104"   # REST API — ANPR + watchlist management
+    environment:
+      DATABASE_URL:  postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas
+      REDIS_URL:     redis://valkey:6379/0
+      DRONE_IDS:     "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
+      VEHICLE_MODEL: /analytics/anpr/models/yolov8m.pt
+      LP_MODEL:      /analytics/anpr/models/license_plate_detector.pt
+      LOG_LEVEL:     INFO
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver:       nvidia
+              count:        1
+              capabilities: [gpu]
+    volumes:
+      - analytics_evidence:/data/evidence
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test:         ["CMD", "curl", "-f", "http://localhost:8104/health"]
+      interval:     30s
+      timeout:      15s
+      retries:      5
+      start_period: 180s  # PaddleOCR model download on first run
