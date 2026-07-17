@@ -1,0 +1,54 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.env
+.venv/
+venv/
+env/
+
+# ── Testing / coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+*.coveragerc
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Buffer / mmap slab files (large, machine-local) ──────────────────────────
+buffer_storage/
+
+# ── WireGuard — NEVER commit filled-in configs with private keys ──────────────
+# The template (wg0-client.conf) IS committed (it has no real keys).
+# Any file matching *-filled.conf or *.key must not be committed.
+config/wireguard/*-filled.conf
+config/wireguard/*.key
+*.key
+
+# ── TLS certificates ──────────────────────────────────────────────────────────
+*.crt
+*.pem
+ingest/certs/
+
+# ── Editor / OS ───────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ── Large video files (source material — not part of the codebase) ────────────
+*.MP4
+*.mp4
+*.avi
+*.mkv

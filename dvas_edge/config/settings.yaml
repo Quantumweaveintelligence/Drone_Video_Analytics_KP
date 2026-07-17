@@ -1,0 +1,256 @@
+# ============================================================
+# config/settings.yaml
+# Kerala Police Drone Video Analytics — Edge Layer Configuration
+# ============================================================
+
+drone:
+  # Primary RTSP stream (Hikvision / Dahua / DJI style URL)
+  rtsp_url: "rtsp://admin:Admin12345@10.10.32.23:554/h264/ch1/main/av_stream"
+
+  # USB/HDMI capture-card fallback (0 = first system camera)
+  usb_device_index: 0
+
+  # Laptop/USB webcam device index for live testing (separate from drone USB fallback)
+  # 0 = first webcam; increase if you have multiple cameras
+  webcam_device_index: 0
+
+  # Preferred backend: "rtsp" | "usb"
+  preferred_source: "rtsp"
+
+  # Never fall back to USB/webcam — keep retrying RTSP with back-off
+  rtsp_only: true
+
+  # Use NVIDIA NVDEC (h264_cuvid) for hardware-accelerated H.264 decode on GPU
+  # Requires FFMPEG built with CUVID support (confirmed available on this system)
+  use_gpu: true
+
+  # RTSP transport: tcp prevents UDP packet-loss corrupting H.264 for NVDEC
+  rtsp_transport: "tcp"
+
+  # GStreamer decode pipeline (leave blank to let OpenCV choose automatically)
+  # Example GPU decode: "rtspsrc location={url} ! rtph264depay ! avdec_h264 ! videoconvert ! appsink"
+  gstreamer_pipeline: ""
+
+  # Reconnection back-off (seconds): base, multiplier, max ceiling
+  reconnect_base_delay_s: 0.5
+  reconnect_multiplier: 1.5
+  reconnect_max_delay_s: 30.0
+
+  # Read timeout: with TCP the stream either delivers or disconnects — 8s is generous
+  read_timeout_s: 8.0
+
+buffer:
+  # Rolling window duration (seconds)
+  duration_s: 60
+
+  # Absolute path to a fast SSD directory for memory-mapped buffer files
+  # Use a raw string or forward slashes on Windows
+  storage_dir: "./buffer_storage"
+
+  # JPEG quality for buffer frames (1–100); 85 balances size (~10–30 KB) vs quality
+  jpeg_quality: 85
+
+  # Maximum number of frames to hold in the index (safety ceiling)
+  # At 30 fps × 60 s = 1800 frames; add 20% headroom
+  max_frames: 2200
+
+  # Size (bytes) of each memory-mapped slab file
+  # 30 fps × 60 s × ~25 KB/frame (JPEG 85%) ≈ 45 MB; 128 MB gives plenty of room
+  mmap_slab_size_bytes: 134217728   # 128 MB
+
+metrics:
+  # Prometheus HTTP port — scrape via http://localhost:8000/metrics  (edge laptop only)
+  prometheus_port: 8000
+
+# ============================================================
+# Ingest Server Connection — edge_sender.py targets
+# The Ubuntu ingest server is reached over the WireGuard VPN.
+#   VPN subnet  : 10.10.20.0/24
+#   Ubuntu server VPN IP : 10.10.20.1
+#   Internal hostname    : ingest.dvas.internal  (resolves via WireGuard DNS or /etc/hosts)
+# ============================================================
+
+ingest:
+  # HTTPS endpoint for frame upload — goes through NGINX on Ubuntu
+  url: "https://ingest.dvas.internal/ingest/frame"
+
+  # Mission lifecycle endpoints
+  mission_start_url: "https://ingest.dvas.internal/ingest/mission/start"
+  mission_end_url:   "https://ingest.dvas.internal/ingest/mission/end"
+
+  # Keycloak token endpoint — direct to Keycloak container port on Ubuntu VPN IP
+  # (Keycloak does not go through NGINX — direct 8080 access over VPN only)
+  token_url: "http://10.10.20.1:8080/realms/kerala-police-drone/protocol/openid-connect/token"
+
+  # Keycloak client credentials — match values configured in Keycloak on Ubuntu
+  client_id:     "drone-ingest-client"
+  client_secret: "j2Icr4lPJHHlvcJBu04nIH7A74k3cl4c"   # rotate after pilot
+
+  # Operator credentials for Resource Owner Password Grant
+  username: "operator_001"
+  password: "Operator@001"   # rotate after pilot
+
+  # Drone / mission identifiers embedded in every frame payload
+  drone_id:   "DRONE_KL_001"
+  mission_id: "MISSION_DEFAULT"
+
+  # TLS verification:
+  #   true  — use ca_cert below to verify the ingest server certificate
+  #   false — skip verification (development only, self-signed / expired cert)
+  tls_verify: true
+
+  # Path to the internal CA root certificate.
+  # Python's httpx does NOT read the Windows certificate store — it needs the cert file explicitly.
+  # Used when tls_verify: true
+  ca_cert: "D:/POLICE_DRONE/drone_analytics/root_ca.crt"
+
+  # How often (seconds) the heartbeat logger prints a human-readable summary
+  heartbeat_log_interval_s: 10
+
+logging:
+  level: "INFO"          # DEBUG | INFO | WARNING | ERROR
+  json_output: false     # true = JSON lines (good for log aggregators)
+  log_file: "./logs/edge.log"
+
+# ============================================================
+# Drone Feed Simulation — Task 1.1 extension
+# Used by combined_change_stream.py (simulation entry point)
+# ============================================================
+
+simulation:
+  # Set to true to use MP4 file playback instead of RTSP
+  enabled: true
+
+  # Ordered playlist of local MP4 files (played sequentially)
+  video_files:
+    - "D:/POLICE_DRONE/drone_analytics/DJI_0110.MP4"
+    - "D:/POLICE_DRONE/drone_analytics/DJI_0111.MP4"
+
+  # Loop the playlist indefinitely when the last file ends
+  loop: true
+
+  # Playback speed multiplier:
+  #   1.0 = real-time  |  2.0 = 2x faster  |  0.5 = half speed
+  playback_speed: 1.0
+
+# ============================================================
+# Change Detection Engine — Task 1.3
+# Two-stage MOG2 + region-scoring pipeline
+# ============================================================
+
+change_detection:
+  # Set to false to disable change detection (buffer + viewer still run)
+  enabled: true
+
+  # MOG2 background subtractor: number of history frames
+  # Tuned for DJI 4K (30 fps):
+  #   100 frames = ~3.3 seconds warm-up before detecting motion
+  #   Higher values = slower adaptation but more stable background model
+  mog2_history: 100
+
+  # Mahalanobis distance squared threshold for foreground classification
+  # 40.0 is robust against minor camera shake and JPEG compression at 4K
+  # Lower  = more sensitive  |  Higher = more conservative
+  mog2_var_threshold: 40.0
+
+  # Mark shadow pixels separately (127) before thresholding
+  # Reduces false positives from ground shadows on aerial footage
+  detect_shadows: true
+
+  # Minimum blob area in pixels² — tuned for DJI 4K (3840×2160)
+  # 1080p equiv of 400px² scales to ~6400px² at 4K (4× resolution area)
+  # 2000 px² catches vehicles and people while ignoring dust/leaves
+  min_contour_area: 2000
+
+  # Minimum composite motion score to emit a ChangeEvent
+  # At 4K (3840×2160 = 8.3M pixels): 0.001 = 8300 px² of confirmed motion
+  # This catches a single moving vehicle in aerial DJI footage
+  # Tune up (e.g. 0.005) if too many events fire on windy scenes
+  motion_score_threshold: 0.001
+
+  # A blob must appear in this many consecutive frames to be confirmed
+  # 2 frames at 30fps = ~66ms persistence (filters single-frame flicker)
+  persistence_frames: 2
+
+  # Maximum frames buffered in the detection queue before dropping
+  max_queue_size: 64
+
+  # Attach binary foreground mask to ChangeEvent.raw_mask (used for HUD overlay)
+  # Set to false in production to save the numpy copy cost at 4K
+  emit_raw_mask: true
+
+  # Attach the full BGR frame to ChangeEvent.raw_frame
+  # Required by CognitiveFrameSelector (Task 1.5) to run signal scoring.
+  # One numpy copy per confirmed ChangeEvent (not every frame) — negligible cost.
+  emit_raw_frame: true
+
+# ============================================================
+# Cognitive Frame Selector — Task 1.5
+# Intelligent filter on top of change detection.
+# Answers: "Of all frames that changed, which are worth sending
+#           for deep GPU analysis?"
+#
+# Calibrated from final_key_frame_extraction.py:
+#   Target: 35% extraction rate, 67% event capture
+# ============================================================
+
+cognitive_frame_selector:
+  # Set to false to disable (ChangeEvents still logged, just not scored further)
+  enabled: true
+
+  # Mission identifier embedded in every SelectedFrame payload
+  mission_id: "MISSION_DEFAULT"
+
+  # ── Extraction rate control ──────────────────────────────────────────────
+  # Target fraction of candidate frames to extract and transmit
+  transmission_target: 0.35
+
+  # Sliding window size for percentile ranking (frames)
+  window_size: 15
+
+  # Select a frame if its priority ranks at or above this percentile
+  # in the sliding window. 0.65 = top 35% (matches transmission_target)
+  percentile_threshold: 0.65
+
+  # ── Priority thresholds ─────────────────────────────────────────────────
+  # Frames below this priority are never selected
+  absolute_min_priority: 0.05
+
+  # Frames at or above this priority are always selected (emergency override)
+  emergency_priority: 0.60
+
+  # ── Context boosts ─────────────────────────────────────────────────────
+  # +30% for vehicle / high-speed motion events
+  vehicle_boost: 0.30
+  # +30% for sudden histogram shifts (scene cuts)
+  scene_change_boost: 0.30
+  # +30% for crowded / high-texture scenes
+  crowd_boost: 0.30
+
+  # ── Signal weights (must sum to ~1.0 before context weight) ────────────
+  weights_histogram: 0.20   # histogram difference vs. last frame
+  weights_motion: 0.40      # multi-threshold motion density
+  weights_object: 0.30      # bright objects + edges + texture
+  weights_context: 0.10     # context boost (applied as multiplier)
+
+  # ── Feature detection parameters ────────────────────────────────────────
+  histogram_bins: 16
+
+  # Pixel-difference thresholds for three-level motion scoring
+  motion_threshold_low: 10
+  motion_threshold_med: 20
+  motion_threshold_high: 30
+
+  # Brightness threshold for vehicle / light detection
+  object_brightness_threshold: 150
+
+  # Canny edge thresholds for structural-object scoring
+  edge_threshold_low: 30
+  edge_threshold_high: 100
+
+  # ── Output settings ─────────────────────────────────────────────────────
+  # JPEG quality for frame encoding in SelectedFrame payload
+  jpeg_quality: 85
+
+  # Maximum frames queued internally (not currently used — evaluate() is sync)
+  max_queue_size: 32

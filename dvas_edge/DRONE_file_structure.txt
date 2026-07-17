@@ -1,0 +1,231 @@
+Folder PATH listing for volume New Volume
+Volume serial number is 000002A8 0607:2957
+D:\POLICE_DRONE\DRONE_ANALYTICS
+|   .coverage
+|   .dockerignore
+|   analytics_worker.py
+|   DJI_0110.MP4
+|   DJI_0111.MP4
+|   docker-compose.yml
+|   Dockerfile
+|   Dockerfile.gpu_consumer
+|   docx_extracted.txt
+|   DRONE_file_structure.txt
+|   DVAS_Production_Roadmap_2Member.md
+|   final_key_frame_extraction.py
+|   fix.py
+|   generate_progress_ppt.py
+|   generate_w2_report.py
+|   main.py
+|   phase1_fastapi_rabbitmq_keycloak_nginx.md
+|   proposal-docuement-drone-video-analytics-kerala-police.docx (1).pdf
+|   pyproject.toml
+|   README.md
+|   requirements.txt
+|   setup_and_test.bat
+|   start-docker.ps1
+|   test_api.ps1
+|   test_frame.jpg
+|   test_jpeg.py
+|   test_nvdec_local.py
+|   token.txt
+|   
++---.pytest_cache
+|   |   .gitignore
+|   |   CACHEDIR.TAG
+|   |   README.md
+|   |   
+|   \---v
+|       \---cache
+|               lastfailed
+|               nodeids
+|               
++---buffer_storage
+|   |   buffer_drone_01.mmap
+|   |   
+|   \---verify_test
++---config
+|   |   config.py
+|   |   settings.docker.yaml
+|   |   settings.yaml
+|   |   
+|   \---__pycache__
+|           config.cpython-310.pyc
+|           
++---htmlcov
+|       .gitignore
+|       class_index.html
+|       coverage_html_cb_188fc9a4.js
+|       favicon_32_cb_c827f16f.png
+|       function_index.html
+|       index.html
+|       keybd_closed_cb_900cfef5.png
+|       status.json
+|       style_cb_5c747636.css
+|       z_08a8bee6f23502af_drone_simulation_source_py.html
+|       z_08a8bee6f23502af_drone_video_source_py.html
+|       z_08a8bee6f23502af_frame_interpolator_py.html
+|       z_08a8bee6f23502af_stream_viewer_py.html
+|       z_08a8bee6f23502af___init___py.html
+|       z_145eef247bfb46b6___init___py.html
+|       z_6156a86a215061be_gpu_utils_py.html
+|       z_6156a86a215061be_logger_py.html
+|       z_6156a86a215061be___init___py.html
+|       z_64d48183a5b96f82_rolling_frame_buffer_py.html
+|       z_64d48183a5b96f82___init___py.html
+|       z_691eba787f6a7a4b_change_detection_engine_py.html
+|       z_691eba787f6a7a4b_change_event_py.html
+|       z_691eba787f6a7a4b___init___py.html
+|       z_9281718d6d2de4fe_prometheus_metrics_py.html
+|       z_9281718d6d2de4fe___init___py.html
+|       z_a291de8b53757eaa_cognitive_frame_selector_py.html
+|       z_a291de8b53757eaa_selected_frame_py.html
+|       z_a291de8b53757eaa___init___py.html
+|       
++---ingest
+|   |   .env.example
+|   |   docker-compose.yml
+|   |   edge_sender.py
+|   |   gpu_consumer.py
+|   |   README.md
+|   |   
+|   +---api
+|   |       auth.py
+|   |       config.py
+|   |       Dockerfile
+|   |       main.py
+|   |       models.py
+|   |       queue_manager.py
+|   |       requirements.txt
+|   |       
+|   +---certs
+|   |       ingest.crt
+|   |       ingest.key
+|   |       
+|   +---nginx
+|   |       default.conf
+|   |       
+|   \---scripts
+|           gen_certs.ps1
+|           setup_keycloak.py
+|           setup_rabbitmq.py
+|           start.ps1
+|           verify.py
+|           
++---logs
+|       edge.log
+|       headless_test.log
+|       headless_test2.log
+|       
++---output_documents
+|       DEEPFAKE VOICE DETECTION.pptx
+|       drone_system_documentation.docx
+|       DVAS_Detailed_Technical_Report.docx
+|       DVAS_Progress_Presentation_30Slides.pptx
+|       DVAS_Project_Progress_Report.docx
+|       Weekly_Progress_Report_Template.docx
+|       Weekly_Progress_Report_W1_Ingest.docx
+|       Weekly_Progress_Report_W2_Verification.docx
+|       
++---scripts
+|   |   extract_evidence_clip.py
+|   |   test_headless.py
+|   |   verify_pipeline.py
+|   |   
+|   \---__pycache__
+|           test_headless.cpython-310.pyc
+|           verify_pipeline.cpython-310.pyc
+|           
++---src
+|   |   __init__.py
+|   |   
+|   +---buffer
+|   |   |   rolling_frame_buffer.py
+|   |   |   __init__.py
+|   |   |   
+|   |   \---__pycache__
+|   |           rolling_frame_buffer.cpython-310.pyc
+|   |           __init__.cpython-310.pyc
+|   |           
+|   +---change_detection
+|   |   |   change_detection_engine.py
+|   |   |   change_event.py
+|   |   |   __init__.py
+|   |   |   
+|   |   \---__pycache__
+|   |           change_detection_engine.cpython-310.pyc
+|   |           change_event.cpython-310.pyc
+|   |           __init__.cpython-310.pyc
+|   |           
+|   +---cognitive_frame_selector
+|   |   |   cognitive_frame_selector.py
+|   |   |   selected_frame.py
+|   |   |   __init__.py
+|   |   |   
+|   |   \---__pycache__
+|   |           cognitive_frame_selector.cpython-310.pyc
+|   |           selected_frame.cpython-310.pyc
+|   |           __init__.cpython-310.pyc
+|   |           
+|   +---metrics
+|   |   |   prometheus_metrics.py
+|   |   |   __init__.py
+|   |   |   
+|   |   \---__pycache__
+|   |           prometheus_metrics.cpython-310.pyc
+|   |           __init__.cpython-310.pyc
+|   |           
+|   +---utils
+|   |   |   gpu_utils.py
+|   |   |   logger.py
+|   |   |   __init__.py
+|   |   |   
+|   |   \---__pycache__
+|   |           gpu_utils.cpython-310.pyc
+|   |           logger.cpython-310.pyc
+|   |           __init__.cpython-310.pyc
+|   |           
+|   +---video
+|   |   |   drone_simulation_source.py
+|   |   |   drone_video_source.py
+|   |   |   frame_interpolator.py
+|   |   |   stream_viewer.py
+|   |   |   __init__.py
+|   |   |   
+|   |   \---__pycache__
+|   |           drone_simulation_source.cpython-310.pyc
+|   |           drone_video_source.cpython-310.pyc
+|   |           frame_interpolator.cpython-310.pyc
+|   |           stream_viewer.cpython-310.pyc
+|   |           __init__.cpython-310.pyc
+|   |           
+|   \---__pycache__
+|           __init__.cpython-310.pyc
+|           __init__.cpython-312.pyc
+|           
++---tests
+|   |   conftest.py
+|   |   test_change_detection.py
+|   |   test_cognitive_frame_selector.py
+|   |   test_drone_video_source.py
+|   |   test_integration.py
+|   |   test_rolling_frame_buffer.py
+|   |   __init__.py
+|   |   
+|   \---__pycache__
+|           conftest.cpython-310-pytest-8.2.2.pyc
+|           conftest.cpython-310-pytest-9.0.3.pyc
+|           conftest.cpython-310.pyc
+|           test_change_detection.cpython-310-pytest-9.0.3.pyc
+|           test_cognitive_frame_selector.cpython-310-pytest-9.0.3.pyc
+|           test_drone_video_source.cpython-310-pytest-9.0.3.pyc
+|           test_drone_video_source.cpython-310.pyc
+|           test_integration.cpython-310-pytest-9.0.3.pyc
+|           test_integration.cpython-310.pyc
+|           test_rolling_frame_buffer.cpython-310-pytest-9.0.3.pyc
+|           test_rolling_frame_buffer.cpython-310.pyc
+|           __init__.cpython-310.pyc
+|           
+\---__pycache__
+        main.cpython-310.pyc
+        

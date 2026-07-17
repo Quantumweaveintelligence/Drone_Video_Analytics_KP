@@ -1,0 +1,61 @@
+# ============================================================
+# Kerala Police Drone Video Analytics System
+# Task 1.1 + 1.2 — Drone Video Input & Rolling Frame Buffer
+# Python 3.8+ | CUDA 11.2 | GTX 1650 (4 GB VRAM) | Windows WDDM
+#
+# Install inside your venv:
+#   python -m venv .venv
+#   .venv\Scripts\activate          (Windows)
+#   pip install -r requirements.txt
+# ============================================================
+
+# Core computer vision
+# NOTE: opencv-python-headless has NO CUDA support.
+#   - For RTSP NVDEC decode: install FFMPEG with h264_cuvid (separate from pip)
+#   - For webcam GPU post-processing: install CuPy (see below)
+#   - Use opencv-python (not headless) if you need imshow() GUI
+opencv-python>=4.8.0
+
+# Image compression for the rolling buffer (JPEG encode/decode)
+# Primary path uses cv2.imencode (faster); Pillow is the fallback
+Pillow>=9.0.0
+
+# Numpy — required by OpenCV
+numpy>=1.24.0
+
+# ── GPU acceleration (webcam frame post-processing) ──────────────────────
+# CuPy provides GPU array operations using the standard CUDA runtime.
+# Works with CUDA 11.x or 12.x — pick the matching build:
+#
+#   CUDA 11.x:  pip install cupy-cuda11x
+#   CUDA 12.x:  pip install cupy-cuda12x
+#
+# If CuPy is not installed, the system gracefully falls back to CPU (cv2.resize).
+# The HUD will show "CPU" instead of "CUDA" in that case.
+cupy-cuda11x>=12.0.0; sys_platform == "win32"   # GTX 1650 → CUDA 11 build
+
+# Live GPU stats (VRAM, utilisation, temperature in HUD)
+nvidia-ml-py3>=7.352.0
+
+# Configuration (YAML parsing) — stdlib fallback available too
+PyYAML>=6.0
+
+# Environment variable helpers
+python-dotenv>=1.0.0
+
+# Metrics — lightweight Prometheus client
+# NOTE: If pip cannot reach PyPI (air-gapped), comment this out.
+# The codebase gracefully degrades: metrics are simply skipped.
+prometheus-client>=0.14.0
+
+# Structured logging
+structlog>=21.0.0
+
+# Pydantic v2 for config validation
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Testing
+pytest>=7.0.0
+pytest-timeout>=2.0.0
+pytest-cov>=4.0.0
