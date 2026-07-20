@@ -108,6 +108,22 @@ let webpackConfig = {
 };
 
 webpackConfig.devServer = (devServerConfig) => {
+  // Proxy /api and /ws requests to the backend to avoid CORS
+  devServerConfig.proxy = {
+    "/api": {
+      target: "http://localhost:8000",
+      changeOrigin: true,
+      secure: false,
+      ws: true,
+    },
+    "/ws": {
+      target: "ws://localhost:8000",
+      ws: true,
+      changeOrigin: true,
+      secure: false,
+    },
+  };
+
   // Add health check endpoints if enabled
   if (config.enableHealthCheck && setupHealthEndpoints && healthPluginInstance) {
     const originalSetupMiddlewares = devServerConfig.setupMiddlewares;

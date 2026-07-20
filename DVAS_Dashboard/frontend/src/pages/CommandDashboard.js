@@ -303,8 +303,8 @@ export default function CommandDashboard() {
         <div className="grid grid-cols-12 gap-4">
           <div className="col-span-12 lg:col-span-8 border border-slate-800 bg-slate-900 p-3">
             <div className="dvas-label mb-2">Crowd Density · Last 24 hours</div>
-            <div style={{ width: "100%", height: 280 }}>
-              <ResponsiveContainer>
+            <div style={{ width: "100%", height: 280, minHeight: 0, minWidth: 0 }}>
+              <ResponsiveContainer minWidth={0} minHeight={0}>
                 <AreaChart data={crowd}>
                   <defs>
                     <linearGradient id="g1" x1="0" y1="0" x2="0" y2="1">
@@ -323,8 +323,8 @@ export default function CommandDashboard() {
           </div>
           <div className="col-span-12 lg:col-span-4 border border-slate-800 bg-slate-900 p-3">
             <div className="dvas-label mb-2">Vehicle Count · Hourly</div>
-            <div style={{ width: "100%", height: 280 }}>
-              <ResponsiveContainer>
+            <div style={{ width: "100%", height: 280, minHeight: 0, minWidth: 0 }}>
+              <ResponsiveContainer minWidth={0} minHeight={0}>
                 <BarChart data={crowd}>
                   <CartesianGrid stroke="#1e293b" />
                   <XAxis dataKey="hour" stroke="#64748b" fontSize={10} interval={3} />
