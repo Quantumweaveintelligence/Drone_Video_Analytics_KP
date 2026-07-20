@@ -353,3 +353,68 @@ textarea:focus-visible {
   outline-offset: 2px;
   border-radius: 8px;
 }
+
+/* =========================================================
+   MULTI-DRONE VIEW — Tactical Animations & Overrides
+   ========================================================= */
+
+/* Scan-line sweep across video feed */
+@keyframes dvas-scan {
+  0%   { transform: translateY(-100%); opacity: 0.6; }
+  100% { transform: translateY(200%);  opacity: 0.0; }
+}
+.dvas-scan-line {
+  position: absolute;
+  left: 0; right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent 0%, rgba(20,184,166,0.5) 50%, transparent 100%);
+  animation: dvas-scan 3s linear infinite;
+  pointer-events: none;
+}
+
+/* Corner bracket pulse (teal glow for live feeds) */
+@keyframes dvas-bracket-pulse {
+  0%, 100% { opacity: 0.6; }
+  50%       { opacity: 1;   }
+}
+.dvas-bracket {
+  animation: dvas-bracket-pulse 2s ease-in-out infinite;
+}
+
+/* Signal strength glow */
+@keyframes dvas-signal-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(20,184,166,0); }
+  50%       { box-shadow: 0 0 6px 2px rgba(20,184,166,0.25); }
+}
+
+/* Card selected ring pulse */
+@keyframes dvas-selected-ring {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(20,184,166,0.30), 0 4px 24px rgba(20,184,166,0.10); }
+  50%       { box-shadow: 0 0 0 2px rgba(20,184,166,0.50), 0 4px 32px rgba(20,184,166,0.20); }
+}
+
+/* Heatmap shimmer */
+@keyframes dvas-heatmap-shift {
+  0%   { background-position: 0% 50%;   }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0% 50%;   }
+}
+
+/* Force dark backgrounds for multidrone panel surfaces on light theme */
+[data-testid="multidrone-view"] .force-dark-bg {
+  background: #0a1628 !important;
+}
+
+/* Event timeline horizontal scroll — always show scrollbar */
+[data-testid="multidrone-view"] .overflow-x-auto {
+  scrollbar-color: rgba(20,184,166,0.3) rgba(15,23,42,0.5);
+  scrollbar-width: thin;
+}
+[data-testid="multidrone-view"] .overflow-x-auto::-webkit-scrollbar {
+  height: 4px;
+}
+[data-testid="multidrone-view"] .overflow-x-auto::-webkit-scrollbar-thumb {
+  background: rgba(20,184,166,0.3);
+  border-radius: 2px;
+}
+

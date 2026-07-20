@@ -9,6 +9,7 @@ COPY package.json yarn.lock* package-lock.json* ./
 # (pins core-js-compat to avoid babel-preset-react-app build errors)
 RUN yarn install --network-timeout 300000
 
+RUN echo "cache bust 4"
 COPY . .
 RUN yarn build
 

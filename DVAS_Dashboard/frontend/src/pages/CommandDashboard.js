@@ -5,6 +5,8 @@ import { useAuth } from "@/context/AuthContext";
 import { useI18n } from "@/context/I18nContext";
 import { useDvasSocket } from "@/lib/useDvasSocket";
 import LiveMap from "@/components/LiveMap";
+import MultiDroneView from "@/components/MultiDroneView";
+import CrowdTrafficAnalytics from "@/components/CrowdTrafficAnalytics";
 import {
   MapPin, Radio as Broadcast, Bell, Film as FilmSlate, ListChecks, BarChart3 as ChartBar, AlertTriangle as Warning, CheckCircle, X, ExternalLink as ArrowSquareOut, Clock, Folder as FolderLock, ClipboardList, Download,
   Cpu, ShieldCheck, User as UserIcon, Users as UsersIcon, Car, Hash,
@@ -64,11 +66,20 @@ export default function CommandDashboard() {
   const { t } = useI18n();
   const [tab, setTab] = useState(() => {
     try {
-      const stored = localStorage.getItem("dvas_cmd_tab");
-      if (stored) { localStorage.removeItem("dvas_cmd_tab"); return stored; }
+      // One-shot deep-link from notification bell (localStorage, consumed once)
+      const deepLink = localStorage.getItem("dvas_cmd_tab");
+      if (deepLink) { localStorage.removeItem("dvas_cmd_tab"); return deepLink; }
+      // Persist active tab across refreshes (sessionStorage, survives F5)
+      const saved = sessionStorage.getItem("dvas_cmd_tab");
+      if (saved) return saved;
     } catch (e) { /* noop */ }
     return "map";
   });
+
+  // Persist tab to sessionStorage on every change
+  useEffect(() => {
+    try { sessionStorage.setItem("dvas_cmd_tab", tab); } catch (e) {}
+  }, [tab]);
 
   // Listen for deep-link jumps from the notification bell
   useEffect(() => {
@@ -300,42 +311,7 @@ export default function CommandDashboard() {
       )}
 
       {tab === "analytics" && (
-        <div className="grid grid-cols-12 gap-4">
-          <div className="col-span-12 lg:col-span-8 border border-slate-800 bg-slate-900 p-3">
-            <div className="dvas-label mb-2">Crowd Density · Last 24 hours</div>
-            <div style={{ width: "100%", height: 280, minHeight: 0, minWidth: 0 }}>
-              <ResponsiveContainer minWidth={0} minHeight={0}>
-                <AreaChart data={crowd}>
-                  <defs>
-                    <linearGradient id="g1" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="#0ea5e9" stopOpacity={0.6} />
-                      <stop offset="100%" stopColor="#0ea5e9" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid stroke="#1e293b" />
-                  <XAxis dataKey="hour" stroke="#64748b" fontSize={10} />
-                  <YAxis stroke="#64748b" fontSize={10} />
-                  <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #334155", fontSize: 12 }} />
-                  <Area dataKey="density" stroke="#0ea5e9" fill="url(#g1)" />
-                </AreaChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-          <div className="col-span-12 lg:col-span-4 border border-slate-800 bg-slate-900 p-3">
-            <div className="dvas-label mb-2">Vehicle Count · Hourly</div>
-            <div style={{ width: "100%", height: 280, minHeight: 0, minWidth: 0 }}>
-              <ResponsiveContainer minWidth={0} minHeight={0}>
-                <BarChart data={crowd}>
-                  <CartesianGrid stroke="#1e293b" />
-                  <XAxis dataKey="hour" stroke="#64748b" fontSize={10} interval={3} />
-                  <YAxis stroke="#64748b" fontSize={10} />
-                  <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #334155", fontSize: 12 }} />
-                  <Bar dataKey="vehicles" fill="#f59e0b" />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-        </div>
+        <CrowdTrafficAnalytics crowdSeries={crowd} drones={drones} />
       )}
 
       {tab === "models" && <ModelsPage user={user} t={t} />}
@@ -391,28 +367,11 @@ export default function CommandDashboard() {
       )}
 
       {tab === "multidrone" && (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {drones.map(d => {
-            const spark = Array.from({length: 12}, (_, i) => 40 + Math.round(Math.sin(i/2 + (d.lat||0)) * 30 + Math.random()*10));
-            return (
-              <div key={d.id} data-testid={`multi-${d.id}`} className="border border-slate-800 bg-slate-900 p-3">
-                <div className="flex justify-between items-center">
-                  <div className="text-sm mono">{d.id}</div>
-                  <span className={`px-1.5 py-0.5 border text-[10px] ${d.status==="live"?"text-emerald-400 border-emerald-500/40 bg-emerald-500/10":d.status==="degraded"?"text-amber-400 border-amber-500/40 bg-amber-500/10":"text-red-400 border-red-500/40 bg-red-500/10"}`}>{d.status}</span>
-                </div>
-                <div className="mono text-[10px] text-slate-500 mt-1">{d.jurisdiction} · {d.mission_id}</div>
-                <div className="mt-3 h-10 flex items-end gap-0.5">
-                  {spark.map((v,i) => <div key={i} className="flex-1 bg-sky-500/70" style={{height: `${v}%`}}/>)}
-                </div>
-                <div className="mt-2 grid grid-cols-3 gap-2 mono text-[10px]">
-                  <div><div className="text-slate-500">Crowd</div><div className="text-slate-100">{d.last_analytics?.crowd_density ?? "—"}</div></div>
-                  <div><div className="text-slate-500">Vehicles</div><div className="text-slate-100">{d.last_analytics?.vehicles ?? "—"}</div></div>
-                  <div><div className="text-slate-500">Battery</div><div className="text-slate-100">{d.battery_pct}%</div></div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
+        <MultiDroneView
+          drones={drones}
+          alerts={alerts}
+          connected={connected}
+        />
       )}
 
       {tab === "forensic" && (

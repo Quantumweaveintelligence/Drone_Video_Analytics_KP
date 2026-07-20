@@ -20,7 +20,14 @@ export default function AdminDashboard() {
   const { user } = useAuth();
   const { t } = useI18n();
   const visible = PAGES.filter(p => p.roles.includes(user.role));
-  const [page, setPage] = useState(visible[0]?.key || "audit");
+  const [page, setPage] = useState(() => {
+    try {
+      const saved = sessionStorage.getItem("dvas_adm_page");
+      // Only restore if the saved page is visible to this role
+      if (saved && visible.some(p => p.key === saved)) return saved;
+    } catch (e) { /* noop */ }
+    return visible[0]?.key || "audit";
+  });
   const [logs, setLogs] = useState([]);
   const [chainInfo, setChainInfo] = useState(null);
   const [users, setUsers] = useState([]);
@@ -29,6 +36,11 @@ export default function AdminDashboard() {
   const [auditScope, setAuditScope] = useState("detail"); // "detail" | "aggregate"
   const [sysCfg, setSysCfg] = useState({ retention_days: 90, backup_time: "02:30", tls_min: "1.3" });
   const [pending, setPending] = useState(null);
+
+  // Persist page to sessionStorage on every change
+  useEffect(() => {
+    try { sessionStorage.setItem("dvas_adm_page", page); } catch (e) {}
+  }, [page]);
 
   useEffect(() => {
     if (page === "audit") {
