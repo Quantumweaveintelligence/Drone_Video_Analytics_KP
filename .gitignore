@@ -48,3 +48,4 @@ headscale_data/
 step_data/
 prometheus_data/
 grafana_data/
+dvas_ingest/output_documents/
