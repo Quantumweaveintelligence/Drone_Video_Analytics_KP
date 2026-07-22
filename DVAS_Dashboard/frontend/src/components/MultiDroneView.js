@@ -6,7 +6,7 @@
  * ─────────────────────────────────────────────────────────
  */
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import {
   Radio,
   Battery,
@@ -36,6 +36,9 @@ import {
   X,
   Layers,
   BarChart2,
+  Camera,
+  ShieldCheck,
+  User as UserIcon,
 } from "lucide-react";
 
 /* ─────────────────────────────────────────────
@@ -329,7 +332,7 @@ function SignalBars({ strength }) {
 /* ─────────────────────────────────────────────
    DRONE FEED CARD
    ───────────────────────────────────────────── */
-function DroneFeedCard({ drone, isSelected, onSelect }) {
+function DroneFeedCard({ drone, isSelected, hasSelection, onSelect }) {
   const spark = useRef(
     Array.from({ length: 14 }, () => 30 + Math.random() * 60)
   );
@@ -337,6 +340,7 @@ function DroneFeedCard({ drone, isSelected, onSelect }) {
 
   const isDegraded = drone.status === "degraded";
   const isOffline = drone.status === "offline";
+  const isOtherSelected = hasSelection && !isSelected;
 
   const borderColor = isDegraded
     ? "border-amber-500/40"
@@ -352,9 +356,15 @@ function DroneFeedCard({ drone, isSelected, onSelect }) {
     ? { boxShadow: "0 0 0 1px rgba(245,158,11,0.2)" }
     : {};
 
+  const focusClass = isOtherSelected 
+    ? "opacity-40 blur-[2px] scale-[0.98] hover:opacity-80 hover:blur-none" 
+    : isSelected 
+    ? "scale-100 ring-1 ring-teal-500/50" 
+    : "hover:scale-[1.012] hover:border-teal-500/40";
+
   return (
     <div
-      className={`relative flex flex-col rounded-xl border ${borderColor} overflow-hidden cursor-pointer transition-all duration-200 hover:scale-[1.012] hover:border-teal-500/40`}
+      className={`relative flex flex-col rounded-xl border ${borderColor} overflow-hidden cursor-pointer transition-all duration-500 ease-in-out ${focusClass} h-full`}
       style={{
         background: "var(--dvas-surface)",
         ...glowStyle,
@@ -512,11 +522,11 @@ function DroneFeedCard({ drone, isSelected, onSelect }) {
       <div className="px-3 py-2.5 flex flex-col gap-2">
         {/* Row 1: Zone name */}
         <div className="flex items-center gap-1.5">
-          <MapPin size={9} className="text-slate-600 shrink-0" />
-          <span className="mono text-[9px] text-slate-500 truncate">{drone.jurisdiction}</span>
+          <MapPin size={9} style={{ color: "var(--dvas-text-dim)" }} className="shrink-0" />
+          <span className="mono text-[9px] truncate uppercase tracking-wide" style={{ color: "var(--dvas-text-muted)" }}>{drone.jurisdiction}</span>
           <span className="ml-auto flex items-center gap-1 shrink-0">
-            <Clock size={9} className="text-slate-600" />
-            <span className="mono text-[9px] text-slate-600">{drone.uptime_min}m</span>
+            <Clock size={9} style={{ color: "var(--dvas-text-dim)" }} />
+            <span className="mono text-[9px]" style={{ color: "var(--dvas-text-muted)" }}>{drone.uptime_min}m</span>
           </span>
         </div>
 
@@ -532,16 +542,16 @@ function DroneFeedCard({ drone, isSelected, onSelect }) {
               <span
                 className={`mono text-[11px] font-bold ${
                   drone.battery_pct <= 20
-                    ? "text-red-400"
+                    ? "text-red-500"
                     : drone.battery_pct <= 50
-                    ? "text-amber-400"
-                    : "text-emerald-400"
+                    ? "text-amber-500"
+                    : "text-emerald-500"
                 }`}
               >
                 {drone.battery_pct}%
               </span>
             </div>
-            <span className="mono text-[8px] text-slate-600">Battery</span>
+            <span className="mono text-[8px]" style={{ color: "var(--dvas-text-dim)" }}>Battery</span>
           </div>
 
           {/* Crowd */}
@@ -550,12 +560,12 @@ function DroneFeedCard({ drone, isSelected, onSelect }) {
             style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border)" }}
           >
             <div className="flex items-center gap-1">
-              <Users size={10} className="text-sky-400" />
-              <span className="mono text-[11px] font-bold text-slate-200">
+              <Users size={10} className="text-sky-500" />
+              <span className="mono text-[11px] font-bold" style={{ color: "var(--dvas-text)" }}>
                 {drone.last_analytics?.crowd_count ?? "—"}
               </span>
             </div>
-            <span className="mono text-[8px] text-slate-600">Crowd</span>
+            <span className="mono text-[8px]" style={{ color: "var(--dvas-text-dim)" }}>Crowd</span>
           </div>
 
           {/* Vehicles */}
@@ -564,12 +574,12 @@ function DroneFeedCard({ drone, isSelected, onSelect }) {
             style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border)" }}
           >
             <div className="flex items-center gap-1">
-              <Car size={10} className="text-violet-400" />
-              <span className="mono text-[11px] font-bold text-slate-200">
+              <Car size={10} className="text-violet-500" />
+              <span className="mono text-[11px] font-bold" style={{ color: "var(--dvas-text)" }}>
                 {drone.last_analytics?.vehicles ?? "—"}
               </span>
             </div>
-            <span className="mono text-[8px] text-slate-600">Vehicles</span>
+            <span className="mono text-[8px]" style={{ color: "var(--dvas-text-dim)" }}>Vehicles</span>
           </div>
         </div>
 
@@ -589,7 +599,8 @@ function DroneFeedCard({ drone, isSelected, onSelect }) {
 /* ─────────────────────────────────────────────
    ANALYTICS ROW  (4 panels, full-width horizontal)
    ───────────────────────────────────────────── */
-function AnalyticsRow({ selectedDrone, drones }) {
+function AnalyticsRow({ selectedDrone, drones, onOpenGallery }) {
+  const [stolenSearch, setStolenSearch] = useState("");
   const drone = drones.find((d) => d.id === selectedDrone) || drones[0];
   const ana = drone?.last_analytics || {};
 
@@ -614,34 +625,46 @@ function AnalyticsRow({ selectedDrone, drones }) {
     { label: "Perimeter Breach",    active: drone?.id === "DR-02", severity: "critical" },
   ];
 
+  /* ANPR Data Mock */
+  const anprData = [
+    { plate: "KL-01-BK-9090", type: "Car", time: "12s ago", match: false },
+    { plate: "KL-22-C-4512", type: "Two-Wheeler", time: "1m ago", match: false },
+    { plate: "KL-01-CJ-1234", type: "Car", time: "2m ago", match: true }, // STOLEN MATCH
+    { plate: "KL-05-AB-7777", type: "Heavy", time: "5m ago", match: false },
+    { plate: "KL-01-CD-9999", type: "Car", time: "8m ago", match: false },
+  ];
+  
+  const matchedPlate = anprData.find(v => v.plate.toLowerCase() === stolenSearch.toLowerCase() && v.match);
+  const hasStolenMatch = !!matchedPlate;
+
   /* shared panel shell */
-  const Panel = ({ children, borderColor = "var(--dvas-border)" }) => (
+  const Panel = ({ children, borderColor = "var(--dvas-border)", className = "" }) => (
     <div
-      className="rounded-lg p-3 flex flex-col gap-2"
+      className={`rounded-lg p-3 flex flex-col gap-2 ${className}`}
       style={{ background: "var(--dvas-surface)", border: `1px solid ${borderColor}` }}
     >
       {children}
     </div>
   );
 
-  /* section heading — uses dvas-label at its natural 11px */
+  /* section heading */
   const SectionHead = ({ icon, label, right }) => (
     <div className="flex items-center gap-1.5 pb-1" style={{ borderBottom: "1px solid var(--dvas-border)" }}>
-      {icon}
-      <span className="dvas-label">{label}</span>
-      {right && <span className="ml-auto mono text-slate-500 text-xs">{right}</span>}
+      {React.cloneElement(icon, { size: 14 })}
+      <span className="text-xs font-semibold" style={{ color: "var(--dvas-text)" }}>{label}</span>
+      {right && <span className="ml-auto mono text-xs font-medium" style={{ color: "var(--dvas-text-dim)" }}>{right}</span>}
     </div>
   );
 
   /* label + bold value row */
-  const MetricRow = ({ label, value, valueClass = "text-slate-100" }) => (
+  const MetricRow = ({ label, value, valueClass }) => (
     <div className="flex items-center justify-between">
-      <span className="mono text-slate-500 text-xs">{label}</span>
-      <span className={`mono font-bold text-sm ${valueClass}`}>{value ?? "—"}</span>
+      <span className="mono text-[11px]" style={{ color: "var(--dvas-text-muted)" }}>{label}</span>
+      <span className={`mono font-semibold text-sm ${valueClass || 'text-[#2D3748]'}`}>{value ?? "—"}</span>
     </div>
   );
 
-  /* progress bar — taller for readability */
+  /* progress bar */
   const Bar = ({ pct, color }) => (
     <div className="h-1.5 rounded-full overflow-hidden" style={{ background: "var(--dvas-elev)" }}>
       <div className="h-full rounded-full transition-all duration-700" style={{ width: `${pct}%`, background: color }} />
@@ -649,10 +672,10 @@ function AnalyticsRow({ selectedDrone, drones }) {
   );
 
   return (
-    <div className="grid grid-cols-4 gap-3">
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8 gap-3">
 
       {/* ── A: Human & Crowd ── */}
-      <Panel>
+      <Panel className="col-span-1">
         <SectionHead
           icon={<Users size={13} className="text-sky-400" />}
           label="Human & Crowd Analytics"
@@ -685,7 +708,7 @@ function AnalyticsRow({ selectedDrone, drones }) {
       </Panel>
 
       {/* ── B: Vehicle Metrics ── */}
-      <Panel>
+      <Panel className="col-span-1">
         <SectionHead
           icon={<Car size={13} className="text-violet-400" />}
           label="Vehicle Metrics"
@@ -707,79 +730,109 @@ function AnalyticsRow({ selectedDrone, drones }) {
         <MetricRow label="Traffic State" value={ana.traffic_state} valueClass={trafficColor} />
       </Panel>
 
-      {/* ── C: Safety Intelligence ── */}
-      <Panel borderColor="rgba(239,68,68,0.3)">
-        <SectionHead
-          icon={<ShieldAlert size={13} className="text-red-400" />}
-          label="Safety Intelligence"
-        />
-
-        <div className="flex flex-col gap-1.5">
-          {safetyItems.map(({ label, active, severity }) => (
-            <div
-              key={label}
-              className="flex items-center gap-2 px-2 py-1.5 rounded"
-              style={{
-                background: active
-                  ? severity === "critical" ? "rgba(239,68,68,0.10)" : "rgba(245,158,11,0.08)"
-                  : "var(--dvas-surface-2)",
-                border: active
-                  ? severity === "critical" ? "1px solid rgba(239,68,68,0.22)" : "1px solid rgba(245,158,11,0.18)"
-                  : "1px solid var(--dvas-border)",
-              }}
-            >
-              <span
-                className={`w-2 h-2 rounded-full shrink-0 ${
-                  active
-                    ? severity === "critical" ? "bg-red-400 dvas-live-dot" : "bg-amber-400 dvas-live-dot"
-                    : "bg-slate-600"
-                }`}
-              />
-              <span
-                className="mono text-xs flex-1"
-                style={{
-                  color: active
-                    ? severity === "critical" ? "#fca5a5" : "#fcd34d"
-                    : "var(--dvas-text-muted)",
-                }}
-              >
-                {label}
-              </span>
-              {active && (
-                <span
-                  className="mono font-bold text-[10px] px-1.5 py-0.5 rounded"
-                  style={{
-                    color: severity === "critical" ? "#f87171" : "#fbbf24",
-                    background: severity === "critical" ? "rgba(239,68,68,0.15)" : "rgba(245,158,11,0.12)",
-                  }}
-                >
-                  ACTIVE
-                </span>
-              )}
-            </div>
-          ))}
-        </div>
-      </Panel>
-
-      {/* ── D: GPU Pipeline Load ── */}
-      <Panel>
+      {/* ── C: GPU Pipeline Load ── */}
+      <Panel className="col-span-1">
         <SectionHead
           icon={<BarChart2 size={13} className="text-teal-400" />}
           label="GPU Pipeline Load"
           right="Processing Batch"
         />
 
-        <div className="flex flex-col gap-2">
+        <div className="flex flex-col gap-2 mt-1">
           {gpuStats.map(({ label, pct, color }) => (
             <div key={label} className="flex flex-col gap-1">
               <div className="flex justify-between items-center">
-                <span className="mono text-slate-500 text-xs">{label}</span>
-                <span className="mono font-bold text-sm" style={{ color }}>{pct}%</span>
+                <span className="mono text-[11px]" style={{ color: "var(--dvas-text-muted)" }}>{label}</span>
+                <span className="mono font-semibold text-sm" style={{ color: "var(--dvas-text)" }}>{pct}%</span>
               </div>
-              <Bar pct={pct} color={color} />
+              <Bar pct={pct} color={color === "#14b8a6" ? "var(--dvas-cyan)" : color} />
             </div>
           ))}
         </div>
+      </Panel>
+
+      {/* ── D: Live ANPR Feed ── */}
+      <Panel className="col-span-1">
+        <SectionHead icon={<Camera size={13} className="text-blue-400" />} label="Live ANPR Feed" right="Scanning" />
+        <div className="flex flex-col gap-1.5 overflow-y-auto max-h-[160px] pr-1 dvas-scrollbar">
+          {anprData.map((v, i) => (
+             <div key={i} className="flex justify-between items-center px-2 py-1.5 rounded" style={{background: v.match ? "var(--dvas-crit-bg)" : "var(--dvas-surface-2)"}}>
+                <div>
+                   <div className={`mono font-semibold text-[11px] ${v.match ? 'text-red-500' : ''}`} style={{ color: v.match ? 'var(--dvas-crit)' : 'var(--dvas-text)' }}>{v.plate}</div>
+                   <div className="mono text-[9px]" style={{ color: "var(--dvas-text-dim)" }}>{v.type}</div>
+                </div>
+                <div className="mono text-[9px]" style={{ color: "var(--dvas-text-dim)" }}>{v.time}</div>
+             </div>
+          ))}
+        </div>
+      </Panel>
+
+      {/* ── E: Subject Tracking & Biometrics ── */}
+      <Panel className="col-span-1 md:col-span-2 xl:col-span-2">
+        <SectionHead icon={<UserIcon size={13} className="text-pink-400" />} label="Subject Tracking & Biometrics" />
+        <div className="flex gap-2 items-center mb-2 mt-1 px-1">
+           <div className="flex-1 flex flex-col items-center p-2 rounded" style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border)" }}>
+             <div className="mono text-[9px] mb-1" style={{ color: "var(--dvas-text-muted)" }}>PERSONS DETECTED</div>
+             <div className="mono font-semibold text-base" style={{ color: "var(--dvas-text)" }}>1,240</div>
+           </div>
+           <div className="flex-1 flex flex-col items-center p-2 rounded" style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border)" }}>
+             <div className="mono text-[9px] mb-1" style={{ color: "var(--dvas-text-muted)" }}>FACES CAPTURED</div>
+             <div className="mono font-semibold text-base" style={{ color: "var(--dvas-text)" }}>842</div>
+           </div>
+        </div>
+        <div className="flex gap-2 mt-auto">
+          <button onClick={() => onOpenGallery('persons')} className="flex-1 py-1.5 text-[10px] font-semibold mono rounded transition-colors" style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border-strong)", color: "var(--dvas-text-muted)" }}>
+            VIEW PERSONS
+          </button>
+          <button onClick={() => onOpenGallery('faces')} className="flex-1 py-1.5 text-[10px] font-semibold mono rounded transition-colors" style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border-strong)", color: "var(--dvas-text-muted)" }}>
+            VIEW FACES
+          </button>
+        </div>
+      </Panel>
+
+      {/* ── F: Stolen Vehicle Match ── */}
+      <Panel 
+        borderColor={hasStolenMatch ? "var(--dvas-crit)" : "var(--dvas-border)"} 
+        className={`col-span-1 md:col-span-2 xl:col-span-2`}
+        style={hasStolenMatch ? { background: "var(--dvas-crit-bg)" } : {}}
+      >
+        <div className="flex items-center justify-between pb-1" style={{ borderBottom: "1px solid var(--dvas-border)" }}>
+           <div className="flex items-center gap-1.5">
+             <ShieldAlert size={14} className={hasStolenMatch ? "text-red-500" : ""} style={{ color: hasStolenMatch ? "var(--dvas-crit)" : "var(--dvas-text-dim)" }} />
+             <span className="text-xs font-semibold" style={{ color: "var(--dvas-text)" }}>Stolen Vehicle Match</span>
+           </div>
+           <input 
+             type="text" 
+             placeholder="Enter Plate #..." 
+             value={stolenSearch}
+             onChange={(e) => setStolenSearch(e.target.value)}
+             className="mono text-[10px] px-2 py-1 rounded w-28 focus:outline-none transition-colors uppercase"
+             style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border-strong)", color: "var(--dvas-text)" }}
+           />
+        </div>
+        
+        {hasStolenMatch ? (
+           <div className="flex items-stretch gap-2 mt-1 h-full min-h-[140px]">
+              <div className="flex-1 flex flex-col items-center justify-center rounded p-2 relative" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-crit)" }}>
+                  <img src="https://images.unsplash.com/photo-1533473359331-0135ef1b58bf?auto=format&fit=crop&q=80&w=200&h=150" alt="DB Photo" className="w-full h-24 object-cover rounded mb-1 opacity-90" />
+                  <span className="mono text-[9px] tracking-wider" style={{ color: "var(--dvas-crit)" }}>REGISTRY DATABASE</span>
+                  <div className="absolute top-3 left-3 text-white mono font-bold text-[8px] px-1.5 py-0.5 rounded shadow-sm" style={{ background: "var(--dvas-crit)" }}>{matchedPlate.plate}</div>
+              </div>
+              <div className="flex-1 flex flex-col items-center justify-center rounded p-2 relative" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-cyan)" }}>
+                  <img src="https://images.unsplash.com/photo-1512428818580-08e13291eb81?auto=format&fit=crop&q=80&w=200&h=150" alt="Live Photo" className="w-full h-24 object-cover rounded mb-1" style={{ borderColor: "var(--dvas-cyan)" }} />
+                  <span className="mono text-[9px] tracking-wider" style={{ color: "var(--dvas-cyan)" }}>LIVE CAPTURE · DR-01</span>
+                  <div className="absolute inset-0 m-2 flex items-center justify-center pointer-events-none">
+                     <div className="w-12 h-12 border-2 rounded-sm" style={{ borderColor: "var(--dvas-crit)", opacity: 0.8 }}></div>
+                  </div>
+              </div>
+           </div>
+        ) : (
+           <div className="flex flex-col items-center justify-center h-full min-h-[140px] text-slate-500">
+               <ShieldCheck size={28} className="mb-2 opacity-40 text-teal-500" />
+               <span className="mono text-[10px] tracking-widest text-slate-400">NO ACTIVE MATCHES</span>
+               <span className="mono text-[9px] opacity-70 mt-1">Search or monitor live feed</span>
+           </div>
+        )}
       </Panel>
 
     </div>
@@ -798,19 +851,19 @@ function EventTimeline({ events, onPlay }) {
 
   const severityRowStyle = {
     critical: {
-      bg: "rgba(239,68,68,0.05)",
-      border: "rgba(239,68,68,0.15)",
-      textType: "text-red-300",
+      bg: "var(--dvas-crit-bg)",
+      border: "var(--dvas-crit)",
+      textType: "var(--dvas-crit)",
     },
     warning: {
-      bg: "rgba(245,158,11,0.05)",
-      border: "rgba(245,158,11,0.12)",
-      textType: "text-amber-300",
+      bg: "var(--dvas-warn-bg)",
+      border: "var(--dvas-warn)",
+      textType: "var(--dvas-warn)",
     },
     info: {
-      bg: "rgba(14,165,233,0.04)",
-      border: "rgba(14,165,233,0.1)",
-      textType: "text-sky-300",
+      bg: "var(--dvas-info-bg)",
+      border: "var(--dvas-blue)",
+      textType: "var(--dvas-blue)",
     },
   };
 
@@ -824,44 +877,45 @@ function EventTimeline({ events, onPlay }) {
     >
       {/* Title bar */}
       <div
-        className="px-4 py-2.5 flex items-center gap-3"
+        className="px-4 py-3 flex items-center gap-2"
         style={{ borderBottom: "1px solid var(--dvas-border)" }}
       >
-        <Layers size={13} className="text-teal-400 shrink-0" />
-        <span className="text-[10px] font-bold text-teal-400 tracking-wider uppercase flex-1">
+        <Layers size={14} className="text-teal-500 shrink-0" style={{ color: "var(--dvas-cyan)" }} />
+        <span className="text-xs font-semibold uppercase flex-1" style={{ color: "var(--dvas-text)" }}>
           Confirmed Events &amp; Evidence Log
         </span>
-        <span className="mono text-[9px] text-slate-600">{events.length} events · Last 2h</span>
+        <span className="mono text-[10px] font-medium" style={{ color: "var(--dvas-text-dim)" }}>{events.length} events · Last 2h</span>
       </div>
 
       {/* Scrollable event list */}
       <div className="overflow-x-auto">
-        <div className="flex gap-2 px-3 py-2" style={{ minWidth: "max-content" }}>
+        <div className="flex gap-4 px-4 py-4" style={{ minWidth: "max-content" }}>
           {events.map((evt) => {
             const s = severityRowStyle[evt.severity] || severityRowStyle.info;
             return (
               <div
                 key={evt.id}
                 data-testid={`event-${evt.id}`}
-                className="flex-shrink-0 flex flex-col gap-1.5 rounded-xl px-3 py-2.5 w-56 transition-all duration-150 hover:scale-[1.02]"
+                className="flex-shrink-0 flex flex-col gap-1.5 rounded-lg px-4 py-3 w-64 transition-all duration-150 hover:shadow-md"
                 style={{
                   background: s.bg || "var(--dvas-surface-2)",
                   border: `1px solid ${s.border || "var(--dvas-border)"}`,
-                  minWidth: "210px",
+                  minWidth: "220px",
                 }}
               >
                 {/* Top row: severity + timestamp */}
                 <div className="flex items-center gap-1.5">
-                  {severityIcon[evt.severity] || severityIcon.info}
-                  <span className="mono text-[9px] text-slate-500 flex-1 truncate">
+                  {React.cloneElement(severityIcon[evt.severity] || severityIcon.info, { size: 12 })}
+                  <span className="mono text-[10px] font-medium flex-1 truncate" style={{ color: "var(--dvas-text-muted)" }}>
                     {fmtAge(evt.ts)}
                   </span>
                   <span
-                    className="mono text-[8px] px-1.5 py-0.5 rounded font-bold"
+                    className="mono text-[9px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wide"
                     style={{
-                      background: "rgba(14,184,166,0.1)",
-                      color: "#2dd4bf",
-                      border: "1px solid rgba(20,184,166,0.2)",
+                      background: "var(--dvas-safe-bg)",
+                      color: "var(--dvas-safe)",
+                      border: "1px solid var(--dvas-safe)",
+                      opacity: 0.8
                     }}
                   >
                     {evt.drone_id}
@@ -869,27 +923,26 @@ function EventTimeline({ events, onPlay }) {
                 </div>
 
                 {/* Event type */}
-                <div className={`mono text-[11px] font-bold ${s.textType}`}>
+                <div className="mono text-xs font-bold uppercase tracking-wide mt-1" style={{ color: s.textType }}>
                   {evt.event_type}
                 </div>
 
                 {/* Zone + mission */}
-                <div className="flex items-center gap-1">
-                  <MapPin size={8} className="text-slate-600 shrink-0" />
-                  <span className="mono text-[8px] text-slate-500 truncate">{evt.zone}</span>
+                <div className="flex items-center gap-1.5 mt-0.5">
+                  <MapPin size={10} style={{ color: "var(--dvas-text-dim)" }} className="shrink-0" />
+                  <span className="mono text-[9px] truncate uppercase tracking-wide" style={{ color: "var(--dvas-text-muted)" }}>{evt.zone}</span>
                 </div>
 
                 {/* Confidence + Play */}
-                <div className="flex items-center gap-2 mt-0.5">
+                <div className="flex items-center gap-2 mt-2">
                   <div className="flex-1">
-                    <div className="flex items-center gap-1">
-                      <TrendingUp size={8} className="text-slate-600" />
-                      <span className="mono text-[9px] text-slate-400">
+                    <div className="flex items-center gap-1.5">
+                      <TrendingUp size={10} style={{ color: "var(--dvas-text-dim)" }} />
+                      <span className="mono text-[9px] font-medium uppercase tracking-wide" style={{ color: "var(--dvas-text-muted)" }}>
                         Conf:{" "}
                         <span
-                          className={`font-bold ${
-                            evt.confidence >= 90 ? "text-emerald-400" : "text-amber-400"
-                          }`}
+                          className="font-bold"
+                          style={{ color: evt.confidence >= 90 ? "var(--dvas-safe)" : "var(--dvas-warn)" }}
                         >
                           {evt.confidence}%
                         </span>
@@ -898,15 +951,15 @@ function EventTimeline({ events, onPlay }) {
                   </div>
                   <button
                     onClick={(e) => { e.stopPropagation(); onPlay && onPlay(evt); }}
-                    className="flex items-center gap-1 px-2 py-1 rounded-lg text-[8px] font-semibold mono transition-all hover:scale-105"
+                    className="flex items-center gap-1 px-2 py-1 rounded text-[9px] font-bold uppercase tracking-wide mono transition-colors hover:shadow-sm"
                     style={{
-                      background: "rgba(20,184,166,0.1)",
-                      border: "1px solid rgba(20,184,166,0.25)",
-                      color: "#2dd4bf",
+                      background: "var(--dvas-safe-bg)",
+                      border: "1px solid var(--dvas-safe)",
+                      color: "var(--dvas-safe)",
                     }}
                     data-testid={`play-evidence-${evt.id}`}
                   >
-                    <Play size={8} />
+                    <Play size={10} />
                     Clip
                   </button>
                 </div>
@@ -972,15 +1025,15 @@ function GlobalHeader({ drones, alerts, connected }) {
         <div className="flex items-center gap-2">
           <div
             className="w-6 h-6 rounded-lg flex items-center justify-center shrink-0"
-            style={{ background: "rgba(20,184,166,0.15)", border: "1px solid rgba(20,184,166,0.3)" }}
+            style={{ background: "var(--dvas-safe-bg)", border: "1px solid var(--dvas-safe)" }}
           >
-            <Radio size={12} className="text-teal-400" />
+            <Radio size={12} style={{ color: "var(--dvas-safe)" }} />
           </div>
-          <div className="text-[11px] font-bold text-teal-300 tracking-wide leading-tight">
+          <div className="text-[11px] font-bold tracking-wide leading-tight" style={{ color: "var(--dvas-safe)" }}>
             DVAS – Kerala Police
           </div>
         </div>
-        <div className="mono text-[8px] text-slate-600 mt-0.5 pl-8">
+        <div className="mono text-[8px] mt-0.5 pl-8" style={{ color: "var(--dvas-text-dim)" }}>
           Central Command &amp; Intelligence · Multi-Drone View
         </div>
       </div>
@@ -990,9 +1043,9 @@ function GlobalHeader({ drones, alerts, connected }) {
         className="hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-lg shrink-0"
         style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border)" }}
       >
-        <MapPin size={10} className="text-slate-500" />
-        <span className="mono text-[9px] text-slate-400 font-medium">
-          Jurisdiction: <span className="text-slate-100">Thiruvananthapuram</span>
+        <MapPin size={10} style={{ color: "var(--dvas-text-dim)" }} />
+        <span className="mono text-[9px] font-medium" style={{ color: "var(--dvas-text-muted)" }}>
+          Jurisdiction: <span className="font-bold" style={{ color: "var(--dvas-text)" }}>Thiruvananthapuram</span>
         </span>
       </div>
 
@@ -1024,7 +1077,7 @@ function GlobalHeader({ drones, alerts, connected }) {
             {icon}
             <div>
               <div className={`mono text-[12px] font-bold ${tone}`}>{value}</div>
-              <div className="mono text-[8px] text-slate-600">{label}</div>
+              <div className="mono text-[8px]" style={{ color: "var(--dvas-text-dim)" }}>{label}</div>
             </div>
           </div>
         ))}
@@ -1043,7 +1096,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
       const mock = MOCK_DRONES.find((m) => m.id === d.id) || {};
       return { ...mock, ...d };
     }
-  );
+  ).sort((a, b) => a.id.localeCompare(b.id)); // Fix auto-cycling / jumping order
 
   const events = liveAlerts && liveAlerts.length > 0
     ? liveAlerts.map((a) => ({
@@ -1060,6 +1113,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
 
   const [selectedDroneId, setSelectedDroneId] = useState(null);
   const [playingEvent, setPlayingEvent] = useState(null);
+  const [galleryType, setGalleryType] = useState(null); // 'persons' | 'faces' | null
 
   // Clock tick for "X min ago" labels
   const [, setTick] = useState(0);
@@ -1077,34 +1131,48 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
       {/* ── 1. Global Header ── */}
       <GlobalHeader drones={drones} alerts={liveAlerts} connected={connected} />
 
-      {/* ── 2. Drone Cards Grid (full width) ── */}
+      {/* ── 2. Drone Cards Grid (flex row with transition) ── */}
       <div
-        className={`grid gap-3 ${
-          drones.length === 1
-            ? "grid-cols-1"
-            : drones.length === 2
-            ? "grid-cols-2"
-            : "grid-cols-1 md:grid-cols-2 lg:grid-cols-3"
-        }`}
+        className="flex flex-col lg:flex-row gap-3 transition-all duration-500 ease-in-out"
       >
-        {drones.map((d) => (
-          <DroneFeedCard
-            key={d.id}
-            drone={d}
-            isSelected={selectedDroneId === d.id}
-            onSelect={setSelectedDroneId}
-          />
-        ))}
+        {drones.map((d) => {
+          const isSelected = selectedDroneId === d.id;
+          const isOtherSelected = !!selectedDroneId && !isSelected;
+          
+          return (
+            <div 
+              key={d.id} 
+              className={`transition-all duration-500 ease-in-out ${
+                isSelected 
+                  ? "lg:flex-[2_2_0%]" 
+                  : isOtherSelected 
+                  ? "lg:flex-1" 
+                  : "lg:flex-1"
+              }`}
+            >
+              <DroneFeedCard
+                drone={d}
+                isSelected={isSelected}
+                hasSelection={!!selectedDroneId}
+                onSelect={setSelectedDroneId}
+              />
+            </div>
+          );
+        })}
       </div>
 
-      {/* ── 3. Analytics Row (4 panels horizontal) ── */}
+      {/* ── 3. Analytics Row (5 panels horizontal) ── */}
       <AnalyticsRow
         selectedDrone={selectedDroneId}
         drones={drones}
+        onOpenGallery={setGalleryType}
       />
 
-      {/* ── 3. Event Timeline ── */}
-      <EventTimeline events={events} onPlay={setPlayingEvent} />
+      {/* ── 4. Event Timeline ── */}
+      <EventTimeline 
+        events={selectedDroneId ? events.filter(e => e.drone_id === selectedDroneId) : events} 
+        onPlay={setPlayingEvent} 
+      />
 
       {/* ── Evidence Clip Modal ── */}
       {playingEvent && (
@@ -1196,6 +1264,70 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
           </div>
         </div>
       )}
+
+      {/* ── Biometrics Gallery Modal ── */}
+      {galleryType && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 md:p-8"
+          style={{ background: "rgba(0,0,0,0.85)", backdropFilter: "blur(6px)" }}
+          onClick={() => setGalleryType(null)}
+        >
+          <div
+            className="relative w-full max-w-5xl max-h-full rounded-2xl flex flex-col"
+            style={{
+              background: "var(--dvas-surface)",
+              border: "1px solid rgba(236,72,153,0.3)", // pink border for biometrics
+              boxShadow: "0 0 0 1px rgba(236,72,153,0.1), 0 24px 64px rgba(0,0,0,0.6)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal header */}
+            <div className="px-5 py-4 flex items-center justify-between" style={{ borderBottom: "1px solid var(--dvas-border)" }}>
+              <div className="flex items-center gap-3">
+                <Users size={18} className="text-pink-400" />
+                <div>
+                  <h2 className="text-sm font-bold text-pink-300 tracking-wide uppercase">
+                    Deduplicated {galleryType === "persons" ? "Persons" : "Faces"} Gallery
+                  </h2>
+                  <div className="mono text-[10px] text-slate-500 mt-1">Cross-jurisdictional biometric tracking</div>
+                </div>
+              </div>
+              <button
+                onClick={() => setGalleryType(null)}
+                className="w-8 h-8 rounded-lg flex items-center justify-center transition-colors hover:bg-slate-800 border border-slate-700 text-slate-300 hover:text-white"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            {/* Gallery Grid */}
+            <div className="flex-1 overflow-y-auto p-5 dvas-scrollbar">
+              <div className={`grid gap-4 ${galleryType === "persons" ? "grid-cols-2 sm:grid-cols-3 lg:grid-cols-5" : "grid-cols-3 sm:grid-cols-4 lg:grid-cols-6"}`}>
+                {Array.from({ length: 15 }).map((_, i) => (
+                  <div key={i} className="flex flex-col rounded-lg overflow-hidden border border-slate-700/60 bg-slate-900/50 transition-transform hover:scale-105 cursor-pointer hover:border-pink-500/50">
+                    <div className={`relative ${galleryType === "persons" ? "aspect-[3/4]" : "aspect-square"}`}>
+                      {galleryType === "persons" ? (
+                        <img src={`https://images.unsplash.com/photo-${1500000000000 + i * 1000}?auto=format&fit=crop&w=300&h=400&q=80`} alt="Person Crop" className="w-full h-full object-cover opacity-80" onError={(e) => { e.target.src = "https://images.unsplash.com/photo-1511367461989-f85a21fda167?auto=format&fit=crop&w=300&h=400&q=80"; }} />
+                      ) : (
+                        <img src={`https://images.unsplash.com/photo-${1550000000000 + i * 1000}?auto=format&fit=facearea&facepad=2&w=256&h=256&q=80`} alt="Face Crop" className="w-full h-full object-cover opacity-80" onError={(e) => { e.target.src = "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=facearea&facepad=2&w=256&h=256&q=80"; }} />
+                      )}
+                      <div className="absolute inset-0 border border-pink-500/20 mix-blend-overlay"></div>
+                    </div>
+                    <div className="p-2 border-t border-slate-700/60 flex flex-col gap-1">
+                      <div className="mono font-bold text-[10px] text-slate-300">SUBJ-{8800 + i}</div>
+                      <div className="flex justify-between items-center">
+                        <span className="mono text-[9px] text-slate-500">{new Date(Date.now() - i * 360000).toLocaleTimeString()}</span>
+                        <span className="mono text-[8px] px-1 bg-slate-800 text-teal-400 rounded">DR-0{i%3 + 1}</span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }

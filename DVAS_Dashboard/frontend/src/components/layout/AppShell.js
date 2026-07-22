@@ -442,7 +442,7 @@ export default function AppShell({ children, title, subtitle }) {
               title={collapsed ? (labelFallback || t(labelKey)) : undefined}
               className={({ isActive }) =>
                 `px-3 py-2.5 rounded-lg flex items-center ${collapsed ? "justify-center" : "gap-3"} text-sm font-medium transition-colors ${
-                  isActive ? "font-semibold" : ""
+                  isActive ? "font-semibold shadow-sm" : ""
                 }`
               }
               style={({ isActive }) => ({
@@ -456,7 +456,6 @@ export default function AppShell({ children, title, subtitle }) {
           ))}
         </nav>
 
-        {/* Sidebar footer collapse trigger */}
         <div className="p-3 border-t" style={{ borderColor: "var(--dvas-border)" }}>
           <button
             data-testid="sidebar-toggle"

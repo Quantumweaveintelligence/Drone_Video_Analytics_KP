@@ -157,37 +157,50 @@ export default function CommandDashboard() {
 
   return (
     <AppShell title={t("cmd.title")} subtitle={user.role === "senior_officer" ? t("cmd.subtitle.aggregated") : `${t("cmd.subtitle.jurisdiction")}: ${user.jurisdiction}`}>
+      
+      {/* ── NEW GLOBAL HEADER ── */}
+      <div className="mb-6 p-4 rounded-xl flex flex-col md:flex-row md:items-center justify-between gap-2 shadow-sm border-l-4" style={{ background: "var(--dvas-surface)", borderLeftColor: "var(--dvas-cyan)", borderRight: "1px solid var(--dvas-border)", borderTop: "1px solid var(--dvas-border)", borderBottom: "1px solid var(--dvas-border)" }}>
+        <h1 className="text-xl font-bold tracking-tight uppercase font-sans" style={{ color: "var(--dvas-text)" }}>
+          Thiruvananthapuram <span className="mx-2 font-light" style={{ color: "var(--dvas-text-dim)" }}>|</span> <span className="text-sm font-medium">{new Date().toLocaleString('en-US', { month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: 'numeric' })}</span>
+        </h1>
+        <div className="font-semibold uppercase tracking-widest text-xs" style={{ color: "var(--dvas-cyan)" }}>
+          Kerala Police Command Center
+        </div>
+      </div>
+
       {/* KPIs */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
-        <KPI label={t("cmd.kpi.dronesOnline")} value={kpis.drones_online} tone="text-emerald-400" />
+        <KPI label={t("cmd.kpi.dronesOnline")} value={kpis.drones_online} tone="text-emerald-500" />
         <KPI label={t("cmd.kpi.activeMissions")} value={kpis.active_missions} />
-        <KPI label={t("cmd.kpi.alertsScope")} value={kpis.alerts_24h} tone="text-amber-400" />
+        <KPI label={t("cmd.kpi.alertsScope")} value={kpis.alerts_24h} tone="text-amber-500" />
         <KPI label={t("cmd.kpi.evidenceItems")} value={kpis.evidence_total} />
-        <KPI label={t("cmd.kpi.exportsPending")} value={kpis.exports_pending} tone="text-red-400" />
+        <KPI label={t("cmd.kpi.exportsPending")} value={kpis.exports_pending} tone="text-red-500" />
       </div>
 
       {/* Side panel + content */}
       <div className="flex flex-col gap-4">
         <nav
           data-testid="cmd-tabbar"
-          className="flex items-center gap-1 overflow-x-auto no-scrollbar"
+          className="flex items-center gap-1 overflow-x-auto no-scrollbar pb-px"
           style={{ borderBottom: "1px solid var(--dvas-border)" }}
         >
-          <span className="dvas-label pr-2 shrink-0" style={{ fontSize: 9 }}>{t("cmd.pages")}</span>
+          <span className="dvas-label pr-3 shrink-0 font-bold text-[10px] uppercase tracking-widest" style={{ color: "var(--dvas-text-dim)" }}>{t("cmd.pages")}</span>
           {ALL_PAGES.filter(p => p.roles.includes(user.role)).map((p, i) => (
             <button
               key={p.key}
               data-testid={`cmd-nav-${p.key}`}
               onClick={() => setTab(p.key)}
-              className={`shrink-0 flex items-center gap-2 px-3 py-2 text-xs whitespace-nowrap transition-colors ${
-                tab === p.key ? "text-white" : "text-slate-400 hover:text-white"
+              className={`shrink-0 flex items-center gap-2 px-3 py-2 text-xs font-semibold whitespace-nowrap transition-colors rounded-t-md ${
+                tab === p.key ? "shadow-sm" : ""
               }`}
               style={{
                 borderBottom: tab === p.key ? "2px solid var(--dvas-cyan)" : "2px solid transparent",
                 marginBottom: "-1px",
+                background: tab === p.key ? "var(--dvas-elev)" : "transparent",
+                color: tab === p.key ? "var(--dvas-cyan)" : "var(--dvas-text-muted)"
               }}
             >
-              <span className="mono text-[10px] text-slate-600">{String(i+1).padStart(2,"0")}</span>
+              <span className="mono text-[10px] opacity-70 font-normal">{String(i+1).padStart(2,"0")}</span>
               <p.Icon size={14} /> {t(p.labelKey)}
             </button>
           ))}
@@ -196,11 +209,11 @@ export default function CommandDashboard() {
 
       {tab === "map" && (
         <div className="grid grid-cols-12 gap-4">
-          <div className="col-span-12 lg:col-span-8 border border-slate-800 bg-slate-900">
-            <div className="p-3 border-b border-slate-800 flex items-center justify-between">
-              <div className="flex items-center gap-2 text-sm">
-                <MapPin size={16} className="text-sky-400" /> {t("cmd.page.map")}
-                <span className={`ml-2 mono text-[10px] flex items-center gap-1 ${connected ? "text-emerald-400" : "text-slate-500"}`}>
+          <div className="col-span-12 lg:col-span-8 rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
+            <div className="p-3 flex items-center justify-between" style={{ borderBottom: "1px solid var(--dvas-border)" }}>
+              <div className="flex items-center gap-2 text-sm font-semibold" style={{ color: "var(--dvas-text)" }}>
+                <MapPin size={16} className="text-sky-500" /> {t("cmd.page.map")}
+                <span className={`ml-2 mono text-[10px] flex items-center gap-1 ${connected ? "text-emerald-500" : "text-slate-400"}`}>
                   <span className={`w-1.5 h-1.5 ${connected ? "bg-emerald-500 dvas-live-dot" : "bg-slate-600"}`} />
                   {connected ? t("cmd.wsLive") : t("cmd.connecting")}
                 </span>
@@ -210,11 +223,11 @@ export default function CommandDashboard() {
             <LiveMap drones={drones} height={480} />
           </div>
 
-          <div className="col-span-12 lg:col-span-4 border border-slate-800 bg-slate-900">
-            <div className="p-3 border-b border-slate-800 text-sm flex items-center gap-2"><Broadcast size={14} className="text-emerald-400 dvas-live-dot" /> {t("cmd.multiDroneGrid")}</div>
+          <div className="col-span-12 lg:col-span-4 rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
+            <div className="p-3 text-sm flex items-center gap-2 font-semibold" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text)" }}><Broadcast size={14} className="text-emerald-500 dvas-live-dot" /> {t("cmd.multiDroneGrid")}</div>
             <div className="p-3 grid grid-cols-2 gap-2">
               {drones.slice(0, 4).map(d => (
-                <div key={d.id} data-testid={`grid-drone-${d.id}`} className="border border-slate-800 aspect-video relative overflow-hidden bg-slate-950">
+                <div key={d.id} data-testid={`grid-drone-${d.id}`} className="aspect-video relative overflow-hidden rounded-md" style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border-strong)" }}>
                   <div className="absolute inset-0 dvas-grid-bg opacity-40" />
                   <div className="absolute top-1 left-1 mono text-[9px] bg-black/70 px-1">{d.id}</div>
                   <div className={`absolute top-1 right-1 mono text-[9px] px-1 ${d.status === "live" ? "text-emerald-400" : d.status === "degraded" ? "text-amber-400" : "text-red-400"}`}>{d.status}</div>
@@ -228,12 +241,12 @@ export default function CommandDashboard() {
       )}
 
       {tab === "alerts" && (
-        <div className="border border-slate-800 bg-slate-900">
-          <div className="p-3 border-b border-slate-800 flex items-center gap-2 text-sm"><Bell size={16} className="text-amber-400" weight="duotone" /> {t("cmd.page.alerts")}</div>
-          <ul className="divide-y divide-slate-800 max-h-[560px] overflow-auto">
+        <div className="rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
+          <div className="p-3 flex items-center gap-2 text-sm font-semibold" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text)" }}><Bell size={16} className="text-amber-500" weight="duotone" /> {t("cmd.page.alerts")}</div>
+          <ul className="divide-y max-h-[560px] overflow-auto" style={{ borderColor: "var(--dvas-border)" }}>
             {alerts.length === 0 && <li className="p-6 text-center text-slate-500 text-xs">{t("cmd.noAlertsInScope")}</li>}
             {alerts.map(a => (
-              <li key={a.id} data-testid={`alert-${a.id}`} className="p-3 hover:bg-slate-800/40">
+              <li key={a.id} data-testid={`alert-${a.id}`} className="p-3 hover:bg-[color:var(--dvas-elev)] transition-colors">
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="mono text-[10px] px-1.5 py-0.5 border border-red-500/50 bg-red-500/10 text-red-400 uppercase">{a.type.replace("_", " ")}</span>
                   <span className="mono text-[10px] text-slate-400">conf {a.confidence}</span>
@@ -260,14 +273,14 @@ export default function CommandDashboard() {
       {tab === "evidence" && (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {evidence.map(ev => (
-            <div key={ev.id} data-testid={`evidence-${ev.id}`} className="border border-slate-800 bg-slate-900">
-              <div className="aspect-video relative overflow-hidden bg-slate-950">
-                <img src={ev.thumbnail} alt="" className="w-full h-full object-cover opacity-70" />
-                <button data-testid={`play-${ev.id}`} onClick={() => setPlaying(ev)} className="absolute inset-0 flex items-center justify-center bg-black/40 hover:bg-black/20 transition-colors text-white">
-                  <div className="border border-white/70 px-3 py-1 text-xs">▶ Play</div>
+            <div key={ev.id} data-testid={`evidence-${ev.id}`} className="rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
+              <div className="aspect-video relative overflow-hidden" style={{ background: "var(--dvas-surface-2)" }}>
+                <img src={ev.thumbnail} alt="" className="w-full h-full object-cover opacity-90" />
+                <button data-testid={`play-${ev.id}`} onClick={() => setPlaying(ev)} className="absolute inset-0 flex items-center justify-center bg-black/10 hover:bg-black/5 transition-colors text-white">
+                  <div className="border border-white/70 px-3 py-1 text-xs bg-black/40 rounded">▶ Play</div>
                 </button>
                 {ev.legal_hold && (
-                  <span className="absolute top-2 left-2 mono text-[10px] px-1.5 py-0.5 border border-red-500/50 bg-red-500/10 text-red-400 uppercase flex items-center gap-1"><FolderLock size={10} /> hold</span>
+                  <span className="absolute top-2 left-2 mono text-[10px] px-1.5 py-0.5 border border-red-500/50 bg-white/90 text-red-500 uppercase flex items-center gap-1 shadow-sm rounded-sm"><FolderLock size={10} /> hold</span>
                 )}
               </div>
               <div className="p-3">
@@ -287,22 +300,22 @@ export default function CommandDashboard() {
       )}
 
       {tab === "missions" && (
-        <div className="border border-slate-800 bg-slate-900">
+        <div className="rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
           <table className="w-full text-xs">
-            <thead className="bg-slate-950/50">
-              <tr>{["ID","Name","Zone","Status","Jurisdiction","Started"].map(h => <th key={h} className="text-left px-3 py-2 dvas-label border-b border-slate-800" style={{ fontSize: 10 }}>{h}</th>)}</tr>
+            <thead style={{ background: "var(--dvas-surface-2)" }}>
+              <tr>{["ID","Name","Zone","Status","Jurisdiction","Started"].map(h => <th key={h} className="text-left px-3 py-2 dvas-label" style={{ fontSize: 10, borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text-dim)" }}>{h}</th>)}</tr>
             </thead>
             <tbody className="mono">
               {missions.map(m => (
-                <tr key={m.id} data-testid={`mission-${m.id}`} className="hover:bg-slate-800/40">
-                  <td className="px-3 py-2 border-b border-slate-800/60">{m.id}</td>
-                  <td className="px-3 py-2 border-b border-slate-800/60 text-slate-100">{m.name}</td>
-                  <td className="px-3 py-2 border-b border-slate-800/60">{m.zone}</td>
-                  <td className="px-3 py-2 border-b border-slate-800/60">
-                    <span className={`px-1.5 py-0.5 border text-[10px] ${m.status === "active" ? "text-emerald-400 border-emerald-500/40 bg-emerald-500/10" : "text-slate-400 border-slate-600 bg-slate-800/40"}`}>{m.status}</span>
+                <tr key={m.id} data-testid={`mission-${m.id}`} className="hover:bg-[color:var(--dvas-elev)] transition-colors">
+                  <td className="px-3 py-2" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text-muted)" }}>{m.id}</td>
+                  <td className="px-3 py-2 font-medium" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text)" }}>{m.name}</td>
+                  <td className="px-3 py-2" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text-muted)" }}>{m.zone}</td>
+                  <td className="px-3 py-2" style={{ borderBottom: "1px solid var(--dvas-border)" }}>
+                    <span className={`px-1.5 py-0.5 border text-[10px] rounded-sm ${m.status === "active" ? "text-emerald-600 border-emerald-500/40 bg-emerald-50" : "text-slate-500 border-slate-300 bg-slate-100"}`}>{m.status}</span>
                   </td>
-                  <td className="px-3 py-2 border-b border-slate-800/60">{m.jurisdiction}</td>
-                  <td className="px-3 py-2 border-b border-slate-800/60 text-slate-400">{new Date(m.started_at).toLocaleString()}</td>
+                  <td className="px-3 py-2" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text-muted)" }}>{m.jurisdiction}</td>
+                  <td className="px-3 py-2" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text-dim)" }}>{new Date(m.started_at).toLocaleString()}</td>
                 </tr>
               ))}
             </tbody>
@@ -317,13 +330,13 @@ export default function CommandDashboard() {
       {tab === "models" && <ModelsPage user={user} t={t} />}
 
       {tab === "exports" && (
-        <div className="border border-slate-800 bg-slate-900">
-          <div className="p-3 border-b border-slate-800 text-sm flex items-center gap-2">
-            <ArrowSquareOut size={16} className="text-sky-400" weight="duotone" /> Evidence Export Requests
+        <div className="rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
+          <div className="p-3 text-sm flex items-center gap-2 font-semibold" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text)" }}>
+            <ArrowSquareOut size={16} className="text-sky-500" weight="duotone" /> Evidence Export Requests
           </div>
           <table className="w-full text-xs">
-            <thead className="bg-slate-950/50">
-              <tr>{["ID","Evidence","Requester","Justification","Status","Actions"].map(h => <th key={h} className="text-left px-3 py-2 dvas-label border-b border-slate-800" style={{ fontSize: 10 }}>{h}</th>)}</tr>
+            <thead style={{ background: "var(--dvas-surface-2)" }}>
+              <tr>{["ID","Evidence","Requester","Justification","Status","Actions"].map(h => <th key={h} className="text-left px-3 py-2 dvas-label" style={{ fontSize: 10, borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text-dim)" }}>{h}</th>)}</tr>
             </thead>
             <tbody className="mono">
               {exports.length === 0 && <tr><td colSpan={6} className="px-3 py-6 text-center text-slate-500">No export requests in scope</td></tr>}
