@@ -66,6 +66,7 @@ class VideoFrame:
     width: int
     height: int
     decode_latency_ms: float            # time from read() call → frame available
+    telemetry: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------

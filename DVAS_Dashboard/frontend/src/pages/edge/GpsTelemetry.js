@@ -40,7 +40,43 @@ export default function GpsTelemetry() {
   );
 
   useEffect(() => {
-    const timer = setInterval(() => {
+    const timer = setInterval(async () => {
+      try {
+        const resp = await fetch('/edge-api/api/edge/telemetry');
+        const tel = await resp.json();
+        if (tel.latitude && tel.longitude) {
+          setTelemetry(prev => ({
+            ...prev,
+            lat: tel.latitude,
+            lng: tel.longitude,
+            alt: tel.altitude_m || prev.alt,
+            heading: tel.heading_deg || prev.heading,
+            speed: tel.speed_mps || prev.speed,
+            battery: tel.battery_pct || prev.battery,
+            signal: tel.signal_pct || prev.signal,
+            lastUpdate: new Date().toLocaleTimeString()
+          }));
+          setPath(prev => {
+            const newPath = [...prev, { lat: tel.latitude, lng: tel.longitude }];
+            if (newPath.length > 30) newPath.shift();
+            return newPath;
+          });
+          setHistory(h => {
+            const newHist = [...h, {
+              time: h.length,
+              alt: tel.altitude_m || 120,
+              speed: tel.speed_mps || 12.5,
+              battery: tel.battery_pct || 100
+            }];
+            if (newHist.length > 30) newHist.shift();
+            return newHist;
+          });
+          return;
+        }
+      } catch (err) {
+        // Fall through to existing mock simulation
+      }
+
       setTelemetry(prev => {
         const newLat = prev.lat + 0.0001 + (Math.random() - 0.5) * 0.00005;
         const newLng = prev.lng + 0.0001 + (Math.random() - 0.5) * 0.00005;

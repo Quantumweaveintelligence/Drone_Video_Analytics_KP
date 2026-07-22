@@ -1,24 +1,137 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import AppShell from '@/components/layout/AppShell';
 import { Target, Play, Trash, XCircle, CheckCircle } from 'lucide-react';
 
 export default function MissionControl() {
-  const [activeMission, setActiveMission] = useState({
-    id: "MSN-9942-ALPHA",
-    designation: "Coastal Surveillance Patrolling",
-    drone: "DRN-001",
-    operator: "Operator K. Kumar",
-    location: "Sector 4, Marina",
-    startTime: "14:02:44"
-  });
+  const [activeMission, setActiveMission] = useState(null);
+  const [serverSend, setServerSend] = useState(false);
 
   const [form, setForm] = useState({ name: '', id: '', drone: '', operator: '', location: '' });
 
-  const missions = [
-    { id: "MSN-9942-ALPHA", designation: "Coastal Surveillance Patrolling", drone: "DRN-001", operator: "K. Kumar", location: "Sector 4, Marina", start: "14:02:44", end: "--:--:--", status: "active" },
+  const [missionLog, setMissionLog] = useState([
     { id: "MSN-9941-BRAVO", designation: "Traffic Monitoring", drone: "DRN-002", operator: "A. Sharma", location: "Junction 12", start: "11:15:00", end: "13:45:00", status: "completed" },
     { id: "MSN-9940-CHARLIE", designation: "VIP Route Sweep", drone: "DRN-001", operator: "K. Kumar", location: "Airport Road", start: "08:30:00", end: "10:15:00", status: "completed" },
-  ];
+  ]);
+
+  const [loading, setLoading] = useState(false);
+
+  const generateMissionId = () => {
+    const num = Math.floor(1000 + Math.random() * 9000);
+    const suffixes = ['ALPHA', 'BRAVO', 'CHARLIE', 'DELTA', 'ECHO', 'FOXTROT'];
+    const suffix = suffixes[Math.floor(Math.random() * suffixes.length)];
+    return `MSN-${num}-${suffix}`;
+  };
+
+  const handleNameChange = (e) => {
+    const name = e.target.value;
+    setForm(prev => ({
+      ...prev,
+      name,
+      id: prev.id && !prev.id.startsWith('MSN-') ? prev.id : generateMissionId()
+    }));
+  };
+
+  const handleStartMission = async () => {
+    if (!form.name || !form.drone) return;
+    setLoading(true);
+    try {
+      const resp = await fetch('/edge-api/api/edge/mission/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mission_id: form.id || generateMissionId(),
+          mission_name: form.name,
+          drone_id: form.drone,
+          operator: form.operator,
+          location: form.location,
+        }),
+      });
+      const data = await resp.json();
+      if (data.status === 'started') {
+        setActiveMission({
+          id: data.mission_id,
+          designation: data.mission_name,
+          drone: data.drone_id,
+          operator: data.operator || form.operator,
+          location: data.location || form.location,
+          startTime: data.start_time,
+        });
+        setServerSend(false);
+        setMissionLog(prev => [{
+          id: data.mission_id,
+          designation: data.mission_name,
+          drone: data.drone_id,
+          operator: form.operator,
+          location: form.location,
+          start: data.start_time,
+          end: '--:--:--',
+          status: 'active',
+        }, ...prev]);
+        setForm({ name: '', id: '', drone: '', operator: '', location: '' });
+      }
+    } catch (err) {
+      console.error('Failed to start mission:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleEndMission = async () => {
+    try {
+      const resp = await fetch('/edge-api/api/edge/mission/end', { method: 'POST' });
+      const data = await resp.json();
+      if (data.status === 'ended') {
+        setMissionLog(prev => prev.map(m => 
+          m.id === activeMission?.id 
+            ? { ...m, end: data.end_time || new Date().toLocaleTimeString('en-GB'), status: 'completed' }
+            : m
+        ));
+        setActiveMission(null);
+      }
+    } catch (err) {
+      console.error('Failed to end mission:', err);
+      setActiveMission(null);
+    }
+  };
+
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const resp = await fetch('/edge-api/api/edge/mission/active');
+        const data = await resp.json();
+        if (data.active) {
+          setServerSend(data.server_send_enabled || false);
+          setActiveMission({
+            id: data.mission_id,
+            designation: data.mission_name,
+            drone: data.drone_id,
+            operator: data.operator,
+            location: data.location,
+            startTime: data.start_time,
+          });
+        }
+      } catch (err) {
+        // Edge server not available - keep current state
+      }
+    };
+    poll();
+    const interval = setInterval(poll, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleToggleServerSend = async () => {
+    try {
+      const resp = await fetch('/edge-api/api/edge/mission/toggle-ingest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !serverSend })
+      });
+      const data = await resp.json();
+      setServerSend(data.server_send_enabled);
+    } catch (err) {
+      console.error('Failed to toggle server send:', err);
+    }
+  };
 
   return (
     <AppShell title="Mission Control" subtitle="Start, monitor, and terminate drone missions">
@@ -67,10 +180,20 @@ export default function MissionControl() {
                   </div>
                 </div>
 
-                <div className="mt-auto">
+                <div className="mt-auto grid grid-cols-2 gap-3">
                   <button 
-                    onClick={() => setActiveMission(null)}
-                    className="w-full py-2.5 border border-red-500/50 hover:bg-red-500/10 text-red-400 text-sm font-semibold tracking-wide uppercase transition-colors rounded"
+                    onClick={handleToggleServerSend}
+                    className={`py-2.5 border text-sm font-semibold tracking-wide uppercase transition-colors rounded ${
+                      serverSend 
+                        ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20' 
+                        : 'border-slate-600 hover:bg-slate-800 text-slate-300'
+                    }`}
+                  >
+                    {serverSend ? 'Server Send: ON' : 'Server Send: OFF'}
+                  </button>
+                  <button 
+                    onClick={handleEndMission}
+                    className="py-2.5 border border-red-500/50 hover:bg-red-500/10 text-red-400 text-sm font-semibold tracking-wide uppercase transition-colors rounded"
                   >
                     End Mission
                   </button>
@@ -91,7 +214,7 @@ export default function MissionControl() {
                 <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Mission Name *</label>
                 <input 
                   type="text" 
-                  value={form.name} onChange={e => setForm({...form, name: e.target.value})}
+                  value={form.name} onChange={handleNameChange}
                   className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm text-slate-200"
                   placeholder="e.g. VIP Route Sweep"
                 />
@@ -108,12 +231,17 @@ export default function MissionControl() {
                 </div>
                 <div>
                   <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Drone ID *</label>
-                  <input 
-                    type="text" 
-                    value={form.drone} onChange={e => setForm({...form, drone: e.target.value})}
+                  <select 
+                    value={form.drone} 
+                    onChange={e => setForm({...form, drone: e.target.value})}
                     className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm font-mono text-slate-200"
-                    placeholder="e.g. DRN-001"
-                  />
+                  >
+                    <option value="">Select Drone</option>
+                    <option value="DRN-001">DRN-001 (Garuda-1)</option>
+                    <option value="DRN-002">DRN-002 (Garuda-2)</option>
+                    <option value="DRN-003">DRN-003 (Garuda-3)</option>
+                    <option value="DRN-004">DRN-004 (Garuda-4)</option>
+                  </select>
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-4">
@@ -137,8 +265,12 @@ export default function MissionControl() {
             </div>
 
             <div className="mt-6 flex gap-3">
-              <button className="flex-1 bg-sky-600 hover:bg-sky-500 text-white py-2.5 text-sm font-semibold tracking-wide flex items-center justify-center gap-2 rounded transition-colors">
-                <Play size={16} fill="currentColor" /> Start Mission
+              <button 
+                onClick={handleStartMission} 
+                disabled={loading || !form.name || !form.drone}
+                className="flex-1 bg-sky-600 hover:bg-sky-500 text-white py-2.5 text-sm font-semibold tracking-wide flex items-center justify-center gap-2 rounded transition-colors disabled:opacity-50"
+              >
+                <Play size={16} fill="currentColor" /> {loading ? 'Starting...' : 'Start Mission'}
               </button>
               <button 
                 onClick={() => setForm({ name: '', id: '', drone: '', operator: '', location: '' })}
@@ -170,7 +302,7 @@ export default function MissionControl() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/50 text-slate-300">
-                {missions.map((m, i) => (
+                {missionLog.map((m, i) => (
                   <tr key={i} className="hover:bg-slate-800/20 transition-colors">
                     <td className="px-4 py-3 font-mono text-sky-200">{m.id}</td>
                     <td className="px-4 py-3 font-medium">{m.designation}</td>

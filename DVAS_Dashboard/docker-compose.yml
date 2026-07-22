@@ -31,6 +31,21 @@ services:
       postgres:
         condition: service_healthy
 
+  edge:
+    build: ../dvas_edge
+    container_name: dvas_edge
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    volumes:
+      - ../dvas_edge/DJI_0110.MP4:/data/DJI_0110.MP4:ro
+      - ../dvas_edge/DJI_0111.MP4:/data/DJI_0111.MP4:ro
+      - edge_buffer:/app/buffer_storage
+    environment:
+      - VIDEO_DIR=/data
+      - SIMULATION__ENABLED=true
+      - INGEST__ENABLED=false
+
   frontend:
     build: ./frontend
     container_name: dvas_frontend
@@ -39,6 +54,8 @@ services:
       - "3000:80"
     depends_on:
       - backend
+      - edge
 
 volumes:
   pgdata:
+  edge_buffer:

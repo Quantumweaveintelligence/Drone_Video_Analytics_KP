@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import AppShell from "@/components/layout/AppShell";
 import { AreaChart, Area, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
 import { Send as Drone, AlertTriangle as Warning, Info } from "lucide-react";
@@ -11,9 +11,6 @@ const generateChartData = (base, variance, count) => {
   }));
 };
 
-const altitudeData = generateChartData(120, 20, 30);
-const speedData = generateChartData(45, 10, 30);
-
 export default function Dashboard() {
   const [activeAlerts, setActiveAlerts] = useState([
     { id: 1, text: "Unidentified object detected in sector 7G", severity: "amber", ack: false, time: "14:32:01" },
@@ -21,23 +18,59 @@ export default function Dashboard() {
     { id: 3, text: "Mission waypoint 4 reached", severity: "neutral", ack: true, time: "14:28:12" },
   ]);
 
+  const [edgeStatus, setEdgeStatus] = useState(null);
+  const [telemetry, setTelemetry] = useState(null);
+  const [activeMission, setActiveMission] = useState(null);
+  const [altData, setAltData] = useState(() => generateChartData(120, 20, 30));
+  const [spdData, setSpdData] = useState(() => generateChartData(45, 10, 30));
+
+  useEffect(() => {
+    let tick = 0;
+    const poll = async () => {
+      try {
+        const [statusResp, telResp, missionResp] = await Promise.all([
+          fetch('/edge-api/api/edge/status'),
+          fetch('/edge-api/api/edge/telemetry'),
+          fetch('/edge-api/api/edge/mission/active'),
+        ]);
+        const status = await statusResp.json();
+        const tel = await telResp.json();
+        const missionData = await missionResp.json();
+        
+        setEdgeStatus(status);
+        setTelemetry(tel);
+        if (missionData.active) setActiveMission(missionData);
+        else setActiveMission(null);
+        
+        tick++;
+        setAltData(prev => [...prev.slice(1), { time: tick, value: Math.round(tel.altitude_m || 120) }]);
+        setSpdData(prev => [...prev.slice(1), { time: tick, value: Math.round((tel.speed_mps || 12) * 3.6) }]);
+      } catch (err) {
+        // Edge not available
+      }
+    };
+    poll();
+    const interval = setInterval(poll, 3000);
+    return () => clearInterval(interval);
+  }, []);
+
   const toggleAck = (id) => {
     setActiveAlerts(prev => prev.map(a => a.id === id ? { ...a, ack: !a.ack } : a));
   };
 
   const kpis = [
-    { label: "Active Mission", value: "1", status: "green", unit: "" },
-    { label: "Drone Link", value: "UP", status: "green", unit: "" },
-    { label: "Stream FPS", value: "30", status: "cyan", unit: "fps" },
+    { label: "Active Mission", value: activeMission ? "1" : "0", status: activeMission ? "green" : "neutral", unit: "" },
+    { label: "Drone Link", value: edgeStatus?.connected ? "UP" : "DOWN", status: edgeStatus?.connected ? "green" : "red", unit: "" },
+    { label: "Stream FPS", value: edgeStatus ? Math.round(edgeStatus.fps) : "--", status: "cyan", unit: "fps" },
     { label: "Bitrate", value: "4.2", status: "blue", unit: "Mbps" },
-    { label: "Buffer Util.", value: "74", status: "amber", unit: "%" },
-    { label: "CPU Usage", value: "42", status: "neutral", unit: "%" },
-    { label: "GPU Usage", value: "68", status: "purple", unit: "%" },
+    { label: "Buffer Util.", value: edgeStatus ? Math.round(edgeStatus.buffer_fill_pct) : "--", status: edgeStatus?.buffer_fill_pct > 80 ? "red" : edgeStatus?.buffer_fill_pct > 60 ? "amber" : "neutral", unit: "%" },
+    { label: "CPU Usage", value: edgeStatus ? Math.round(edgeStatus.cpu_pct) : "--", status: edgeStatus?.cpu_pct > 80 ? "red" : "neutral", unit: "%" },
+    { label: "GPU Usage", value: edgeStatus ? Math.round(edgeStatus.gpu_pct) : "--", status: edgeStatus?.gpu_pct > 80 ? "red" : "purple", unit: "%" },
     { label: "Storage", value: "62", status: "amber", unit: "%" },
-    { label: "Upload Queue", value: "127", status: "neutral", unit: "" },
-    { label: "Selected Frames", value: "12,800", status: "green", unit: "" },
-    { label: "Discarded Frames", value: "32,200", status: "neutral", unit: "" },
-    { label: "Drone Battery", value: "78", status: "green", unit: "%" },
+    { label: "Upload Queue", value: edgeStatus ? edgeStatus.upload_queue : "--", status: "neutral", unit: "" },
+    { label: "Selected Frames", value: edgeStatus ? edgeStatus.frames_selected.toLocaleString() : "--", status: "green", unit: "" },
+    { label: "Discarded Frames", value: edgeStatus ? (edgeStatus.frames_total - edgeStatus.frames_selected).toLocaleString() : "--", status: "neutral", unit: "" },
+    { label: "Drone Battery", value: telemetry ? Math.round(telemetry.battery_pct) : "--", status: telemetry?.battery_pct > 50 ? "green" : telemetry?.battery_pct > 20 ? "amber" : "red", unit: "%" },
   ];
 
   const getColorClass = (status) => {
@@ -77,25 +110,27 @@ export default function Dashboard() {
           <div className="bg-slate-900 border border-slate-800 p-5 rounded-lg flex flex-col relative overflow-hidden">
             <div className="flex justify-between items-start mb-4">
               <div className="text-xs text-slate-500 font-semibold uppercase tracking-wider">Active Mission</div>
-              <div className="flex items-center gap-2 text-xs px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                ACTIVE
-              </div>
+              {activeMission && (
+                <div className="flex items-center gap-2 text-xs px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                  ACTIVE
+                </div>
+              )}
             </div>
-            <div className="text-xl font-bold text-sky-200 font-mono mb-1">MSN-9942-ALPHA</div>
-            <div className="text-sm text-slate-300 font-medium mb-4">Coastal Surveillance Patrolling</div>
+            <div className="text-xl font-bold text-sky-200 font-mono mb-1">{activeMission?.mission_id || 'NO ACTIVE MISSION'}</div>
+            <div className="text-sm text-slate-300 font-medium mb-4">{activeMission?.mission_name || '--'}</div>
             <div className="grid grid-cols-2 gap-y-3 mt-auto text-sm">
               <div>
                 <div className="text-[10px] text-slate-500 uppercase">Drone Assigned</div>
-                <div className="text-slate-200">DRN-001</div>
+                <div className="text-slate-200">{activeMission?.drone_id || '--'}</div>
               </div>
               <div>
                 <div className="text-[10px] text-slate-500 uppercase">Location</div>
-                <div className="text-slate-200">Sector 4, Marina</div>
+                <div className="text-slate-200">{activeMission?.location || '--'}</div>
               </div>
               <div>
                 <div className="text-[10px] text-slate-500 uppercase">Duration</div>
-                <div className="text-slate-200">42 mins</div>
+                <div className="text-slate-200">--</div>
               </div>
             </div>
           </div>
@@ -178,7 +213,7 @@ export default function Dashboard() {
             <div className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-4">Altitude Trend</div>
             <div className="flex-1 min-h-0 w-full">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={altitudeData} margin={{ top: 5, right: 0, left: -20, bottom: 0 }}>
+                <AreaChart data={altData} margin={{ top: 5, right: 0, left: -20, bottom: 0 }}>
                   <defs>
                     <linearGradient id="colorAlt" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="5%" stopColor="#22d3ee" stopOpacity={0.3}/>
@@ -201,7 +236,7 @@ export default function Dashboard() {
             <div className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-4">Speed Trend</div>
             <div className="flex-1 min-h-0 w-full">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={speedData} margin={{ top: 5, right: 0, left: -20, bottom: 0 }}>
+                <AreaChart data={spdData} margin={{ top: 5, right: 0, left: -20, bottom: 0 }}>
                   <defs>
                     <linearGradient id="colorSpd" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="5%" stopColor="#fbbf24" stopOpacity={0.3}/>

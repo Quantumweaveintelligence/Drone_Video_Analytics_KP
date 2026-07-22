@@ -107,6 +107,7 @@ class DroneSimulationSource:
         frame_queue_size: int = 8,
         on_frame: Optional[Callable[[VideoFrame], None]] = None,
         heartbeat_interval_frames: int = 60,
+        telemetry_simulator=None,
     ) -> None:
         self.drone_id = drone_id
         self.video_files: List[Path] = []
@@ -114,6 +115,7 @@ class DroneSimulationSource:
         self.playback_speed = max(0.01, playback_speed)
         self.on_frame = on_frame
         self.heartbeat_interval_frames = heartbeat_interval_frames
+        self.telemetry_simulator = telemetry_simulator
 
         # Validate and store video file paths
         for p in (video_files or []):
@@ -373,6 +375,10 @@ class DroneSimulationSource:
                 decode_latency_ms = (t_decoded - t_frame_start) * 1_000.0
                 utc_ms = int(time.time() * 1_000)
 
+                telemetry_data = None
+                if self.telemetry_simulator is not None:
+                    telemetry_data = self.telemetry_simulator.update(self._frame_index, utc_ms)
+
                 vf = VideoFrame(
                     frame_index=self._frame_index,
                     utc_timestamp_ms=utc_ms,
@@ -380,6 +386,7 @@ class DroneSimulationSource:
                     width=w,
                     height=h,
                     decode_latency_ms=decode_latency_ms,
+                    telemetry=telemetry_data,
                 )
                 self._frame_index += 1
                 self._fps_frame_count += 1
