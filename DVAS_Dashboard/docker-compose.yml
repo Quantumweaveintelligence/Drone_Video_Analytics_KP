@@ -44,6 +44,8 @@ services:
     volumes:
       - ../dvas_edge/DJI_0110.MP4:/data/DJI_0110.MP4:ro
       - ../dvas_edge/DJI_0111.MP4:/data/DJI_0111.MP4:ro
+      - ../dvas_edge/DJI_0112.MP4:/data/DJI_0112.MP4:ro
+      - ../dvas_edge/DJI_0113.mp4:/data/DJI_0113.mp4:ro
       - edge_buffer:/app/buffer_storage
     environment:
       - VIDEO_DIR=/data

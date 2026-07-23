@@ -64,7 +64,7 @@ DRONE_VIDEO_MAP = {
     "DRN-001": "DJI_0110.MP4",
     "DRN-002": "DJI_0111.MP4",
     "DRN-003": "DJI_0112.MP4",
-    "DRN-004": "DJI_0113.MP4",
+    "DRN-004": "DJI_0113.mp4",
 }
 
 
@@ -245,13 +245,13 @@ class PipelineManager:
         path = os.path.join(script_dir, filename)
         if os.path.exists(path):
             return path
-        # Last resort: fallback to DJI_0110.MP4
-        for fallback_name in ["DJI_0110.MP4", "DJI_0111.MP4"]:
+        # Last resort: fallback in order
+        for fallback_name in ["DJI_0110.MP4", "DJI_0111.MP4", "DJI_0112.MP4", "DJI_0113.mp4"]:
             for d in [video_dir, script_dir]:
-                fb = os.path.join(d, fallback_name) if d else fallback_name
-                if os.path.exists(fb):
-                    log.warning("video_file_fallback", requested=filename, using=fb)
-                    return fb
+                if d:
+                    path = os.path.join(d, fallback_name)
+                    if os.path.exists(path):
+                        return path
         return filename  # will fail at open time with a clear error
 
     # ── Mission lifecycle ─────────────────────────────────────────────────
