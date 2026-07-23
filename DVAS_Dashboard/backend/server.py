@@ -262,8 +262,8 @@ def scope_filter_for(user: dict):
     if role == "senior_officer":
         return {}  # full jurisdiction-wide + cross-jurisdiction aggregate access
     if role == "control_room_officer":
-        # mission-scoped access (covers former field_supervisor capability)
-        return {"mission_id": {"$in": user.get("mission_scope", [])}}
+        # jurisdiction-scoped access (covers former field_supervisor capability)
+        return {"jurisdiction": user.get("jurisdiction")}
     return {"__deny__": True}  # everyone else: no direct data access
 
 

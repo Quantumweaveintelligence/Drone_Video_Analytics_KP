@@ -30,7 +30,7 @@ import time
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 
 logger = logging.getLogger("dvas.ingest_proxy")
 

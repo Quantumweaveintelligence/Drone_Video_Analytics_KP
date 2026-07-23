@@ -1130,7 +1130,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
       const mock = MOCK_DRONES.find((m) => m.id === d.id) || {};
       return { ...mock, ...d };
     }
-  ).sort((a, b) => a.id.localeCompare(b.id)); // Fix auto-cycling / jumping order
+  ).filter((d) => d.id.startsWith("DRN")).sort((a, b) => a.id.localeCompare(b.id)); // Fix auto-cycling / jumping order
 
   const events = liveAlerts && liveAlerts.length > 0
     ? liveAlerts.map((a) => ({
@@ -1167,7 +1167,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
 
       {/* ── 2. Drone Cards Grid (flex row with transition) ── */}
       <div
-        className="flex flex-col lg:flex-row gap-3 transition-all duration-500 ease-in-out"
+        className="flex flex-col lg:flex-row gap-3 transition-all duration-500 ease-in-out min-h-[60vh] xl:min-h-[500px]"
       >
         {drones.map((d) => {
           const isSelected = selectedDroneId === d.id;
@@ -1178,7 +1178,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
               key={d.id} 
               className={`transition-all duration-500 ease-in-out ${
                 isSelected 
-                  ? "lg:flex-[2_2_0%]" 
+                  ? "lg:flex-[4_4_0%]" 
                   : isOtherSelected 
                   ? "lg:flex-1" 
                   : "lg:flex-1"
