@@ -231,7 +231,7 @@ export default function MissionControl() {
                   </button>
                   {!pipelineEnabled && (
                     <div className="text-[10px] text-amber-400/70 text-center font-mono tracking-wide">
-                      Change Detection & Cognitive Selection bypassed — frames sent directly at ~1 fps
+                      Change Detection & Cognitive Selection bypassed — frames sent directly at ~30 fps
                     </div>
                   )}
                 </div>

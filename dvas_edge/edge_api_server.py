@@ -345,11 +345,10 @@ class PipelineManager:
                 except Exception:
                     pass
 
-                # Pipeline bypass: send frames directly at ~1 fps
+                # Pipeline bypass: send frames directly at source FPS (usually ~30 fps)
                 if self.pipeline_bypass:
                     self._bypass_frame_counter += 1
-                    src_fps = self.source.source_fps if self.source else 30.0
-                    sample_interval = max(int(src_fps), 1)  # ~1 frame per second
+                    sample_interval = 1  # 1 = send every frame (~30+ fps)
                     if (self._bypass_frame_counter % sample_interval == 0
                             and self.server_send_enabled
                             and self.sender_thread is not None):
