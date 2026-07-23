@@ -29,6 +29,8 @@ ALLOWED_ORIGINS: list[str] = [
     f"https://{SERVER_HOSTNAME}",
     "http://localhost:3000",          # Grafana dashboard (local access)
     "http://localhost:8080",          # Keycloak admin console (local access)
+    "http://10.51.27.155:3000",      # Edge laptop dashboard (LAN demo)
+    "http://10.51.27.250:3000",      # Ingest server dashboard (LAN demo)
 ]
 
 ALLOWED_ROLES: set[str] = {"drone-operator", "sys-admin"}

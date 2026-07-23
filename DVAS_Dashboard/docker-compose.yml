@@ -26,33 +26,16 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://dvas:dvas_secret@postgres:5432/dvas
       - JWT_SECRET=super-secret-dvas-key-change-in-prod
-      - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
-      - INGEST_SERVER_URL=${INGEST_SERVER_URL:-http://ingest-api:8000}
-      - EDGE_SERVER_URL=http://edge:8765
+      - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://10.51.27.155:3000,http://10.51.27.250:3000
+      # Ingest server runs on the same machine — access via host IP
+      - INGEST_SERVER_URL=http://10.51.27.250:8000
+      # Edge runs on the remote teammate laptop
+      - EDGE_SERVER_URL=http://10.51.27.155:8765
     depends_on:
       postgres:
         condition: service_healthy
-    networks:
-      - default
-      - ingest_net
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-
-  edge:
-    build: ../dvas_edge
-    container_name: dvas_edge
-    restart: unless-stopped
-    ports:
-      - "8765:8765"
-    volumes:
-      - ../dvas_edge/DJI_0110.MP4:/data/DJI_0110.MP4:ro
-      - ../dvas_edge/DJI_0111.MP4:/data/DJI_0111.MP4:ro
-      - edge_buffer:/app/buffer_storage
-    environment:
-      - VIDEO_DIR=/data
-      - SIMULATION__ENABLED=true
-      - INGEST__ENABLED=${EDGE_INGEST_ENABLED:-false}
-      - INGEST__URL=${INGEST_URL:-https://ingest.dvas.internal/ingest/frame}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   frontend:
     build: ./frontend
@@ -62,14 +45,6 @@ services:
       - "3000:80"
     depends_on:
       - backend
-      - edge
 
 volumes:
   pgdata:
-  edge_buffer:
-
-networks:
-  default: {}
-  ingest_net:
-    external: true
-    name: dvas_ingest_drone-net

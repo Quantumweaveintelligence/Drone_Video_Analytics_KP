@@ -29,18 +29,18 @@ from typing import Optional
 import httpx
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-# All URLs point to the Ubuntu ingest server over the WireGuard VPN tunnel.
-#   VPN subnet      : 10.10.20.0/24
-#   Ubuntu server   : 10.10.20.1  (also reachable as ingest.dvas.internal once DNS/hosts is set)
+# LAN demo: direct HTTP to ingest server (no VPN / no TLS)
+#   Ingest server LAN IP : 10.51.27.250
+#   Edge laptop LAN IP   : 10.51.27.155
 #
 # To override at runtime without editing this file, set environment variables:
-#   set INGEST_URL=https://ingest.dvas.internal/ingest/frame
-#   set TOKEN_URL=http://10.10.20.1:8080/realms/kerala-police-drone/protocol/openid-connect/token
+#   set INGEST_URL=http://10.51.27.250/ingest/frame
+#   set TOKEN_URL=http://10.51.27.250:8080/realms/kerala-police-drone/protocol/openid-connect/token
 
 import os
 
-INGEST_URL  = os.getenv("INGEST_URL",  "https://ingest.dvas.internal/ingest/frame")
-TOKEN_URL   = os.getenv("TOKEN_URL",   "http://10.10.20.1:8080/realms/kerala-police-drone/protocol/openid-connect/token")
+INGEST_URL  = os.getenv("INGEST_URL",  "http://10.51.27.250/ingest/frame")
+TOKEN_URL   = os.getenv("TOKEN_URL",   "http://10.51.27.250:8080/realms/kerala-police-drone/protocol/openid-connect/token")
 CLIENT_ID   = os.getenv("KC_CLIENT_ID",  "drone-ingest-client")
 CLIENT_SEC  = os.getenv("KC_CLIENT_SEC", "j2Icr4lPJHHlvcJBu04nIH7A74k3cl4c")  # rotate after pilot
 
@@ -315,7 +315,7 @@ class IngestClient:
         """Register mission start with the ingest server."""
         mission_start_url = os.getenv(
             "MISSION_START_URL",
-            "https://ingest.dvas.internal/ingest/mission/start"
+            "http://10.51.27.250/ingest/mission/start"
         )
         token = await self.get_token()
         async with httpx.AsyncClient(verify=_tls_param(), timeout=10.0) as client:
@@ -335,7 +335,7 @@ class IngestClient:
         """Register mission end with the ingest server."""
         mission_end_url = os.getenv(
             "MISSION_END_URL",
-            "https://ingest.dvas.internal/ingest/mission/end"
+            "http://10.51.27.250/ingest/mission/end"
         )
         token = await self.get_token()
         async with httpx.AsyncClient(verify=_tls_param(), timeout=10.0) as client:

@@ -212,6 +212,8 @@ services:
       # Logging
       LOG_LEVEL: "INFO"
       LOG_JSON:  "true"
+      # Demo: skip Keycloak JWT validation for LAN demo
+      SKIP_AUTH: "true"
     depends_on:
       keycloak:
         condition: service_healthy
@@ -219,6 +221,8 @@ services:
         condition: service_healthy
     expose:
       - "8000"
+    ports:
+      - "0.0.0.0:8000:8000"   # Direct API access for dashboard proxy (LAN demo)
     healthcheck:
       test:         ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval:     10s

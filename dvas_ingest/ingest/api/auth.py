@@ -29,6 +29,12 @@ from config import (
     JWKS_URL,
 )
 
+# ── Demo auth bypass ─────────────────────────────────────────────────────────
+# Set SKIP_AUTH=true in .env / docker-compose to bypass Keycloak JWT validation.
+# Useful for LAN demos where Keycloak realm may not be fully configured.
+import os
+SKIP_AUTH: bool = os.getenv("SKIP_AUTH", "false").lower() == "true"
+
 log = logging.getLogger(__name__)
 
 # ── JWKS cache ────────────────────────────────────────────────────────────────
@@ -94,6 +100,15 @@ async def validate_token(
         403  if token is valid but the user lacks an allowed role
     """
     token = creds.credentials
+
+    # ── Demo bypass — skip all JWT validation ─────────────────────────────
+    if SKIP_AUTH:
+        log.info("skip_auth_enabled — bypassing JWT validation (demo mode)")
+        return {
+            "sub": "demo-operator",
+            "preferred_username": "demo_operator",
+            "realm_access": {"roles": ["drone-operator", "sys-admin"]},
+        }
 
     try:
         jwks    = await get_jwks()

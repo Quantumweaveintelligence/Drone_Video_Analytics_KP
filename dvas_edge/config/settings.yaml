@@ -64,23 +64,21 @@ metrics:
 
 # ============================================================
 # Ingest Server Connection — edge_sender.py targets
-# The Ubuntu ingest server is reached over the WireGuard VPN.
-#   VPN subnet  : 10.10.20.0/24
-#   Ubuntu server VPN IP : 10.10.20.1
-#   Internal hostname    : ingest.dvas.internal  (resolves via WireGuard DNS or /etc/hosts)
+# LAN demo: direct HTTP to ingest server (no VPN / no TLS)
+#   Ingest server LAN IP : 10.51.27.250
+#   Edge laptop LAN IP   : 10.51.27.155
 # ============================================================
 
 ingest:
-  # HTTPS endpoint for frame upload — goes through NGINX on Ubuntu
-  url: "https://ingest.dvas.internal/ingest/frame"
+  # HTTP endpoint for frame upload — goes through NGINX on ingest server
+  url: "http://10.51.27.250/ingest/frame"
 
   # Mission lifecycle endpoints
-  mission_start_url: "https://ingest.dvas.internal/ingest/mission/start"
-  mission_end_url:   "https://ingest.dvas.internal/ingest/mission/end"
+  mission_start_url: "http://10.51.27.250/ingest/mission/start"
+  mission_end_url:   "http://10.51.27.250/ingest/mission/end"
 
-  # Keycloak token endpoint — direct to Keycloak container port on Ubuntu VPN IP
-  # (Keycloak does not go through NGINX — direct 8080 access over VPN only)
-  token_url: "http://10.10.20.1:8080/realms/kerala-police-drone/protocol/openid-connect/token"
+  # Keycloak token endpoint — direct to Keycloak container port on ingest server
+  token_url: "http://10.51.27.250:8080/realms/kerala-police-drone/protocol/openid-connect/token"
 
   # Keycloak client credentials — match values configured in Keycloak on Ubuntu
   client_id:     "drone-ingest-client"
@@ -94,15 +92,11 @@ ingest:
   drone_id:   "DRONE_KL_001"
   mission_id: "MISSION_DEFAULT"
 
-  # TLS verification:
-  #   true  — use ca_cert below to verify the ingest server certificate
-  #   false — skip verification (development only, self-signed / expired cert)
-  tls_verify: true
+  # TLS verification: disabled for LAN demo (plain HTTP)
+  tls_verify: false
 
-  # Path to the internal CA root certificate.
-  # Python's httpx does NOT read the Windows certificate store — it needs the cert file explicitly.
-  # Used when tls_verify: true
-  ca_cert: "D:/POLICE_DRONE/drone_analytics/root_ca.crt"
+  # Path to the internal CA root certificate (not used when tls_verify: false)
+  ca_cert: ""
 
   # How often (seconds) the heartbeat logger prints a human-readable summary
   heartbeat_log_interval_s: 10
