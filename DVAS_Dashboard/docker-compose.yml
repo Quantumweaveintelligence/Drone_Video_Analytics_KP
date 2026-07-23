@@ -22,7 +22,9 @@ services:
     container_name: dvas_backend
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "8001:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - DATABASE_URL=postgresql+asyncpg://dvas:dvas_secret@postgres:5432/dvas
       - JWT_SECRET=super-secret-dvas-key-change-in-prod
