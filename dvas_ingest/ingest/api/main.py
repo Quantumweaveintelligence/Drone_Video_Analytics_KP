@@ -41,7 +41,7 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import PlainTextResponse, JSONResponse, Response
 from prometheus_client import (
     Counter,
     Gauge,
@@ -93,6 +93,7 @@ async def _is_redis_healthy():
 # In-memory ingest stats (replaces old queue_manager counters)
 _ingest_stats: dict = {}   # drone_id → {frames_received, frames_queued, bytes_ingested, ...}
 _rejections:   dict = {}   # drone_id → int
+_latest_metadata: dict = {}  # drone_id → {lat, lng, battery_pct, speed_mps, altitude_m, ...}
 
 def _record_frame(drone_id, n_bytes, mission_id=None):
     s = _ingest_stats.setdefault(drone_id, {
@@ -364,6 +365,22 @@ async def ingest_frame(
     elapsed = time.monotonic() - t_start
     INGEST_LATENCY.labels(drone_id=drone_id).observe(elapsed)
 
+    # ── Cache latest telemetry ────────────────────────────────────────────────
+    _latest_metadata[drone_id] = {
+        "drone_id":    drone_id,
+        "mission_id":  mission_id,
+        "latitude":    meta.latitude,
+        "longitude":   meta.longitude,
+        "altitude_m":  meta.altitude_m,
+        "battery_pct": meta.battery_pct,
+        "speed_mps":   meta.speed_mps,
+        "heading_deg": meta.heading_deg,
+        "change_score":meta.change_score,
+        "frame_sequence": meta.frame_sequence,
+        "timestamp":   meta.timestamp,
+        "last_seen":   time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+    }
+
     queue_name = f"drone:frames:{drone_id}"
     log.info(
         "frame_queued",
@@ -389,6 +406,11 @@ async def ingest_frame(
             "timestamp":      meta.timestamp,
             "bytes":          len(data),
             "latency_ms":     round(elapsed * 1000, 1),
+            "latitude":       meta.latitude,
+            "longitude":      meta.longitude,
+            "altitude_m":     meta.altitude_m,
+            "battery_pct":    meta.battery_pct,
+            "speed_mps":      meta.speed_mps,
         })
     )
 
@@ -608,6 +630,59 @@ async def mission_end(
         mission_id = req.mission_id,
         timestamp  = ts,
     )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TELEMETRY & FRAME RETRIEVAL ENDPOINTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.get(
+    "/ingest/telemetry",
+    summary = "Latest telemetry for all active drones",
+    tags    = ["Telemetry"],
+)
+async def get_telemetry():
+    """
+    Returns cached latest telemetry (GPS, battery, speed, etc.) for every drone
+    that has sent at least one frame since server startup.
+    No auth required — used internally by the dashboard backend telemetry pump.
+    """
+    return {"drones": list(_latest_metadata.values()), "count": len(_latest_metadata)}
+
+
+@app.get(
+    "/ingest/frame/{drone_id}/latest",
+    summary = "Latest raw JPEG frame for a drone",
+    tags    = ["Telemetry"],
+)
+async def get_latest_frame(drone_id: str):
+    """
+    Reads the most recent entry from the Valkey stream for the given drone
+    and returns the raw JPEG bytes. Used by the command dashboard multi-drone
+    view to display live frames.
+    """
+    if not _qm:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Queue unavailable")
+    try:
+        stream_key = f"drone:frames:{drone_id}"
+        entries = await _qm._client.xrevrange(stream_key, max="+", min="-", count=1)
+        if not entries:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"No frames yet for drone {drone_id}")
+        _entry_id, fields = entries[0]
+        raw_jpeg = fields[b"frame"]
+        return Response(
+            content      = raw_jpeg,
+            media_type   = "image/jpeg",
+            headers      = {
+                "Cache-Control": "no-store",
+                "X-Drone-ID":   drone_id,
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.error("latest_frame_error", extra={"drone_id": drone_id, "error": str(exc)})
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Frame retrieval failed")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
