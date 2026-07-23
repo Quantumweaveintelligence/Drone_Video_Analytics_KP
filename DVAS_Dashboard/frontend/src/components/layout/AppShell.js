@@ -41,31 +41,28 @@ const SB_KEY = "dvas_sidebar_collapsed";
 
 /* ---------- Ingest health polling ---------- */
 function useIngestHealth() {
-  const { user } = useAuth();
   const [state, setState] = useState({ status: "unknown", labelKey: "topbar.online" });
   useEffect(() => {
-    if (!user) return;
     let mounted = true;
     const tick = async () => {
       try {
-        if (user.role === "system_administrator") {
-          const { data } = await api.get("/infra/health");
-          const degraded = (data?.feeds || []).some((f) => f.status !== "live");
-          if (mounted) setState(degraded
-            ? { status: "warn", labelKey: "topbar.degraded" }
-            : { status: "safe", labelKey: "topbar.healthy" });
+        const { data } = await api.get("/ingest-server/health");
+        if (!mounted) return;
+        if (!data.reachable) {
+          setState({ status: "crit", labelKey: "topbar.offline" });
+        } else if (data.status === "ok") {
+          setState({ status: "safe", labelKey: "topbar.online" });
         } else {
-          await api.get("/auth/me");
-          if (mounted) setState({ status: "safe", labelKey: "topbar.online" });
+          setState({ status: "warn", labelKey: "topbar.degraded" });
         }
       } catch (e) {
         if (mounted) setState({ status: "crit", labelKey: "topbar.offline" });
       }
     };
     tick();
-    const t = setInterval(tick, 15000);
+    const t = setInterval(tick, 10000);
     return () => { mounted = false; clearInterval(t); };
-  }, [user]);
+  }, []);
   return state;
 }
 

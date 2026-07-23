@@ -36,6 +36,7 @@ from fpdf import FPDF
 
 from database import engine, async_session_factory, get_db
 from models import Base, User, AuditLog, Mission, Drone, Alert, Evidence, Export, ModelConfig
+from ingest_proxy import ingest_api
 
 # ---------- Setup ----------
 JWT_ALGORITHM = "HS256"
@@ -1788,6 +1789,7 @@ async def _start_pump():
 
 
 app.include_router(api)
+app.include_router(ingest_api)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,

@@ -1,14 +1,16 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import AppShell from "@/components/layout/AppShell";
 import { api, ROLE_LABELS } from "@/lib/api";
 import { useI18n } from "@/context/I18nContext";
+import { useIngestServer } from "@/hooks/useIngestServer";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, BarChart, Bar, CartesianGrid,
 } from "recharts";
 import {
   CircuitBoard, AlertTriangle, Table as TableIcon, Activity, Cpu, ClipboardList,
   Users, Trash2, Plus, ShieldAlert, LayoutDashboard, Gauge, Database, HardDrive,
-  Zap, CheckCircle2, XCircle, TrendingUp,
+  Zap, CheckCircle2, XCircle, TrendingUp, Server, Wifi, WifiOff, Radio,
+  Power, PowerOff, RotateCcw, AlertOctagon, Terminal, ChevronDown,
 } from "lucide-react";
 
 const sevColor = {
@@ -18,6 +20,7 @@ const sevColor = {
 };
 
 const PAGES = [
+  { key: "server", labelKey: "ingest.page.server", Icon: Server },
   { key: "overview", labelKey: "ingest.page.overview", Icon: LayoutDashboard },
   { key: "feeds",  labelKey: "ingest.page.feeds",  Icon: TableIcon },
   { key: "queue",  labelKey: "ingest.page.queue",  Icon: Activity },
@@ -62,12 +65,13 @@ function TopNav({ page, setPage }) {
 
 export default function IngestDashboard() {
   const { t } = useI18n();
-  const [page, setPage] = useState("overview");
+  const [page, setPage] = useState("server");
   const [h, setH] = useState(null);
   const [ov, setOv] = useState(null);
   const [tick, setTick] = useState(0);
   const [audit, setAudit] = useState([]);
   const [users, setUsers] = useState([]);
+  const ingestSrv = useIngestServer();
   const [ackedAlertIds, setAckedAlertIds] = useState([]);
   const [feedFilter, setFeedFilter] = useState("all");
   const [feedSort, setFeedSort] = useState("drone_id");
@@ -121,6 +125,7 @@ export default function IngestDashboard() {
         <TopNav page={page} setPage={setPage} />
 
         <div className="min-w-0">
+          {page === "server" && <ServerPage srv={ingestSrv} />}
           {page === "overview" && <OverviewPage ov={ov} />}
           {page === "feeds" && <FeedsPage feeds={feeds} filter={feedFilter} setFilter={setFeedFilter} setSort={setFeedSort} />}
           {page === "queue" && <QueuePage throughput={throughput} queue={h?.queue || []} />}
@@ -135,6 +140,685 @@ export default function IngestDashboard() {
 }
 
 /* ---------- Sub-pages ---------- */
+
+/* ---------- SERVER (new — real ingest server integration) ---------- */
+
+function formatUptime(seconds) {
+  if (!seconds || seconds < 0) return "—";
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  return `${m}m ${s}s`;
+}
+
+function formatBytes(bytes) {
+  if (!bytes || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
+}
+
+function StatusDot({ ok, pulse }) {
+  return (
+    <span
+      className={`inline-block w-2 h-2 rounded-full ${pulse && ok ? "dvas-live-dot" : ""}`}
+      style={{ background: ok ? "var(--dvas-safe)" : "var(--dvas-crit)" }}
+    />
+  );
+}
+
+/* ── Confirmation Modal ──────────────────────────────────────────────────── */
+function ConfirmModal({ open, title, message, confirmWord, onConfirm, onCancel, danger }) {
+  const [typed, setTyped] = useState("");
+  useEffect(() => { if (open) setTyped(""); }, [open]);
+  if (!open) return null;
+  const ready = !confirmWord || typed.toUpperCase() === confirmWord.toUpperCase();
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center"
+      style={{ background: "rgba(0,0,0,0.75)" }}
+      onClick={(e) => { if (e.target === e.currentTarget) onCancel(); }}>
+      <div className="w-full max-w-md border border-slate-700 bg-slate-900 p-6 shadow-2xl">
+        <div className="flex items-center gap-3 mb-4">
+          <AlertOctagon size={20} className={danger ? "text-red-400" : "text-amber-400"} />
+          <h3 className="text-base font-semibold" style={{ color: "var(--dvas-text)" }}>{title}</h3>
+        </div>
+        <p className="text-sm text-slate-400 mb-4 leading-relaxed">{message}</p>
+        {confirmWord && (
+          <div className="mb-4">
+            <div className="dvas-label mb-1.5" style={{ fontSize: 10 }}>
+              Type <span className="mono font-bold text-slate-200">{confirmWord}</span> to confirm
+            </div>
+            <input
+              autoFocus
+              value={typed}
+              onChange={e => setTyped(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter" && ready) onConfirm(); }}
+              className="w-full mono text-sm px-3 py-2"
+              style={{
+                background: "var(--dvas-elev)",
+                border: `1px solid ${ready && typed ? "var(--dvas-safe)" : "var(--dvas-border)"}`,
+                color: "var(--dvas-text)",
+                outline: "none",
+              }}
+              placeholder={`Type ${confirmWord}…`}
+            />
+          </div>
+        )}
+        <div className="flex gap-3 justify-end">
+          <button onClick={onCancel}
+            className="px-4 py-2 text-sm rounded"
+            style={{ background: "var(--dvas-elev)", color: "var(--dvas-text-dim)", border: "1px solid var(--dvas-border)" }}>
+            Cancel
+          </button>
+          <button onClick={onConfirm} disabled={!ready}
+            className="px-4 py-2 text-sm rounded font-semibold transition-opacity"
+            style={{
+              background: danger ? "#dc2626" : "var(--dvas-safe)",
+              color: "#fff",
+              opacity: ready ? 1 : 0.4,
+              cursor: ready ? "pointer" : "not-allowed",
+            }}>
+            Confirm
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Container Status Grid ───────────────────────────────────────────────── */
+function ContainerGrid({ containers, loading }) {
+  const statusColor = (s) => {
+    if (s === "running") return { bg: "var(--dvas-safe-bg)", fg: "var(--dvas-safe)" };
+    if (s === "not_found") return { bg: "rgba(100,116,139,0.1)", fg: "#64748b" };
+    return { bg: "var(--dvas-crit-bg)", fg: "var(--dvas-crit)" };
+  };
+
+  const coreNames = ["ingest_api", "nginx"];
+
+  return (
+    <div className="border border-slate-800 bg-slate-900">
+      <div className="p-3 border-b border-slate-800 text-sm flex items-center gap-2">
+        <Terminal size={16} className="text-sky-400" />
+        Container Status
+        <span className="ml-auto mono text-[10px] text-slate-500">
+          {loading ? "refreshing…" : `${containers.filter(c => c.running).length} / ${containers.length} running`}
+        </span>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-px bg-slate-800">
+        {containers.map(c => {
+          const col = statusColor(c.status);
+          const isCore = coreNames.includes(c.short_name);
+          return (
+            <div key={c.name}
+              className="bg-slate-900 p-3 flex flex-col gap-1.5"
+              data-testid={`container-${c.short_name}`}>
+              <div className="flex items-center justify-between">
+                <span className="w-2 h-2 rounded-full flex-shrink-0"
+                  style={{ background: col.fg, boxShadow: c.running ? `0 0 6px ${col.fg}` : "none" }} />
+                {isCore && (
+                  <span className="text-[8px] px-1 py-0.5 rounded"
+                    style={{ background: "var(--dvas-blue-bg)", color: "var(--dvas-blue)" }}>CORE</span>
+                )}
+              </div>
+              <div className="mono text-[11px] font-semibold text-slate-100 truncate" title={c.short_name}>
+                {c.short_name}
+              </div>
+              <div className="text-[9px] px-1.5 py-0.5 rounded font-semibold uppercase tracking-wide"
+                style={{ background: col.bg, color: col.fg, width: "fit-content" }}>
+                {c.status}
+              </div>
+            </div>
+          );
+        })}          
+      </div>
+    </div>
+  );
+}
+
+function ServerPage({ srv }) {
+  const { t } = useI18n();
+  const { health, status, drones, readiness, wsEvents, wsConnected, fps, testConnection } = srv;
+  const [testing, setTesting] = useState(false);
+  const feedRef = useRef(null);
+
+  // ── Docker control state ──
+  const [containers, setContainers] = useState([]);
+  const [containersLoading, setContainersLoading] = useState(false);
+  const [controlScope, setControlScope] = useState("core");
+  const [modal, setModal] = useState(null); // { action, title, message, confirmWord, danger }
+  const [actionBusy, setActionBusy] = useState(false);
+  const [actionResult, setActionResult] = useState(null);
+
+  const isOnline = health?.reachable === true;
+
+  const loadContainers = useCallback(async () => {
+    setContainersLoading(true);
+    try {
+      const { data } = await api.get("/ingest-server/containers");
+      setContainers(data);
+    } catch (e) {
+      // socket may not be mounted yet
+    } finally {
+      setContainersLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadContainers();
+    const iv = setInterval(loadContainers, 15000);
+    return () => clearInterval(iv);
+  }, [loadContainers]);
+
+  const openModal = (action) => {
+    const configs = {
+      stop: {
+        title: `Stop Ingest Server (${controlScope === "core" ? "Frame Reception" : "Full Stack"})`,
+        message: controlScope === "core"
+          ? "This will stop drone_ingest_api and drone_nginx. No new frames will be accepted. Database, monitoring and analytics workers remain running. You can restart at any time."
+          : "This will stop ALL 18 ingest containers including the database. Evidence data is preserved. Only use for full maintenance windows.",
+        confirmWord: "SHUTDOWN",
+        danger: true,
+      },
+      start: {
+        title: `Start Ingest Server (${controlScope === "core" ? "Frame Reception" : "Full Stack"})`,
+        message: controlScope === "core"
+          ? "This will start drone_ingest_api and drone_nginx to resume accepting drone frames."
+          : "This will start all ingest stack containers. Keycloak may take ~90 seconds to become healthy.",
+        confirmWord: "",
+        danger: false,
+      },
+      restart: {
+        title: "Restart Ingest Server",
+        message: controlScope === "core"
+          ? "This will restart drone_ingest_api and drone_nginx. There will be ~10 seconds of downtime for frame reception."
+          : "This will restart all ingest stack containers. Full startup may take 2–3 minutes.",
+        confirmWord: "RESTART",
+        danger: false,
+      },
+    };
+    setModal({ action, ...configs[action] });
+    setActionResult(null);
+  };
+
+  const handleControl = async () => {
+    if (!modal) return;
+    setModal(null);
+    setActionBusy(true);
+    setActionResult(null);
+    try {
+      const { data } = await api.post("/ingest-server/control", {
+        action: modal.action,
+        scope: controlScope,
+      });
+      setActionResult({ ok: data.success, message: data.success
+        ? `${modal.action.charAt(0).toUpperCase() + modal.action.slice(1)} completed. ${data.results.length} container(s) affected.`
+        : `Partial failure: ${data.errors.map(e => e.container).join(", ")}` });
+      // Refresh container grid after action
+      setTimeout(loadContainers, 2000);
+      setTimeout(loadContainers, 6000);
+    } catch (e) {
+      setActionResult({ ok: false, message: e?.response?.data?.detail || "Action failed" });
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleTest = async () => {
+    setTesting(true);
+    await testConnection();
+    setTesting(false);
+  };
+
+  // FPS history for sparkline (rolling 30 data points)
+  const [fpsHistory, setFpsHistory] = useState(() => Array(30).fill(0));
+  useEffect(() => {
+    const iv = setInterval(() => {
+      setFpsHistory(prev => [...prev.slice(1), fps]);
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [fps]);
+
+  const totalFrames = drones.reduce((a, d) => a + (d.frames_total || d.frames_queued || 0), 0);
+  const totalQueued = drones.reduce((a, d) => a + (d.queue_depth || 0), 0);
+  const totalBytes = drones.reduce((a, d) => a + (d.bytes_ingested || 0), 0);
+  const activeDrones = drones.filter(d => d.queue_depth > 0 || (Date.now() / 1000 - (d.last_frame_ts || 0)) < 30).length;
+
+  return (
+    <div className="flex flex-col gap-5">
+      {/* ── Confirmation Modal ──────────────────────────────────────────── */}
+      <ConfirmModal
+        open={!!modal}
+        title={modal?.title}
+        message={modal?.message}
+        confirmWord={modal?.confirmWord}
+        danger={modal?.danger}
+        onConfirm={handleControl}
+        onCancel={() => setModal(null)}
+      />
+
+      {/* ── Server Control Panel ─────────────────────────────────────────── */}
+      <div className="border border-slate-700 bg-slate-900"
+        style={{ borderLeft: "3px solid var(--dvas-blue)" }}>
+        <div className="p-4">
+          <div className="flex flex-wrap items-center gap-3 mb-4">
+            <div className="flex items-center gap-2">
+              <Power size={16} className="text-sky-400" />
+              <span className="text-sm font-semibold" style={{ color: "var(--dvas-text)" }}>
+                Server Control
+              </span>
+              <span className="mono text-[10px] px-2 py-0.5 rounded"
+                style={{ background: "var(--dvas-elev)", color: "var(--dvas-text-dim)" }}>
+                System Administrator Only
+              </span>
+            </div>
+
+            {/* Scope selector */}
+            <div className="ml-auto flex items-center gap-2">
+              <span className="dvas-label" style={{ fontSize: 9 }}>SCOPE</span>
+              <div className="flex rounded overflow-hidden border border-slate-700">
+                {[["core", "Core (API + Nginx)"], ["all", "Full Stack (All 18)"]].map(([val, label]) => (
+                  <button key={val} onClick={() => setControlScope(val)}
+                    className="px-3 py-1.5 text-xs font-medium transition-colors"
+                    style={{
+                      background: controlScope === val ? "var(--dvas-blue)" : "var(--dvas-elev)",
+                      color: controlScope === val ? "#fff" : "var(--dvas-text-dim)",
+                    }}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Scope description */}
+          <div className="text-[11px] text-slate-500 mb-4 p-2 rounded"
+            style={{ background: "var(--dvas-bg)", border: "1px solid var(--dvas-border)" }}>
+            {controlScope === "core"
+              ? "⚡ Core scope controls drone_ingest_api + drone_nginx only. Database, analytics workers, and monitoring remain running. Recommended for routine maintenance."
+              : "⚠ Full Stack scope controls all 18 ingest containers including the database. Use only for scheduled maintenance windows or security incidents."}
+          </div>
+
+          {/* Action result banner */}
+          {actionResult && (
+            <div className="mb-4 px-3 py-2 rounded text-xs flex items-center gap-2"
+              style={{
+                background: actionResult.ok ? "var(--dvas-safe-bg)" : "var(--dvas-crit-bg)",
+                color: actionResult.ok ? "var(--dvas-safe)" : "var(--dvas-crit)",
+                border: `1px solid ${actionResult.ok ? "var(--dvas-safe)" : "var(--dvas-crit)"}40`,
+              }}>
+              {actionResult.ok ? <CheckCircle2 size={13} /> : <XCircle size={13} />}
+              {actionResult.message}
+            </div>
+          )}
+
+          {/* Control buttons */}
+          <div className="flex flex-wrap gap-3">
+            {/* START */}
+            <button
+              data-testid="ingest-control-start"
+              disabled={actionBusy || isOnline}
+              onClick={() => openModal("start")}
+              className="flex items-center gap-2 px-5 py-2.5 rounded text-sm font-semibold transition-all"
+              style={{
+                background: !actionBusy && !isOnline ? "var(--dvas-safe)" : "var(--dvas-elev)",
+                color: !actionBusy && !isOnline ? "#fff" : "var(--dvas-text-dim)",
+                opacity: actionBusy || isOnline ? 0.5 : 1,
+                cursor: actionBusy || isOnline ? "not-allowed" : "pointer",
+                border: "1px solid transparent",
+              }}>
+              <Power size={14} />
+              Start Ingest
+            </button>
+
+            {/* STOP */}
+            <button
+              data-testid="ingest-control-stop"
+              disabled={actionBusy || !isOnline}
+              onClick={() => openModal("stop")}
+              className="flex items-center gap-2 px-5 py-2.5 rounded text-sm font-semibold transition-all"
+              style={{
+                background: !actionBusy && isOnline ? "#dc2626" : "var(--dvas-elev)",
+                color: !actionBusy && isOnline ? "#fff" : "var(--dvas-text-dim)",
+                opacity: actionBusy || !isOnline ? 0.5 : 1,
+                cursor: actionBusy || !isOnline ? "not-allowed" : "pointer",
+                border: "1px solid transparent",
+              }}>
+              <PowerOff size={14} />
+              Stop Ingest
+            </button>
+
+            {/* RESTART */}
+            <button
+              data-testid="ingest-control-restart"
+              disabled={actionBusy || !isOnline}
+              onClick={() => openModal("restart")}
+              className="flex items-center gap-2 px-5 py-2.5 rounded text-sm font-semibold transition-all"
+              style={{
+                background: "var(--dvas-elev)",
+                color: !actionBusy && isOnline ? "var(--dvas-warn)" : "var(--dvas-text-dim)",
+                opacity: actionBusy || !isOnline ? 0.5 : 1,
+                cursor: actionBusy || !isOnline ? "not-allowed" : "pointer",
+                border: `1px solid ${!actionBusy && isOnline ? "var(--dvas-warn)" : "var(--dvas-border)"}40`,
+              }}>
+              <RotateCcw size={14} className={actionBusy ? "animate-spin" : ""} />
+              Restart Ingest
+            </button>
+
+            {/* Busy spinner */}
+            {actionBusy && (
+              <div className="flex items-center gap-2 text-xs text-amber-400 ml-2">
+                <RotateCcw size={13} className="animate-spin" />
+                Sending command…
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Row 1: Connection Status + Quick Stats ─────────────────────── */}
+      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+        {/* Connection Status Card */}
+        <div className="lg:col-span-2 border border-slate-800 bg-slate-900 p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <Server size={16} className="text-sky-400" />
+            <span className="text-sm font-semibold" style={{ color: "var(--dvas-text)" }}>
+              {t("ingest.server.status")}
+            </span>
+            <span className="ml-auto">
+              {isOnline ? (
+                <span className="flex items-center gap-1.5 px-2 py-1 rounded text-[10px] font-semibold"
+                  style={{ background: "var(--dvas-safe-bg)", color: "var(--dvas-safe)" }}>
+                  <StatusDot ok pulse /> {t("ingest.server.online")}
+                </span>
+              ) : (
+                <span className="flex items-center gap-1.5 px-2 py-1 rounded text-[10px] font-semibold"
+                  style={{ background: "var(--dvas-crit-bg)", color: "var(--dvas-crit)" }}>
+                  <StatusDot ok={false} /> {t("ingest.server.offline")}
+                </span>
+              )}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3 text-xs">
+            <div>
+              <div className="dvas-label" style={{ fontSize: 9 }}>{t("ingest.server.url")}</div>
+              <div className="mono text-slate-100 mt-0.5 truncate">{health?.url || "—"}</div>
+            </div>
+            <div>
+              <div className="dvas-label" style={{ fontSize: 9 }}>{t("ingest.server.version")}</div>
+              <div className="mono text-slate-100 mt-0.5">{health?.version || health?.api_version || "—"}</div>
+            </div>
+            <div>
+              <div className="dvas-label" style={{ fontSize: 9 }}>{t("ingest.server.uptime")}</div>
+              <div className="mono text-slate-100 mt-0.5">{formatUptime(health?.uptime_s || health?.uptime)}</div>
+            </div>
+            <div>
+              <div className="dvas-label" style={{ fontSize: 9 }}>{t("ingest.server.wsRelay")}</div>
+              <div className="flex items-center gap-1.5 mt-0.5">
+                {wsConnected
+                  ? <><Wifi size={12} className="text-emerald-400" /> <span className="mono text-emerald-400">{t("ingest.server.connected")}</span></>
+                  : <><WifiOff size={12} className="text-slate-500" /> <span className="mono text-slate-500">{t("ingest.server.disconnected")}</span></>}
+              </div>
+            </div>
+          </div>
+
+          {/* Readiness check */}
+          {readiness && (
+            <div className="mt-3 p-2 rounded text-[10px] mono"
+              style={{
+                background: readiness.reachable && readiness.ready !== false ? "var(--dvas-safe-bg)" : "var(--dvas-warn-bg)",
+                color: readiness.reachable && readiness.ready !== false ? "var(--dvas-safe)" : "var(--dvas-warn)",
+              }}>
+              {readiness.reachable ? (readiness.ready !== false ? "✓ All systems ready" : "⚠ Server reachable but downstream services degraded") : "✗ Server unreachable"}
+              {readiness.redis_ok !== undefined && <span className="ml-2">· Redis: {readiness.redis_ok ? "✓" : "✗"}</span>}
+              {readiness.keycloak_ok !== undefined && <span className="ml-2">· Keycloak: {readiness.keycloak_ok ? "✓" : "✗"}</span>}
+            </div>
+          )}
+
+          <button
+            data-testid="test-connection-btn"
+            onClick={handleTest}
+            disabled={testing}
+            className="mt-3 w-full flex items-center justify-center gap-2 px-3 py-2 rounded text-xs font-medium transition-colors"
+            style={{
+              background: "var(--dvas-elev)",
+              color: testing ? "var(--dvas-text-dim)" : "var(--dvas-blue)",
+              border: "1px solid var(--dvas-border)",
+            }}
+          >
+            <Radio size={12} />
+            {testing ? "Testing…" : t("ingest.server.testConn")}
+          </button>
+        </div>
+
+        {/* Quick Stats */}
+        <div className="border border-slate-800 bg-slate-900 p-4">
+          <div className="dvas-label mb-3" style={{ fontSize: 9 }}>{t("ingest.server.framesIngested")}</div>
+          <div className="mono text-3xl font-bold text-sky-400">{totalFrames.toLocaleString()}</div>
+          <div className="mono text-[10px] text-slate-500 mt-1">{t("ingest.server.framesQueued")}: {totalQueued}</div>
+          <div className="mt-3">
+            <div className="dvas-label mb-1" style={{ fontSize: 9 }}>{t("ingest.server.bytesIngested")}</div>
+            <div className="mono text-lg text-slate-100 font-semibold">{formatBytes(totalBytes)}</div>
+          </div>
+        </div>
+
+        <div className="border border-slate-800 bg-slate-900 p-4">
+          <div className="dvas-label mb-3" style={{ fontSize: 9 }}>{t("ingest.server.fpsRate")}</div>
+          <div className="mono text-3xl font-bold" style={{ color: fps > 0 ? "var(--dvas-safe)" : "var(--dvas-text-dim)" }}>
+            {fps.toFixed(1)}
+          </div>
+          <div className="mono text-[10px] text-slate-500 mt-1">
+            {t("ingest.server.connectedEdges")}: {activeDrones} / {drones.length}
+          </div>
+          <div className="mt-3">
+            <Sparkline data={fpsHistory} color={fps > 0 ? "#10b981" : "#475569"} height={32} />
+          </div>
+        </div>
+      </div>
+
+      {/* ── Row 2: Connected Edge Devices ──────────────────────────────── */}
+      <div className="border border-slate-800 bg-slate-900">
+        <div className="p-3 border-b border-slate-800 text-sm flex items-center gap-2">
+          <Wifi size={16} className="text-sky-400" />
+          {t("ingest.server.connectedEdges")}
+          <span className="ml-auto mono text-[10px] text-slate-500">
+            {drones.length} {drones.length === 1 ? "drone" : "drones"}
+          </span>
+        </div>
+        {drones.length === 0 ? (
+          <div className="p-8 text-center text-xs" style={{ color: "var(--dvas-text-dim)" }}>
+            {isOnline ? "No drones registered yet" : "Ingest server offline — cannot fetch drone status"}
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs" data-testid="edge-devices-table">
+              <thead className="bg-slate-950/60">
+                <tr>
+                  {[t("ingest.server.droneId"), t("ingest.server.missionId"), "Status",
+                    t("ingest.server.queueDepth"), t("ingest.server.framesIngested"),
+                    t("ingest.server.bytesIngested"), t("ingest.server.lastFrame")
+                  ].map(h => (
+                    <th key={h} className="text-left px-3 py-2 dvas-label border-b border-slate-800" style={{ fontSize: 10 }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="mono">
+                {drones.map(d => {
+                  const isActive = d.queue_depth > 0 || (d.last_frame_ts && (Date.now() / 1000 - d.last_frame_ts) < 30);
+                  return (
+                    <tr key={d.drone_id} className="hover:bg-slate-800/40" data-testid={`drone-row-${d.drone_id}`}>
+                      <td className="px-3 py-2 border-b border-slate-800/60">
+                        <span className="text-slate-100 font-medium">{d.drone_id}</span>
+                      </td>
+                      <td className="px-3 py-2 border-b border-slate-800/60 text-slate-400">
+                        {d.mission_id || "—"}
+                      </td>
+                      <td className="px-3 py-2 border-b border-slate-800/60">
+                        {isActive ? (
+                          <span className="flex items-center gap-1.5 text-emerald-400">
+                            <StatusDot ok pulse /> Live
+                          </span>
+                        ) : (
+                          <span className="flex items-center gap-1.5 text-slate-500">
+                            <StatusDot ok={false} /> Idle
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 border-b border-slate-800/60">
+                        <span className={d.queue_depth > 50 ? "text-amber-400" : "text-slate-100"}>
+                          {d.queue_depth ?? 0}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 border-b border-slate-800/60 text-slate-100">
+                        {(d.frames_total || d.frames_queued || 0).toLocaleString()}
+                      </td>
+                      <td className="px-3 py-2 border-b border-slate-800/60 text-slate-300">
+                        {formatBytes(d.bytes_ingested || 0)}
+                      </td>
+                      <td className="px-3 py-2 border-b border-slate-800/60 text-slate-400">
+                        {d.last_frame_ts ? new Date(d.last_frame_ts * 1000).toLocaleTimeString() : "—"}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* ── Row 3: Live Frame Feed + Queue Health ─────────────────────── */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        {/* Live Frame Feed */}
+        <div className="lg:col-span-2 border border-slate-800 bg-slate-900">
+          <div className="p-3 border-b border-slate-800 text-sm flex items-center gap-2">
+            <Radio size={16} className={wsConnected ? "text-emerald-400" : "text-slate-500"} />
+            {t("ingest.server.liveFeed")}
+            {wsConnected && (
+              <span className="ml-2 flex items-center gap-1 text-[10px] font-medium text-emerald-400">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 dvas-live-dot" /> LIVE
+              </span>
+            )}
+            <span className="ml-auto mono text-[10px] text-slate-500">
+              {wsEvents.length} events
+            </span>
+          </div>
+          <div ref={feedRef} className="max-h-80 overflow-auto" data-testid="live-feed">
+            {wsEvents.length === 0 ? (
+              <div className="p-8 text-center text-xs" style={{ color: "var(--dvas-text-dim)" }}>
+                {t("ingest.server.noEvents")}
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-800/60">
+                {wsEvents.map((ev, i) => {
+                  const isMission = ev.event === "mission_started" || ev.event === "mission_ended";
+                  const isFrame = ev.event === "frame_queued";
+                  return (
+                    <div
+                      key={`${ev._received}-${i}`}
+                      className={`px-3 py-2 text-xs flex items-start gap-3 transition-colors ${
+                        i === 0 ? "bg-sky-500/5" : ""
+                      } ${isMission ? "bg-amber-500/5" : ""}`}
+                      data-testid={`feed-event-${i}`}
+                    >
+                      <div className="shrink-0 mt-0.5">
+                        {isMission ? (
+                          <AlertTriangle size={12} className="text-amber-400" />
+                        ) : isFrame ? (
+                          <Zap size={12} className="text-sky-400" />
+                        ) : (
+                          <Activity size={12} className="text-slate-500" />
+                        )}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="mono font-medium text-slate-100">
+                            {ev.event || ev.type || "event"}
+                          </span>
+                          {ev.drone_id && (
+                            <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold"
+                              style={{ background: "var(--dvas-elev)", color: "var(--dvas-blue)" }}>
+                              {ev.drone_id}
+                            </span>
+                          )}
+                          {ev.change_score !== undefined && (
+                            <span className="mono text-[10px] text-slate-400">
+                              Δ {(ev.change_score * 100).toFixed(0)}%
+                            </span>
+                          )}
+                        </div>
+                        <div className="mono text-[10px] text-slate-500 mt-0.5">
+                          {ev.mission_id && <span>mission: {ev.mission_id} · </span>}
+                          {ev.message_id && <span>msg: {ev.message_id.slice(0, 12)}… · </span>}
+                          {ev._received && new Date(ev._received).toLocaleTimeString()}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Queue Health */}
+        <div className="border border-slate-800 bg-slate-900 p-4">
+          <div className="flex items-center gap-2 mb-4">
+            <Database size={14} className="text-sky-400" />
+            <span className="text-sm font-semibold" style={{ color: "var(--dvas-text)" }}>
+              {t("ingest.server.queueHealth")}
+            </span>
+          </div>
+          {drones.length === 0 ? (
+            <div className="text-xs text-center py-6" style={{ color: "var(--dvas-text-dim)" }}>
+              No queues active
+            </div>
+          ) : (
+            <div className="flex flex-col gap-3">
+              {drones.map(d => {
+                const pct = Math.min(100, Math.round(((d.queue_depth || 0) / 1000) * 100));
+                const barColor = pct > 85 ? "#ef4444" : pct > 60 ? "#f59e0b" : "#10b981";
+                return (
+                  <div key={d.drone_id}>
+                    <div className="flex items-baseline justify-between mb-1">
+                      <span className="dvas-label" style={{ fontSize: 9 }}>{d.drone_id}</span>
+                      <span className="mono text-[11px] text-slate-100 font-semibold">{d.queue_depth || 0}</span>
+                    </div>
+                    <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
+                      <div
+                        className="h-full transition-all duration-500 rounded-full"
+                        style={{ width: `${pct}%`, background: barColor }}
+                      />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Throughput sparkline */}
+          <div className="mt-5 pt-4" style={{ borderTop: "1px solid var(--dvas-border)" }}>
+            <div className="flex items-center justify-between mb-2">
+              <span className="dvas-label" style={{ fontSize: 9 }}>{t("ingest.server.throughput")}</span>
+              <span className="mono text-[11px] font-semibold" style={{ color: fps > 0 ? "var(--dvas-safe)" : "var(--dvas-text-dim)" }}>
+                {fps.toFixed(1)} f/s
+              </span>
+            </div>
+            <Sparkline data={fpsHistory} color={fps > 0 ? "#10b981" : "#475569"} height={40} />
+          </div>
+        </div>
+      </div>
+
+      {/* ── Row 4: Container Status Grid ─────────────────────────────────── */}
+      <ContainerGrid containers={containers} loading={containersLoading} />
+
+    </div>
+  );
+}
 
 /* ---------- OVERVIEW ---------- */
 function StatCard({ label, value, sub, tone = "text-slate-100", Icon }) {

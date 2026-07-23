@@ -3,7 +3,8 @@ import AppShell from "@/components/layout/AppShell";
 import { api, ROLE_LABELS } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { useI18n } from "@/context/I18nContext";
-import { ShieldCheck, Users, ClipboardList, Folder, Settings, Key, FileText, ShieldAlert, Download } from "lucide-react";
+import { ShieldCheck, Users, ClipboardList, Folder, Settings, Key, FileText, ShieldAlert, Download, Server, Activity } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 
 // 4-role model: supervisory_officer pages merged into senior_officer
 const PAGES = [
@@ -36,6 +37,25 @@ export default function AdminDashboard() {
   const [auditScope, setAuditScope] = useState("detail"); // "detail" | "aggregate"
   const [sysCfg, setSysCfg] = useState({ retention_days: 90, backup_time: "02:30", tls_min: "1.3" });
   const [pending, setPending] = useState(null);
+  const nav = useNavigate();
+
+  // Ingest server health (for sys admin quick-glance card)
+  const [ingestHealth, setIngestHealth] = useState(null);
+  useEffect(() => {
+    if (user.role !== "system_administrator") return;
+    let mounted = true;
+    const fetchHealth = async () => {
+      try {
+        const { data } = await api.get("/ingest-server/health");
+        if (mounted) setIngestHealth(data);
+      } catch {
+        if (mounted) setIngestHealth({ reachable: false, status: "unreachable" });
+      }
+    };
+    fetchHealth();
+    const iv = setInterval(fetchHealth, 15000);
+    return () => { mounted = false; clearInterval(iv); };
+  }, [user.role]);
 
   // Persist page to sessionStorage on every change
   useEffect(() => {
@@ -57,6 +77,32 @@ export default function AdminDashboard() {
         <div className="text-xs text-slate-300">{t("admin.sepPowers")}</div>
       </div>
       <div className="flex flex-col gap-4">
+        {/* Ingest Server Quick Status — sys admin only */}
+        {user.role === "system_administrator" && (
+          <div
+            data-testid="admin-ingest-card"
+            className="border bg-slate-900 p-4 flex items-center gap-4 cursor-pointer hover:bg-slate-800/40 transition-colors"
+            style={{ borderColor: ingestHealth?.reachable ? "var(--dvas-safe)" : "var(--dvas-crit)" }}
+            onClick={() => nav("/ingest")}
+          >
+            <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0"
+              style={{ background: ingestHealth?.reachable ? "var(--dvas-safe-bg)" : "var(--dvas-crit-bg)" }}>
+              <Server size={20} style={{ color: ingestHealth?.reachable ? "var(--dvas-safe)" : "var(--dvas-crit)" }} />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-semibold" style={{ color: "var(--dvas-text)" }}>Ingest Server</div>
+              <div className="text-xs mt-0.5" style={{ color: "var(--dvas-text-muted)" }}>
+                {ingestHealth?.reachable
+                  ? <span style={{ color: "var(--dvas-safe)" }}>● Online{ingestHealth?.version ? ` · v${ingestHealth.version}` : ""}</span>
+                  : <span style={{ color: "var(--dvas-crit)" }}>● Offline — server unreachable</span>}
+              </div>
+            </div>
+            <div className="text-xs mono" style={{ color: "var(--dvas-blue)" }}>
+              Open Ingest Dashboard →
+            </div>
+          </div>
+        )}
+
         <nav
           data-testid="adm-tabbar"
           className="flex items-center gap-1 overflow-x-auto no-scrollbar"

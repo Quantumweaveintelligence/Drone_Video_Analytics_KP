@@ -348,7 +348,7 @@ services:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
     ports:
-      - "0.0.0.0:3000:3000"   # Dashboard UI — bind to VPN IP in production
+      - "0.0.0.0:3001:3000"   # Grafana UI — moved to 3001 (port 3000 used by DVAS Dashboard frontend)
     environment:
       GF_SECURITY_ADMIN_USER:     admin
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-Grafana@KP2025!}
@@ -408,7 +408,7 @@ services:
     ports:
       - "0.0.0.0:8101:8101"   # REST API — crowd analysis
     environment:
-      DATABASE_URL:          postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas
+      DATABASE_URL:          postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
       REDIS_URL:             redis://valkey:6379/0
       DRONE_IDS:             "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
       MODEL_PATH:            /analytics/crowd/models/crowd_counting.pth
@@ -446,7 +446,7 @@ services:
     ports:
       - "0.0.0.0:8102:8102"   # REST API — person/face analysis
     environment:
-      DATABASE_URL: postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas
+      DATABASE_URL: postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
       REDIS_URL:    redis://valkey:6379/0
       DRONE_IDS:    "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
       PERSON_MODEL: /analytics/person/models/yolov8m.pt
@@ -484,7 +484,7 @@ services:
     ports:
       - "0.0.0.0:8103:8103"   # REST API — vehicle detection
     environment:
-      DATABASE_URL:  postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas
+      DATABASE_URL:  postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
       REDIS_URL:     redis://valkey:6379/0
       DRONE_IDS:     "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
       VEHICLE_MODEL: /analytics/vehicle/models/visdrone.pt
@@ -522,7 +522,7 @@ services:
     ports:
       - "0.0.0.0:8104:8104"   # REST API — ANPR + watchlist management
     environment:
-      DATABASE_URL:  postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas
+      DATABASE_URL:  postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
       REDIS_URL:     redis://valkey:6379/0
       DRONE_IDS:     "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
       VEHICLE_MODEL: /analytics/anpr/models/yolov8m.pt
