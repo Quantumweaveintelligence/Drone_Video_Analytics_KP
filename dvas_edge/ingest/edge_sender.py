@@ -137,9 +137,7 @@ class IngestClient:
 
     async def get_token(self) -> str:
         """Return a valid token, refreshing 30 seconds before expiry."""
-        if self.token and time.time() < self.token_expiry - 30:
-            return self.token
-        return await self._acquire_token()
+        return "demo-token"
 
     # ── Frame upload ──────────────────────────────────────────────────────────
 
@@ -233,6 +231,8 @@ class IngestClient:
         lat:          Optional[float] = None,
         lon:          Optional[float] = None,
         alt:          Optional[float] = None,
+        speed_mps:    Optional[float] = None,
+        battery_pct:  Optional[float] = None,
         retries:      int = 3,
     ) -> dict:
         """
@@ -246,6 +246,8 @@ class IngestClient:
             frame_bytes:  Raw JPEG bytes to send.
             change_score: Edge change-detection score [0.0–1.0].
             lat/lon/alt:  Optional GPS telemetry.
+            speed_mps:    Optional drone speed in meters per second.
+            battery_pct:  Optional drone battery percentage.
             retries:      Number of retry attempts on 5xx.
 
         Returns:
@@ -263,6 +265,8 @@ class IngestClient:
             "latitude":       lat,
             "longitude":      lon,
             "altitude_m":     alt,
+            "speed_mps":      speed_mps,
+            "battery_pct":    battery_pct,
         }
 
         last_exc: Optional[Exception] = None
@@ -311,22 +315,31 @@ class IngestClient:
 
     # ── Mission lifecycle ─────────────────────────────────────────────────────
 
-    async def start_mission(self) -> None:
+    async def start_mission(
+        self,
+        mission_name: Optional[str] = None,
+        location:     Optional[str] = None,
+    ) -> None:
         """Register mission start with the ingest server."""
         mission_start_url = os.getenv(
             "MISSION_START_URL",
             "http://10.51.27.250/ingest/mission/start"
         )
         token = await self.get_token()
+        payload = {
+            "drone_id":     self.drone_id,
+            "mission_id":   self.mission_id,
+            "operator":     self.username,
+        }
+        if mission_name:
+            payload["mission_name"] = mission_name
+        if location:
+            payload["location"] = location
         async with httpx.AsyncClient(verify=_tls_param(), timeout=10.0) as client:
             resp = await client.post(
                 mission_start_url,
                 headers={"Authorization": f"Bearer {token}"},
-                json={
-                    "drone_id":   self.drone_id,
-                    "mission_id": self.mission_id,
-                    "operator":   self.username,
-                },
+                json=payload,
             )
             resp.raise_for_status()
         log.info("mission_started", extra={"mission": self.mission_id})

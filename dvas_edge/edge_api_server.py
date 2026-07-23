@@ -27,7 +27,7 @@ import time
 import asyncio
 import threading
 import queue
-from typing import Optional
+from typing import Optional, Union
 
 # ── Third party ──────────────────────────────────────────────────────────────
 import uvicorn
@@ -85,23 +85,48 @@ class ToggleIngestRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Edge sender background thread
 # ---------------------------------------------------------------------------
+
+# Item placed into the sender queue: either a SelectedFrame (from the
+# cognitive pipeline) or a (jpeg_bytes, telemetry_dict) tuple when the
+# pipeline is bypassed.
+_QueueItem = Union[SelectedFrame, tuple, None]
+
+
 class EdgeSenderThread(threading.Thread):
     def __init__(self, client: IngestClient, max_queue: int = 64) -> None:
         super().__init__(name="EdgeSenderThread", daemon=True)
         self._client   = client
-        self._queue:   queue.Queue[Optional[SelectedFrame]] = queue.Queue(maxsize=max_queue)
+        self._queue:   queue.Queue[_QueueItem] = queue.Queue(maxsize=max_queue)
         self._loop:    Optional[asyncio.AbstractEventLoop] = None
         self._running  = True
+        self._mission_name: Optional[str] = None
+        self._location:     Optional[str] = None
 
-    def put_frame(self, frame: SelectedFrame) -> None:
+    def set_mission_details(self, mission_name: str = None, location: str = None) -> None:
+        """Store mission details so they can be sent at start_mission time."""
+        self._mission_name = mission_name
+        self._location = location
+
+    def put_frame(self, frame: SelectedFrame, telemetry: dict = None) -> None:
+        """Queue a SelectedFrame (from cognitive pipeline) with optional telemetry."""
         try:
-            self._queue.put_nowait(frame)
+            self._queue.put_nowait(("selected", frame, telemetry))
+        except queue.Full:
+            pass
+
+    def put_raw_frame(self, jpeg_bytes: bytes, telemetry: dict = None) -> None:
+        """Queue raw JPEG bytes (pipeline bypass mode) with optional telemetry."""
+        try:
+            self._queue.put_nowait(("raw", jpeg_bytes, telemetry))
         except queue.Full:
             pass
 
     def stop(self) -> None:
         self._running = False
-        self._queue.put_nowait(None)
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
 
     def run(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -111,30 +136,69 @@ class EdgeSenderThread(threading.Thread):
 
     async def _async_run(self) -> None:
         try:
-            await self._client.start_mission()
+            await self._client.start_mission(
+                mission_name=self._mission_name,
+                location=self._location,
+            )
         except Exception:
             pass
 
         while True:
             try:
-                frame = await asyncio.get_event_loop().run_in_executor(
+                item = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: self._queue.get(timeout=1.0)
                 )
             except queue.Empty:
                 if not self._running:
                     break
                 continue
-            if frame is None:
+            if item is None:
                 break
             try:
-                jpeg_bytes = frame.encode_jpeg()
-                await self._client.send_frame_bytes(
-                    frame_bytes  = jpeg_bytes,
-                    change_score = frame.change_score,
-                    lat          = frame.location.lat   if frame.location.lat   != 0.0 else None,
-                    lon          = frame.location.lon   if frame.location.lon   != 0.0 else None,
-                    alt          = frame.location.altitude_m if frame.location.altitude_m != 0.0 else None,
-                )
+                if isinstance(item, tuple) and len(item) == 3:
+                    kind, payload, telemetry = item
+                    tel = telemetry or {}
+                    speed   = tel.get("speed_mps")
+                    battery = tel.get("battery_pct")
+
+                    if kind == "selected":
+                        # payload is a SelectedFrame
+                        frame = payload
+                        jpeg_bytes = frame.encode_jpeg()
+                        await self._client.send_frame_bytes(
+                            frame_bytes  = jpeg_bytes,
+                            change_score = frame.change_score,
+                            lat          = frame.location.lat   if frame.location.lat   != 0.0 else None,
+                            lon          = frame.location.lon   if frame.location.lon   != 0.0 else None,
+                            alt          = frame.location.altitude_m if frame.location.altitude_m != 0.0 else None,
+                            speed_mps    = speed,
+                            battery_pct  = battery,
+                        )
+                    elif kind == "raw":
+                        # payload is raw JPEG bytes (bypass mode)
+                        lat = tel.get("latitude")
+                        lon = tel.get("longitude")
+                        alt = tel.get("altitude_m")
+                        await self._client.send_frame_bytes(
+                            frame_bytes  = payload,
+                            change_score = 0.0,
+                            lat          = lat if lat and lat != 0.0 else None,
+                            lon          = lon if lon and lon != 0.0 else None,
+                            alt          = alt if alt and alt != 0.0 else None,
+                            speed_mps    = speed,
+                            battery_pct  = battery,
+                        )
+                else:
+                    # Legacy: bare SelectedFrame (should not happen, but safe fallback)
+                    frame = item
+                    jpeg_bytes = frame.encode_jpeg()
+                    await self._client.send_frame_bytes(
+                        frame_bytes  = jpeg_bytes,
+                        change_score = frame.change_score,
+                        lat          = frame.location.lat   if frame.location.lat   != 0.0 else None,
+                        lon          = frame.location.lon   if frame.location.lon   != 0.0 else None,
+                        alt          = frame.location.altitude_m if frame.location.altitude_m != 0.0 else None,
+                    )
             except Exception:
                 pass
         try:
@@ -161,6 +225,8 @@ class PipelineManager:
         self.sender_thread: Optional[EdgeSenderThread] = None
         self.frames_selected: int = 0
         self.server_send_enabled: bool = False
+        self.pipeline_bypass: bool = False
+        self._bypass_frame_counter: int = 0
         self._start_wall: float = 0
 
     # ── Helpers ───────────────────────────────────────────────────────────
@@ -242,7 +308,9 @@ class PipelineManager:
                 def _on_selected_frame(frame: SelectedFrame) -> None:
                     self.frames_selected += 1
                     if self.server_send_enabled and self.sender_thread is not None:
-                        self.sender_thread.put_frame(frame)
+                        # Attach telemetry data for speed/battery
+                        tel = self.telemetry_simulator.get_current() if self.telemetry_simulator else {}
+                        self.sender_thread.put_frame(frame, telemetry=tel)
 
                 self.cognitive_selector = CognitiveFrameSelector(
                     drone_id=req.drone_id,
@@ -276,6 +344,26 @@ class PipelineManager:
                     self.buffer.write_video_frame(vf)
                 except Exception:
                     pass
+
+                # Pipeline bypass: send frames directly at ~1 fps
+                if self.pipeline_bypass:
+                    self._bypass_frame_counter += 1
+                    src_fps = self.source.source_fps if self.source else 30.0
+                    sample_interval = max(int(src_fps), 1)  # ~1 frame per second
+                    if (self._bypass_frame_counter % sample_interval == 0
+                            and self.server_send_enabled
+                            and self.sender_thread is not None):
+                        try:
+                            import cv2 as _cv2
+                            ok, buf = _cv2.imencode(".jpg", vf.frame, [_cv2.IMWRITE_JPEG_QUALITY, 80])
+                            if ok:
+                                tel = vf.telemetry or {}
+                                self.sender_thread.put_raw_frame(bytes(buf), telemetry=tel)
+                                self.frames_selected += 1
+                        except Exception:
+                            pass
+                    return  # skip change detection + cognitive pipeline
+
                 if self.change_engine is not None:
                     try:
                         self.change_engine.push_frame(vf)
@@ -301,6 +389,10 @@ class PipelineManager:
                 mission_id=req.mission_id
             )
             self.sender_thread = EdgeSenderThread(client=client)
+            self.sender_thread.set_mission_details(
+                mission_name=req.mission_name,
+                location=req.location,
+            )
             self.sender_thread.start()
 
             # ── Start all ─────────────────────────────────────────────────
@@ -351,6 +443,8 @@ class PipelineManager:
             self.telemetry_simulator = None
             self.sender_thread = None
             self.server_send_enabled = False
+            self.pipeline_bypass = False
+            self._bypass_frame_counter = 0
 
             log.info("mission_ended", mission_id=mission_id, frames_processed=frames_processed)
             return {
@@ -464,10 +558,29 @@ def toggle_ingest(req: ToggleIngestRequest):
     pipeline.server_send_enabled = req.enabled
     return {"server_send_enabled": pipeline.server_send_enabled}
 
+
+class TogglePipelineRequest(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/edge/mission/toggle-pipeline")
+def toggle_pipeline(req: TogglePipelineRequest):
+    """Toggle change detection + cognitive frame selection pipeline.
+    When disabled (bypass), frames are sampled directly at ~1 fps."""
+    pipeline.pipeline_bypass = not req.enabled
+    pipeline._bypass_frame_counter = 0
+    return {"pipeline_enabled": not pipeline.pipeline_bypass}
+
+
 @app.get("/api/edge/mission/active")
 def get_active_mission():
     if pipeline.active_mission:
-        return {"active": True, "server_send_enabled": pipeline.server_send_enabled, **pipeline.active_mission}
+        return {
+            "active": True,
+            "server_send_enabled": pipeline.server_send_enabled,
+            "pipeline_enabled": not pipeline.pipeline_bypass,
+            **pipeline.active_mission,
+        }
     return {"active": False}
 
 

@@ -1,10 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import AppShell from '@/components/layout/AppShell';
-import { Target, Play, Trash, XCircle, CheckCircle } from 'lucide-react';
+import { Target, Play, Trash, XCircle, CheckCircle, Cpu } from 'lucide-react';
 
 export default function MissionControl() {
   const [activeMission, setActiveMission] = useState(null);
   const [serverSend, setServerSend] = useState(false);
+  const [pipelineEnabled, setPipelineEnabled] = useState(true);
 
   const [form, setForm] = useState({ name: '', id: '', drone: '', operator: '', location: '' });
 
@@ -57,6 +58,7 @@ export default function MissionControl() {
           startTime: data.start_time,
         });
         setServerSend(false);
+        setPipelineEnabled(true);
         setMissionLog(prev => [{
           id: data.mission_id,
           designation: data.mission_name,
@@ -101,6 +103,7 @@ export default function MissionControl() {
         const data = await resp.json();
         if (data.active) {
           setServerSend(data.server_send_enabled || false);
+          setPipelineEnabled(data.pipeline_enabled !== undefined ? data.pipeline_enabled : true);
           setActiveMission({
             id: data.mission_id,
             designation: data.mission_name,
@@ -130,6 +133,20 @@ export default function MissionControl() {
       setServerSend(data.server_send_enabled);
     } catch (err) {
       console.error('Failed to toggle server send:', err);
+    }
+  };
+
+  const handleTogglePipeline = async () => {
+    try {
+      const resp = await fetch('/edge-api/api/edge/mission/toggle-pipeline', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !pipelineEnabled })
+      });
+      const data = await resp.json();
+      setPipelineEnabled(data.pipeline_enabled);
+    } catch (err) {
+      console.error('Failed to toggle pipeline:', err);
     }
   };
 
@@ -180,23 +197,43 @@ export default function MissionControl() {
                   </div>
                 </div>
 
-                <div className="mt-auto grid grid-cols-2 gap-3">
+                <div className="mt-auto space-y-3">
+                  <div className="grid grid-cols-2 gap-3">
+                    <button 
+                      onClick={handleToggleServerSend}
+                      className={`py-2.5 border text-sm font-semibold tracking-wide uppercase transition-colors rounded ${
+                        serverSend 
+                          ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20' 
+                          : 'border-slate-600 hover:bg-slate-800 text-slate-300'
+                      }`}
+                    >
+                      {serverSend ? 'Server Send: ON' : 'Server Send: OFF'}
+                    </button>
+                    <button 
+                      onClick={handleEndMission}
+                      className="py-2.5 border border-red-500/50 hover:bg-red-500/10 text-red-400 text-sm font-semibold tracking-wide uppercase transition-colors rounded"
+                    >
+                      End Mission
+                    </button>
+                  </div>
+
+                  {/* Pipeline Toggle */}
                   <button 
-                    onClick={handleToggleServerSend}
-                    className={`py-2.5 border text-sm font-semibold tracking-wide uppercase transition-colors rounded ${
-                      serverSend 
-                        ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20' 
-                        : 'border-slate-600 hover:bg-slate-800 text-slate-300'
+                    onClick={handleTogglePipeline}
+                    className={`w-full py-2.5 border text-sm font-semibold tracking-wide uppercase transition-colors rounded flex items-center justify-center gap-2 ${
+                      pipelineEnabled
+                        ? 'border-sky-500/50 bg-sky-500/10 text-sky-400 hover:bg-sky-500/20'
+                        : 'border-amber-500/50 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20'
                     }`}
                   >
-                    {serverSend ? 'Server Send: ON' : 'Server Send: OFF'}
+                    <Cpu size={16} />
+                    {pipelineEnabled ? 'Pipeline: ON' : 'Pipeline: OFF — Direct Send'}
                   </button>
-                  <button 
-                    onClick={handleEndMission}
-                    className="py-2.5 border border-red-500/50 hover:bg-red-500/10 text-red-400 text-sm font-semibold tracking-wide uppercase transition-colors rounded"
-                  >
-                    End Mission
-                  </button>
+                  {!pipelineEnabled && (
+                    <div className="text-[10px] text-amber-400/70 text-center font-mono tracking-wide">
+                      Change Detection & Cognitive Selection bypassed — frames sent directly at ~1 fps
+                    </div>
+                  )}
                 </div>
               </div>
             ) : (
