@@ -226,7 +226,7 @@ export default function CommandDashboard() {
           <div className="col-span-12 lg:col-span-4 rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
             <div className="p-3 text-sm flex items-center gap-2 font-semibold" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text)" }}><Broadcast size={14} className="text-emerald-500 dvas-live-dot" /> {t("cmd.multiDroneGrid")}</div>
             <div className="p-3 grid grid-cols-2 gap-2">
-              {drones.slice(0, 4).map(d => (
+              {[...drones].sort((a, b) => (a.status === "live" ? -1 : b.status === "live" ? 1 : 0)).slice(0, 4).map(d => (
                 <div key={d.id} data-testid={`grid-drone-${d.id}`} className="aspect-video relative overflow-hidden rounded-md" style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border-strong)" }}>
                   <div className="absolute inset-0 dvas-grid-bg opacity-40" />
                   <div className="absolute top-1 left-1 mono text-[9px] bg-black/70 px-1">{d.id}</div>

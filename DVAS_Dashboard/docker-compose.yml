@@ -29,7 +29,7 @@ services:
       - DATABASE_URL=postgresql+asyncpg://dvas:dvas_secret@postgres:5432/dvas
       - JWT_SECRET=super-secret-dvas-key-change-in-prod
       - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://10.51.27.155:3000,http://10.51.27.250:3000
-      - INGEST_SERVER_URL=http://10.51.27.250:8000
+      - INGEST_SERVER_URL=http://10.51.27.250
       - EDGE_SERVER_URL=http://edge:8765
     depends_on:
       postgres:

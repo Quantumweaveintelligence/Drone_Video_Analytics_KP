@@ -74,7 +74,7 @@ function LiveFrame({ droneId, isOffline, isDegraded }) {
     };
 
     load();
-    intervalRef.current = setInterval(load, 500);
+    intervalRef.current = setInterval(load, 50);
     return () => clearInterval(intervalRef.current);
   }, [droneId, isOffline]);
 

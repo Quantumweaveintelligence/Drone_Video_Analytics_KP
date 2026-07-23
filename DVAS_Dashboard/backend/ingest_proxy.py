@@ -41,14 +41,12 @@ INGEST_SERVER_URL = os.environ.get("INGEST_SERVER_URL", "http://localhost:8000")
 ingest_api = APIRouter(prefix="/api/ingest-server", tags=["Ingest Server Proxy"])
 
 
-# ── Helper: import auth dependency from server.py (deferred to avoid circular) ─
-def _get_require_roles():
-    from server import require_roles
-    return require_roles
-
-
-def _get_admin_dep():
-    return _get_require_roles()("system_administrator")
+async def _admin_user(request: Request):
+    from server import get_current_user
+    user = await get_current_user(request)
+    if user.get("role") != "system_administrator":
+        raise HTTPException(403, "Role not permitted")
+    return user
 
 
 # ── Cached health state for the top-bar indicator ────────────────────────────
@@ -120,7 +118,7 @@ async def ingest_health():
 
 
 @ingest_api.get("/ready", summary="Proxy: ingest server readiness")
-async def ingest_ready(user: dict = Depends(_get_admin_dep)):
+async def ingest_ready(user: dict = Depends(_admin_user)):
     """
     Checks ingest server /health/ready (Redis + Keycloak connectivity).
     Returns the readiness state including component health.
@@ -148,7 +146,7 @@ async def ingest_ready(user: dict = Depends(_get_admin_dep)):
 # ═════════════════════════════════════════════════════════════════════════════
 
 @ingest_api.get("/status", summary="Proxy: aggregate drone status")
-async def ingest_status(user: dict = Depends(_get_admin_dep)):
+async def ingest_status(user: dict = Depends(_admin_user)):
     """
     Proxies GET /ingest/status — returns queue depths, frame counters, and
     drone connection states for ALL tracked drones.
@@ -157,7 +155,7 @@ async def ingest_status(user: dict = Depends(_get_admin_dep)):
 
 
 @ingest_api.get("/status/{drone_id}", summary="Proxy: per-drone status")
-async def ingest_drone_status(drone_id: str, user: dict = Depends(_get_admin_dep)):
+async def ingest_drone_status(drone_id: str, user: dict = Depends(_admin_user)):
     """Proxies GET /ingest/status/{drone_id} — single drone detail."""
     return await _proxy_get(f"/ingest/status/{drone_id}")
 
@@ -167,7 +165,7 @@ async def ingest_drone_status(drone_id: str, user: dict = Depends(_get_admin_dep
 # ═════════════════════════════════════════════════════════════════════════════
 
 @ingest_api.get("/metrics", summary="Proxy: Prometheus metrics")
-async def ingest_metrics(user: dict = Depends(_get_admin_dep)):
+async def ingest_metrics(user: dict = Depends(_admin_user)):
     """
     Proxies GET /metrics from the ingest server.
     Returns raw Prometheus text for parsing on the frontend.
@@ -280,7 +278,7 @@ def _docker_client():
 
 
 @ingest_api.get("/containers", summary="List ingest container statuses")
-async def list_containers(user: dict = Depends(_get_admin_dep)):
+async def list_containers(user: dict = Depends(_admin_user)):
     """
     Returns the live status of every container in the dvas_ingest stack.
     Used by the admin control panel to show a container health grid.
@@ -316,7 +314,7 @@ async def list_containers(user: dict = Depends(_get_admin_dep)):
 
 
 @ingest_api.post("/control", summary="Start / Stop / Restart ingest server")
-async def control_ingest(body: dict, user: dict = Depends(_get_admin_dep)):
+async def control_ingest(body: dict, user: dict = Depends(_admin_user)):
     """
     Perform a lifecycle action on the ingest server containers.
 

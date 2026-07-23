@@ -107,9 +107,7 @@ export default function IngestDashboard() {
     const buf = throughputBufferRef.current;
     buf.push({ t: buf.length, ingested: totalIngested, queued: totalQueued });
     if (buf.length > 24) buf.shift();
-    // Normalise to delta from first snapshot so the chart shows incremental growth
-    const base = buf[0]?.ingested || 0;
-    return buf.map((pt, i) => ({ t: i, ingested: pt.ingested - base, queued: pt.queued }));
+    return buf.map((pt, i) => ({ t: i, ingested: pt.ingested, queued: pt.queued }));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick, ingestSrv?.status]);
 

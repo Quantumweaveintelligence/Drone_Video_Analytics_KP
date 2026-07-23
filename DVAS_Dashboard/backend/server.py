@@ -1844,7 +1844,7 @@ async def _telemetry_pump():
             if random.random() < 0.28 and drone_objs:
                 d = random.choice(drone_objs)
                 a = {
-                    "id": f"A-{random.randint(9000, 9999)}",
+                    "id": f"A-{uuid.uuid4().hex[:8].upper()}",
                     "mission_id": d.mission_id,
                     "jurisdiction": d.jurisdiction,
                     "drone_id": d.id,
@@ -1855,10 +1855,13 @@ async def _telemetry_pump():
                     "acknowledged_by": None,
                     "acknowledged_at": None,
                 }
-                async with async_session_factory() as session:
-                    session.add(Alert(**a))
-                    await session.commit()
-                await hub.broadcast({"type": "alert", "alert": a})
+                try:
+                    async with async_session_factory() as session:
+                        session.add(Alert(**a))
+                        await session.commit()
+                    await hub.broadcast({"type": "alert", "alert": a})
+                except Exception as e:
+                    logger.debug(f"telemetry pump alert generation error: {e}")
         except Exception as e:
             logger.warning(f"telemetry pump: {e}")
 
