@@ -98,10 +98,20 @@ export default function IngestDashboard() {
   }, [page]);
   useEffect(() => { if (page === "audit") loadAudit(); if (page === "users") loadUsers(); }, [page]);
 
-  const throughput = useMemo(() => Array.from({ length: 24 }, (_, i) => ({
-    t: i, ingested: 120 + Math.round(Math.sin((i + tick) / 3) * 30 + Math.random() * 15),
-    processed: 110 + Math.round(Math.sin((i + tick) / 3 - 0.3) * 28 + Math.random() * 12),
-  })), [tick]);
+  // Real throughput from ingest server status — rolling buffer of snapshots
+  const throughputBufferRef = useRef([]);
+  const throughput = useMemo(() => {
+    const drones = ingestSrv?.status?.drones || [];
+    const totalIngested = drones.reduce((s, d) => s + (d?.ingest_stats?.frames_received || 0), 0);
+    const totalQueued  = drones.reduce((s, d) => s + (d?.queue?.messages_ready || 0), 0);
+    const buf = throughputBufferRef.current;
+    buf.push({ t: buf.length, ingested: totalIngested, queued: totalQueued });
+    if (buf.length > 24) buf.shift();
+    // Normalise to delta from first snapshot so the chart shows incremental growth
+    const base = buf[0]?.ingested || 0;
+    return buf.map((pt, i) => ({ t: i, ingested: pt.ingested - base, queued: pt.queued }));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tick, ingestSrv?.status]);
 
   const feeds = useMemo(() => {
     let arr = [...(h?.feeds || [])];
@@ -128,7 +138,7 @@ export default function IngestDashboard() {
           {page === "server" && <ServerPage srv={ingestSrv} />}
           {page === "overview" && <OverviewPage ov={ov} />}
           {page === "feeds" && <FeedsPage feeds={feeds} filter={feedFilter} setFilter={setFeedFilter} setSort={setFeedSort} />}
-          {page === "queue" && <QueuePage throughput={throughput} queue={h?.queue || []} />}
+          {page === "queue" && <QueuePage throughput={throughput} queue={h?.queue || []} ingestSrv={ingestSrv} />}
           {page === "gpu" && <GpuPage gpu={h?.gpu || []} />}
           {page === "alerts" && <AlertsPage alerts={(h?.alerts || []).filter(a => !ackedAlertIds.includes(a.id))} onAck={(id) => setAckedAlertIds(v => [...v, id])} />}
           {page === "audit" && <AuditPage audit={audit} />}
@@ -1116,8 +1126,18 @@ function FeedsPage({ feeds, filter, setFilter, setSort }) {
   );
 }
 
-function QueuePage({ throughput, queue }) {
+function QueuePage({ throughput, queue, ingestSrv }) {
   const backlog = queue.filter(q => q.depth > 180);
+  // Real drone-level frames data from the ingest server
+  const drones = ingestSrv?.status?.drones || [];
+  const droneFrameData = drones.map(d => ({
+    drone: d.drone_id || d.id || "—",
+    frames: d?.ingest_stats?.frames_received || 0,
+    queued: d?.queue?.messages_ready || 0,
+    bytes: d?.ingest_stats?.bytes_ingested || 0,
+    online: d?.online ?? false,
+  }));
+
   return (
     <div className="space-y-4">
       {backlog.length > 0 && (
@@ -1125,8 +1145,44 @@ function QueuePage({ throughput, queue }) {
           Back-pressure detected on {backlog.length} partition(s): {backlog.map(b => b.partition).join(", ")}
         </div>
       )}
+
+      {/* Live drone frame ingestion table */}
+      {droneFrameData.length > 0 && (
+        <div className="border border-slate-800 bg-slate-900 p-3">
+          <div className="dvas-label mb-2">Live Drone Ingestion · Real-Time</div>
+          <table className="w-full text-xs mono">
+            <thead>
+              <tr className="text-slate-500 border-b border-slate-800">
+                <th className="text-left pb-1.5 pr-3">Drone ID</th>
+                <th className="text-right pb-1.5 pr-3">Frames Rcv'd</th>
+                <th className="text-right pb-1.5 pr-3">Queue Depth</th>
+                <th className="text-right pb-1.5">Bytes In</th>
+              </tr>
+            </thead>
+            <tbody>
+              {droneFrameData.map(d => (
+                <tr key={d.drone} className="border-b border-slate-800/50">
+                  <td className="py-1.5 pr-3 flex items-center gap-1.5">
+                    <span
+                      className="inline-block w-1.5 h-1.5 rounded-full"
+                      style={{ background: d.online ? "#10b981" : "#ef4444" }}
+                    />
+                    {d.drone}
+                  </td>
+                  <td className="text-right py-1.5 pr-3 text-sky-400">{d.frames.toLocaleString()}</td>
+                  <td className="text-right py-1.5 pr-3 text-amber-400">{d.queued}</td>
+                  <td className="text-right py-1.5 text-slate-400">
+                    {d.bytes > 0 ? `${(d.bytes / 1024 / 1024).toFixed(1)} MB` : "—"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
       <div className="border border-slate-800 bg-slate-900 p-3">
-        <div className="dvas-label mb-2">Ingested vs Processed · fps (rolling 24 points)</div>
+        <div className="dvas-label mb-2">Cumulative Frames Ingested · rolling snapshots</div>
         <div style={{ width: "100%", height: 260 }}>
           <ResponsiveContainer>
             <LineChart data={throughput}>
@@ -1134,8 +1190,8 @@ function QueuePage({ throughput, queue }) {
               <XAxis dataKey="t" hide />
               <YAxis stroke="#64748b" fontSize={10} />
               <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #334155", fontSize: 12 }} />
-              <Line dataKey="ingested" stroke="#0ea5e9" dot={false} strokeWidth={2} />
-              <Line dataKey="processed" stroke="#10b981" dot={false} strokeWidth={2} />
+              <Line dataKey="ingested" name="Frames In" stroke="#0ea5e9" dot={false} strokeWidth={2} />
+              <Line dataKey="queued" name="Queue Depth" stroke="#f59e0b" dot={false} strokeWidth={1} strokeDasharray="4 2" />
             </LineChart>
           </ResponsiveContainer>
         </div>

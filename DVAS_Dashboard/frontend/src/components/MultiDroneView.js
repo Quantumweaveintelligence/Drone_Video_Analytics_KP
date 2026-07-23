@@ -7,6 +7,7 @@
  */
 
 import React, { useEffect, useRef, useState, useCallback } from "react";
+import { API } from "@/lib/api";
 import {
   Radio,
   Battery,
@@ -45,6 +46,92 @@ import {
    STATIC / FALLBACK DATA
    (merged with live API props)
    ───────────────────────────────────────────── */
+/* ─────────────────────────────────────────────
+   LIVE FRAME COMPONENT
+   Polls the ingest server's latest JPEG every 500ms
+   for live drones. Falls back to placeholder for offline.
+   ───────────────────────────────────────────── */
+function LiveFrame({ droneId, isOffline, isDegraded }) {
+  const [imgSrc, setImgSrc] = useState(null);
+  const [hasFrame, setHasFrame] = useState(false);
+  const intervalRef = useRef(null);
+
+  useEffect(() => {
+    if (isOffline) return;
+
+    const load = () => {
+      const ts = Date.now();
+      const url = `${API}/ingest-server/frame/${droneId}/latest?t=${ts}`;
+      const img = new Image();
+      img.onload = () => {
+        setImgSrc(url);
+        setHasFrame(true);
+      };
+      img.onerror = () => {
+        // Frame not yet available – keep showing placeholder
+      };
+      img.src = url;
+    };
+
+    load();
+    intervalRef.current = setInterval(load, 500);
+    return () => clearInterval(intervalRef.current);
+  }, [droneId, isOffline]);
+
+  if (isOffline) {
+    return null; // handled by parent
+  }
+
+  if (!hasFrame) {
+    // Waiting for first frame — show animated placeholder
+    return (
+      <>
+        <div
+          className="absolute inset-0 opacity-20"
+          style={{
+            background: isDegraded
+              ? "radial-gradient(ellipse at 50% 50%, rgba(245,158,11,0.3) 0%, transparent 70%)"
+              : "radial-gradient(ellipse at 50% 50%, rgba(20,184,166,0.15) 0%, transparent 70%)",
+          }}
+        />
+        <div className="absolute bottom-10 left-0 right-0 flex justify-center">
+          <div
+            className="mono text-[8px] px-2 py-0.5 rounded"
+            style={{ background: "rgba(6,14,26,0.65)", color: "rgba(148,163,184,0.5)" }}
+          >
+            AWAITING FEED…
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  return (
+    <>
+      {/* Real JPEG frame */}
+      <img
+        src={imgSrc}
+        alt={`Live feed ${droneId}`}
+        className="absolute inset-0 w-full h-full object-cover"
+        style={{ opacity: 0.95 }}
+      />
+      {/* LIVE badge overlay */}
+      <div className="absolute bottom-10 left-0 right-0 flex justify-center pointer-events-none">
+        <div
+          className="mono text-[8px] px-2 py-0.5 rounded flex items-center gap-1"
+          style={{ background: "rgba(6,14,26,0.75)", color: isDegraded ? "#fbbf24" : "#2dd4bf" }}
+        >
+          <span
+            className="inline-block w-1.5 h-1.5 rounded-full"
+            style={{ background: isDegraded ? "#fbbf24" : "#2dd4bf", animation: "pulse 1s infinite" }}
+          />
+          LIVE FEED · {droneId}
+        </div>
+      </div>
+    </>
+  );
+}
+
 const MOCK_EVENTS = [
   {
     id: "evt-001",
@@ -427,7 +514,7 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect }) {
           <StatusPill status={drone.status} />
         </div>
 
-        {/* Center graphic: cognitive feed placeholder */}
+        {/* Center graphic: real live feed or placeholder */}
         <div className="absolute inset-0 flex flex-col items-center justify-center">
           {isOffline ? (
             <div className="flex flex-col items-center gap-2">
@@ -435,66 +522,7 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect }) {
               <span className="mono text-[10px] text-red-400/60">FEED OFFLINE</span>
             </div>
           ) : (
-            <>
-              {/* Simulated thermal-overlay grid */}
-              <div
-                className="absolute inset-0 opacity-20"
-                style={{
-                  background: isDegraded
-                    ? "radial-gradient(ellipse at 50% 50%, rgba(245,158,11,0.3) 0%, transparent 70%)"
-                    : "radial-gradient(ellipse at 50% 50%, rgba(20,184,166,0.15) 0%, transparent 70%)",
-                }}
-              />
-              {/* Centered crosshair */}
-              <div className="relative">
-                <div
-                  className="w-8 h-8 rounded-full border flex items-center justify-center"
-                  style={{
-                    borderColor: isDegraded
-                      ? "rgba(245,158,11,0.25)"
-                      : "rgba(20,184,166,0.25)",
-                    background: isDegraded
-                      ? "rgba(245,158,11,0.05)"
-                      : "rgba(20,184,166,0.05)",
-                  }}
-                >
-                  <div
-                    className="w-1.5 h-1.5 rounded-full"
-                    style={{
-                      background: isDegraded ? "#fbbf24" : "#2dd4bf",
-                      opacity: 0.7,
-                    }}
-                  />
-                </div>
-                <div
-                  className="absolute top-1/2 -translate-y-1/2 -left-5 w-3 h-px"
-                  style={{ background: isDegraded ? "rgba(245,158,11,0.35)" : "rgba(20,184,166,0.35)" }}
-                />
-                <div
-                  className="absolute top-1/2 -translate-y-1/2 -right-5 w-3 h-px"
-                  style={{ background: isDegraded ? "rgba(245,158,11,0.35)" : "rgba(20,184,166,0.35)" }}
-                />
-                <div
-                  className="absolute -top-5 left-1/2 -translate-x-1/2 w-px h-3"
-                  style={{ background: isDegraded ? "rgba(245,158,11,0.35)" : "rgba(20,184,166,0.35)" }}
-                />
-                <div
-                  className="absolute -bottom-5 left-1/2 -translate-x-1/2 w-px h-3"
-                  style={{ background: isDegraded ? "rgba(245,158,11,0.35)" : "rgba(20,184,166,0.35)" }}
-                />
-              </div>
-              <div className="absolute bottom-10 left-0 right-0 flex justify-center">
-                <div
-                  className="mono text-[8px] px-2 py-0.5 rounded"
-                  style={{
-                    background: "rgba(6,14,26,0.65)",
-                    color: "rgba(148,163,184,0.5)",
-                  }}
-                >
-                  COGNITIVE FRAME · AI PROCESSING
-                </div>
-              </div>
-            </>
+            <LiveFrame droneId={drone.id} isOffline={isOffline} isDegraded={isDegraded} />
           )}
         </div>
 
@@ -509,7 +537,13 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect }) {
           </div>
           <div className="flex items-center gap-1">
             <Activity size={9} className="text-slate-500" />
-            <span className="mono text-[9px] text-slate-400">{drone.speed_kmh} km/h</span>
+            <span className="mono text-[9px] text-slate-400">
+              {drone.speed_mps != null
+                ? `${(drone.speed_mps * 3.6).toFixed(1)} km/h`
+                : drone.speed_kmh != null
+                ? `${drone.speed_kmh} km/h`
+                : "—"}
+            </span>
           </div>
           <div className="flex items-center gap-1 ml-auto">
             <SignalBars strength={drone.signal_strength} />

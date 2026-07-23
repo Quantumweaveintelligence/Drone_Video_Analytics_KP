@@ -34,11 +34,13 @@ class FrameMetadata(BaseModel):
     camera_id:    Optional[str]   = None
     heading_deg:  Optional[float] = Field(None, ge=0.0, le=360.0)
     speed_kmh:    Optional[float] = Field(None, ge=0.0)
+    speed_mps:    Optional[float] = Field(None, ge=0.0)          # m/s from edge device
+    battery_pct:  Optional[float] = Field(None, ge=0.0, le=100.0)  # 0–100% from edge device
 
     @field_validator("drone_id")
     @classmethod
     def validate_drone_id(cls, v: str) -> str:
-        if not re.match(r"^[A-Z0-9_]{3,30}$", v):
+        if not re.match(r"^[A-Z0-9_\-]{3,30}$", v):
             raise ValueError(
                 "drone_id must be 3-30 uppercase alphanumeric/underscore characters"
             )

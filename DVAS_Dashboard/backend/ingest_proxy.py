@@ -178,6 +178,58 @@ async def ingest_metrics(user: dict = Depends(_get_admin_dep)):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# TELEMETRY PROXY (any authenticated role — used by command dashboard)
+# ═════════════════════════════════════════════════════════════════════════════
+
+@ingest_api.get("/telemetry", summary="Proxy: latest telemetry for all drones")
+async def ingest_telemetry():
+    """
+    Returns the latest cached telemetry (GPS, battery, speed, etc.) for every
+    drone that has sent at least one frame to the ingest server.
+    Open to any authenticated role — used by the command dashboard map and
+    multi-drone view, and by the backend telemetry pump to sync real drone data.
+    """
+    try:
+        return await _proxy_get("/ingest/telemetry", timeout=3.0)
+    except HTTPException:
+        return {"drones": [], "count": 0}
+
+
+@ingest_api.get("/frame/{drone_id}/latest", summary="Proxy: latest JPEG frame for a drone")
+async def ingest_latest_frame(drone_id: str):
+    """
+    Fetches the most recent JPEG frame stored in the ingest server's Valkey queue
+    for the given drone and streams it back as image/jpeg.
+    Used by the command dashboard multi-drone view (<img> polling every 500 ms).
+    Open to any authenticated role.
+    """
+    url = f"{INGEST_SERVER_URL}/ingest/frame/{drone_id}/latest"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url)
+            if resp.status_code == 404:
+                raise HTTPException(404, f"No frames yet for drone {drone_id}")
+            resp.raise_for_status()
+            from fastapi.responses import Response
+            return Response(
+                content=resp.content,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "no-store"},
+            )
+    except HTTPException:
+        raise
+    except httpx.ConnectError:
+        raise HTTPException(502, "Ingest server unreachable")
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Ingest server timed out")
+    except Exception as exc:
+        logger.warning("Frame proxy error for %s: %s", drone_id, exc)
+        raise HTTPException(500, "Frame retrieval failed")
+
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # DOCKER CONTAINER CONTROL
 # Controls the ingest server containers via the host Docker socket.
 # The backend container must have /var/run/docker.sock mounted (read-only
