@@ -27,6 +27,7 @@ import time
 import asyncio
 import threading
 import queue
+import collections
 from typing import Optional, Union
 
 # ── Third party ──────────────────────────────────────────────────────────────
@@ -228,6 +229,8 @@ class PipelineManager:
         self.pipeline_bypass: bool = False
         self._bypass_frame_counter: int = 0
         self._start_wall: float = 0
+        self.history_deque = collections.deque(maxlen=60)
+        self._history_thread: Optional[threading.Thread] = None
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -399,6 +402,10 @@ class PipelineManager:
                 self.change_engine.start()
             self.source.start()
 
+            self.history_deque.clear()
+            self._history_thread = threading.Thread(target=self._history_loop, daemon=True)
+            self._history_thread.start()
+
             self.active_mission = {
                 "mission_id": req.mission_id,
                 "mission_name": req.mission_name,
@@ -452,6 +459,28 @@ class PipelineManager:
                 "end_time": end_time_str,
                 "frames_processed": frames_processed,
             }
+
+    def _history_loop(self):
+        while self._running:
+            try:
+                buf_fill = 0.0
+                if self.buffer:
+                    buf_frames = self.buffer.get_frame_count()
+                    max_frames = cfg.buffer.max_frames
+                    buf_fill = round(buf_frames / max(max_frames, 1) * 100, 1)
+
+                cd_score = 0.0
+                if self.change_engine:
+                    cd_score = round(self.change_engine.last_motion_score, 4)
+
+                self.history_deque.append({
+                    "time": time.time(),
+                    "buffer_fill": buf_fill,
+                    "change_score": cd_score
+                })
+            except Exception:
+                pass
+            time.sleep(1.0)
 
     # ── Status / Telemetry ────────────────────────────────────────────────
 
@@ -591,6 +620,32 @@ def get_status():
 @app.get("/api/edge/telemetry")
 def get_telemetry():
     return pipeline.get_telemetry()
+
+
+@app.get("/api/edge/analytics")
+def get_analytics():
+    if not pipeline._running:
+        return {"active": False}
+    
+    # Get history
+    history = list(pipeline.history_deque)
+    
+    # Get buffer stats
+    buffer_stats = {}
+    if pipeline.buffer:
+        buffer_stats = pipeline.buffer.get_stats()
+        
+    # Get change stats
+    change_stats = {}
+    if pipeline.change_engine:
+        change_stats = pipeline.change_engine.get_stats()
+        
+    return {
+        "active": True,
+        "history": history,
+        "buffer": buffer_stats,
+        "change_detection": change_stats
+    }
 
 
 async def mjpeg_generator():

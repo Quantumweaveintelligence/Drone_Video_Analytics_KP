@@ -3,8 +3,7 @@ import Dashboard from "./Dashboard";
 import MissionControl from "./MissionControl";
 import LiveMonitoring from "./LiveMonitoring";
 import GpsTelemetry from "./GpsTelemetry";
-import BufferAnalytics from "./BufferAnalytics";
-import ChangeDetection from "./ChangeDetection";
+import BufferAndChange from "./BufferAndChange";
 import FrameSelection from "./FrameSelection";
 import UploadMonitoring from "./UploadMonitoring";
 import Incidents from "./Incidents";
@@ -20,8 +19,7 @@ export default function EdgeRouter() {
       <Route path="mission-control" element={<MissionControl />} />
       <Route path="live-monitoring" element={<LiveMonitoring />} />
       <Route path="gps-telemetry" element={<GpsTelemetry />} />
-      <Route path="buffer-analytics" element={<BufferAnalytics />} />
-      <Route path="change-detection" element={<ChangeDetection />} />
+      <Route path="buffer-and-change" element={<BufferAndChange />} />
       <Route path="frame-selection" element={<FrameSelection />} />
       <Route path="upload-monitoring" element={<UploadMonitoring />} />
       <Route path="incidents" element={<Incidents />} />

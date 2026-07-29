@@ -138,6 +138,19 @@ export default function EvidenceManagement() {
                 </div>
               </div>
 
+              <div>
+                <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Extraction Time Range</label>
+                <div className="flex items-center gap-2 text-xs font-mono">
+                  <div className="flex-1 bg-slate-950 border border-slate-700 px-3 py-1.5 rounded text-slate-200">
+                    10:15:00 <span className="text-slate-500 text-[10px] ml-1">UTC</span>
+                  </div>
+                  <span className="text-slate-500 font-sans">to</span>
+                  <div className="flex-1 bg-slate-950 border border-slate-700 px-3 py-1.5 rounded text-slate-200">
+                    11:30:00 <span className="text-slate-500 text-[10px] ml-1">UTC</span>
+                  </div>
+                </div>
+              </div>
+
               <div className="bg-slate-950 border border-slate-800 p-3 rounded text-xs text-slate-400 leading-relaxed">
                 <span className="font-semibold text-slate-300">Note:</span> This will package selected frames from the rolling buffer spanning the entire duration of the selected mission.
               </div>
