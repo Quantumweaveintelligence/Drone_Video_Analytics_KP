@@ -6,28 +6,34 @@ import { useI18n } from "@/context/I18nContext";
 import { useDvasSocket } from "@/lib/useDvasSocket";
 import LiveMap from "@/components/LiveMap";
 import MultiDroneView from "@/components/MultiDroneView";
-import CrowdTrafficAnalytics from "@/components/CrowdTrafficAnalytics";
+import CrowdAnalytics from "@/components/CrowdAnalytics";
+import TrafficAnalytics from "@/components/TrafficAnalytics";
+import PersonTrackingAnalytics from "@/components/PersonTrackingAnalytics";
 import {
-  MapPin, Radio as Broadcast, Bell, Film as FilmSlate, ListChecks, BarChart3 as ChartBar, AlertTriangle as Warning, CheckCircle, X, ExternalLink as ArrowSquareOut, Clock, Folder as FolderLock, ClipboardList, Download,
+  MapPin, Radio as Broadcast, Bell, Film as FilmSlate,
+  BarChart3 as ChartBar, AlertTriangle as Warning, CheckCircle, X,
+  ExternalLink as ArrowSquareOut, Folder as FolderLock, Download,
   Cpu, ShieldCheck, User as UserIcon, Users as UsersIcon, Car, Hash,
+  UserSearch,
 } from "lucide-react";
+import LiveFrame from "../components/LiveFrame";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, BarChart, Bar } from "recharts";
 
 // Tab visibility — 4-role model
 // CRO inherits all former field_supervisor tabs
 // SR  inherits all former supervisory_officer tabs
 const ALL_PAGES = [
-  { key: "map",         labelKey: "cmd.page.map",         Icon: MapPin,        roles: ["control_room_officer","senior_officer"] },
-  { key: "alerts",      labelKey: "cmd.page.alerts",      Icon: Bell,          roles: ["control_room_officer","senior_officer"] },
-  { key: "multidrone",  labelKey: "cmd.page.multidrone",  Icon: Broadcast,     roles: ["control_room_officer","senior_officer"] },
-  { key: "evidence",    labelKey: "cmd.page.evidence",    Icon: FilmSlate,     roles: ["control_room_officer","senior_officer"] },
-  { key: "forensic",    labelKey: "cmd.page.forensic",    Icon: ClipboardList, roles: ["control_room_officer","senior_officer"] },
-  { key: "analytics",   labelKey: "cmd.page.analytics",   Icon: ChartBar,      roles: ["control_room_officer","senior_officer"] },
-  { key: "missions",    labelKey: "cmd.page.missions",    Icon: ListChecks,    roles: ["control_room_officer","senior_officer"] },
-  { key: "models",      labelKey: "cmd.page.models",      Icon: Cpu,           roles: ["control_room_officer","senior_officer"] },
-  { key: "exports",     labelKey: "cmd.page.exports",     Icon: ArrowSquareOut,roles: ["control_room_officer","senior_officer"] },
-  { key: "aggregated",  labelKey: "cmd.page.aggregated",  Icon: ChartBar,      roles: ["senior_officer"] },
-  { key: "reports",     labelKey: "cmd.page.reports",     Icon: FilmSlate,     roles: ["control_room_officer","senior_officer"] },
+  { key: "map",       label: "Tactical Map",         Icon: MapPin,          roles: ["control_room_officer","senior_officer"] },
+  { key: "alerts",    label: "Alerts",               Icon: Bell,            roles: ["control_room_officer","senior_officer"] },
+  { key: "multidrone",label: "Multi-Drone View",     Icon: Broadcast,       roles: ["control_room_officer","senior_officer"] },
+  { key: "evidence",  label: "Evidence",             Icon: FilmSlate,       roles: ["control_room_officer","senior_officer"] },
+  { key: "crowd",     label: "Crowd Analytics",      Icon: UsersIcon,       roles: ["control_room_officer","senior_officer"] },
+  { key: "traffic",   label: "Traffic & ANPR",       Icon: Car,             roles: ["control_room_officer","senior_officer"] },
+  { key: "person",    label: "Person Tracking",      Icon: UserSearch,      roles: ["control_room_officer","senior_officer"] },
+  { key: "models",    label: "Detection Models",     Icon: Cpu,             roles: ["control_room_officer","senior_officer"] },
+  { key: "exports",   label: "Exports",              Icon: ArrowSquareOut,  roles: ["control_room_officer","senior_officer"] },
+  { key: "aggregated",label: "Aggregated View",      Icon: ChartBar,        roles: ["senior_officer"] },
+  { key: "reports",   label: "Reports",              Icon: FilmSlate,       roles: ["control_room_officer","senior_officer"] },
 ];
 
 const MODEL_ICONS = { person: UserIcon, face: ShieldCheck, vehicle: Car, crowd: UsersIcon, plate: Hash };
@@ -201,7 +207,7 @@ export default function CommandDashboard() {
               }}
             >
               <span className="mono text-[10px] opacity-70 font-normal">{String(i+1).padStart(2,"0")}</span>
-              <p.Icon size={14} /> {t(p.labelKey)}
+              <p.Icon size={14} /> {p.label}
             </button>
           ))}
         </nav>
@@ -228,7 +234,7 @@ export default function CommandDashboard() {
             <div className="p-3 grid grid-cols-2 gap-2">
               {[...drones].sort((a, b) => (a.status === "live" ? -1 : b.status === "live" ? 1 : 0)).slice(0, 4).map(d => (
                 <div key={d.id} data-testid={`grid-drone-${d.id}`} className="aspect-video relative overflow-hidden rounded-md" style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border-strong)" }}>
-                  <div className="absolute inset-0 dvas-grid-bg opacity-40" />
+                  <LiveFrame droneId={d.id} isOffline={d.status === "offline"} isDegraded={d.status === "degraded"} />
                   <div className="absolute top-1 left-1 mono text-[9px] bg-black/70 px-1">{d.id}</div>
                   <div className={`absolute top-1 right-1 mono text-[9px] px-1 ${d.status === "live" ? "text-emerald-400" : d.status === "degraded" ? "text-amber-400" : "text-red-400"}`}>{d.status}</div>
                   <div className="absolute bottom-1 left-1 mono text-[9px] text-slate-300 bg-black/60 px-1">crowd {d.last_analytics?.crowd_density ?? "—"}</div>
@@ -299,32 +305,16 @@ export default function CommandDashboard() {
         </div>
       )}
 
-      {tab === "missions" && (
-        <div className="rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
-          <table className="w-full text-xs">
-            <thead style={{ background: "var(--dvas-surface-2)" }}>
-              <tr>{["ID","Name","Zone","Status","Jurisdiction","Started"].map(h => <th key={h} className="text-left px-3 py-2 dvas-label" style={{ fontSize: 10, borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text-dim)" }}>{h}</th>)}</tr>
-            </thead>
-            <tbody className="mono">
-              {missions.map(m => (
-                <tr key={m.id} data-testid={`mission-${m.id}`} className="hover:bg-[color:var(--dvas-elev)] transition-colors">
-                  <td className="px-3 py-2" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text-muted)" }}>{m.id}</td>
-                  <td className="px-3 py-2 font-medium" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text)" }}>{m.name}</td>
-                  <td className="px-3 py-2" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text-muted)" }}>{m.zone}</td>
-                  <td className="px-3 py-2" style={{ borderBottom: "1px solid var(--dvas-border)" }}>
-                    <span className={`px-1.5 py-0.5 border text-[10px] rounded-sm ${m.status === "active" ? "text-emerald-600 border-emerald-500/40 bg-emerald-50" : "text-slate-500 border-slate-300 bg-slate-100"}`}>{m.status}</span>
-                  </td>
-                  <td className="px-3 py-2" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text-muted)" }}>{m.jurisdiction}</td>
-                  <td className="px-3 py-2" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text-dim)" }}>{new Date(m.started_at).toLocaleString()}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+      {tab === "crowd" && (
+        <CrowdAnalytics crowdSeries={crowd} drones={drones} />
       )}
 
-      {tab === "analytics" && (
-        <CrowdTrafficAnalytics crowdSeries={crowd} drones={drones} />
+      {tab === "traffic" && (
+        <TrafficAnalytics drones={drones} />
+      )}
+
+      {tab === "person" && (
+        <PersonTrackingAnalytics drones={drones} />
       )}
 
       {tab === "models" && <ModelsPage user={user} t={t} />}
@@ -387,24 +377,7 @@ export default function CommandDashboard() {
         />
       )}
 
-      {tab === "forensic" && (
-        <div className="border border-slate-800 bg-slate-900 font-mono">
-          <div className="p-3 border-b border-slate-800 flex items-center gap-2 font-sans">
-            <ClipboardList size={16} className="text-sky-400" />
-            <div className="text-sm">{t("cmd.page.forensic")}</div>
-            {/* SR (former supervisory_officer) can export full forensic log as CSV */}
-            {user.role === "senior_officer" && (
-              <button data-testid="export-csv" onClick={() => { const rows = ["ts,drone_id,type,confidence,zone",...alerts.map(a=>`${a.ts},${a.drone_id},${a.type},${a.confidence},${a.zone}`)].join("\n"); const b=new Blob([rows],{type:"text/csv"}); const u=URL.createObjectURL(b); const a=document.createElement("a"); a.href=u; a.download="forensic_log.csv"; a.click(); }} className="ml-auto text-xs px-2 py-1 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 flex items-center gap-1"><Download size={11}/> {t("common.exportCsv")}</button>
-            )}
-          </div>
-          <div className="max-h-[500px] overflow-auto">
-            <table className="w-full text-xs mono">
-              <thead className="bg-slate-950/60 sticky top-0"><tr>{[t("table.timestamp"),t("table.drone"),t("table.type"),t("table.confidence"),t("table.zone"),t("table.systemAction")].map(h=><th key={h} className="text-left px-3 py-2 dvas-label border-b border-slate-800" style={{fontSize:10}}>{h}</th>)}</tr></thead>
-              <tbody>{alerts.map(a=>(<tr key={a.id} className="hover:bg-slate-800/40"><td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-400">{new Date(a.ts).toLocaleString()}</td><td className="px-3 py-1.5 border-b border-slate-800/60">{a.drone_id}</td><td className="px-3 py-1.5 border-b border-slate-800/60">{a.type}</td><td className="px-3 py-1.5 border-b border-slate-800/60">{a.confidence}</td><td className="px-3 py-1.5 border-b border-slate-800/60">{a.zone}</td><td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-500">{a.acknowledged_by?t("common.acked"):t("common.logged")}</td></tr>))}</tbody>
-            </table>
-          </div>
-        </div>
-      )}
+      {/* Forensic Log Viewer removed per overhaul requirements */}
 
       {tab === "aggregated" && user.role === "senior_officer" && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">

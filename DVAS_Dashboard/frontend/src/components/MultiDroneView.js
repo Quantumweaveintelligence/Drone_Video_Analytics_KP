@@ -42,95 +42,15 @@ import {
   User as UserIcon,
 } from "lucide-react";
 
+import LiveFrame from "./LiveFrame";
+
 /* ─────────────────────────────────────────────
    STATIC / FALLBACK DATA
    (merged with live API props)
    ───────────────────────────────────────────── */
 /* ─────────────────────────────────────────────
-   LIVE FRAME COMPONENT
-   Polls the ingest server's latest JPEG every 500ms
-   for live drones. Falls back to placeholder for offline.
+   HELPERS
    ───────────────────────────────────────────── */
-function LiveFrame({ droneId, isOffline, isDegraded }) {
-  const [imgSrc, setImgSrc] = useState(null);
-  const [hasFrame, setHasFrame] = useState(false);
-  const intervalRef = useRef(null);
-
-  useEffect(() => {
-    if (isOffline) return;
-
-    const load = () => {
-      const ts = Date.now();
-      const url = `${API}/ingest-server/frame/${droneId}/latest?t=${ts}`;
-      const img = new Image();
-      img.onload = () => {
-        setImgSrc(url);
-        setHasFrame(true);
-      };
-      img.onerror = () => {
-        // Frame not yet available – keep showing placeholder
-      };
-      img.src = url;
-    };
-
-    load();
-    intervalRef.current = setInterval(load, 50);
-    return () => clearInterval(intervalRef.current);
-  }, [droneId, isOffline]);
-
-  if (isOffline) {
-    return null; // handled by parent
-  }
-
-  if (!hasFrame) {
-    // Waiting for first frame — show animated placeholder
-    return (
-      <>
-        <div
-          className="absolute inset-0 opacity-20"
-          style={{
-            background: isDegraded
-              ? "radial-gradient(ellipse at 50% 50%, rgba(245,158,11,0.3) 0%, transparent 70%)"
-              : "radial-gradient(ellipse at 50% 50%, rgba(20,184,166,0.15) 0%, transparent 70%)",
-          }}
-        />
-        <div className="absolute bottom-10 left-0 right-0 flex justify-center">
-          <div
-            className="mono text-[8px] px-2 py-0.5 rounded"
-            style={{ background: "rgba(6,14,26,0.65)", color: "rgba(148,163,184,0.5)" }}
-          >
-            AWAITING FEED…
-          </div>
-        </div>
-      </>
-    );
-  }
-
-  return (
-    <>
-      {/* Real JPEG frame */}
-      <img
-        src={imgSrc}
-        alt={`Live feed ${droneId}`}
-        className="absolute inset-0 w-full h-full object-cover"
-        style={{ opacity: 0.95 }}
-      />
-      {/* LIVE badge overlay */}
-      <div className="absolute bottom-10 left-0 right-0 flex justify-center pointer-events-none">
-        <div
-          className="mono text-[8px] px-2 py-0.5 rounded flex items-center gap-1"
-          style={{ background: "rgba(6,14,26,0.75)", color: isDegraded ? "#fbbf24" : "#2dd4bf" }}
-        >
-          <span
-            className="inline-block w-1.5 h-1.5 rounded-full"
-            style={{ background: isDegraded ? "#fbbf24" : "#2dd4bf", animation: "pulse 1s infinite" }}
-          />
-          LIVE FEED · {droneId}
-        </div>
-      </div>
-    </>
-  );
-}
 
 const MOCK_EVENTS = [
   {
