@@ -1,0 +1,18 @@
+FROM python:3.11-slim
+
+WORKDIR /analytics
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY gateway/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+COPY shared/ /analytics/shared/
+COPY gateway/ /analytics/gateway/
+
+EXPOSE 8100
+
+CMD ["uvicorn", "gateway.main:app", "--host", "0.0.0.0", "--port", "8100", "--workers", "1"]

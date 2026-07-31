@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Face De-duplicator — adapted from person_dedupe.py.
-Uses ResNet50 embeddings + Agglomerative Clustering.
-Embeddings are stored in Postgres face_embeddings table.
-Duplicates are deleted from the DB after clustering.
+Face De-duplicator — ResNet50 embeddings + Agglomerative Clustering.
+Embeddings stored in Postgres face_embeddings table.
+Duplicates are marked with is_duplicate=True and cluster_id set.
 """
+import asyncio
 import logging
 import numpy as np
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import torch
@@ -18,7 +18,6 @@ from sklearn.cluster import AgglomerativeClustering
 
 log = logging.getLogger(__name__)
 
-# Best approach: cosine similarity with 0.25 threshold (proven in person_dedupe.py)
 DISTANCE_THRESHOLD = 0.25
 BATCH_SIZE = 32
 
@@ -57,10 +56,7 @@ def extract_embedding_from_bytes(
     image_bytes: bytes,
     device: torch.device,
 ) -> Optional[List[float]]:
-    """
-    Extract a 2048-dim ResNet50 embedding from JPEG bytes.
-    Returns normalized float list or None on failure.
-    """
+    """Extract a 2048-dim ResNet50 embedding from JPEG bytes."""
     try:
         import io
         pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -74,40 +70,16 @@ def extract_embedding_from_bytes(
         return None
 
 
-def extract_embedding_batch(
-    model: nn.Module,
-    image_bytes_list: List[bytes],
-    device: torch.device,
-) -> List[Optional[List[float]]]:
-    """Batch embedding extraction."""
-    results = []
-    for i in range(0, len(image_bytes_list), BATCH_SIZE):
-        batch_bytes = image_bytes_list[i:i + BATCH_SIZE]
-        tensors = []
-        valid_idx = []
-        for j, b in enumerate(batch_bytes):
-            emb = extract_embedding_from_bytes(model, b, device)
-            if emb:
-                tensors.append(emb)
-                valid_idx.append(i + j)
-            results.append(None)
-        for idx, emb in zip(valid_idx, tensors):
-            results[idx] = emb
-    return results
-
-
 def cluster_embeddings(
     embeddings: List[List[float]],
     distance_threshold: float = DISTANCE_THRESHOLD,
 ) -> List[int]:
     """
-    Run Agglomerative Clustering on embeddings.
-    Returns list of cluster labels (integers).
-    Best approach: cosine metric + average linkage (from person_dedupe.py)
+    Agglomerative Clustering on embeddings (cosine metric, average linkage).
+    Returns list of cluster labels.
     """
     if len(embeddings) < 2:
         return list(range(len(embeddings)))
-
     arr = np.array(embeddings, dtype=np.float32)
     try:
         clustering = AgglomerativeClustering(
@@ -117,14 +89,12 @@ def cluster_embeddings(
             linkage="average",
         ).fit(arr)
     except TypeError:
-        # Fallback for older sklearn
         clustering = AgglomerativeClustering(
             n_clusters=None,
             distance_threshold=distance_threshold,
             affinity="euclidean",
             linkage="average",
         ).fit(arr)
-
     return clustering.labels_.tolist()
 
 
@@ -134,28 +104,69 @@ def find_duplicates_in_clusters(
     sharpness_scores: Optional[List[float]] = None,
 ) -> Tuple[List[str], int]:
     """
-    Given a list of DB row IDs and cluster labels, determine which IDs
-    are duplicates (i.e. not the best representative of their cluster).
-    Returns (list_of_duplicate_ids_to_delete, unique_count).
+    Given DB row IDs and cluster labels, find which IDs are duplicates.
+    Returns (list_of_duplicate_ids, unique_count).
+    The sharpest image in each cluster is kept; rest are duplicates.
     """
-    clusters = {}
+    clusters: Dict[int, List[Tuple[int, str]]] = {}
     for idx, (row_id, label) in enumerate(zip(ids, labels)):
         clusters.setdefault(label, []).append((idx, row_id))
 
-    duplicate_ids = []
-    unique_count  = 0
+    duplicate_ids: List[str] = []
+    unique_count = 0
 
     for label, members in clusters.items():
         unique_count += 1
         if len(members) <= 1:
             continue
-        # Pick the sharpest as the winner; if no sharpness data, pick first
         if sharpness_scores:
             scored = sorted(members, key=lambda m: sharpness_scores[m[0]], reverse=True)
         else:
             scored = members
-        # All except the winner are duplicates
         for (_, row_id) in scored[1:]:
             duplicate_ids.append(row_id)
 
     return duplicate_ids, unique_count
+
+
+def get_identity_representatives(
+    ids: List[str],
+    labels: List[int],
+    sharpness_scores: Optional[List[float]] = None,
+) -> Dict[int, str]:
+    """
+    Return {cluster_id -> best_embedding_id} mapping.
+    The best representative per cluster is the sharpest image.
+    """
+    clusters: Dict[int, List[Tuple[int, str]]] = {}
+    for idx, (row_id, label) in enumerate(zip(ids, labels)):
+        clusters.setdefault(label, []).append((idx, row_id))
+
+    representatives: Dict[int, str] = {}
+    for label, members in clusters.items():
+        if sharpness_scores:
+            best = max(members, key=lambda m: sharpness_scores[m[0]])
+        else:
+            best = members[0]
+        representatives[label] = best[1]
+    return representatives
+
+
+async def update_cluster_labels_db(
+    ids: List[str],
+    labels: List[int],
+    duplicate_ids_set: set,
+) -> None:
+    """
+    Write cluster_id and is_duplicate back to face_embeddings rows.
+    """
+    from shared.db import update_face_embedding_cluster
+    tasks = [
+        update_face_embedding_cluster(
+            embedding_id=row_id,
+            cluster_id=label,
+            is_duplicate=(row_id in duplicate_ids_set),
+        )
+        for row_id, label in zip(ids, labels)
+    ]
+    await asyncio.gather(*tasks, return_exceptions=True)

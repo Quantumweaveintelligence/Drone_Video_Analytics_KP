@@ -1,12 +1,12 @@
+# -*- coding: utf-8 -*-
 """
-DVAS Analytics — Postgres Database Client
-Async connection pool using asyncpg. Single Postgres instance, 'dvas' database.
+DVAS Analytics — PostgreSQL helpers (asyncpg).
+All functions use a shared connection pool.
 """
-import uuid
 import json
 import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+import uuid
+from typing import Dict, List, Optional, Any
 
 import asyncpg
 
@@ -26,11 +26,11 @@ async def get_pool() -> asyncpg.Pool:
             max_size=10,
             command_timeout=30,
         )
-        log.info("Postgres connection pool established")
+        log.info("DB pool created: %s", cfg.DATABASE_URL)
     return _pool
 
 
-async def close_pool():
+async def close_pool() -> None:
     global _pool
     if _pool:
         await _pool.close()
@@ -38,16 +38,15 @@ async def close_pool():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Drone helpers
+# Drones
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def ensure_drone(drone_id: str) -> None:
-    """Insert drone row if it doesn't exist (idempotent)."""
     pool = await get_pool()
     await pool.execute(
         """
-        INSERT INTO drones (drone_id, label, status)
-        VALUES ($1, $1, 'active')
+        INSERT INTO drones (drone_id, status)
+        VALUES ($1, 'active')
         ON CONFLICT (drone_id) DO NOTHING
         """,
         drone_id,
@@ -55,42 +54,64 @@ async def ensure_drone(drone_id: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Track management
+# Tracks
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def upsert_track(
     drone_id: str,
-    mission_id: Optional[str],
-    track_type: str,  # 'person' | 'vehicle' | 'vessel'
-    first_seen: datetime,
-    last_seen: datetime,
-    metadata: Optional[Dict] = None,
+    external_id: Optional[str],
+    track_type: str,
+    first_seen,
+    last_seen,
+    tracker_id: Optional[int] = None,
 ) -> str:
-    """Create or update a track, return track_id (UUID string)."""
+    """
+    Insert or update a track row. Returns track_id (UUID string).
+    Deduplication: if tracker_id is provided, upsert by (drone_id, tracker_id, track_type).
+    """
     pool = await get_pool()
     track_id = str(uuid.uuid4())
+    if tracker_id is not None:
+        row = await pool.fetchrow(
+            """
+            INSERT INTO tracks (track_id, drone_id, track_type, first_seen, last_seen,
+                                metadata)
+            VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb)
+            ON CONFLICT DO NOTHING
+            RETURNING track_id::text
+            """,
+            track_id, drone_id, track_type, first_seen, last_seen,
+            json.dumps({"tracker_id": tracker_id}),
+        )
+        if row:
+            return str(row["track_id"])
+        # Already exists — fetch it
+        existing = await pool.fetchrow(
+            """
+            SELECT track_id::text FROM tracks
+            WHERE drone_id=$1 AND track_type=$2
+              AND metadata->>'tracker_id' = $3
+            ORDER BY first_seen DESC LIMIT 1
+            """,
+            drone_id, track_type, str(tracker_id),
+        )
+        if existing:
+            # Update last_seen
+            await pool.execute(
+                "UPDATE tracks SET last_seen=$1 WHERE track_id=$2::uuid",
+                last_seen, existing["track_id"],
+            )
+            return existing["track_id"]
+    # Plain insert
     await pool.execute(
         """
-        INSERT INTO tracks (track_id, drone_id, mission_id, track_type, first_seen, last_seen, metadata)
-        VALUES ($1, $2, $3::uuid, $4, $5, $6, $7::jsonb)
+        INSERT INTO tracks (track_id, drone_id, track_type, first_seen, last_seen)
+        VALUES ($1::uuid, $2, $3, $4, $5)
+        ON CONFLICT (track_id) DO UPDATE SET last_seen = EXCLUDED.last_seen
         """,
-        track_id,
-        drone_id,
-        mission_id,
-        first_seen,
-        last_seen,
-        json.dumps(metadata or {}),
+        track_id, drone_id, track_type, first_seen, last_seen,
     )
     return track_id
-
-
-async def update_track_last_seen(track_id: str, last_seen: datetime) -> None:
-    pool = await get_pool()
-    await pool.execute(
-        "UPDATE tracks SET last_seen=$1 WHERE track_id=$2::uuid",
-        last_seen,
-        track_id,
-    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,39 +122,39 @@ async def write_confirmed_event(
     drone_id: str,
     event_type: str,
     confidence: float,
-    ts: datetime,
+    ts,
     track_id: Optional[str] = None,
-    mission_id: Optional[str] = None,
-    zone_id: Optional[str] = None,
-    latitude: Optional[float] = None,
-    longitude: Optional[float] = None,
     attributes: Optional[Dict] = None,
 ) -> str:
-    """Insert a confirmed event, return event_id."""
     pool = await get_pool()
     event_id = str(uuid.uuid4())
     await pool.execute(
         """
         INSERT INTO confirmed_events
-            (event_id, drone_id, mission_id, zone_id, track_id,
-             event_type, confidence, ts, latitude, longitude, attributes)
-        VALUES
-            ($1::uuid, $2, $3::uuid, $4::uuid, $5::uuid,
-             $6, $7, $8, $9, $10, $11::jsonb)
+            (event_id, drone_id, event_type, confidence, ts, track_id, attributes)
+        VALUES ($1::uuid, $2, $3, $4, $5, $6::uuid, $7::jsonb)
         """,
-        event_id,
-        drone_id,
-        mission_id,
-        zone_id,
-        track_id,
-        event_type,
-        confidence,
-        ts,
-        latitude,
-        longitude,
-        json.dumps(attributes or {}),
+        event_id, drone_id, event_type, confidence, ts,
+        track_id, json.dumps(attributes or {}),
     )
     return event_id
+
+
+async def get_recent_confirmed_events(
+    limit: int = 50,
+    drone_id: Optional[str] = None,
+) -> List[Dict]:
+    pool = await get_pool()
+    if drone_id:
+        rows = await pool.fetch(
+            "SELECT * FROM confirmed_events WHERE drone_id=$1 ORDER BY ts DESC LIMIT $2",
+            drone_id, limit,
+        )
+    else:
+        rows = await pool.fetch(
+            "SELECT * FROM confirmed_events ORDER BY ts DESC LIMIT $1", limit
+        )
+    return [dict(r) for r in rows]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -142,18 +163,20 @@ async def write_confirmed_event(
 
 async def write_crowd_reading(
     drone_id: str,
-    ts: datetime,
+    ts,
     estimated_count: float,
     density_per_sqm: Optional[float] = None,
     zone_id: Optional[str] = None,
     heatmap_object_key: Optional[str] = None,
+    zone_densities: Optional[Dict] = None,
 ) -> None:
     pool = await get_pool()
     await pool.execute(
         """
         INSERT INTO crowd_density_readings
-            (drone_id, zone_id, ts, estimated_count, density_per_sqm, heatmap_object_key)
-        VALUES ($1, $2::uuid, $3, $4, $5, $6)
+            (drone_id, zone_id, ts, estimated_count, density_per_sqm,
+             heatmap_object_key, zone_densities)
+        VALUES ($1, $2::uuid, $3, $4, $5, $6, $7::jsonb)
         """,
         drone_id,
         zone_id,
@@ -161,6 +184,7 @@ async def write_crowd_reading(
         estimated_count,
         density_per_sqm,
         heatmap_object_key,
+        json.dumps(zone_densities) if zone_densities else None,
     )
 
 
@@ -219,6 +243,58 @@ async def write_vehicle_attributes(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Vehicle-plate linkage (DB-level, mirrors Redis)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def write_vehicle_plate_link(
+    tracker_id: int,
+    drone_id: str,
+    plate_text: str,
+    plate_conf: float,
+    vehicle_type: Optional[str] = None,
+    colour: Optional[str] = None,
+    plate_image_key: Optional[str] = None,
+    vehicle_image_key: Optional[str] = None,
+) -> str:
+    pool = await get_pool()
+    link_id = str(uuid.uuid4())
+    await pool.execute(
+        """
+        INSERT INTO vehicle_plate_links
+            (id, tracker_id, drone_id, plate_text, plate_conf,
+             vehicle_type, colour, plate_image_key, vehicle_image_key)
+        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (tracker_id, drone_id, plate_text)
+        DO UPDATE SET
+            plate_conf        = GREATEST(vehicle_plate_links.plate_conf, EXCLUDED.plate_conf),
+            colour            = COALESCE(EXCLUDED.colour, vehicle_plate_links.colour),
+            plate_image_key   = COALESCE(EXCLUDED.plate_image_key, vehicle_plate_links.plate_image_key),
+            vehicle_image_key = COALESCE(EXCLUDED.vehicle_image_key, vehicle_plate_links.vehicle_image_key),
+            linked_at         = now()
+        """,
+        link_id, tracker_id, drone_id, plate_text, plate_conf,
+        vehicle_type, colour, plate_image_key, vehicle_image_key,
+    )
+    return link_id
+
+
+async def get_vehicle_plate_link(
+    tracker_id: int,
+    drone_id: str,
+) -> Optional[Dict]:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """
+        SELECT * FROM vehicle_plate_links
+        WHERE tracker_id=$1 AND drone_id=$2
+        ORDER BY plate_conf DESC LIMIT 1
+        """,
+        tracker_id, drone_id,
+    )
+    return dict(row) if row else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Plate reads
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -228,30 +304,29 @@ async def write_plate_read(
     plate_text: str,
     ocr_confidence: float,
     is_reliable: bool,
-    vehicle_image_b64: Optional[str] = None,
+    vehicle_image_b64: Optional[str] = None,  # deprecated — use vehicle_image_key
+    plate_image_key: Optional[str] = None,
+    vehicle_image_key: Optional[str] = None,
 ) -> str:
-    """Insert plate read, return plate record id. Deduplication is by track_id."""
     pool = await get_pool()
     plate_id = str(uuid.uuid4())
     await pool.execute(
         """
         INSERT INTO plate_reads
-            (id, track_id, event_id, plate_text, ocr_confidence, is_reliable, vehicle_image_b64)
-        VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7)
+            (id, track_id, event_id, plate_text, ocr_confidence, is_reliable,
+             vehicle_image_b64, plate_image_key, vehicle_image_key)
+        VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9)
         ON CONFLICT (track_id) DO UPDATE SET
-            plate_text = EXCLUDED.plate_text,
-            ocr_confidence = EXCLUDED.ocr_confidence,
-            is_reliable = EXCLUDED.is_reliable,
-            vehicle_image_b64 = EXCLUDED.vehicle_image_b64,
-            updated_at = now()
+            plate_text        = EXCLUDED.plate_text,
+            ocr_confidence    = EXCLUDED.ocr_confidence,
+            is_reliable       = EXCLUDED.is_reliable,
+            vehicle_image_b64 = COALESCE(EXCLUDED.vehicle_image_b64, plate_reads.vehicle_image_b64),
+            plate_image_key   = COALESCE(EXCLUDED.plate_image_key,   plate_reads.plate_image_key),
+            vehicle_image_key = COALESCE(EXCLUDED.vehicle_image_key, plate_reads.vehicle_image_key),
+            updated_at        = now()
         """,
-        plate_id,
-        track_id,
-        event_id,
-        plate_text,
-        ocr_confidence,
-        is_reliable,
-        vehicle_image_b64,
+        plate_id, track_id, event_id, plate_text, ocr_confidence, is_reliable,
+        vehicle_image_b64, plate_image_key, vehicle_image_key,
     )
     return plate_id
 
@@ -298,7 +373,9 @@ async def remove_from_watchlist(plate_text: str) -> None:
 
 async def get_watchlist() -> List[Dict]:
     pool = await get_pool()
-    rows = await pool.fetch("SELECT * FROM plate_watchlist WHERE is_active=true ORDER BY added_at DESC")
+    rows = await pool.fetch(
+        "SELECT * FROM plate_watchlist WHERE is_active=true ORDER BY added_at DESC"
+    )
     return [dict(r) for r in rows]
 
 
@@ -320,19 +397,22 @@ async def write_face_embedding(
     image_path: str,
     embedding: List[float],
     drone_id: Optional[str] = None,
+    object_key: Optional[str] = None,
 ) -> str:
     pool = await get_pool()
     emb_id = str(uuid.uuid4())
     await pool.execute(
         """
-        INSERT INTO face_embeddings (id, track_id, image_path, embedding, drone_id, created_at)
-        VALUES ($1::uuid, $2::uuid, $3, $4::float4[], $5, now())
+        INSERT INTO face_embeddings
+            (id, track_id, image_path, embedding, drone_id, object_key, created_at)
+        VALUES ($1::uuid, $2::uuid, $3, $4::float4[], $5, $6, now())
         """,
         emb_id,
         track_id,
         image_path,
         embedding,
         drone_id,
+        object_key,
     )
     return emb_id
 
@@ -340,13 +420,17 @@ async def write_face_embedding(
 async def get_all_face_embeddings() -> List[Dict]:
     pool = await get_pool()
     rows = await pool.fetch(
-        "SELECT id, track_id, image_path, embedding, drone_id, created_at FROM face_embeddings ORDER BY created_at"
+        """
+        SELECT id, track_id, image_path, embedding, drone_id, cluster_id,
+               is_duplicate, object_key, created_at
+        FROM face_embeddings
+        ORDER BY created_at
+        """
     )
     return [dict(r) for r in rows]
 
 
 async def delete_face_embeddings(ids: List[str]) -> int:
-    """Delete duplicate embedding rows, return count deleted."""
     pool = await get_pool()
     if not ids:
         return 0
@@ -354,19 +438,105 @@ async def delete_face_embeddings(ids: List[str]) -> int:
         "DELETE FROM face_embeddings WHERE id = ANY($1::uuid[])",
         ids,
     )
-    # result is like "DELETE N"
     return int(result.split()[-1])
 
 
-async def get_recent_confirmed_events(limit: int = 50, drone_id: Optional[str] = None) -> List[Dict]:
+async def update_face_embedding_cluster(
+    embedding_id: str,
+    cluster_id: int,
+    is_duplicate: bool,
+) -> None:
     pool = await get_pool()
-    if drone_id:
-        rows = await pool.fetch(
-            "SELECT * FROM confirmed_events WHERE drone_id=$1 ORDER BY ts DESC LIMIT $2",
-            drone_id, limit
+    await pool.execute(
+        """
+        UPDATE face_embeddings
+        SET cluster_id=$1, is_duplicate=$2
+        WHERE id=$3::uuid
+        """,
+        cluster_id, is_duplicate, embedding_id,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Person identities (Re-ID)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def write_person_identity(
+    cluster_id: int,
+    best_image_key: Optional[str],
+    drone_id: Optional[str],
+    embedding_count: int = 1,
+) -> str:
+    pool = await get_pool()
+    identity_id = str(uuid.uuid4())
+    await pool.execute(
+        """
+        INSERT INTO person_identities
+            (identity_id, cluster_id, best_image_key, drone_id, embedding_count)
+        VALUES ($1::uuid, $2, $3, $4, $5)
+        ON CONFLICT DO NOTHING
+        """,
+        identity_id, cluster_id, best_image_key, drone_id, embedding_count,
+    )
+    return identity_id
+
+
+async def upsert_person_identity(
+    cluster_id: int,
+    best_image_key: Optional[str],
+    drone_id: Optional[str],
+    embedding_count: int = 1,
+) -> str:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT identity_id::text FROM person_identities WHERE cluster_id=$1 LIMIT 1",
+        cluster_id,
+    )
+    if row:
+        await pool.execute(
+            """
+            UPDATE person_identities
+            SET best_image_key=COALESCE($1, best_image_key),
+                embedding_count=$2,
+                last_seen=now()
+            WHERE cluster_id=$3
+            """,
+            best_image_key, embedding_count, cluster_id,
         )
-    else:
-        rows = await pool.fetch(
-            "SELECT * FROM confirmed_events ORDER BY ts DESC LIMIT $1", limit
-        )
+        return row["identity_id"]
+    return await write_person_identity(cluster_id, best_image_key, drone_id, embedding_count)
+
+
+async def get_person_identities(limit: int = 50) -> List[Dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT * FROM person_identities ORDER BY last_seen DESC LIMIT $1", limit
+    )
     return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Evidence frames (MinIO object references)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def write_evidence_frame(
+    object_key: str,
+    frame_type: str,
+    checksum_sha256: str,
+    event_id: Optional[str] = None,
+    evidence_id: Optional[str] = None,
+    bucket: str = "dvas-evidence",
+) -> str:
+    pool = await get_pool()
+    frame_id = str(uuid.uuid4())
+    await pool.execute(
+        """
+        INSERT INTO evidence_frames
+            (frame_id, event_id, evidence_id, object_key, frame_type,
+             checksum_sha256, bucket)
+        VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7)
+        """,
+        frame_id, event_id, evidence_id, object_key, frame_type,
+        checksum_sha256, bucket,
+    )
+    return frame_id

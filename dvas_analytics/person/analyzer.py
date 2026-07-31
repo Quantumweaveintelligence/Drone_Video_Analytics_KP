@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Person & Face Analyzer — headless adaptation of person_face_crowd.py.
-Uses tile-based detection for accuracy on aerial/drone footage.
+Person & Face Analyzer — production-ready with ByteTrack cross-frame tracking.
+Uses YOLOv8m for person tracking (.track persist=True) and YOLOv8n-face
+for tile-based face detection, linking faces to person tracks by IoU.
 """
 import base64
 import logging
 import time
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -16,12 +17,13 @@ from ultralytics import YOLO
 
 log = logging.getLogger(__name__)
 
-TILE_ROWS        = 2
-TILE_COLS        = 2
+FACE_TILE_ROWS   = 2
+FACE_TILE_COLS   = 2
 TILE_IMG_SIZE    = 1280
-CONF_THRESHOLD   = 0.20
+CONF_PERSON      = 0.20
+CONF_FACE        = 0.25
 NMS_IOU          = 0.40
-SAVE_EVERY_N     = 5     # Save face crops every N frames
+SAVE_EVERY_N     = 5
 
 
 def _bbox_dict(x1, y1, x2, y2):
@@ -29,7 +31,6 @@ def _bbox_dict(x1, y1, x2, y2):
 
 
 def _crop_to_b64(frame: np.ndarray, x1, y1, x2, y2) -> Optional[str]:
-    """Crop a region from frame and return base64 JPEG."""
     h, w = frame.shape[:2]
     x1, y1 = max(0, int(x1)), max(0, int(y1))
     x2, y2 = min(w, int(x2)), min(h, int(y2))
@@ -40,22 +41,54 @@ def _crop_to_b64(frame: np.ndarray, x1, y1, x2, y2) -> Optional[str]:
     return base64.b64encode(buf).decode()
 
 
-def detect_on_tiles(
+def _crop_to_bytes(frame: np.ndarray, x1, y1, x2, y2) -> Optional[bytes]:
+    h, w = frame.shape[:2]
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(w, int(x2)), min(h, int(y2))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    crop = frame[y1:y2, x1:x2]
+    _, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return bytes(buf)
+
+
+def _iou(b1, b2) -> float:
+    """IoU between two (x1,y1,x2,y2) boxes."""
+    ix1 = max(b1[0], b2[0]); iy1 = max(b1[1], b2[1])
+    ix2 = min(b1[2], b2[2]); iy2 = min(b1[3], b2[3])
+    iw = max(0, ix2 - ix1); ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter == 0:
+        return 0.0
+    a1 = (b1[2]-b1[0]) * (b1[3]-b1[1])
+    a2 = (b2[2]-b2[0]) * (b2[3]-b2[1])
+    return inter / (a1 + a2 - inter + 1e-6)
+
+
+def _face_in_person(face_bbox, person_bbox, threshold=0.1) -> bool:
+    """True if face centre falls inside person bbox (with some tolerance)."""
+    fx = (face_bbox["x1"] + face_bbox["x2"]) / 2
+    fy = (face_bbox["y1"] + face_bbox["y2"]) / 2
+    px1, py1 = person_bbox["x1"], person_bbox["y1"]
+    px2, py2 = person_bbox["x2"], person_bbox["y2"]
+    pw = px2 - px1; ph = py2 - py1
+    return (
+        px1 - pw * threshold <= fx <= px2 + pw * threshold and
+        py1 - ph * threshold <= fy <= py2 + ph * threshold
+    )
+
+
+def detect_faces_on_tiles(
     model: YOLO,
     frame: np.ndarray,
-    rows: int = TILE_ROWS,
-    cols: int = TILE_COLS,
-    classes: Optional[List[int]] = None,
+    rows: int = FACE_TILE_ROWS,
+    cols: int = FACE_TILE_COLS,
     device=0,
 ) -> List[Tuple[int, int, int, int, float]]:
-    """
-    Tile-based detection — identical logic to person_face_crowd.py.
-    Returns list of (x1, y1, x2, y2, confidence).
-    """
+    """Tile-based face detection. Returns list of (x1, y1, x2, y2, conf)."""
     h_img, w_img = frame.shape[:2]
     step_h, step_w = h_img // rows, w_img // cols
     overlap = 150
-
     all_boxes, all_confidences = [], []
 
     for r in range(rows):
@@ -65,25 +98,22 @@ def detect_on_tiles(
             y2 = min(h_img, (r + 1) * step_h + overlap)
             x2 = min(w_img, (c + 1) * step_w + overlap)
             tile = frame[y1:y2, x1:x2]
-
             results = model(
                 tile, device=device, imgsz=TILE_IMG_SIZE,
-                conf=CONF_THRESHOLD, classes=classes,
-                verbose=False, agnostic_nms=True,
+                conf=CONF_FACE, verbose=False, agnostic_nms=True,
             )
             for res in results:
                 for box in res.boxes:
                     bx1, by1, bx2, by2 = box.xyxy[0].cpu().numpy()
                     conf = float(box.conf[0].cpu().numpy())
-                    gx1, gy1 = int(bx1 + x1), int(by1 + y1)
-                    gx2, gy2 = int(bx2 + x1), int(by2 + y1)
+                    gx1 = int(bx1 + x1); gy1 = int(by1 + y1)
+                    gx2 = int(bx2 + x1); gy2 = int(by2 + y1)
                     all_boxes.append([gx1, gy1, gx2 - gx1, gy2 - gy1])
                     all_confidences.append(conf)
 
     if not all_boxes:
         return []
-
-    indices = cv2.dnn.NMSBoxes(all_boxes, all_confidences, CONF_THRESHOLD, NMS_IOU)
+    indices = cv2.dnn.NMSBoxes(all_boxes, all_confidences, CONF_FACE, NMS_IOU)
     final = []
     if len(indices) > 0:
         for i in indices.flatten():
@@ -95,8 +125,7 @@ def detect_on_tiles(
 
 class PersonFaceAnalyzer:
     """
-    Headless person + face detector.
-    Wraps YOLOv8m (person) and YOLOv8n-face (face) with tile-based inference.
+    Production person + face analyzer with ByteTrack cross-frame person tracking.
     """
 
     def __init__(self, person_model_path: str, face_model_path: str):
@@ -130,45 +159,84 @@ class PersonFaceAnalyzer:
         save_crops: bool = True,
     ) -> dict:
         """
-        Detect persons and faces in a frame.
-        Returns a dict matching FrameAnalysisResult.
+        Detect and track persons (ByteTrack) + detect faces (tile-based).
+        Persons get stable tracker_id across frames.
+        Each face is linked to the nearest person by centre-point containment.
         """
         t0 = time.perf_counter()
         self._frame_count += 1
+        persons: List[dict] = []
+        faces:   List[dict] = []
 
-        persons, faces = [], []
-
-        # ── Person detection ─────────────────────────────────────────────
+        # ── Person detection + ByteTrack ─────────────────────────────────────
         if self.person_model:
-            person_boxes = detect_on_tiles(
-                self.person_model, frame_bgr,
-                classes=[0], device=self.device,
-            )
-            for (x1, y1, x2, y2, conf) in person_boxes:
-                crop_b64 = None
-                if save_crops and self._frame_count % 10 == 0:
-                    crop_b64 = _crop_to_b64(frame_bgr, x1, y1, x2, y2)
-                persons.append({
-                    "bbox": _bbox_dict(x1, y1, x2, y2),
-                    "confidence": round(conf, 4),
-                    "crop_b64": crop_b64,
-                })
+            try:
+                results = self.person_model.track(
+                    frame_bgr,
+                    persist=True,
+                    imgsz=640,
+                    conf=CONF_PERSON,
+                    classes=[0],      # person class
+                    device=self.device,
+                    verbose=False,
+                )
+                if results and results[0].boxes:
+                    for box in results[0].boxes:
+                        if box.id is None:
+                            continue
+                        tracker_id = int(box.id[0])
+                        conf = float(box.conf[0])
+                        x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
 
-        # ── Face detection ────────────────────────────────────────────────
+                        crop_b64  = None
+                        crop_bytes = None
+                        if save_crops and self._frame_count % SAVE_EVERY_N == 0:
+                            crop_bytes = _crop_to_bytes(frame_bgr, x1, y1, x2, y2)
+                            if crop_bytes:
+                                crop_b64 = base64.b64encode(crop_bytes).decode()
+
+                        persons.append({
+                            "tracker_id": tracker_id,
+                            "bbox":       _bbox_dict(x1, y1, x2, y2),
+                            "confidence": round(conf, 4),
+                            "crop_b64":   crop_b64,
+                            "crop_bytes": crop_bytes,   # kept for MinIO upload
+                        })
+            except Exception as exc:
+                log.warning("Person tracking error: %s", exc)
+
+        # ── Face detection (tile-based) ───────────────────────────────────────
         if self.face_model:
-            face_boxes = detect_on_tiles(
-                self.face_model, frame_bgr,
-                classes=[0], device=self.device,
-            )
-            for (x1, y1, x2, y2, conf) in face_boxes:
-                crop_b64 = None
-                if save_crops and self._frame_count % SAVE_EVERY_N == 0:
-                    crop_b64 = _crop_to_b64(frame_bgr, x1, y1, x2, y2)
-                faces.append({
-                    "bbox": _bbox_dict(x1, y1, x2, y2),
-                    "confidence": round(conf, 4),
-                    "crop_b64": crop_b64,
-                })
+            try:
+                face_boxes = detect_faces_on_tiles(
+                    self.face_model, frame_bgr, device=self.device
+                )
+                for (x1, y1, x2, y2, conf) in face_boxes:
+                    face_bbox = _bbox_dict(x1, y1, x2, y2)
+
+                    # Link face to person by containment
+                    linked_tracker_id = None
+                    for p in persons:
+                        if _face_in_person(face_bbox, p["bbox"]):
+                            linked_tracker_id = p["tracker_id"]
+                            break
+
+                    crop_b64  = None
+                    crop_bytes = None
+                    if save_crops and self._frame_count % SAVE_EVERY_N == 0:
+                        crop_bytes = _crop_to_bytes(frame_bgr, x1, y1, x2, y2)
+                        if crop_bytes:
+                            crop_b64 = base64.b64encode(crop_bytes).decode()
+
+                    faces.append({
+                        "tracker_id": linked_tracker_id,
+                        "bbox":       face_bbox,
+                        "confidence": round(conf, 4),
+                        "crop_b64":   crop_b64,
+                        "crop_bytes": crop_bytes,
+                    })
+            except Exception as exc:
+                log.warning("Face detection error: %s", exc)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
         return {
