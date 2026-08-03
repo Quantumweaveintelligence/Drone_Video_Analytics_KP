@@ -54,11 +54,14 @@ class AuditLog(Base):
 class Mission(Base):
     __tablename__ = "missions"
 
-    id = Column(String, primary_key=True)
+    mission_id = Column(String, primary_key=True)
     name = Column(String, nullable=False)
     status = Column(String, nullable=False)
+    drone_id = Column(String, nullable=True)
+    operator_name = Column(String, nullable=True)
     jurisdiction = Column(String)
     started_at = Column(String)
+    ended_at = Column(String, nullable=True)
     operator_ids = Column(JSONB, default=list)  # list of user IDs
     supervisor = Column(String)
     zone = Column(String)

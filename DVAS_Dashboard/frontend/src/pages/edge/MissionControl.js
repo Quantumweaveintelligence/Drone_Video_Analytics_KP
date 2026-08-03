@@ -9,10 +9,24 @@ export default function MissionControl() {
 
   const [form, setForm] = useState({ name: '', id: '', drone: '', operator: '', location: '' });
 
-  const [missionLog, setMissionLog] = useState([
-    { id: "MSN-9941-BRAVO", designation: "Traffic Monitoring", drone: "DRN-002", operator: "A. Sharma", location: "Junction 12", start: "11:15:00", end: "13:45:00", status: "completed" },
-    { id: "MSN-9940-CHARLIE", designation: "VIP Route Sweep", drone: "DRN-001", operator: "K. Kumar", location: "Airport Road", start: "08:30:00", end: "10:15:00", status: "completed" },
-  ]);
+  const [missionLog, setMissionLog] = useState(() => {
+    const saved = localStorage.getItem('dvas_mission_log');
+    if (saved) {
+      try {
+        return JSON.parse(saved);
+      } catch (e) {
+        console.error("Failed to parse saved mission log", e);
+      }
+    }
+    return [
+      { id: "MSN-9941-BRAVO", designation: "Traffic Monitoring", drone: "DRN-002", operator: "A. Sharma", location: "Junction 12", start: "11:15:00", end: "13:45:00", status: "completed" },
+      { id: "MSN-9940-CHARLIE", designation: "VIP Route Sweep", drone: "DRN-001", operator: "K. Kumar", location: "Airport Road", start: "08:30:00", end: "10:15:00", status: "completed" },
+    ];
+  });
+
+  useEffect(() => {
+    localStorage.setItem('dvas_mission_log', JSON.stringify(missionLog));
+  }, [missionLog]);
 
   const [loading, setLoading] = useState(false);
 
@@ -70,6 +84,27 @@ export default function MissionControl() {
           status: 'active',
         }, ...prev]);
         setForm({ name: '', id: '', drone: '', operator: '', location: '' });
+
+        // Save to backend database
+        try {
+          await fetch('/api/missions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${localStorage.getItem('token')}`
+            },
+            body: JSON.stringify({
+              mission_id: data.mission_id,
+              name: data.mission_name,
+              drone_id: data.drone_id,
+              operator_name: form.operator,
+              location: form.location,
+              started_at: data.start_time
+            })
+          });
+        } catch (backendErr) {
+          console.error("Failed to save mission to backend:", backendErr);
+        }
       }
     } catch (err) {
       console.error('Failed to start mission:', err);
@@ -88,6 +123,21 @@ export default function MissionControl() {
             ? { ...m, end: data.end_time || new Date().toLocaleTimeString('en-GB'), status: 'completed' }
             : m
         ));
+        
+        // Update backend database
+        if (activeMission?.id) {
+          try {
+            await fetch(`/api/missions/${activeMission.id}/end`, {
+              method: 'PATCH',
+              headers: {
+                'Authorization': `Bearer ${localStorage.getItem('token')}`
+              }
+            });
+          } catch (backendErr) {
+            console.error("Failed to mark mission as ended in backend:", backendErr);
+          }
+        }
+        
         setActiveMission(null);
       }
     } catch (err) {

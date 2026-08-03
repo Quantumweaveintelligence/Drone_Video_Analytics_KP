@@ -20,6 +20,7 @@ import zipfile
 from fastapi import (
     FastAPI,
     APIRouter,
+    Body,
     Depends,
     HTTPException,
     Request,
@@ -29,7 +30,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
-from sqlalchemy import select, update, delete, func, or_
+from sqlalchemy import select, update, delete, func, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, EmailStr
 from fpdf import FPDF
@@ -389,10 +390,61 @@ async def list_missions(user: dict = Depends(get_current_user)):
         if "mission_id" in f:
             in_list = f["mission_id"].get("$in", [])
             if in_list:
-                stmt = stmt.where(Mission.id.in_(in_list))
+                stmt = stmt.where(Mission.mission_id.in_(in_list))
         stmt = stmt.order_by(Mission.started_at.desc()).limit(50)
         result = await session.execute(stmt)
         return [_row_to_dict(r) for r in result.scalars().all()]
+
+
+# ---------- Mission create / end (wired to Edge Mission Control) ----------
+@api.post("/missions")
+async def create_mission(payload: dict = Body(...)):
+    """
+    Save a new mission record to the database.
+    Called by the frontend after the edge node confirms mission start.
+    """
+    mission_id = payload.get("mission_id")
+    name = payload.get("name") or payload.get("mission_name", "Unnamed Mission")
+    drone_id = payload.get("drone_id", "")
+    operator_name = payload.get("operator_name") or payload.get("operator", "")
+    location = payload.get("location", "")
+    started_at = payload.get("started_at", "")
+
+    if not mission_id:
+        raise HTTPException(400, "mission_id is required")
+
+    async with async_session_factory() as session:
+        # Check for duplicate
+        existing = await session.get(Mission, mission_id)
+        if existing:
+            return {"status": "already_exists", "mission_id": mission_id}
+
+        mission = Mission(
+            mission_id=mission_id,
+            name=name,
+            status="active",
+            drone_id=drone_id,
+            operator_name=operator_name,
+            zone=location,
+            started_at=started_at,
+        )
+        session.add(mission)
+        await session.commit()
+
+    return {"status": "saved", "mission_id": mission_id}
+
+
+@api.patch("/missions/{mission_id}/end")
+async def end_mission_record(mission_id: str):
+    """Mark a mission as completed and record the end time."""
+    async with async_session_factory() as session:
+        mission = await session.get(Mission, mission_id)
+        if not mission:
+            raise HTTPException(404, f"Mission {mission_id} not found")
+        mission.status = "completed"
+        mission.ended_at = datetime.now(timezone.utc).isoformat()
+        await session.commit()
+    return {"status": "ended", "mission_id": mission_id}
 
 
 # ---------- Export approval workflow ----------
@@ -642,7 +694,7 @@ async def edge_shift_summary(request: Request, token: str = ""):
     if user.get("mission_scope"):
         async with async_session_factory() as session:
             result = await session.execute(
-                select(Mission).where(Mission.id.in_(user["mission_scope"]))
+                select(Mission).where(Mission.mission_id.in_(user["mission_scope"]))
             )
             missions = [_row_to_dict(r) for r in result.scalars().all()]
     # Look up own audit entries in last 12h to summarise anomalies reported
@@ -1198,7 +1250,22 @@ SEED_USERS = [
 
 
 async def seed_data():
-    # Create all tables
+    # ── Migrate existing missions table (rename id → mission_id, add new cols) ──
+    async with engine.begin() as conn:
+        # Check if old 'id' column exists in missions table
+        result = await conn.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'missions' AND column_name = 'id'"
+        ))
+        has_old_id = result.fetchone() is not None
+
+        if has_old_id:
+            logger.info("Migrating missions table: renaming 'id' → 'mission_id', adding new columns...")
+            # Drop and recreate missions table (safe — seed data will re-populate)
+            await conn.execute(text("DROP TABLE IF EXISTS missions CASCADE"))
+            logger.info("Dropped old missions table; it will be recreated with new schema.")
+
+    # Create all tables (including the new missions schema)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
@@ -1244,14 +1311,23 @@ async def seed_data():
                 await _seed_audit_chain(session, user_ids_by_email)
             return  # already seeded
 
+        # Clean slate for dependent seed tables to prevent IntegrityError on re-seed
+        await session.execute(delete(Drone))
+        await session.execute(delete(Alert))
+        await session.execute(delete(Evidence))
+        await session.execute(delete(Export))
+        await session.commit()
+
         now = datetime.now(timezone.utc)
         op_id = user_ids_by_email["operator@dvas.kp"]
 
         missions = [
             {
-                "id": "M-101",
+                "mission_id": "M-101",
                 "name": "Attukal Pongala Crowd Watch",
                 "status": "active",
+                "drone_id": "DR-01",
+                "operator_name": "Ravi Menon",
                 "jurisdiction": "Thiruvananthapuram",
                 "started_at": (now - timedelta(hours=3)).isoformat(),
                 "operator_ids": [op_id],
@@ -1260,9 +1336,11 @@ async def seed_data():
                 "objective": "Crowd density & choke-point monitoring",
             },
             {
-                "id": "M-102",
+                "mission_id": "M-102",
                 "name": "Kochi Marine Drive Traffic",
                 "status": "active",
+                "drone_id": "DR-02",
+                "operator_name": "K. Suresh",
                 "jurisdiction": "Thiruvananthapuram",
                 "started_at": (now - timedelta(hours=1)).isoformat(),
                 "operator_ids": [],
@@ -1271,9 +1349,11 @@ async def seed_data():
                 "objective": "Vehicle flow & anomaly detection",
             },
             {
-                "id": "M-103",
+                "mission_id": "M-103",
                 "name": "Kozhikode Beach Perimeter",
                 "status": "closed",
+                "drone_id": "DR-03",
+                "operator_name": "R. Menon",
                 "jurisdiction": "Kozhikode",
                 "started_at": (now - timedelta(days=2)).isoformat(),
                 "operator_ids": [],
