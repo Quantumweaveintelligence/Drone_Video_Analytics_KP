@@ -16,6 +16,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - default
 
   backend:
     build: ./backend
@@ -25,15 +27,20 @@ services:
       - "8001:8000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - DATABASE_URL=postgresql+asyncpg://dvas:dvas_secret@postgres:5432/dvas
       - JWT_SECRET=super-secret-dvas-key-change-in-prod
-      - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://10.51.27.155:3000,http://10.51.27.250:3000
-      - INGEST_SERVER_URL=http://10.51.27.250
+      - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://10.235.245.250:3000,http://10.51.27.155:3000,http://10.51.27.250:3000
+      - INGEST_SERVER_URL=http://drone_nginx
       - EDGE_SERVER_URL=http://edge:8765
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - default
+      - drone-net
 
   edge:
     build: ../dvas_edge
@@ -47,16 +54,21 @@ services:
       - ../dvas_edge/DJI_0112.MP4:/data/DJI_0112.MP4:ro
       - ../dvas_edge/DJI_0113.mp4:/data/DJI_0113.mp4:ro
       - edge_buffer:/app/buffer_storage
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - VIDEO_DIR=/data
       - SIMULATION__ENABLED=true
       - INGEST__ENABLED=true
-      - INGEST__URL=http://10.51.27.250/ingest/frame
-      - INGEST_URL=http://10.51.27.250/ingest/frame
-      - TOKEN_URL=http://10.51.27.250:8080/realms/kerala-police-drone/protocol/openid-connect/token
-      - MISSION_START_URL=http://10.51.27.250/ingest/mission/start
-      - MISSION_END_URL=http://10.51.27.250/ingest/mission/end
+      - INGEST__URL=http://drone_nginx/ingest/frame
+      - INGEST_URL=http://drone_nginx/ingest/frame
+      - TOKEN_URL=http://drone_keycloak:8080/realms/kerala-police-drone/protocol/openid-connect/token
+      - MISSION_START_URL=http://drone_nginx/ingest/mission/start
+      - MISSION_END_URL=http://drone_nginx/ingest/mission/end
       - TLS_VERIFY=false
+    networks:
+      - default
+      - drone-net
 
   frontend:
     build: ./frontend
@@ -67,6 +79,14 @@ services:
     depends_on:
       - backend
       - edge
+    networks:
+      - default
+
+networks:
+  default:
+  drone-net:
+    name: dvas_ingest_drone-net
+    external: true
 
 volumes:
   pgdata:

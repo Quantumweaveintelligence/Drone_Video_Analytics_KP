@@ -281,7 +281,7 @@ services:
       valkey:
         condition: service_healthy
     healthcheck:
-      test:     ["CMD-SHELL", "pgrep -f gpu_consumer.py || exit 1"]
+      test:     ["CMD-SHELL", "kill -0 1 || exit 1"]
       interval: 30s
       timeout:  5s
       retries:  3
@@ -443,7 +443,7 @@ services:
       minio:
         condition: service_healthy
     healthcheck:
-      test:         ["CMD", "curl", "-f", "http://localhost:8101/health"]
+      test:         ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8101/health')"]
       interval:     30s
       timeout:      10s
       retries:      3
@@ -490,7 +490,7 @@ services:
       minio:
         condition: service_healthy
     healthcheck:
-      test:         ["CMD", "curl", "-f", "http://localhost:8102/health"]
+      test:         ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8102/health')"]
       interval:     30s
       timeout:      10s
       retries:      3
@@ -535,7 +535,7 @@ services:
       minio:
         condition: service_healthy
     healthcheck:
-      test:         ["CMD", "curl", "-f", "http://localhost:8103/health"]
+      test:         ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8103/health')"]
       interval:     30s
       timeout:      10s
       retries:      3
@@ -559,6 +559,15 @@ services:
       VEHICLE_MODEL: /analytics/anpr/models/yolov8m.pt
       LP_MODEL:      /analytics/anpr/models/license_plate_detector.pt
       LOG_LEVEL:     INFO
+      MINIO_ENDPOINT:   minio:9000
+      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-minioadmin}"
+      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-minioadmin}"
+      MINIO_SECURE:     "false"
+      BUCKET_EVIDENCE:  dvas-evidence
+      BUCKET_FACES:     dvas-faces
+      BUCKET_PLATES:    dvas-plates
+      BUCKET_HEATMAPS:  dvas-heatmaps
+      BUCKET_VEHICLES:  dvas-vehicles
     deploy:
       resources:
         reservations:
@@ -573,28 +582,14 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     healthcheck:
       test:         ["CMD", "curl", "-f", "http://localhost:8104/health"]
       interval:     30s
       timeout:      15s
       retries:      5
       start_period: 180s  # PaddleOCR model download on first run
-    environment:
-      DATABASE_URL:  postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
-      REDIS_URL:     redis://valkey:6379/0
-      DRONE_IDS:     "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
-      VEHICLE_MODEL: /analytics/anpr/models/yolov8m.pt
-      LP_MODEL:      /analytics/anpr/models/license_plate_detector.pt
-      LOG_LEVEL:     INFO
-      MINIO_ENDPOINT:   minio:9000
-      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-minioadmin}"
-      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-minioadmin}"
-      MINIO_SECURE:     "false"
-      BUCKET_EVIDENCE:  dvas-evidence
-      BUCKET_FACES:     dvas-faces
-      BUCKET_PLATES:    dvas-plates
-      BUCKET_HEATMAPS:  dvas-heatmaps
-      BUCKET_VEHICLES:  dvas-vehicles
 
   # ════════════════════════════════════════════════════════════════════════════
   # OBJECT STORAGE — MinIO (S3-compatible)
