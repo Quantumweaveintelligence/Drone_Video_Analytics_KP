@@ -105,6 +105,8 @@ class IngestClient:
         self.token:        Optional[str] = None
         self.token_expiry: float         = 0.0
         self.frame_seq:    int           = 0
+        # Persistent HTTP client — avoids TCP+TLS handshake per frame
+        self._http_client: Optional[httpx.AsyncClient] = None
 
     # ── Token management ──────────────────────────────────────────────────────
 
@@ -137,7 +139,24 @@ class IngestClient:
 
     async def get_token(self) -> str:
         """Return a valid token, refreshing 30 seconds before expiry."""
-        return "demo-token"
+        if self.token and time.time() < self.token_expiry - 30:
+            return self.token
+        return await self._acquire_token()
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Return the persistent HTTP client, creating it on first use."""
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(
+                verify=_tls_param(),
+                timeout=15.0,
+            )
+        return self._http_client
+
+    async def close(self) -> None:
+        """Close the persistent HTTP client."""
+        if self._http_client and not self._http_client.is_closed:
+            await self._http_client.close()
+            self._http_client = None
 
     # ── Frame upload ──────────────────────────────────────────────────────────
 
@@ -184,13 +203,13 @@ class IngestClient:
 
         for attempt in range(1, retries + 1):
             try:
-                async with httpx.AsyncClient(verify=_tls_param(), timeout=15.0) as client:
-                    resp = await client.post(
-                        INGEST_URL,
-                        headers={"Authorization": f"Bearer {token}"},
-                        files={"frame": ("frame.jpg", frame_bytes, "image/jpeg")},
-                        data={"metadata_json": json.dumps(meta)},
-                    )
+                client = await self._get_client()
+                resp = await client.post(
+                    INGEST_URL,
+                    headers={"Authorization": f"Bearer {token}"},
+                    files={"frame": ("frame.jpg", frame_bytes, "image/jpeg")},
+                    data={"metadata_json": json.dumps(meta)},
+                )
 
                 if resp.status_code < 500:
                     # Client errors (4xx) — do not retry
@@ -273,13 +292,13 @@ class IngestClient:
 
         for attempt in range(1, retries + 1):
             try:
-                async with httpx.AsyncClient(verify=_tls_param(), timeout=15.0) as client:
-                    resp = await client.post(
-                        INGEST_URL,
-                        headers={"Authorization": f"Bearer {token}"},
-                        files={"frame": ("frame.jpg", frame_bytes, "image/jpeg")},
-                        data={"metadata_json": json.dumps(meta)},
-                    )
+                client = await self._get_client()
+                resp = await client.post(
+                    INGEST_URL,
+                    headers={"Authorization": f"Bearer {token}"},
+                    files={"frame": ("frame.jpg", frame_bytes, "image/jpeg")},
+                    data={"metadata_json": json.dumps(meta)},
+                )
 
                 if resp.status_code < 500:
                     resp.raise_for_status()
@@ -335,13 +354,13 @@ class IngestClient:
             payload["mission_name"] = mission_name
         if location:
             payload["location"] = location
-        async with httpx.AsyncClient(verify=_tls_param(), timeout=10.0) as client:
-            resp = await client.post(
-                mission_start_url,
-                headers={"Authorization": f"Bearer {token}"},
-                json=payload,
-            )
-            resp.raise_for_status()
+        client = await self._get_client()
+        resp = await client.post(
+            mission_start_url,
+            headers={"Authorization": f"Bearer {token}"},
+            json=payload,
+        )
+        resp.raise_for_status()
         log.info("mission_started", extra={"mission": self.mission_id})
 
     async def end_mission(self) -> None:
@@ -351,17 +370,17 @@ class IngestClient:
             "http://10.51.27.250/ingest/mission/end"
         )
         token = await self.get_token()
-        async with httpx.AsyncClient(verify=_tls_param(), timeout=10.0) as client:
-            resp = await client.post(
-                mission_end_url,
-                headers={"Authorization": f"Bearer {token}"},
-                json={
-                    "drone_id":    self.drone_id,
-                    "mission_id":  self.mission_id,
-                    "frames_sent": self.frame_seq,
-                },
-            )
-            resp.raise_for_status()
+        client = await self._get_client()
+        resp = await client.post(
+            mission_end_url,
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "drone_id":    self.drone_id,
+                "mission_id":  self.mission_id,
+                "frames_sent": self.frame_seq,
+            },
+        )
+        resp.raise_for_status()
         log.info(
             "mission_ended",
             extra={"mission": self.mission_id, "frames": self.frame_seq},
@@ -388,6 +407,7 @@ async def run_single(args: argparse.Namespace) -> None:
     )
     print(json.dumps(result, indent=2))
     await client.end_mission()
+    await client.close()
 
 
 async def run_loop(args: argparse.Namespace) -> None:
@@ -428,6 +448,7 @@ async def run_loop(args: argparse.Namespace) -> None:
         log.info("loop_stopped")
     finally:
         await client.end_mission()
+        await client.close()
 
 
 def main() -> None:

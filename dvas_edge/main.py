@@ -85,7 +85,10 @@ from src.video.drone_simulation_source import DroneSimulationSource
 from src.video.drone_video_source import DroneVideoSource
 from src.video.frame_interpolator import FrameInterpolator
 from src.video.stream_viewer import StreamViewer
+from core.camera_source import VideoFrame
+from core.models import SelectedFrame, LocationData
 from ingest.edge_sender import IngestClient
+from ingest.offline_buffer import OfflineBuffer
 
 
 # ---------------------------------------------------------------------------
@@ -105,23 +108,27 @@ class EdgeSenderThread(threading.Thread):
     def __init__(self, client: IngestClient, max_queue: int = 64) -> None:
         super().__init__(name="EdgeSenderThread", daemon=True)
         self._client   = client
-        self._queue:   queue.Queue[Optional[SelectedFrame]] = queue.Queue(maxsize=max_queue)
+        self._buffer   = OfflineBuffer()
         self._loop:    Optional[asyncio.AbstractEventLoop] = None
         self._started  = threading.Event()
         self._running  = True
 
     def put_frame(self, frame: SelectedFrame) -> None:
-        """Enqueue a SelectedFrame for transmission (non-blocking; drops on full)."""
-        try:
-            self._queue.put_nowait(frame)
-        except queue.Full:
-            log.warning("edge_sender_queue_full_dropping_frame",
-                        drone_id=frame.drone_id, frame_index=frame.frame_index)
+        """Enqueue a SelectedFrame for transmission."""
+        jpeg_bytes = frame.encode_jpeg()
+        tel = {
+            "lat": frame.location.lat if frame.location.lat != 0.0 else None,
+            "lon": frame.location.lon if frame.location.lon != 0.0 else None,
+            "alt": frame.location.altitude_m if frame.location.altitude_m != 0.0 else None,
+            "change_score": frame.change_score
+        }
+        self._buffer.put("selected", jpeg_bytes, tel)
 
     def stop(self) -> None:
         """Signal the thread to drain remaining frames and exit."""
         self._running = False
-        self._queue.put_nowait(None)   # sentinel to unblock get()
+        with self._buffer._cond:
+            self._buffer._cond.notify_all()
 
     def run(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -139,31 +146,31 @@ class EdgeSenderThread(threading.Thread):
 
         self._started.set()
 
-        while True:
-            try:
-                frame = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: self._queue.get(timeout=1.0)
-                )
-            except queue.Empty:
-                if not self._running:
-                    break
+        while self._running:
+            item = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self._buffer.get(timeout=1.0)
+            )
+
+            if item is None:
                 continue
 
-            if frame is None:          # stop sentinel
-                break
+            frame_id, kind, jpeg_bytes, tel = item
 
             try:
-                jpeg_bytes = frame.encode_jpeg()
                 await self._client.send_frame_bytes(
                     frame_bytes  = jpeg_bytes,
-                    change_score = frame.change_score,
-                    lat          = frame.location.lat   if frame.location.lat   != 0.0 else None,
-                    lon          = frame.location.lon   if frame.location.lon   != 0.0 else None,
-                    alt          = frame.location.altitude_m if frame.location.altitude_m != 0.0 else None,
+                    change_score = tel.get("change_score", 0.0),
+                    lat          = tel.get("lat"),
+                    lon          = tel.get("lon"),
+                    alt          = tel.get("alt"),
                 )
+                self._buffer.commit(frame_id)
             except Exception as exc:
                 log.error("edge_sender_frame_failed",
-                          frame_index=frame.frame_index, error=str(exc))
+                          frame_id=frame_id, error=str(exc))
+                await asyncio.sleep(2.0)
+                
+        self._buffer.close()
 
         # End mission lifecycle
         try:

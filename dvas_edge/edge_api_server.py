@@ -57,6 +57,7 @@ from src.change_detection.change_event import ChangeEvent
 from src.cognitive_frame_selector import CognitiveFrameSelector
 from src.cognitive_frame_selector.selected_frame import SelectedFrame
 from ingest.edge_sender import IngestClient
+from ingest.offline_buffer import OfflineBuffer
 
 # ---------------------------------------------------------------------------
 # Drone ID → video file mapping
@@ -97,7 +98,7 @@ class EdgeSenderThread(threading.Thread):
     def __init__(self, client: IngestClient, max_queue: int = 64) -> None:
         super().__init__(name="EdgeSenderThread", daemon=True)
         self._client   = client
-        self._queue:   queue.Queue[_QueueItem] = queue.Queue(maxsize=max_queue)
+        self._buffer   = OfflineBuffer()
         self._loop:    Optional[asyncio.AbstractEventLoop] = None
         self._running  = True
         self._mission_name: Optional[str] = None
@@ -110,24 +111,25 @@ class EdgeSenderThread(threading.Thread):
 
     def put_frame(self, frame: SelectedFrame, telemetry: dict = None) -> None:
         """Queue a SelectedFrame (from cognitive pipeline) with optional telemetry."""
-        try:
-            self._queue.put_nowait(("selected", frame, telemetry))
-        except queue.Full:
-            pass
+        jpeg_bytes = frame.encode_jpeg()
+        
+        tel = telemetry or {}
+        tel["lat"] = frame.location.lat if frame.location.lat != 0.0 else None
+        tel["lon"] = frame.location.lon if frame.location.lon != 0.0 else None
+        tel["alt"] = frame.location.altitude_m if frame.location.altitude_m != 0.0 else None
+        tel["change_score"] = frame.change_score
+        
+        self._buffer.put("selected", jpeg_bytes, tel)
 
     def put_raw_frame(self, jpeg_bytes: bytes, telemetry: dict = None) -> None:
         """Queue raw JPEG bytes (pipeline bypass mode) with optional telemetry."""
-        try:
-            self._queue.put_nowait(("raw", jpeg_bytes, telemetry))
-        except queue.Full:
-            pass
+        self._buffer.put("raw", jpeg_bytes, telemetry or {})
 
     def stop(self) -> None:
         self._running = False
-        try:
-            self._queue.put_nowait(None)
-        except queue.Full:
-            pass
+        # Wake up the buffer get() if it's waiting
+        with self._buffer._cond:
+            self._buffer._cond.notify_all()
 
     def run(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -144,64 +146,52 @@ class EdgeSenderThread(threading.Thread):
         except Exception:
             pass
 
-        while True:
-            try:
-                item = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: self._queue.get(timeout=1.0)
-                )
-            except queue.Empty:
-                if not self._running:
-                    break
-                continue
+        while self._running:
+            item = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self._buffer.get(timeout=1.0)
+            )
+            
             if item is None:
-                break
+                continue
+                
+            frame_id, kind, jpeg_bytes, tel = item
+            
             try:
-                if isinstance(item, tuple) and len(item) == 3:
-                    kind, payload, telemetry = item
-                    tel = telemetry or {}
-                    speed   = tel.get("speed_mps")
-                    battery = tel.get("battery_pct")
-
-                    if kind == "selected":
-                        # payload is a SelectedFrame
-                        frame = payload
-                        jpeg_bytes = frame.encode_jpeg()
-                        await self._client.send_frame_bytes(
-                            frame_bytes  = jpeg_bytes,
-                            change_score = frame.change_score,
-                            lat          = frame.location.lat   if frame.location.lat   != 0.0 else None,
-                            lon          = frame.location.lon   if frame.location.lon   != 0.0 else None,
-                            alt          = frame.location.altitude_m if frame.location.altitude_m != 0.0 else None,
-                            speed_mps    = speed,
-                            battery_pct  = battery,
-                        )
-                    elif kind == "raw":
-                        # payload is raw JPEG bytes (bypass mode)
-                        lat = tel.get("latitude")
-                        lon = tel.get("longitude")
-                        alt = tel.get("altitude_m")
-                        await self._client.send_frame_bytes(
-                            frame_bytes  = payload,
-                            change_score = 0.0,
-                            lat          = lat if lat and lat != 0.0 else None,
-                            lon          = lon if lon and lon != 0.0 else None,
-                            alt          = alt if alt and alt != 0.0 else None,
-                            speed_mps    = speed,
-                            battery_pct  = battery,
-                        )
-                else:
-                    # Legacy: bare SelectedFrame (should not happen, but safe fallback)
-                    frame = item
-                    jpeg_bytes = frame.encode_jpeg()
+                speed   = tel.get("speed_mps")
+                battery = tel.get("battery_pct")
+                
+                if kind == "selected":
                     await self._client.send_frame_bytes(
                         frame_bytes  = jpeg_bytes,
-                        change_score = frame.change_score,
-                        lat          = frame.location.lat   if frame.location.lat   != 0.0 else None,
-                        lon          = frame.location.lon   if frame.location.lon   != 0.0 else None,
-                        alt          = frame.location.altitude_m if frame.location.altitude_m != 0.0 else None,
+                        change_score = tel.get("change_score", 0.0),
+                        lat          = tel.get("lat"),
+                        lon          = tel.get("lon"),
+                        alt          = tel.get("alt"),
+                        speed_mps    = speed,
+                        battery_pct  = battery,
                     )
-            except Exception:
-                pass
+                elif kind == "raw":
+                    await self._client.send_frame_bytes(
+                        frame_bytes  = jpeg_bytes,
+                        change_score = 0.0,
+                        lat          = tel.get("latitude"),
+                        lon          = tel.get("longitude"),
+                        alt          = tel.get("altitude_m"),
+                        speed_mps    = speed,
+                        battery_pct  = battery,
+                    )
+                    
+                # Success! Remove from buffer
+                self._buffer.commit(frame_id)
+                
+            except Exception as exc:
+                log.error(f"edge_sender_frame_failed_buffering id={frame_id} error={exc}")
+                # Do NOT commit, meaning it will be retried on next loop.
+                # Sleep briefly to avoid hammering the network while offline
+                await asyncio.sleep(2.0)
+                
+        # Graceful shutdown cleanup
+        self._buffer.close()
         try:
             await self._client.end_mission()
         except Exception:
