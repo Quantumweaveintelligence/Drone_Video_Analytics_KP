@@ -102,3 +102,43 @@ async def get_stream_info(drone_id: str) -> Dict:
         }
     except Exception:
         return {"stream_key": stream_key, "length": 0, "status": "not_found"}
+
+async def hset_vehicle_track(
+    tracker_id: int,
+    drone_id: str,
+    data: Dict[str, Any],
+    ttl: int = 300,
+) -> None:
+    """
+    Store vehicle track info (type, colour, plate) in Redis hash.
+    Key: vehicle:track:{drone_id}:{tracker_id}
+    TTL: 5 minutes by default.
+    """
+    client = get_client()
+    key = f"{cfg.VEHICLE_TRACK_KEY_PREFIX}:{drone_id}:{tracker_id}"
+    serialized = {k: json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+                  for k, v in data.items()}
+    await client.hset(key, mapping=serialized)
+    await client.expire(key, ttl)
+
+
+async def hget_vehicle_track(
+    tracker_id: int,
+    drone_id: str,
+) -> Dict[str, Any]:
+    """
+    Retrieve vehicle track info from Redis.
+    Returns {} if not found.
+    """
+    client = get_client()
+    key = f"{cfg.VEHICLE_TRACK_KEY_PREFIX}:{drone_id}:{tracker_id}"
+    raw = await client.hgetall(key)
+    if not raw:
+        return {}
+    result = {}
+    for k, v in raw.items():
+        try:
+            result[k] = json.loads(v)
+        except (json.JSONDecodeError, ValueError):
+            result[k] = v
+    return result

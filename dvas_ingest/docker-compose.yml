@@ -60,6 +60,8 @@ volumes:
     driver: local
   analytics_evidence:
     driver: local     # evidence crops saved by analytics services (../dvas_analytics/)
+  minio_data:
+    driver: local     # MinIO object storage for crops, heatmaps, plate images
 
 services:
 
@@ -418,6 +420,12 @@ services:
       MODEL_PATH:            /analytics/crowd/models/crowd_counting.pth
       CROWD_ALERT_THRESHOLD: "${CROWD_ALERT_THRESHOLD:-50}"
       LOG_LEVEL:             INFO
+      MINIO_ENDPOINT:        minio:9000
+      MINIO_ACCESS_KEY:      "${MINIO_ACCESS_KEY:-minioadmin}"
+      MINIO_SECRET_KEY:      "${MINIO_SECRET_KEY:-minioadmin}"
+      MINIO_SECURE:          "false"
+      BUCKET_HEATMAPS:       dvas-heatmaps
+      BUCKET_EVIDENCE:       dvas-evidence
     deploy:
       resources:
         reservations:
@@ -431,6 +439,8 @@ services:
       postgres:
         condition: service_healthy
       valkey:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     healthcheck:
       test:         ["CMD", "curl", "-f", "http://localhost:8101/health"]
@@ -456,6 +466,13 @@ services:
       PERSON_MODEL: /analytics/person/models/yolov8m.pt
       FACE_MODEL:   /analytics/person/models/yolov8n-face.pt
       LOG_LEVEL:    INFO
+      MINIO_ENDPOINT:   minio:9000
+      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-minioadmin}"
+      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-minioadmin}"
+      MINIO_SECURE:     "false"
+      BUCKET_FACES:     dvas-faces
+      BUCKET_EVIDENCE:  dvas-evidence
+      REID_CLUSTER_INTERVAL: "${REID_CLUSTER_INTERVAL:-50}"
     deploy:
       resources:
         reservations:
@@ -469,6 +486,8 @@ services:
       postgres:
         condition: service_healthy
       valkey:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     healthcheck:
       test:         ["CMD", "curl", "-f", "http://localhost:8102/health"]
@@ -493,6 +512,12 @@ services:
       DRONE_IDS:     "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
       VEHICLE_MODEL: /analytics/vehicle/models/visdrone.pt
       LOG_LEVEL:     INFO
+      MINIO_ENDPOINT:   minio:9000
+      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-minioadmin}"
+      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-minioadmin}"
+      MINIO_SECURE:     "false"
+      BUCKET_VEHICLES:  dvas-vehicles
+      BUCKET_EVIDENCE:  dvas-evidence
     deploy:
       resources:
         reservations:
@@ -506,6 +531,8 @@ services:
       postgres:
         condition: service_healthy
       valkey:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     healthcheck:
       test:         ["CMD", "curl", "-f", "http://localhost:8103/health"]
@@ -552,3 +579,117 @@ services:
       timeout:      15s
       retries:      5
       start_period: 180s  # PaddleOCR model download on first run
+    environment:
+      DATABASE_URL:  postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
+      REDIS_URL:     redis://valkey:6379/0
+      DRONE_IDS:     "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
+      VEHICLE_MODEL: /analytics/anpr/models/yolov8m.pt
+      LP_MODEL:      /analytics/anpr/models/license_plate_detector.pt
+      LOG_LEVEL:     INFO
+      MINIO_ENDPOINT:   minio:9000
+      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-minioadmin}"
+      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-minioadmin}"
+      MINIO_SECURE:     "false"
+      BUCKET_EVIDENCE:  dvas-evidence
+      BUCKET_FACES:     dvas-faces
+      BUCKET_PLATES:    dvas-plates
+      BUCKET_HEATMAPS:  dvas-heatmaps
+      BUCKET_VEHICLES:  dvas-vehicles
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # OBJECT STORAGE — MinIO (S3-compatible)
+  # Stores: face crops, vehicle crops, plate images, crowd heatmaps, evidence
+  # UI:  http://localhost:9001  (admin / see MINIO_ACCESS_KEY + MINIO_SECRET_KEY)
+  # API: http://minio:9000      (internal S3 endpoint for analytics services)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  minio:
+    image: minio/minio:latest
+    container_name: drone_minio
+    networks: [drone-net]
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "0.0.0.0:9000:9000"   # S3 API
+      - "127.0.0.1:9001:9001" # MinIO console (localhost only)
+    environment:
+      MINIO_ROOT_USER:     "${MINIO_ACCESS_KEY:-minioadmin}"
+      MINIO_ROOT_PASSWORD: "${MINIO_SECRET_KEY:-minioadmin}"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test:         ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval:     30s
+      timeout:      10s
+      retries:      3
+      start_period: 10s
+
+  # One-shot bucket initializer — runs once, creates all required buckets, then exits
+  minio-init:
+    image: minio/mc:latest
+    container_name: drone_minio_init
+    networks: [drone-net]
+    restart: on-failure
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD} &&
+        mc mb --ignore-existing local/dvas-evidence &&
+        mc mb --ignore-existing local/dvas-faces &&
+        mc mb --ignore-existing local/dvas-plates &&
+        mc mb --ignore-existing local/dvas-heatmaps &&
+        mc mb --ignore-existing local/dvas-vehicles &&
+        mc anonymous set download local/dvas-evidence &&
+        echo '[minio-init] All buckets ready.'
+      "
+    environment:
+      MINIO_ROOT_USER:     "${MINIO_ACCESS_KEY:-minioadmin}"
+      MINIO_ROOT_PASSWORD: "${MINIO_SECRET_KEY:-minioadmin}"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # ANALYTICS GATEWAY — Unified SSE + Health + Stats for dashboard (port 8100)
+  # Dashboard connects here for: live events, summary stats, health checks
+  # ════════════════════════════════════════════════════════════════════════════
+
+  analytics-gateway:
+    build:
+      context:    ../dvas_analytics
+      dockerfile: gateway/Dockerfile
+    container_name: drone_analytics_gateway
+    networks: [drone-net]
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8100:8100"   # Unified analytics API for dashboard
+    environment:
+      DATABASE_URL: postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
+      REDIS_URL:    redis://valkey:6379/0
+      DRONE_IDS:    "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
+      CROWD_URL:    http://crowd-analyzer:8101
+      PERSON_URL:   http://person-analyzer:8102
+      VEHICLE_URL:  http://vehicle-analyzer:8103
+      ANPR_URL:     http://anpr-analyzer:8104
+      MINIO_ENDPOINT:   minio:9000
+      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-minioadmin}"
+      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-minioadmin}"
+      LOG_LEVEL:    INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      crowd-analyzer:
+        condition: service_healthy
+      person-analyzer:
+        condition: service_healthy
+      vehicle-analyzer:
+        condition: service_healthy
+      anpr-analyzer:
+        condition: service_healthy
+    healthcheck:
+      test:         ["CMD", "curl", "-f", "http://localhost:8100/health"]
+      interval:     30s
+      timeout:      10s
+      retries:      3
+      start_period: 30s

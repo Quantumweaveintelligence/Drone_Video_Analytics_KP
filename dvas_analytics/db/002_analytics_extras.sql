@@ -59,3 +59,18 @@ CREATE INDEX IF NOT EXISTS idx_theft_alerts_time  ON theft_alerts (detected_at D
 -- Grant access to dvas_app
 GRANT ALL PRIVILEGES ON face_embeddings, plate_watchlist, theft_alerts TO dvas_app;
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO dvas_app;
+
+-- person_identities: global Re-ID across cameras
+CREATE TABLE IF NOT EXISTS person_identities (
+    identity_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    cluster_id       INT NOT NULL,
+    best_image_key   TEXT,                    -- MinIO object key for best face crop
+    drone_id         TEXT REFERENCES drones(drone_id),
+    first_seen       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    embedding_count  INT NOT NULL DEFAULT 1,
+    notes            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_person_identities_cluster ON person_identities(cluster_id);
+GRANT ALL PRIVILEGES ON person_identities TO dvas_app;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO dvas_app;

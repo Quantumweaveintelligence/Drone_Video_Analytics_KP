@@ -1,43 +1,79 @@
 # -*- coding: utf-8 -*-
 """
-Vehicle Analyzer — wraps VehicleDetectionTracker for headless/API use.
-Adapted from detection.py.
+Vehicle Analyzer — wraps YOLO for vehicle detection/tracking.
+Uses HSV colour classifier (shared.colour_classifier) instead of TF1 model.
+Publishes vehicle track info to Redis for ANPR linkage.
 """
 import base64
-import json
 import logging
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import torch
+from ultralytics import YOLO
 
 log = logging.getLogger(__name__)
 
-VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle", "auto-rickshaw"}
+# Vehicle classes present in VisDrone model
+VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle", "auto-rickshaw",
+                   "van", "motor", "bicycle"}
+VEHICLE_COCO_IDS = {2, 3, 5, 6, 7}  # car, motorcycle, bus, train, truck
 
 
-def _crop_to_b64(frame: np.ndarray, x, y, w, h) -> Optional[str]:
-    """Crop vehicle from frame and return base64 JPEG."""
+def _crop_to_bytes(frame: np.ndarray, x1, y1, x2, y2) -> Optional[bytes]:
     fh, fw = frame.shape[:2]
-    x1 = max(0, int(x))
-    y1 = max(0, int(y))
-    x2 = min(fw, int(x + w))
-    y2 = min(fh, int(y + h))
+    x1 = max(0, int(x1)); y1 = max(0, int(y1))
+    x2 = min(fw, int(x2)); y2 = min(fh, int(y2))
     if x2 <= x1 or y2 <= y1:
         return None
     crop = frame[y1:y2, x1:x2]
     _, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    return base64.b64encode(buf).decode()
+    return bytes(buf)
+
+
+def _crop_to_b64(frame: np.ndarray, x1, y1, x2, y2) -> Optional[str]:
+    b = _crop_to_bytes(frame, x1, y1, x2, y2)
+    return base64.b64encode(b).decode() if b else None
+
+
+class _TrackState:
+    """Per-vehicle track state for speed estimation."""
+    def __init__(self):
+        self.positions: List[Tuple[float, float]] = []  # (cx, cy) history
+        self.timestamps: List[float] = []
+        self.max_history = 10
+
+    def update(self, cx: float, cy: float, ts: float):
+        self.positions.append((cx, cy))
+        self.timestamps.append(ts)
+        if len(self.positions) > self.max_history:
+            self.positions.pop(0)
+            self.timestamps.pop(0)
+
+    def estimate_speed_px_per_s(self) -> Optional[float]:
+        """Pixel displacement speed — caller converts to km/h with calibration."""
+        if len(self.positions) < 2:
+            return None
+        dx = self.positions[-1][0] - self.positions[0][0]
+        dy = self.positions[-1][1] - self.positions[0][1]
+        dt = self.timestamps[-1] - self.timestamps[0]
+        if dt < 0.001:
+            return None
+        return (dx**2 + dy**2) ** 0.5 / dt
 
 
 class VehicleAnalyzer:
     """
-    Headless wrapper around VehicleDetectionTracker.
-    Processes individual frames and returns structured detection results.
+    Headless vehicle detection + tracking with:
+    - ByteTrack cross-frame tracker
+    - HSV colour classification (no TF dependency)
+    - Speed estimation via centroid displacement
+    - Redis track info publishing for ANPR linkage
     """
 
     def __init__(self, model_path: str):
@@ -45,87 +81,63 @@ class VehicleAnalyzer:
         self.device     = "cuda" if torch.cuda.is_available() else "cpu"
         log.info("VehicleAnalyzer device: %s", self.device)
 
-        self.tracker = None
-        self._frame_detections: List[Dict] = []   # staging for callback
-        self._load_tracker()
-        self._vehicle_counter = 0
+        self.model: Optional[YOLO] = None
+        self._load_model()
 
-    def _load_tracker(self):
+        # Per-tracker state for speed estimation
+        self._track_states: Dict[int, _TrackState] = defaultdict(_TrackState)
+
+        # HSV colour classifier (lazy import to avoid issues if shared/ not on path yet)
+        self._colour_classifier = None
+
+    def _load_model(self):
         try:
-            sys.path.insert(0, "/analytics/vehicle")
-            from VehicleDetectionTracker.VehicleDetectionTracker import VehicleDetectionTracker
-            self.tracker = VehicleDetectionTracker(model_path=self.model_path)
-            log.info("VehicleDetectionTracker loaded: %s", self.model_path)
+            self.model = YOLO(self.model_path)
+            log.info("Vehicle YOLO model loaded: %s", self.model_path)
         except Exception as exc:
-            log.error("Failed to load VehicleDetectionTracker: %s", exc)
-            self.tracker = None
+            log.error("Failed to load vehicle model: %s", exc)
+            self.model = None
+
+    def _get_colour_classifier(self):
+        if self._colour_classifier is None:
+            try:
+                from shared.colour_classifier import classify_colour
+                self._colour_classifier = classify_colour
+            except ImportError:
+                log.warning("Colour classifier not available")
+                self._colour_classifier = lambda x, **kwargs: []
+        return self._colour_classifier
 
     @property
     def ready(self) -> bool:
-        return self.tracker is not None
-
-    # ── Frame-level callback used by VehicleDetectionTracker.process_video ────
-    def _frame_callback(self, result: dict):
-        """Capture detections emitted by the tracker callback."""
-        frame_ts = datetime.now(timezone.utc).isoformat()
-        for veh in result.get("detected_vehicles", []):
-            vtype = veh.get("vehicle_type", "")
-            if vtype not in VEHICLE_CLASSES:
-                continue
-            self._frame_detections.append({
-                "frame_timestamp":  frame_ts,
-                "vehicle_id":       veh.get("vehicle_id"),
-                "tracker_id":       veh.get("tracker_id"),
-                "vehicle_type":     vtype,
-                "confidence":       round(veh.get("detection_confidence", 0.0), 4),
-                "bbox_x":           round(veh["vehicle_coordinates"]["x"], 2),
-                "bbox_y":           round(veh["vehicle_coordinates"]["y"], 2),
-                "bbox_w":           round(veh["vehicle_coordinates"]["width"], 2),
-                "bbox_h":           round(veh["vehicle_coordinates"]["height"], 2),
-                "speed_info":       veh.get("speed_info", {}),
-                "colour_top3":      self._parse_json_field(veh.get("color_info")),
-                "make_model_top3":  self._parse_json_field(veh.get("model_info")),
-            })
-
-    @staticmethod
-    def _parse_json_field(value) -> list:
-        if not value:
-            return []
-        if isinstance(value, list):
-            return value
-        try:
-            return json.loads(value)
-        except Exception:
-            return []
+        return self.model is not None
 
     def analyze_frame(
         self,
         frame_bgr: np.ndarray,
         drone_id: str = "DRONE_KL_001",
         save_crops: bool = True,
+        px_per_meter: float = 0.1,   # calibration: pixels per meter (drone altitude dependent)
     ) -> dict:
         """
-        Process a single BGR frame through VehicleDetectionTracker.
-        Returns a dict matching VehicleFrameResult.
+        Process a single BGR frame.
+        Returns structured detection dict with colour, speed, and crop data.
         """
         if not self.ready:
             return {
-                "drone_id": drone_id, "ts": datetime.now(timezone.utc).isoformat(),
+                "drone_id": drone_id,
+                "ts": datetime.now(timezone.utc).isoformat(),
                 "frame_timestamp": datetime.now(timezone.utc).isoformat(),
                 "vehicles": [], "vehicle_count": 0, "inference_ms": 0.0,
             }
 
         t0 = time.perf_counter()
-        self._frame_detections.clear()
+        classify_colour = self._get_colour_classifier()
+        vehicles = []
+        now_ts = time.time()
 
-        # VehicleDetectionTracker expects a callback for each processed result.
-        # We call process_frame() if it exists, otherwise fall back to process_video
-        # with an in-memory capture. Use direct YOLO tracking for single-frame mode.
         try:
-            # Direct inference — use tracker's underlying model
-            import torch
-            model = self.tracker.model
-            results = model.track(
+            results = self.model.track(
                 frame_bgr,
                 persist=True,
                 imgsz=640,
@@ -134,48 +146,70 @@ class VehicleAnalyzer:
                 verbose=False,
             )
 
-            vehicles = []
             if results and results[0].boxes:
-                self.tracker._initialize_classifiers()
+                class_names = self.model.names
                 for box in results[0].boxes:
                     if box.id is None:
                         continue
+
                     tracker_id = int(box.id[0])
-                    seq_id     = self.tracker._get_sequential_id(tracker_id)
                     cls_id     = int(box.cls[0])
                     conf       = float(box.conf[0])
+                    vtype      = class_names.get(cls_id, "vehicle")
 
-                    # Map YOLO COCO class ID to vehicle type
-                    class_names = model.names
-                    vtype = class_names.get(cls_id, "vehicle")
-                    if vtype not in VEHICLE_CLASSES:
+                    # Accept any vehicle-ish class
+                    if vtype.lower() not in VEHICLE_CLASSES and cls_id not in VEHICLE_COCO_IDS:
                         continue
 
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    bx, by, bw, bh  = float(x1), float(y1), float(x2 - x1), float(y2 - y1)
+                    x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].cpu().numpy()]
+                    bx, by = float(x1), float(y1)
+                    bw, bh = float(x2 - x1), float(y2 - y1)
+                    cx, cy = x1 + bw / 2, y1 + bh / 2
 
-                    crop_b64 = None
+                    # Update track state for speed estimation
+                    state = self._track_states[tracker_id]
+                    state.update(cx, cy, now_ts)
+                    px_speed = state.estimate_speed_px_per_s()
+                    kph = None
+                    if px_speed is not None and px_per_meter > 0:
+                        # pixels/s -> m/s -> km/h
+                        kph = round((px_speed / px_per_meter) * 3.6, 1)
+                        kph = min(kph, 200.0)  # sanity cap
+
+                    # Crop vehicle
+                    crop_bytes = None
+                    crop_b64   = None
+                    colour_top3 = []
                     if save_crops:
-                        crop_b64 = _crop_to_b64(frame_bgr, bx, by, bw, bh)
+                        crop_bytes = _crop_to_bytes(frame_bgr, x1, y1, x2, y2)
+                        if crop_bytes:
+                            crop_b64 = base64.b64encode(crop_bytes).decode()
+                            # HSV colour classification on crop
+                            nparr = np.frombuffer(crop_bytes, np.uint8)
+                            crop_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                            if crop_bgr is not None:
+                                colour_top3 = classify_colour(crop_bgr, top_k=3)
 
                     vehicles.append({
-                        "vehicle_id":      seq_id,
-                        "tracker_id":      tracker_id,
-                        "vehicle_type":    vtype,
-                        "confidence":      round(conf, 4),
-                        "bbox_x":          round(bx, 2),
-                        "bbox_y":          round(by, 2),
-                        "bbox_w":          round(bw, 2),
-                        "bbox_h":          round(bh, 2),
-                        "speed_info":      {},
-                        "colour_top3":     [],
+                        "tracker_id":  tracker_id,
+                        "vehicle_type": vtype,
+                        "confidence":  round(conf, 4),
+                        "bbox_x":      round(bx, 2),
+                        "bbox_y":      round(by, 2),
+                        "bbox_w":      round(bw, 2),
+                        "bbox_h":      round(bh, 2),
+                        "speed_info": {
+                            "kph":         kph,
+                            "reliability": "estimated" if kph is not None else "unavailable",
+                        },
+                        "colour_top3":     colour_top3,
                         "make_model_top3": [],
                         "crop_b64":        crop_b64,
+                        "crop_bytes":      crop_bytes,  # kept for MinIO upload by main.py
                     })
 
         except Exception as exc:
-            log.error("Frame inference error: %s", exc)
-            vehicles = []
+            log.error("Vehicle frame inference error: %s", exc)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
         ts = datetime.now(timezone.utc)
