@@ -7,6 +7,8 @@ torchvision>=0.15.0
 opencv-python-headless==4.9.0.80
 numpy>=1.24.0
 ultralytics>=8.0.0
+# PaddleOCR pulls in an old shellingham; pin it so typer (from ultralytics) resolves
+shellingham>=1.3.0
 paddlepaddle-gpu; sys_platform != 'darwin'
 paddlepaddle; sys_platform == 'darwin'
 paddleocr>=2.6.0
