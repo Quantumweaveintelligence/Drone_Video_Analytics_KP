@@ -56,7 +56,7 @@ const MOCK_EVENTS = [
   {
     id: "evt-001",
     ts: new Date(Date.now() - 4 * 60000).toISOString(),
-    drone_id: "DR-02",
+    drone_id: "DRN-002",
     mission_id: "M-104",
     event_type: "Perimeter Breach",
     confidence: 94,
@@ -66,7 +66,7 @@ const MOCK_EVENTS = [
   {
     id: "evt-002",
     ts: new Date(Date.now() - 11 * 60000).toISOString(),
-    drone_id: "DR-01",
+    drone_id: "DRN-001",
     mission_id: "M-102",
     event_type: "Crowd Surge",
     confidence: 88,
@@ -76,7 +76,7 @@ const MOCK_EVENTS = [
   {
     id: "evt-003",
     ts: new Date(Date.now() - 23 * 60000).toISOString(),
-    drone_id: "DR-02",
+    drone_id: "DRN-002",
     mission_id: "M-104",
     event_type: "Suspicious Object",
     confidence: 77,
@@ -86,7 +86,7 @@ const MOCK_EVENTS = [
   {
     id: "evt-004",
     ts: new Date(Date.now() - 38 * 60000).toISOString(),
-    drone_id: "DR-01",
+    drone_id: "DRN-001",
     mission_id: "M-102",
     event_type: "Vehicle Violation",
     confidence: 91,
@@ -96,7 +96,7 @@ const MOCK_EVENTS = [
   {
     id: "evt-005",
     ts: new Date(Date.now() - 61 * 60000).toISOString(),
-    drone_id: "DR-03",
+    drone_id: "DRN-003",
     mission_id: "M-106",
     event_type: "Loitering Detected",
     confidence: 82,
@@ -106,7 +106,7 @@ const MOCK_EVENTS = [
   {
     id: "evt-006",
     ts: new Date(Date.now() - 78 * 60000).toISOString(),
-    drone_id: "DR-02",
+    drone_id: "DRN-002",
     mission_id: "M-104",
     event_type: "Intrusion Detection",
     confidence: 96,
@@ -117,7 +117,7 @@ const MOCK_EVENTS = [
 
 const MOCK_DRONES = [
   {
-    id: "DR-01",
+    id: "DRN-001",
     mission_id: "M-102",
     status: "live",
     battery_pct: 78,
@@ -138,7 +138,7 @@ const MOCK_DRONES = [
     uptime_min: 47,
   },
   {
-    id: "DR-02",
+    id: "DRN-002",
     mission_id: "M-104",
     status: "live",
     battery_pct: 51,
@@ -159,7 +159,7 @@ const MOCK_DRONES = [
     uptime_min: 31,
   },
   {
-    id: "DR-03",
+    id: "DRN-003",
     mission_id: "M-106",
     status: "degraded",
     battery_pct: 23,
@@ -574,9 +574,9 @@ function AnalyticsRow({ selectedDrone, drones, onOpenGallery }) {
   ];
 
   const safetyItems = [
-    { label: "Intrusion Detection", active: drone?.id === "DR-02", severity: "critical" },
-    { label: "Suspicious Object",   active: drone?.id === "DR-02", severity: "warning"  },
-    { label: "Perimeter Breach",    active: drone?.id === "DR-02", severity: "critical" },
+    { label: "Intrusion Detection", active: drone?.id === "DRN-002", severity: "critical" },
+    { label: "Suspicious Object",   active: drone?.id === "DRN-002", severity: "warning"  },
+    { label: "Perimeter Breach",    active: drone?.id === "DRN-002", severity: "critical" },
   ];
 
   /* ANPR Data Mock */
@@ -774,7 +774,7 @@ function AnalyticsRow({ selectedDrone, drones, onOpenGallery }) {
               </div>
               <div className="flex-1 flex flex-col items-center justify-center rounded p-2 relative" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-cyan)" }}>
                   <img src="https://images.unsplash.com/photo-1512428818580-08e13291eb81?auto=format&fit=crop&q=80&w=200&h=150" alt="Live Photo" className="w-full h-24 object-cover rounded mb-1" style={{ borderColor: "var(--dvas-cyan)" }} />
-                  <span className="mono text-[9px] tracking-wider" style={{ color: "var(--dvas-cyan)" }}>LIVE CAPTURE · DR-01</span>
+                  <span className="mono text-[9px] tracking-wider" style={{ color: "var(--dvas-cyan)" }}>LIVE CAPTURE · DRN-001</span>
                   <div className="absolute inset-0 m-2 flex items-center justify-center pointer-events-none">
                      <div className="w-12 h-12 border-2 rounded-sm" style={{ borderColor: "var(--dvas-crit)", opacity: 0.8 }}></div>
                   </div>

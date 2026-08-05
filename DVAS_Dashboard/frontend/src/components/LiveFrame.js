@@ -1,55 +1,106 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { API } from "@/lib/api";
 
+// Backoff schedule (ms) for consecutive 404/error responses.
+// After BACKOFF_STEPS.length failures we stay at the last (max) interval.
+const BACKOFF_STEPS = [500, 1000, 2000, 4000, 8000, 16000, 30000];
+
 export default function LiveFrame({ droneId, isOffline, isDegraded }) {
-  const [imgSrc, setImgSrc] = useState(null);
+  const [imgSrc,   setImgSrc]   = useState(null);
   const [hasFrame, setHasFrame] = useState(false);
   const [feedDead, setFeedDead] = useState(false);
-  const intervalRef = useRef(null);
+
+  // Refs so callbacks always see current values without re-registering effects
+  const timerRef     = useRef(null);   // setTimeout handle (replaces setInterval)
   const failCountRef = useRef(0);
   const deadTimerRef = useRef(null);
+  const mountedRef   = useRef(true);
+
+  // Clear all pending timers
+  const clearTimers = useCallback(() => {
+    if (timerRef.current)     clearTimeout(timerRef.current);
+    if (deadTimerRef.current) clearTimeout(deadTimerRef.current);
+    timerRef.current     = null;
+    deadTimerRef.current = null;
+  }, []);
 
   useEffect(() => {
-    if (isOffline) return;
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      clearTimers();
+    };
+  }, [clearTimers]);
 
-    setFeedDead(false);
+  useEffect(() => {
+    if (isOffline) {
+      clearTimers();
+      return;
+    }
+
+    // Reset state when droneId changes
     failCountRef.current = 0;
+    setFeedDead(false);
+    setHasFrame(false);
+    setImgSrc(null);
+    clearTimers();
+
+    const scheduleNext = (delayMs) => {
+      if (!mountedRef.current) return;
+      timerRef.current = setTimeout(load, delayMs);
+    };
 
     const load = () => {
-      const ts = Date.now();
+      if (!mountedRef.current) return;
+
+      const ts  = Date.now();
       const url = `${API}/ingest-server/frame/${droneId}/latest?t=${ts}`;
       const img = new Image();
-      
+
       img.onload = () => {
+        if (!mountedRef.current) return;
+        failCountRef.current = 0;
         setImgSrc(url);
         setHasFrame(true);
         setFeedDead(false);
-        failCountRef.current = 0;
-        
-        // Reset the dead feed timer
+
+        // Arm a "feed died" watchdog — if no new frame arrives in 3 s, mark dead
         if (deadTimerRef.current) clearTimeout(deadTimerRef.current);
         deadTimerRef.current = setTimeout(() => {
-          setFeedDead(true);
+          if (mountedRef.current) setFeedDead(true);
         }, 3000);
+
+        // Poll again at normal speed
+        scheduleNext(500);
       };
-      
+
       img.onerror = () => {
+        if (!mountedRef.current) return;
         failCountRef.current += 1;
+
+        // After 6 failures show FEED OFFLINE and slow right down
         if (failCountRef.current > 6) {
           setFeedDead(true);
         }
+
+        // Exponential backoff — cap at last step
+        const stepIdx = Math.min(failCountRef.current - 1, BACKOFF_STEPS.length - 1);
+        const delay   = BACKOFF_STEPS[stepIdx];
+        scheduleNext(delay);
       };
-      
+
       img.src = url;
     };
 
+    // Kick off immediately
     load();
-    intervalRef.current = setInterval(load, 500);
+
     return () => {
-      clearInterval(intervalRef.current);
-      if (deadTimerRef.current) clearTimeout(deadTimerRef.current);
+      clearTimers();
     };
-  }, [droneId, isOffline]);
+  }, [droneId, isOffline, clearTimers]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* ── Render ────────────────────────────────────────────── */
 
   if (isOffline || feedDead) {
     return (

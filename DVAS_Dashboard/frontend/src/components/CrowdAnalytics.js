@@ -24,6 +24,7 @@ import {
 import {
   useCrowdReadings, useCrowdTimeline, useCrowdHeatmap, useAnalyticsSSE,
 } from '../lib/useAnalytics';
+import LiveFrame from './LiveFrame';
 
 /* ───────────────────────────────────────────────────────────────
    CONSTANTS
@@ -104,17 +105,7 @@ function ServiceBadge({ online }) {
    SECTION 1 — Live Detection Video Stream
    ────────────────────────────────────────────────────────────── */
 function LiveStreamSection({ activeDrone, drones, setActiveDrone, liveCount, liveLevel }) {
-  const [playing, setPlaying] = useState(true);
-  const videoRef = useRef(null);
-  const isDemo = activeDrone === 'DRN-003';
-
-  const togglePlay = () => {
-    if (videoRef.current) {
-      if (playing) videoRef.current.pause();
-      else videoRef.current.play();
-    }
-    setPlaying(!playing);
-  };
+  const hasDrone = !!activeDrone;
 
   return (
     <div className="rounded-xl overflow-hidden"
@@ -122,7 +113,7 @@ function LiveStreamSection({ activeDrone, drones, setActiveDrone, liveCount, liv
       {/* Header */}
       <div className="px-4 py-3 flex items-center gap-3"
         style={{ borderBottom: '1px solid var(--dvas-border)' }}>
-        <span className={`w-2 h-2 rounded-full dvas-live-dot ${isDemo ? 'bg-red-500' : 'bg-slate-500'}`} />
+        <span className={`w-2 h-2 rounded-full dvas-live-dot ${hasDrone ? 'bg-red-500' : 'bg-slate-500'}`} />
         <span className="dvas-label font-semibold">Crowd Detection Live Feed</span>
         <div className="flex items-center gap-1 ml-2">
           {(drones?.length > 0 ? drones : [{ id: 'DRN-001' }, { id: 'DRN-002' }, { id: 'DRN-003' }, { id: 'DRN-004' }]).map(d => (
@@ -138,53 +129,36 @@ function LiveStreamSection({ activeDrone, drones, setActiveDrone, liveCount, liv
             >{d.id}</button>
           ))}
         </div>
-        <div className="ml-auto flex items-center gap-2">
-          {isDemo && (
-            <button
-              onClick={togglePlay}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
-              style={{ background: 'var(--dvas-elev)', color: 'var(--dvas-text-muted)', border: '1px solid var(--dvas-border)' }}
-            >
-              {playing ? <Pause size={12} /> : <Play size={12} />}
-              {playing ? 'Pause' : 'Play'}
-            </button>
-          )}
-        </div>
       </div>
 
       {/* Video area */}
       <div className="relative bg-black flex items-center justify-center" style={{ height: 420 }}>
-        {isDemo ? (
-          <>
-            <video
-              ref={videoRef}
-              src="/DETECTED/Demo_annotated.mp4"
-              autoPlay loop muted
-              className="w-full h-full object-cover"
-            />
-            <div className="absolute top-3 left-3 flex flex-col gap-1.5">
+        {hasDrone ? (
+          <div className="relative w-full h-full">
+            <LiveFrame droneId={activeDrone} isOffline={false} isDegraded={false} />
+            <div className="absolute top-3 left-3 flex flex-col gap-1.5 z-10">
               <div className="mono text-[10px] bg-black/80 px-2 py-1 rounded flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full" style={{ background: liveLevel.color }} />
-                <span style={{ color: liveLevel.color }}>{liveLevel.label}</span>
+                <span className="w-2 h-2 rounded-full" style={{ background: liveLevel?.color }} />
+                <span style={{ color: liveLevel?.color }}>{liveLevel?.label}</span>
                 <span className="text-slate-200 ml-1 font-bold">{liveCount} persons</span>
               </div>
               <div className="mono text-[10px] bg-black/80 px-2 py-1 rounded text-slate-300">
                 {(liveCount / 200).toFixed(2)} p/m²
               </div>
             </div>
-            <div className="absolute top-3 right-3 mono text-[10px] bg-black/80 px-2 py-1 rounded text-emerald-400 flex items-center gap-1">
+            <div className="absolute top-3 right-3 mono text-[10px] bg-black/80 px-2 py-1 rounded text-emerald-400 flex items-center gap-1 z-10">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 dvas-live-dot" />
-              LIVE · DEMO MODE
+              LIVE
             </div>
-            <div className="absolute bottom-3 left-3 mono text-[10px] bg-black/80 px-2 py-1 rounded text-slate-400">
+            <div className="absolute bottom-3 left-3 mono text-[10px] bg-black/80 px-2 py-1 rounded text-slate-400 z-10">
               Crowd Analytics Model · YOLOv8 · Tile-Based Detection
             </div>
-          </>
+          </div>
         ) : (
           <div className="text-center text-slate-500 flex flex-col items-center">
             <VideoOff size={48} className="mb-3 opacity-50 text-slate-600" />
             <p className="mono text-sm">Crowd analytics offline</p>
-            <p className="mono text-[10px] mt-1 text-slate-600">Select DRN-003 to view demo feed</p>
+            <p className="mono text-[10px] mt-1 text-slate-600">Select a drone to view live feed</p>
           </div>
         )}
       </div>

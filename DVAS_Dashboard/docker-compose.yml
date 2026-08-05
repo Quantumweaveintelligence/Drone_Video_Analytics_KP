@@ -65,6 +65,7 @@ services:
       - VIDEO_DIR=/data
       - SIMULATION__ENABLED=true
       - INGEST__ENABLED=true
+      - INGEST__DRONE_ID=DRN-004
       - KC_CLIENT_SEC=yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn
       - INGEST__URL=http://10.235.245.250/ingest/frame
       - INGEST_URL=http://10.235.245.250/ingest/frame

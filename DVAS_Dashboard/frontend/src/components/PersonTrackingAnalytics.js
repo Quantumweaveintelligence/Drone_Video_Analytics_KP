@@ -21,13 +21,14 @@ import {
 } from 'recharts';
 import {
   Users, Activity, AlertTriangle, CheckCircle, Eye, Radio,
-  Play, Pause, VideoOff, RefreshCw, Wifi, WifiOff, UserCheck,
+  VideoOff, RefreshCw, Wifi, WifiOff, UserCheck,
   Fingerprint, Clock, Copy, Database,
 } from 'lucide-react';
 import {
   usePersonTracks, usePersonDedup, usePersonIdentities,
   useFacesGallery, usePersonCount, useAnalyticsSSE,
 } from '../lib/useAnalytics';
+import LiveFrame from './LiveFrame';
 import { api } from '../lib/api';
 
 /* ───────────────────────────────────────────────────────────────
@@ -80,17 +81,7 @@ function Panel({ title, icon: Icon, iconClass = 'text-sky-400', children, right,
    SECTION 1 — Live Detection Video Stream
    ────────────────────────────────────────────────────────────── */
 function LiveStreamSection({ activeDrone, setActiveDrone, drones, liveCount }) {
-  const [playing, setPlaying] = useState(true);
-  const videoRef = useRef(null);
-  const isDemo   = activeDrone === 'DRN-003';
-
-  const togglePlay = () => {
-    if (videoRef.current) {
-      if (playing) videoRef.current.pause();
-      else videoRef.current.play();
-    }
-    setPlaying(!playing);
-  };
+  const hasDrone = !!activeDrone;
 
   const droneList = drones?.length > 0
     ? drones
@@ -101,7 +92,7 @@ function LiveStreamSection({ activeDrone, setActiveDrone, drones, liveCount }) {
       style={{ background: 'var(--dvas-surface)', border: '1px solid var(--dvas-border)' }}>
       <div className="px-4 py-3 flex items-center gap-3"
         style={{ borderBottom: '1px solid var(--dvas-border)' }}>
-        <span className={`w-2 h-2 rounded-full dvas-live-dot ${isDemo ? 'bg-sky-500' : 'bg-slate-500'}`} />
+        <span className={`w-2 h-2 rounded-full dvas-live-dot ${hasDrone ? 'bg-sky-500' : 'bg-slate-500'}`} />
         <span className="dvas-label font-semibold">Person & Face Detection Live Feed</span>
         <div className="flex items-center gap-1 ml-2">
           {droneList.map(d => (
@@ -114,29 +105,13 @@ function LiveStreamSection({ activeDrone, setActiveDrone, drones, liveCount }) {
               }}>{d.id}</button>
           ))}
         </div>
-        <div className="ml-auto flex items-center gap-2">
-          {liveCount > 0 && (
-            <span className="mono text-[10px] px-2 py-1 rounded"
-              style={{ background: 'rgba(56,189,248,0.1)', color: '#38bdf8', border: '1px solid rgba(56,189,248,0.2)' }}>
-              {liveCount} detected
-            </span>
-          )}
-          {isDemo && (
-            <button onClick={togglePlay}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium"
-              style={{ background: 'var(--dvas-elev)', color: 'var(--dvas-text-muted)', border: '1px solid var(--dvas-border)' }}>
-              {playing ? <Pause size={12} /> : <Play size={12} />}
-              {playing ? 'Pause' : 'Play'}
-            </button>
-          )}
-        </div>
       </div>
 
       <div className="relative bg-black flex items-center justify-center" style={{ height: 420 }}>
-        {isDemo ? (
-          <>
-            <video ref={videoRef} src="/DETECTED/Demo_annotated.mp4" autoPlay loop muted className="w-full h-full object-cover" />
-            <div className="absolute top-3 left-3 flex flex-col gap-1.5">
+        {hasDrone ? (
+          <div className="relative w-full h-full">
+            <LiveFrame droneId={activeDrone} isOffline={false} isDegraded={false} />
+            <div className="absolute top-3 left-3 flex flex-col gap-1.5 z-10">
               <div className="mono text-[10px] bg-black/80 px-2 py-1 rounded text-sky-300">
                 Person tracking active · ByteTrack
               </div>
@@ -144,19 +119,19 @@ function LiveStreamSection({ activeDrone, setActiveDrone, drones, liveCount }) {
                 Face detection · Re-ID enabled
               </div>
             </div>
-            <div className="absolute top-3 right-3 mono text-[10px] bg-black/80 px-2 py-1 rounded text-emerald-400 flex items-center gap-1">
+            <div className="absolute top-3 right-3 mono text-[10px] bg-black/80 px-2 py-1 rounded text-emerald-400 flex items-center gap-1 z-10">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 dvas-live-dot" />
-              LIVE · DEMO MODE
+              LIVE
             </div>
-            <div className="absolute bottom-3 left-3 mono text-[10px] bg-black/80 px-2 py-1 rounded text-slate-400">
+            <div className="absolute bottom-3 left-3 mono text-[10px] bg-black/80 px-2 py-1 rounded text-slate-400 z-10">
               YOLOv8m Person · YOLOv8n-face · ResNet50 Re-ID
             </div>
-          </>
+          </div>
         ) : (
           <div className="text-center text-slate-500 flex flex-col items-center">
             <VideoOff size={48} className="mb-3 opacity-50 text-slate-600" />
             <p className="mono text-sm">Person analytics offline</p>
-            <p className="mono text-[10px] mt-1 text-slate-600">Select DRN-003 for demo feed · Live feed when drones stream</p>
+            <p className="mono text-[10px] mt-1 text-slate-600">Select a drone to view live feed</p>
           </div>
         )}
       </div>

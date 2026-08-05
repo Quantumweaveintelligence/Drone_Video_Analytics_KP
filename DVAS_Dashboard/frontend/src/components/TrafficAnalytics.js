@@ -23,7 +23,7 @@ import {
 } from 'recharts';
 import {
   Car, Activity, AlertTriangle, CheckCircle, Hash,
-  TrendingUp, Gauge, ShieldAlert, Play, Pause, Search,
+  TrendingUp, Gauge, ShieldAlert, Search,
   Clock, VideoOff, RefreshCw, Plus, Trash2, Wifi, WifiOff,
 } from 'lucide-react';
 import {
@@ -31,6 +31,7 @@ import {
   usePlatesRecent, useTheftAlerts, useWatchlist, useAnalyticsSSE,
 } from '../lib/useAnalytics';
 import { api } from '../lib/api';
+import LiveFrame from './LiveFrame';
 
 /* ───────────────────────────────────────────────────────────────
    CONSTANTS
@@ -105,19 +106,9 @@ function Panel({ title, icon: Icon, iconClass = 'text-teal-400', children, right
    SECTION 1 — Live Detection Video Stream
    ────────────────────────────────────────────────────────────── */
 function LiveStreamSection({ activeDrone, setActiveDrone, drones, vehicleCount }) {
-  const [playing, setPlaying] = useState(true);
-  const videoRef = useRef(null);
   const isTrafficDrone = TRAFFIC_DRONES.includes(activeDrone);
-  const videoSrc = DRONE_VIDEO_MAP[activeDrone];
   const droneList = drones?.length > 0 ? drones : ALL_DRONE_IDS.map(id => ({ id }));
-
-  const togglePlay = () => {
-    if (videoRef.current) {
-      if (playing) videoRef.current.pause();
-      else videoRef.current.play();
-    }
-    setPlaying(!playing);
-  };
+  const isOffline = !activeDrone || !isTrafficDrone;
 
   return (
     <div className="rounded-xl overflow-hidden"
@@ -137,28 +128,13 @@ function LiveStreamSection({ activeDrone, setActiveDrone, drones, vehicleCount }
               }}>{d.id}</button>
           ))}
         </div>
-        <div className="ml-auto flex items-center gap-2">
-          {vehicleCount > 0 && (
-            <span className="mono text-[10px] px-2 py-1 rounded" style={{ background: 'rgba(139,92,246,0.12)', color: '#a78bfa', border: '1px solid rgba(139,92,246,0.2)' }}>
-              {vehicleCount} tracked
-            </span>
-          )}
-          {isTrafficDrone && (
-            <button onClick={togglePlay}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
-              style={{ background: 'var(--dvas-elev)', color: 'var(--dvas-text-muted)', border: '1px solid var(--dvas-border)' }}>
-              {playing ? <Pause size={12} /> : <Play size={12} />}
-              {playing ? 'Pause' : 'Play'}
-            </button>
-          )}
-        </div>
       </div>
 
       <div className="relative bg-black flex items-center justify-center" style={{ height: 420 }}>
-        {isTrafficDrone && videoSrc ? (
-          <>
-            <video ref={videoRef} src={videoSrc} autoPlay loop muted className="w-full h-full object-cover" />
-            <div className="absolute top-3 left-3 flex flex-col gap-1.5">
+        {isTrafficDrone ? (
+          <div className="relative w-full h-full">
+            <LiveFrame droneId={activeDrone} isOffline={false} isDegraded={false} />
+            <div className="absolute top-3 left-3 flex flex-col gap-1.5 z-10">
               <div className="mono text-[10px] bg-black/80 px-2 py-1 rounded text-violet-300">
                 Vehicle tracking active · {activeDrone}
               </div>
@@ -166,17 +142,17 @@ function LiveStreamSection({ activeDrone, setActiveDrone, drones, vehicleCount }
                 ANPR active · Number plate detection
               </div>
             </div>
-            <div className="absolute top-3 right-3 mono text-[10px] bg-black/80 px-2 py-1 rounded text-emerald-400 flex items-center gap-1">
+            <div className="absolute top-3 right-3 mono text-[10px] bg-black/80 px-2 py-1 rounded text-emerald-400 flex items-center gap-1 z-10">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 dvas-live-dot" />
-              LIVE · DEMO MODE
+              LIVE
             </div>
-            <div className="absolute bottom-3 left-3 mono text-[10px] bg-black/80 px-2 py-1 rounded text-slate-400">
+            <div className="absolute bottom-3 left-3 mono text-[10px] bg-black/80 px-2 py-1 rounded text-slate-400 z-10">
               YOLOv8 Vehicle Tracker · ANPR OCR Engine
             </div>
-            <div className="absolute bottom-3 right-3 mono text-[10px] bg-black/80 px-2 py-1 rounded text-slate-400">
+            <div className="absolute bottom-3 right-3 mono text-[10px] bg-black/80 px-2 py-1 rounded text-slate-400 z-10">
               {activeDrone} · Thiruvananthapuram
             </div>
-          </>
+          </div>
         ) : (
           <div className="text-center text-slate-500 flex flex-col items-center">
             <VideoOff size={48} className="mb-3 opacity-50 text-slate-600" />

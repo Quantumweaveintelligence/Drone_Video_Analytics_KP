@@ -59,14 +59,14 @@ const MOCK_TRACKING_LEDGER = [
 ];
 
 const MOCK_PLATES = [
-  { plate: "KL 01 AB 4521", ts: new Date(NOW - 12000).toISOString(),  drone: "DR-01", zone: "MG Road"     },
-  { plate: "KL 04 CD 8877", ts: new Date(NOW - 34000).toISOString(),  drone: "DR-02", zone: "North Gate"  },
-  { plate: "KL 11 EF 2210", ts: new Date(NOW - 71000).toISOString(),  drone: "DR-01", zone: "Beach Sector A" },
-  { plate: "TN 09 GH 3301", ts: new Date(NOW - 98000).toISOString(),  drone: "DR-03", zone: "East Fort"   },
-  { plate: "KL 02 JK 7654", ts: new Date(NOW - 143000).toISOString(), drone: "DR-02", zone: "Secretariat Rd" },
-  { plate: "KL 07 LM 5509", ts: new Date(NOW - 189000).toISOString(), drone: "DR-01", zone: "Palayam"     },
-  { plate: "KA 03 NP 0012", ts: new Date(NOW - 231000).toISOString(), drone: "DR-03", zone: "MG Road"     },
-  { plate: "KL 10 QR 9988", ts: new Date(NOW - 284000).toISOString(), drone: "DR-01", zone: "North Gate"  },
+  { plate: "KL 01 AB 4521", ts: new Date(NOW - 12000).toISOString(),  drone: "DRN-001", zone: "MG Road"     },
+  { plate: "KL 04 CD 8877", ts: new Date(NOW - 34000).toISOString(),  drone: "DRN-002", zone: "North Gate"  },
+  { plate: "KL 11 EF 2210", ts: new Date(NOW - 71000).toISOString(),  drone: "DRN-001", zone: "Beach Sector A" },
+  { plate: "TN 09 GH 3301", ts: new Date(NOW - 98000).toISOString(),  drone: "DRN-003", zone: "East Fort"   },
+  { plate: "KL 02 JK 7654", ts: new Date(NOW - 143000).toISOString(), drone: "DRN-002", zone: "Secretariat Rd" },
+  { plate: "KL 07 LM 5509", ts: new Date(NOW - 189000).toISOString(), drone: "DRN-001", zone: "Palayam"     },
+  { plate: "KA 03 NP 0012", ts: new Date(NOW - 231000).toISOString(), drone: "DRN-003", zone: "MG Road"     },
+  { plate: "KL 10 QR 9988", ts: new Date(NOW - 284000).toISOString(), drone: "DRN-001", zone: "North Gate"  },
 ];
 
 /* ─────────────────────────────────────────────
