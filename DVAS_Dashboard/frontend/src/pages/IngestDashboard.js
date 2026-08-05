@@ -1320,7 +1320,7 @@ function AuditPage({ audit }) {
 }
 
 function UsersPage({ users, reload }) {
-  const [form, setForm] = useState({ email: "", name: "", role: "drone_operator", jurisdiction: "", mission_scope: "" });
+  const [form, setForm] = useState({ email: "", name: "", password: "", role: "drone_operator", jurisdiction: "", mission_scope: "" });
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
 
@@ -1331,8 +1331,8 @@ function UsersPage({ users, reload }) {
         ...form,
         mission_scope: form.mission_scope.split(",").map(s => s.trim()).filter(Boolean),
       });
-      setForm({ email: "", name: "", role: "drone_operator", jurisdiction: "", mission_scope: "" });
-      setMsg("User created."); reload();
+      setForm({ email: "", name: "", password: "", role: "drone_operator", jurisdiction: "", mission_scope: "" });
+      setMsg("User created successfully."); reload();
     } catch (e) { setMsg(e.response?.data?.detail || "Failed"); } finally { setBusy(false); }
   };
 
@@ -1350,13 +1350,14 @@ function UsersPage({ users, reload }) {
         <form onSubmit={submit} className="p-3 grid grid-cols-1 md:grid-cols-6 gap-2">
           <input data-testid="user-email" required type="email" placeholder="email" value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono" />
           <input data-testid="user-name" required placeholder="full name" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono" />
+          <input data-testid="user-password" required type="password" placeholder="initial password" value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono" />
           <select data-testid="user-role" value={form.role} onChange={e => setForm({ ...form, role: e.target.value })} className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono">
             {Object.entries(ROLE_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
           </select>
-          <input data-testid="user-jurisdiction" placeholder="jurisdiction" value={form.jurisdiction} onChange={e => setForm({ ...form, jurisdiction: e.target.value })} className="col-span-3 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono" />
-          <input data-testid="user-missions" placeholder="mission scope (M-101,M-102)" value={form.mission_scope} onChange={e => setForm({ ...form, mission_scope: e.target.value })} className="col-span-3 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono" />
+          <input data-testid="user-jurisdiction" placeholder="jurisdiction" value={form.jurisdiction} onChange={e => setForm({ ...form, jurisdiction: e.target.value })} className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono" />
+          <input data-testid="user-missions" placeholder="mission scope (M-101,M-102)" value={form.mission_scope} onChange={e => setForm({ ...form, mission_scope: e.target.value })} className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono" />
           <button data-testid="user-create" disabled={busy} className="col-span-6 md:col-span-6 bg-sky-600 hover:bg-sky-500 text-white text-xs py-2">
-            {busy ? "Creating…" : "Create user (password: dvas1234)"}
+            {busy ? "Creating…" : "Create User"}
           </button>
           {msg && <div className="col-span-6 mono text-[11px] text-slate-300">{msg}</div>}
         </form>

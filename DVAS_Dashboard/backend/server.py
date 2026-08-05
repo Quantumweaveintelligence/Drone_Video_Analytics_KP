@@ -187,6 +187,7 @@ def _audit_hash(entry: dict) -> str:
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
+    role: str
 
 
 class ExportRequestIn(BaseModel):
@@ -208,6 +209,8 @@ async def login(body: LoginIn, response: Response, request: Request):
         user_obj = result.scalar_one_or_none()
     if not user_obj or not verify_password(body.password, user_obj.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    if user_obj.role != body.role:
+        raise HTTPException(status_code=401, detail="Role mismatch — select the correct role for this account")
     user = _user_to_dict(user_obj)
     token = create_access_token(user["id"], user["email"], user["role"])
     response.set_cookie(

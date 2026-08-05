@@ -2,15 +2,9 @@ import { useState } from "react";
 import { useNavigate, Navigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import { useI18n } from "@/context/I18nContext";
-import { ROLE_HOME } from "@/lib/api";
-import { Shield, Lock as LockKey, User } from "lucide-react";
+import { ROLE_HOME, ROLE_LABELS } from "@/lib/api";
+import { Shield, Lock as LockKey, User, ChevronDown } from "lucide-react";
 
-const QUICK = [
-  { email: "operator@dvas.kp", role: "drone_operator" },
-  { email: "control@dvas.kp", role: "control_room_officer" },
-  { email: "senior@dvas.kp", role: "senior_officer" },
-  { email: "admin@dvas.kp", role: "system_administrator" },
-];
 
 function fmt(detail) {
   if (!detail) return "Login failed";
@@ -22,8 +16,9 @@ function fmt(detail) {
 export default function Login() {
   const { user, ready, login } = useAuth();
   const { t } = useI18n();
+  const [role, setRole] = useState("drone_operator");
   const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("dvas1234");
+  const [password, setPassword] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const nav = useNavigate();
@@ -35,7 +30,7 @@ export default function Login() {
     e.preventDefault();
     setErr(""); setBusy(true);
     try {
-      const u = await login(email.trim().toLowerCase(), password);
+      const u = await login(email.trim().toLowerCase(), password, role);
       nav(ROLE_HOME[u.role] || "/command", { replace: true });
     } catch (ex) {
       setErr(fmt(ex.response?.data?.detail) || ex.message);
@@ -83,6 +78,24 @@ export default function Login() {
 
           <form onSubmit={submit} className="space-y-4">
             <label className="block">
+              <div className="dvas-label mb-1.5">Role</div>
+              <div className="relative">
+                <Shield size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+                <select
+                  data-testid="input-role"
+                  required
+                  value={role}
+                  onChange={(e) => setRole(e.target.value)}
+                  className="w-full bg-slate-900 border border-slate-700 focus:border-sky-500 outline-none px-9 py-2.5 text-sm mono appearance-none cursor-pointer"
+                >
+                  {Object.entries(ROLE_LABELS).map(([k, v]) => (
+                    <option key={k} value={k}>{v}</option>
+                  ))}
+                </select>
+                <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none" />
+              </div>
+            </label>
+            <label className="block">
               <div className="dvas-label mb-1.5">{t("login.email")}</div>
               <div className="relative">
                 <User size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
@@ -128,24 +141,7 @@ export default function Login() {
             </button>
           </form>
 
-          <div className="mt-8 border-t border-slate-800 pt-4">
-            <div className="dvas-label mb-2">{t("login.quickTitle")}</div>
-            <div className="grid grid-cols-2 gap-1.5">
-              {QUICK.map((q) => (
-                <button
-                  key={q.email}
-                  type="button"
-                  data-testid={`quick-${q.role}`}
-                  onClick={() => { setEmail(q.email); setPassword("dvas1234"); }}
-                  className="text-left text-xs px-2.5 py-1.5 border border-slate-800 hover:border-sky-500/60 hover:bg-slate-900 transition-colors"
-                >
-                  <div className="text-slate-100">{t(`role.${q.role}`)}</div>
-                  <div className="mono text-[10px] text-slate-500 truncate">{q.email}</div>
-                </button>
-              ))}
-            </div>
-            <div className="mono text-[10px] text-slate-600 mt-3">{t("login.demoNote")}</div>
-          </div>
+
         </div>
       </div>
     </div>
