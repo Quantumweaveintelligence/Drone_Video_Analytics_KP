@@ -29,6 +29,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import StreamingResponse
+import httpx
 from starlette.middleware.cors import CORSMiddleware
 from sqlalchemy import select, update, delete, func, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1155,47 +1156,376 @@ async def command_kpis(user: dict = Depends(get_current_user)):
     }
 
 
-# ---------- Analytics ----------
-@api.get("/analytics/crowd")
-async def crowd_analytics(user: dict = Depends(get_current_user)):
+# ---------- Analytics — proxy to analytics microservices ----------
+# Gateway is at port 8100; individual services at 8101-8104
+# URL from env or default to host.docker.internal for docker compose setup
+ANALYTICS_BASE = os.getenv("ANALYTICS_GATEWAY_URL", "http://host.docker.internal:8100")
+CROWD_URL   = os.getenv("CROWD_ANALYTICS_URL",   "http://host.docker.internal:8101")
+PERSON_URL  = os.getenv("PERSON_ANALYTICS_URL",  "http://host.docker.internal:8102")
+VEHICLE_URL = os.getenv("VEHICLE_ANALYTICS_URL", "http://host.docker.internal:8103")
+ANPR_URL    = os.getenv("ANPR_ANALYTICS_URL",    "http://host.docker.internal:8104")
+
+
+async def _analytics_get(url: str, timeout: float = 8.0) -> dict:
+    """Forward GET to analytics service; return response JSON or error envelope."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+            return {"error": f"upstream {r.status_code}", "detail": r.text[:200]}
+    except httpx.ConnectError:
+        return {"error": "service_unavailable", "detail": f"Cannot reach {url}"}
+    except httpx.TimeoutException:
+        return {"error": "timeout", "detail": f"Timeout reaching {url}"}
+    except Exception as exc:
+        return {"error": "proxy_error", "detail": str(exc)}
+
+
+async def _analytics_post(url: str, payload: dict, timeout: float = 8.0) -> dict:
+    """Forward POST to analytics service."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(url, json=payload, timeout=timeout)
+            if r.status_code in (200, 201):
+                return r.json()
+            return {"error": f"upstream {r.status_code}", "detail": r.text[:200]}
+    except httpx.ConnectError:
+        return {"error": "service_unavailable", "detail": f"Cannot reach {url}"}
+    except Exception as exc:
+        return {"error": "proxy_error", "detail": str(exc)}
+
+
+async def _analytics_delete(url: str, timeout: float = 8.0) -> dict:
+    """Forward DELETE to analytics service."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.delete(url, timeout=timeout)
+            if r.status_code in (200, 204):
+                return r.json() if r.content else {"ok": True}
+            return {"error": f"upstream {r.status_code}", "detail": r.text[:200]}
+    except httpx.ConnectError:
+        return {"error": "service_unavailable", "detail": f"Cannot reach {url}"}
+    except Exception as exc:
+        return {"error": "proxy_error", "detail": str(exc)}
+
+
+# ── Analytics Health ──────────────────────────────────────────────────────────
+@api.get("/analytics/health")
+async def analytics_health(user: dict = Depends(get_current_user)):
+    """Aggregated health check across all 4 analytics services."""
+    return await _analytics_get(f"{ANALYTICS_BASE}/health/all")
+
+
+@api.get("/analytics/summary")
+async def analytics_summary(user: dict = Depends(get_current_user)):
+    """Unified stats snapshot from gateway."""
     if user["role"] in ("drone_operator", "system_administrator"):
         raise HTTPException(403, "Not permitted")
-    # 24 buckets — synthesized crowd density trend
-    base = [
-        120,
-        130,
-        90,
-        60,
-        40,
-        30,
-        45,
-        90,
-        180,
-        260,
-        320,
-        400,
-        380,
-        350,
-        300,
-        340,
-        420,
-        500,
-        460,
-        380,
-        300,
-        240,
-        190,
-        150,
-    ]
-    data = [
-        {
-            "hour": f"{h:02d}:00",
-            "density": base[h] + random.randint(-15, 15),
-            "vehicles": max(0, base[h] // 4 + random.randint(-8, 8)),
-        }
-        for h in range(24)
-    ]
-    return {"series": data}
+    return await _analytics_get(f"{ANALYTICS_BASE}/summary")
+
+
+@api.get("/analytics/models/status")
+async def analytics_models_status(user: dict = Depends(get_current_user)):
+    """Real model status from each analytics service health endpoint."""
+    import asyncio as _asyncio
+    results = await _asyncio.gather(
+        _analytics_get(f"{CROWD_URL}/health"),
+        _analytics_get(f"{PERSON_URL}/health"),
+        _analytics_get(f"{VEHICLE_URL}/health"),
+        _analytics_get(f"{ANPR_URL}/health"),
+    )
+    return {
+        "crowd":   results[0],
+        "person":  results[1],
+        "vehicle": results[2],
+        "anpr":    results[3],
+    }
+
+
+# ── SSE Stream proxy ──────────────────────────────────────────────────────────
+@api.get("/analytics/events/stream")
+async def analytics_events_stream(request: Request, drone_id: str = ""):
+    """Proxy the gateway SSE stream to the browser with auth check."""
+    token = request.cookies.get("access_token")
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+    if not token:
+        raise HTTPException(401, "Not authenticated")
+    try:
+        jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.PyJWTError:
+        raise HTTPException(401, "Invalid token")
+
+    upstream_url = f"{ANALYTICS_BASE}/events/stream"
+    if drone_id:
+        upstream_url += f"?drone_id={drone_id}"
+
+    async def event_generator():
+        try:
+            async with httpx.AsyncClient() as client:
+                async with client.stream("GET", upstream_url, timeout=None) as resp:
+                    async for line in resp.aiter_lines():
+                        if await request.is_disconnected():
+                            break
+                        yield line + "\n"
+        except Exception as exc:
+            logger.warning("SSE proxy error: %s", exc)
+            yield f"data: {{\"error\": \"{exc}\"}}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ── Crowd Analytics ───────────────────────────────────────────────────────────
+@api.get("/analytics/crowd")
+async def crowd_analytics(user: dict = Depends(get_current_user)):
+    """Crowd density timeline — proxied from crowd-analyzer with fallback."""
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    result = await _analytics_get(f"{CROWD_URL}/density/timeline")
+    if "error" in result:
+        # Fallback: synthesized data when service is offline
+        base = [120,130,90,60,40,30,45,90,180,260,320,400,380,350,300,340,420,500,460,380,300,240,190,150]
+        data = [{"hour": f"{h:02d}:00", "density": base[h], "vehicles": max(0, base[h] // 4)} for h in range(24)]
+        return {"series": data, "source": "fallback"}
+    return result
+
+
+@api.get("/analytics/crowd/readings")
+async def crowd_readings(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 50):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    url = f"{CROWD_URL}/readings/latest?limit={limit}"
+    if drone_id:
+        url += f"&drone_id={drone_id}"
+    return await _analytics_get(url)
+
+
+@api.get("/analytics/crowd/timeline")
+async def crowd_timeline(user: dict = Depends(get_current_user), drone_id: str = "", hours: int = 24):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    url = f"{CROWD_URL}/density/timeline?hours={hours}"
+    if drone_id:
+        url += f"&drone_id={drone_id}"
+    return await _analytics_get(url)
+
+
+@api.get("/analytics/crowd/heatmap")
+async def crowd_heatmap(user: dict = Depends(get_current_user), drone_id: str = ""):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    url = f"{CROWD_URL}/density/heatmap/latest"
+    if drone_id:
+        url += f"?drone_id={drone_id}"
+    return await _analytics_get(url)
+
+
+@api.get("/analytics/crowd/health")
+async def crowd_health(user: dict = Depends(get_current_user)):
+    return await _analytics_get(f"{CROWD_URL}/health")
+
+
+# ── Person Analytics ──────────────────────────────────────────────────────────
+@api.get("/analytics/person/identities")
+async def person_identities(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 50):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    url = f"{PERSON_URL}/persons/identities?limit={limit}"
+    if drone_id:
+        url += f"&drone_id={drone_id}"
+    return await _analytics_get(url)
+
+
+@api.get("/analytics/person/gallery")
+async def person_gallery(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 60):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    url = f"{PERSON_URL}/faces/gallery?limit={limit}"
+    if drone_id:
+        url += f"&drone_id={drone_id}"
+    return await _analytics_get(url)
+
+
+@api.get("/analytics/person/count")
+async def person_count(user: dict = Depends(get_current_user), drone_id: str = ""):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    url = f"{PERSON_URL}/persons/count"
+    if drone_id:
+        url += f"?drone_id={drone_id}"
+    return await _analytics_get(url)
+
+
+@api.get("/analytics/person/tracks")
+async def person_tracks(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 100):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    url = f"{PERSON_URL}/tracks/active?limit={limit}"
+    if drone_id:
+        url += f"&drone_id={drone_id}"
+    return await _analytics_get(url)
+
+
+@api.get("/analytics/person/dedup")
+async def person_dedup(user: dict = Depends(get_current_user)):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{PERSON_URL}/faces/deduplicate")
+
+
+@api.get("/analytics/person/detections")
+async def person_detections(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 50):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    url = f"{PERSON_URL}/detections/recent?limit={limit}"
+    if drone_id:
+        url += f"&drone_id={drone_id}"
+    return await _analytics_get(url)
+
+
+@api.post("/analytics/person/reid")
+async def person_reid_trigger(user: dict = Depends(get_current_user)):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_post(f"{PERSON_URL}/reid/trigger", {})
+
+
+# ── Vehicle Analytics ─────────────────────────────────────────────────────────
+@api.get("/analytics/vehicle/tracks")
+async def vehicle_tracks(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 100):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    url = f"{VEHICLE_URL}/tracks/active?limit={limit}"
+    if drone_id:
+        url += f"&drone_id={drone_id}"
+    return await _analytics_get(url)
+
+
+@api.get("/analytics/vehicle/recent")
+async def vehicle_recent(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 50):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    url = f"{VEHICLE_URL}/vehicles/recent?limit={limit}"
+    if drone_id:
+        url += f"&drone_id={drone_id}"
+    return await _analytics_get(url)
+
+
+@api.get("/analytics/vehicle/stats")
+async def vehicle_stats(user: dict = Depends(get_current_user)):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{VEHICLE_URL}/stats/summary")
+
+
+@api.get("/analytics/vehicle/by-colour")
+async def vehicle_by_colour(user: dict = Depends(get_current_user)):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{VEHICLE_URL}/stats/by-colour")
+
+
+@api.get("/analytics/vehicle/{tracker_id}/plate")
+async def vehicle_plate(tracker_id: str, user: dict = Depends(get_current_user), drone_id: str = ""):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    url = f"{VEHICLE_URL}/vehicles/{tracker_id}/plate"
+    if drone_id:
+        url += f"?drone_id={drone_id}"
+    return await _analytics_get(url)
+
+
+@api.get("/analytics/vehicle/{tracker_id}/image")
+async def vehicle_image_url(tracker_id: str, user: dict = Depends(get_current_user), drone_id: str = ""):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    url = f"{VEHICLE_URL}/vehicles/{tracker_id}/image"
+    if drone_id:
+        url += f"?drone_id={drone_id}"
+    return await _analytics_get(url)
+
+
+# ── ANPR Analytics ────────────────────────────────────────────────────────────
+@api.get("/analytics/plates/recent")
+async def plates_recent(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 50):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    url = f"{ANPR_URL}/plates/recent?limit={limit}"
+    if drone_id:
+        url += f"&drone_id={drone_id}"
+    return await _analytics_get(url)
+
+
+@api.get("/analytics/plates/{plate_text}")
+async def plate_lookup(plate_text: str, user: dict = Depends(get_current_user)):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{ANPR_URL}/plates/{plate_text}")
+
+
+@api.get("/analytics/plates/{plate_text}/image")
+async def plate_image_url(plate_text: str, user: dict = Depends(get_current_user)):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{ANPR_URL}/plates/{plate_text}/image")
+
+
+@api.get("/analytics/watchlist")
+async def watchlist_get(user: dict = Depends(get_current_user)):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{ANPR_URL}/watchlist")
+
+
+class WatchlistAddIn(BaseModel):
+    plate: str
+    reason: str = ""
+    vehicle_type: str = ""
+
+
+@api.post("/analytics/watchlist")
+async def watchlist_add(
+    body: WatchlistAddIn,
+    user: dict = Depends(get_current_user),
+    request: Request = None,
+):
+    if user["role"] not in ("control_room_officer", "senior_officer"):
+        raise HTTPException(403, "Not permitted")
+    result = await _analytics_post(f"{ANPR_URL}/watchlist/add", body.model_dump())
+    await write_audit(user, "watchlist_add", body.plate, body.reason,
+                      request.client.host if request and request.client else "-")
+    return result
+
+
+@api.delete("/analytics/watchlist/{plate}")
+async def watchlist_remove(
+    plate: str,
+    user: dict = Depends(get_current_user),
+    request: Request = None,
+):
+    if user["role"] not in ("control_room_officer", "senior_officer"):
+        raise HTTPException(403, "Not permitted")
+    result = await _analytics_delete(f"{ANPR_URL}/watchlist/{plate}")
+    await write_audit(user, "watchlist_remove", plate, "",
+                      request.client.host if request and request.client else "-")
+    return result
+
+
+@api.get("/analytics/alerts/theft")
+async def theft_alerts(user: dict = Depends(get_current_user), limit: int = 20):
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{ANPR_URL}/alerts/theft?limit={limit}")
 
 
 # ---------- Startup: seed ----------

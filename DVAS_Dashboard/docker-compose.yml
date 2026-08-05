@@ -35,6 +35,11 @@ services:
       - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://10.235.245.250:3000,http://10.51.27.155:3000,http://10.51.27.250:3000
       - INGEST_SERVER_URL=http://drone_nginx
       - EDGE_SERVER_URL=http://edge:8765
+      - ANALYTICS_GATEWAY_URL=http://host.docker.internal:8100
+      - CROWD_ANALYTICS_URL=http://host.docker.internal:8101
+      - PERSON_ANALYTICS_URL=http://host.docker.internal:8102
+      - VEHICLE_ANALYTICS_URL=http://host.docker.internal:8103
+      - ANPR_ANALYTICS_URL=http://host.docker.internal:8104
     depends_on:
       postgres:
         condition: service_healthy
