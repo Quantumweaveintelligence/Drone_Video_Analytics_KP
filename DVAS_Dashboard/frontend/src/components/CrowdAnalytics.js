@@ -352,8 +352,20 @@ function DroneStatusGrid({ readings, drones }) {
 /* ───────────────────────────────────────────────────────────────
    MAIN EXPORT
    ────────────────────────────────────────────────────────────── */
-export default function CrowdAnalytics({ drones }) {
-  const [activeDrone, setActiveDrone] = useState('DRN-003');
+export default function CrowdAnalytics({ crowdSeries, drones }) {
+  const [activeDrone, setActiveDrone] = useState(null);
+
+  // Auto-select the first online drone when drones list loads/changes
+  useEffect(() => {
+    if (!drones || drones.length === 0) return;
+    // Only auto-select if no drone is currently selected, or if the
+    // currently selected drone is no longer in the list
+    const currentStillValid = drones.some(d => d.id === activeDrone);
+    if (!activeDrone || !currentStillValid) {
+      const onlineDrone = drones.find(d => d.status !== 'offline');
+      setActiveDrone(onlineDrone ? onlineDrone.id : drones[0].id);
+    }
+  }, [drones]); // eslint-disable-line react-hooks/exhaustive-deps
   // Rolling SSE window for the real-time chart (last 30 readings)
   const [sseWindow, setSseWindow]     = useState([]);
 

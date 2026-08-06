@@ -494,7 +494,17 @@ function DedupPanel({ dedupData, onReidTrigger, reidLoading }) {
    MAIN EXPORT
    ────────────────────────────────────────────────────────────── */
 export default function PersonTrackingAnalytics({ drones }) {
-  const [activeDrone, setActiveDrone] = useState('DRN-003');
+  const [activeDrone, setActiveDrone] = useState(null);
+
+  // Auto-select the first online drone when drones list loads/changes
+  useEffect(() => {
+    if (!drones || drones.length === 0) return;
+    const currentStillValid = drones.some(d => d.id === activeDrone);
+    if (!activeDrone || !currentStillValid) {
+      const onlineDrone = drones.find(d => d.status !== 'offline');
+      setActiveDrone(onlineDrone ? onlineDrone.id : drones[0].id);
+    }
+  }, [drones]); // eslint-disable-line react-hooks/exhaustive-deps
   const [reidLoading, setReidLoading] = useState(false);
   const [sseWindow,   setSseWindow]   = useState([]); // rolling detection counts
 

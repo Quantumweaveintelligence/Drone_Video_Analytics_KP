@@ -700,7 +700,7 @@ function useActiveDrones() {
 /* ─── Main Component ──────────────────────────────────────────────── */
 export default function TrafficAnalytics() {
   const { drones: activeDrones, loading: dronesLoading } = useActiveDrones();
-  const [activeDrone, setActiveDrone] = useState(null);  // null = auto-select
+  const [activeDrone, setActiveDrone] = useState(null);
   const [feedMode, setFeedMode]       = useState('vehicle');
   const [serviceStatus, setServiceStatus] = useState({ vehicle: false, anpr: false });
   const [adding, setAdding] = useState(false);
