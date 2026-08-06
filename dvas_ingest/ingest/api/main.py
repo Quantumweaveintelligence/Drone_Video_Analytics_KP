@@ -13,6 +13,8 @@ Endpoints
   GET  /ingest/status/{id}  — Per-drone queue + ingest stats  [JWT required]
   POST /ingest/mission/start — Register mission start  [JWT required]
   POST /ingest/mission/end   — Register mission end    [JWT required]
+  GET  /ingest/frame/{id}/latest  — Latest JPEG snapshot for a drone
+  GET  /ingest/stream/{id}  — Live MJPEG stream for a drone (for dashboard video)
   GET  /metrics              — Prometheus metrics (text/plain)
   WS   /ws/status            — Live status WebSocket for control-room dashboard
   GET  /docs                 — Swagger UI (internal dev only)
@@ -21,11 +23,12 @@ Endpoints
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import AsyncGenerator, Optional
 
 import httpx
 from fastapi import (
@@ -41,7 +44,7 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, JSONResponse, Response
+from fastapi.responses import PlainTextResponse, JSONResponse, Response, StreamingResponse
 from prometheus_client import (
     Counter,
     Gauge,
@@ -636,6 +639,86 @@ async def mission_end(
 # TELEMETRY & FRAME RETRIEVAL ENDPOINTS
 # ═════════════════════════════════════════════════════════════════════════════
 
+
+@app.get(
+    "/ingest/streams/active",
+    summary = "Active drone stream keys from Valkey (restart-safe)",
+    tags    = ["Telemetry"],
+)
+async def get_active_streams():
+    """
+    Scans Valkey for ``drone:frames:*`` stream keys and returns the list of
+    drone IDs that have frames stored.  Unlike ``/ingest/telemetry`` this
+    survives server restarts because it reads directly from the persistent
+    Valkey store rather than the in-memory ``_latest_metadata`` dict.
+
+    Returns::
+
+        {
+          "drones": [
+            {
+              "drone_id": "DRN-004",
+              "stream_key": "drone:frames:DRN-004",
+              "frame_count": 1234,
+              "mission_id": "MSN-3705-FOXTROT",   // from in-memory cache or null
+              "last_seen": "2026-08-06T07:40:00.000Z" // from in-memory or null
+            }
+          ],
+          "count": 1
+        }
+    """
+    if not _qm:
+        return {"drones": [], "count": 0}
+    try:
+        client = _qm._client
+        # SCAN for all drone:frames:* keys.
+        # redis-py async returns integer cursor (0 = iteration complete),
+        # NOT bytes b"0". Use integer 0 for init and termination check.
+        pattern = "drone:frames:*"
+        cursor = 0          # ← integer, not b"0"
+        found_keys = []
+        for _ in range(200):    # safety cap — avoids infinite loop on large keyspaces
+            cursor, keys = await client.scan(cursor=cursor, match=pattern, count=100)
+            found_keys.extend(keys)
+            if cursor == 0:     # ← integer comparison (redis-py returns int)
+                break
+
+        drones = []
+        for key in found_keys:
+            key_str = key.decode() if isinstance(key, bytes) else key
+            # key_str = "drone:frames:DRN-003"
+            parts = key_str.split(":", 2)
+            if len(parts) < 3:
+                continue
+            drone_id = parts[2]
+            try:
+                frame_count = await client.xlen(key_str)
+            except Exception:
+                frame_count = 0
+            meta = _latest_metadata.get(drone_id) or {}
+            drones.append({
+                "drone_id":        drone_id,
+                "stream_key":      key_str,
+                "frame_count":     frame_count,
+                "frames_received": frame_count,   # alias for frontend compatibility
+                "mission_id":      meta.get("mission_id") or _active_missions.get(drone_id, {}).get("mission_id"),
+                "last_seen":       meta.get("last_seen"),
+                "latitude":        meta.get("latitude"),
+                "longitude":       meta.get("longitude"),
+                "battery_pct":     meta.get("battery_pct"),
+                "altitude_m":      meta.get("altitude_m"),
+            })
+
+        # Sort: most frames first (i.e. most active drone at top)
+        drones.sort(key=lambda d: d["frame_count"], reverse=True)
+        return {"drones": drones, "count": len(drones)}
+
+    except Exception as exc:
+        log.warning("streams_active_error: %s", exc)
+        return {"drones": [], "count": 0}
+
+
+
 @app.get(
     "/ingest/telemetry",
     summary = "Latest telemetry for all active drones",
@@ -683,6 +766,143 @@ async def get_latest_frame(drone_id: str):
     except Exception as exc:
         log.error("latest_frame_error", extra={"drone_id": drone_id, "error": str(exc)})
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Frame retrieval failed")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# LIVE MJPEG STREAM  — /ingest/stream/{drone_id}
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def _mjpeg_frame_generator(drone_id: str) -> AsyncGenerator[bytes, None]:
+    """
+    Async generator that reads JPEG frames live from the Valkey stream for
+    the given drone and yields them as MJPEG multipart chunks.
+
+    Protocol: multipart/x-mixed-replace; boundary=frame
+    Each part:
+        --frame\\r\\n
+        Content-Type: image/jpeg\\r\\n
+        Content-Length: <n>\\r\\n
+        \\r\\n
+        <jpeg bytes>
+        \\r\\n
+
+    Keepalive: when no frame arrives within the block window, a boundary
+    chunk with an empty body is sent so the connection stays alive.
+
+    The stream cursor starts at the CURRENT position ("$") so only NEW
+    frames (received after the HTTP connection opens) are streamed — no
+    replay of old frames.
+    """
+    if not _qm or not _qm._connected:
+        return
+
+    stream_key = f"drone:frames:{drone_id}"
+    # Start at current position — do NOT replay old frames
+    last_id = "$"
+    BLOCK_MS = 2000   # 2-second long-poll per XREAD call
+
+    BOUNDARY = b"--frame\r\n"
+    KEEPALIVE = b"--frame\r\nContent-Type: text/plain\r\n\r\n\r\n"
+
+    while True:
+        try:
+            results = await _qm._client.xread(
+                {stream_key: last_id},
+                count=1,
+                block=BLOCK_MS,
+            )
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            log.warning("mjpeg_stream_error drone=%s error=%s", drone_id, exc)
+            await asyncio.sleep(1.0)
+            continue
+
+        if not results:
+            # No new frame within block window — send keepalive boundary
+            yield KEEPALIVE
+            continue
+
+        for _stream, entries in results:
+            for entry_id_raw, fields in entries:
+                entry_id = (
+                    entry_id_raw.decode()
+                    if isinstance(entry_id_raw, bytes)
+                    else entry_id_raw
+                )
+                last_id = entry_id
+
+                # Prefer raw bytes field (stored by queue_manager);
+                # fall back to decoding jpeg_b64 if only the b64 field exists.
+                raw_jpeg: Optional[bytes] = None
+                if b"frame" in fields:
+                    raw_jpeg = fields[b"frame"]
+                elif "frame" in fields:
+                    v = fields["frame"]
+                    raw_jpeg = v if isinstance(v, bytes) else v.encode("latin-1")
+                elif b"jpeg_b64" in fields:
+                    raw_jpeg = base64.b64decode(fields[b"jpeg_b64"])
+                elif "jpeg_b64" in fields:
+                    raw_jpeg = base64.b64decode(fields["jpeg_b64"])
+
+                if raw_jpeg:
+                    chunk = (
+                        BOUNDARY
+                        + b"Content-Type: image/jpeg\r\n"
+                        + b"Content-Length: " + str(len(raw_jpeg)).encode() + b"\r\n"
+                        + b"X-Frame-ID: " + entry_id.encode() + b"\r\n"
+                        + b"\r\n"
+                        + raw_jpeg
+                        + b"\r\n"
+                    )
+                    yield chunk
+
+
+@app.get(
+    "/ingest/stream/{drone_id}",
+    summary="Live MJPEG frame stream for a drone",
+    tags=["Streaming"],
+    response_class=StreamingResponse,
+)
+async def live_stream(drone_id: str) -> StreamingResponse:
+    """
+    Live MJPEG stream that pumps real-time drone frames from the Valkey
+    queue directly to the browser or dashboard.
+
+    **Usage in the dashboard:**
+
+    ```html
+    <img src="https://ingest.dvas.internal/ingest/stream/DRONE_KL_001"
+         style="width:100%;" />
+    ```
+
+    Or in JavaScript / fetch:
+    ```js
+    const img = document.getElementById('liveView');
+    img.src = `/ingest/stream/${droneId}`;
+    ```
+
+    **Notes:**
+    - Only frames received *after* the HTTP connection opens are delivered
+      (cursor starts at `$`). There is no replay of old frames.
+    - The stream stays open until the client disconnects.
+    - A keepalive boundary is sent every 2 seconds when no new frame
+      arrives, so the connection is not dropped by proxies/firewalls.
+    - No authentication required (internal network only).
+      Add JWT middleware here if the stream must be internet-facing.
+    """
+    if not _qm:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Queue unavailable")
+
+    return StreamingResponse(
+        _mjpeg_frame_generator(drone_id),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma":        "no-cache",
+            "X-Drone-ID":    drone_id,
+        },
+    )
 
 
 # ═════════════════════════════════════════════════════════════════════════════

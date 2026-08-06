@@ -14,7 +14,7 @@ import {
   BarChart3 as ChartBar, AlertTriangle as Warning, CheckCircle, X,
   ExternalLink as ArrowSquareOut, Folder as FolderLock, Download,
   Cpu, ShieldCheck, User as UserIcon, Users as UsersIcon, Car, Hash,
-  UserSearch,
+  UserSearch, RefreshCw, Play, Square, CheckCircle2,
 } from "lucide-react";
 import LiveFrame from "../components/LiveFrame";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, BarChart, Bar } from "recharts";
@@ -450,61 +450,126 @@ export default function CommandDashboard() {
 
 /* ---------- Detection Models (GPU Layer) ---------- */
 function ModelsPage({ user, t }) {
-  const [cfg, setCfg] = useState(null);
+  const [cfg, setCfg]         = useState(null);
   const [selected, setSelected] = useState([]);
-  const [saving, setSaving] = useState(false);
-  const [msg, setMsg] = useState("");
+  const [saving, setSaving]   = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [msg, setMsg]         = useState({ text: "", ok: true });
+  const [actions, setActions] = useState(null); // stream_actions from last deploy
 
-  const load = async () => {
+  const load = async (silent = false) => {
+    if (!silent) setRefreshing(true);
     try {
       const { data } = await api.get("/models");
       setCfg(data);
-      setSelected(data.active);
-    } catch (e) { console.error(e); }
+      // Only reset selection on first load, not on refresh
+      if (!cfg) setSelected(data.active);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setRefreshing(false);
+    }
   };
+
+  // Initial load
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { load(); }, []);
+
+  // Auto-refresh stream status every 15 seconds (lightweight health poll)
+  useEffect(() => {
+    const id = setInterval(() => load(true), 15000);
+    return () => clearInterval(id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const toggle = (key) => {
     if (cfg?.read_only) return;
     setSelected(s => s.includes(key) ? s.filter(x => x !== key) : [...s, key]);
   };
 
-  const save = async () => {
-    setSaving(true); setMsg("");
+  const deploy = async () => {
+    setSaving(true); setMsg({ text: "", ok: true }); setActions(null);
     try {
       const { data } = await api.post("/models", { active: selected });
       setCfg(c => ({ ...c, ...data }));
-      setMsg("Configuration deployed to GPU cluster");
-      setTimeout(() => setMsg(""), 2500);
+      setActions(data.stream_actions || null);
+
+      // Build human-readable summary
+      const started = Object.entries(data.stream_actions || {})
+        .filter(([, v]) => v === "started").map(([k]) => k);
+      const stopped = Object.entries(data.stream_actions || {})
+        .filter(([, v]) => v === "stopped").map(([k]) => k);
+      let summary = "Deployed.";
+      if (started.length) summary += ` Started: ${started.join(", ")}.`;
+      if (stopped.length) summary += ` Stopped: ${stopped.join(", ")}.`;
+      if (!started.length && !stopped.length) summary = "No stream changes — already in desired state.";
+      setMsg({ text: summary, ok: true });
+      setTimeout(() => setMsg({ text: "", ok: true }), 5000);
     } catch (e) {
-      setMsg(e?.response?.data?.detail || "Failed to update");
+      setMsg({ text: e?.response?.data?.detail || "Deploy failed", ok: false });
     } finally { setSaving(false); }
   };
 
-  if (!cfg) return <div className="border border-slate-800 bg-slate-900 p-8 text-center text-xs text-slate-500">Loading model roster…</div>;
+  if (!cfg) return (
+    <div className="border border-slate-800 bg-slate-900 p-8 text-center text-xs text-slate-500 flex items-center justify-center gap-2">
+      <RefreshCw size={13} className="animate-spin" /> Loading model roster and stream status…
+    </div>
+  );
 
   const gpuUsed = cfg.available.filter(m => selected.includes(m.key)).reduce((s, m) => s + m.gpu_pct, 0);
-  const fpsMin = cfg.available.filter(m => selected.includes(m.key)).reduce((s, m) => Math.min(s, m.throughput_fps), Infinity);
+  const fpsMin  = cfg.available.filter(m => selected.includes(m.key)).reduce((s, m) => Math.min(s, m.throughput_fps), Infinity);
   const gpuTone = gpuUsed > 90 ? "text-red-400" : gpuUsed > 70 ? "text-amber-400" : "text-emerald-400";
-  const dirty = JSON.stringify([...selected].sort()) !== JSON.stringify([...cfg.active].sort());
+  const dirty   = JSON.stringify([...selected].sort()) !== JSON.stringify([...cfg.active].sort());
+  const streamStatus = cfg.stream_status || {};
+  const runningCount = Object.values(streamStatus).filter(Boolean).length;
+
+  // Action badge colour helper
+  const actionColour = (v) => {
+    if (!v) return "text-slate-500";
+    if (v === "started")         return "text-emerald-400";
+    if (v === "stopped")         return "text-amber-400";
+    if (v === "already_running") return "text-sky-400";
+    if (v === "already_stopped") return "text-slate-500";
+    return "text-red-400"; // errors
+  };
+
+  const actionLabel = (v) => {
+    if (!v) return "";
+    if (v === "started")         return "▶ Started";
+    if (v === "stopped")         return "■ Stopped";
+    if (v === "already_running") return "● Running";
+    if (v === "already_stopped") return "○ Idle";
+    return v; // show raw error string
+  };
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+
+      {/* ── KPI strip ──────────────────────────────────────────────────── */}
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
         <div className="border border-slate-800 bg-slate-900 p-4">
           <div className="dvas-label">Scope</div>
           <div className="mono text-lg mt-1 text-slate-100">{cfg.scope}</div>
-          {cfg.read_only && <div className="mono text-[10px] text-amber-300 mt-1">Read-only for your role</div>}
+          {cfg.read_only && <div className="mono text-[10px] text-amber-300 mt-1">Read-only</div>}
         </div>
         <div className="border border-slate-800 bg-slate-900 p-4">
-          <div className="dvas-label">Active models</div>
+          <div className="dvas-label">Selected</div>
           <div className="mono text-2xl mt-1 text-sky-400">{selected.length}<span className="text-slate-500 text-sm"> / {cfg.available.length}</span></div>
+          <div className="mono text-[9px] text-slate-500 mt-1">toggled for deploy</div>
         </div>
         <div className="border border-slate-800 bg-slate-900 p-4">
-          <div className="dvas-label">GPU allocation</div>
+          <div className="dvas-label">Running Now</div>
+          <div className={`mono text-2xl mt-1 font-semibold ${runningCount > 0 ? "text-emerald-400" : "text-slate-500"}`}>
+            {runningCount}<span className="text-slate-500 text-sm"> / 4</span>
+          </div>
+          <div className="mono text-[9px] text-slate-500 mt-1">live stream loops</div>
+        </div>
+        <div className="border border-slate-800 bg-slate-900 p-4">
+          <div className="dvas-label">GPU Allocation</div>
           <div className={`mono text-2xl mt-1 font-semibold ${gpuTone}`}>{gpuUsed}%</div>
           <div className="h-1.5 bg-slate-800 rounded-full mt-2 overflow-hidden">
-            <div className={`h-full ${gpuUsed > 90 ? "bg-red-500" : gpuUsed > 70 ? "bg-amber-500" : "bg-emerald-500"} transition-all`} style={{width: `${Math.min(100,gpuUsed)}%`}}/>
+            <div className={`h-full ${gpuUsed > 90 ? "bg-red-500" : gpuUsed > 70 ? "bg-amber-500" : "bg-emerald-500"} transition-all`}
+              style={{ width: `${Math.min(100, gpuUsed)}%` }} />
           </div>
         </div>
         <div className="border border-slate-800 bg-slate-900 p-4">
@@ -514,58 +579,127 @@ function ModelsPage({ user, t }) {
         </div>
       </div>
 
+      {/* ── Deploy result / stream actions feedback ──────────────────── */}
+      {actions && (
+        <div className="border border-slate-700 bg-slate-900 p-3 rounded-lg">
+          <div className="mono text-[10px] text-slate-400 mb-2 uppercase tracking-widest">Last Deploy — Stream Actions</div>
+          <div className="flex flex-wrap gap-3">
+            {Object.entries(actions).map(([svc, result]) => (
+              <div key={svc} className="flex items-center gap-1.5">
+                <span className="mono text-[11px] text-slate-300 font-semibold">{svc}:</span>
+                <span className={`mono text-[11px] font-bold ${actionColour(result)}`}>{actionLabel(result)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── Model cards ──────────────────────────────────────────────── */}
       <div className="border border-slate-800 bg-slate-900">
         <div className="p-3 border-b border-slate-800 flex items-center gap-2 text-sm">
-          <Cpu size={16} className="text-sky-400" /> Detection Models on GPU Layer
-          <span className="mono text-[10px] text-slate-500 ml-2">Toggle models to add or remove them from the live inference pipeline.</span>
-          {cfg.updated_at && (
-            <span className="ml-auto mono text-[10px] text-slate-500">
-              last change · {new Date(cfg.updated_at).toLocaleString()} · {cfg.updated_by || "—"}
-            </span>
-          )}
+          <Cpu size={16} className="text-sky-400" />
+          <span className="text-slate-100 font-semibold">Detection Models on GPU Layer</span>
+          <span className="mono text-[10px] text-slate-500 ml-1">Toggle to select, then Deploy to start/stop inference.</span>
+          <div className="ml-auto flex items-center gap-3">
+            {cfg.updated_at && (
+              <span className="mono text-[10px] text-slate-500">
+                last deploy · {new Date(cfg.updated_at).toLocaleString()} · {cfg.updated_by || "—"}
+              </span>
+            )}
+            <button
+              onClick={() => load(false)}
+              disabled={refreshing}
+              title="Refresh stream status"
+              className="flex items-center gap-1 px-2 py-1 border border-slate-700 rounded text-[10px] mono text-slate-400 hover:border-sky-600 hover:text-sky-400 transition-colors disabled:opacity-50"
+            >
+              <RefreshCw size={11} className={refreshing ? "animate-spin" : ""} />
+              {refreshing ? "Refreshing…" : "Refresh Status"}
+            </button>
+          </div>
         </div>
 
         <div className="p-4 grid grid-cols-1 md:grid-cols-2 gap-3">
           {cfg.available.map(m => {
-            const on = selected.includes(m.key);
-            const ModelIcon = MODEL_ICONS[m.key] || Cpu;
+            const checked      = selected.includes(m.key);
+            const isRunning    = m.stream_running === true;   // from health endpoint
+            const ModelIcon    = MODEL_ICONS[m.key] || Cpu;
+            const lastAction   = actions?.[m.key === "face" ? "person" : m.key] ||
+                                 actions?.[m.key];
+
             return (
               <label
                 key={m.key}
                 data-testid={`model-${m.key}`}
-                data-active={on ? "true" : "false"}
-                className={`border p-3 flex items-start gap-3 cursor-pointer transition-colors ${
-                  on ? "border-sky-500/60 bg-sky-500/10" : "border-slate-800 bg-slate-900 hover:border-slate-700"
+                data-active={checked ? "true" : "false"}
+                data-running={isRunning ? "true" : "false"}
+                className={`border p-3 flex items-start gap-3 cursor-pointer transition-all rounded-lg ${
+                  isRunning
+                    ? "border-emerald-500/50 bg-emerald-500/5"
+                    : checked
+                      ? "border-sky-500/60 bg-sky-500/8"
+                      : "border-slate-800 bg-slate-900 hover:border-slate-700"
                 } ${cfg.read_only ? "cursor-not-allowed opacity-70" : ""}`}
                 onClick={(e) => { e.preventDefault(); toggle(m.key); }}
               >
-                <div className={`h-9 w-9 flex items-center justify-center rounded-lg shrink-0 ${on ? "bg-sky-500/20 text-sky-300" : "bg-slate-800 text-slate-500"}`}>
+                {/* Icon */}
+                <div className={`h-9 w-9 flex items-center justify-center rounded-lg shrink-0 ${
+                  isRunning ? "bg-emerald-500/20 text-emerald-300"
+                  : checked  ? "bg-sky-500/20 text-sky-300"
+                             : "bg-slate-800 text-slate-500"
+                }`}>
                   <ModelIcon size={16} />
                 </div>
+
+                {/* Info */}
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <div className="text-sm text-slate-100 font-medium">{m.label}</div>
                     {m.default && <span className="mono text-[9px] px-1.5 py-0.5 border border-slate-700 text-slate-400 uppercase">default</span>}
+                    {/* Real running status badge */}
+                    {isRunning ? (
+                      <span className="mono text-[9px] px-1.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block" style={{ animation: 'pulse 2s infinite' }} />
+                        RUNNING
+                      </span>
+                    ) : (
+                      <span className="mono text-[9px] px-1.5 py-0.5 rounded-full bg-slate-800 text-slate-500 border border-slate-700">
+                        IDLE
+                      </span>
+                    )}
                   </div>
                   <div className="mono text-[10px] text-slate-500 mt-1 flex items-center gap-3">
                     <span>GPU <span className="text-slate-300">{m.gpu_pct}%</span></span>
                     <span>·</span>
                     <span>Peak <span className="text-slate-300">{m.throughput_fps} fps</span></span>
+                    {lastAction && (
+                      <><span>·</span>
+                      <span className={`font-bold ${actionColour(lastAction)}`}>{actionLabel(lastAction)}</span></>
+                    )}
                   </div>
                 </div>
+
+                {/* Toggle checkbox */}
                 <input
                   type="checkbox"
                   data-testid={`model-toggle-${m.key}`}
-                  checked={on}
+                  checked={checked}
                   onChange={() => toggle(m.key)}
                   disabled={cfg.read_only}
-                  className="h-5 w-5 accent-sky-500 shrink-0"
+                  className="h-5 w-5 accent-sky-500 shrink-0 mt-1"
                 />
               </label>
             );
           })}
         </div>
 
+        {/* ── Legend ─────────────────────────────────────────────────── */}
+        <div className="px-4 pb-3 flex items-center gap-4 text-[10px] mono text-slate-500">
+          <div className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-emerald-400" />Running — frame inference active</div>
+          <div className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-sky-500" />Selected — will start on Deploy</div>
+          <div className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-slate-600" />Idle — not processing frames</div>
+        </div>
+
+        {/* ── Deploy bar ─────────────────────────────────────────────── */}
         {!cfg.read_only && (
           <div className="p-3 border-t border-slate-800 flex items-center gap-3">
             {gpuUsed > 100 && (
@@ -573,23 +707,30 @@ function ModelsPage({ user, t }) {
                 <Warning size={12} /> GPU over-committed ({gpuUsed}%) — reduce active models before deploying
               </div>
             )}
-            {msg && !gpuUsed > 100 && <div className="mono text-[11px] text-emerald-400">{msg}</div>}
+            {msg.text && (
+              <div className={`mono text-[11px] flex items-center gap-1.5 ${
+                msg.ok ? "text-emerald-400" : "text-red-400"
+              }`}>
+                {msg.ok ? <CheckCircle2 size={12} /> : <Warning size={12} />}
+                {msg.text}
+              </div>
+            )}
             <div className="ml-auto flex gap-2">
               <button
                 data-testid="models-reset"
                 disabled={!dirty || saving}
-                onClick={() => setSelected(cfg.active)}
-                className="px-3 py-1.5 border border-slate-700 text-xs disabled:opacity-50"
+                onClick={() => { setSelected(cfg.active); setActions(null); setMsg({ text: "", ok: true }); }}
+                className="px-3 py-1.5 border border-slate-700 text-xs rounded-lg disabled:opacity-50 text-slate-300 hover:border-slate-500 transition-colors"
               >
                 Reset
               </button>
               <button
                 data-testid="models-save"
                 disabled={!dirty || saving || gpuUsed > 100}
-                onClick={save}
-                className="px-4 py-1.5 bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold rounded-lg disabled:opacity-50 transition-colors"
+                onClick={deploy}
+                className="px-4 py-1.5 bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold rounded-lg disabled:opacity-50 transition-colors flex items-center gap-1.5"
               >
-                {saving ? "Deploying…" : "Deploy to GPU cluster"}
+                {saving ? <><RefreshCw size={11} className="animate-spin" /> Deploying…</> : <><Play size={11} fill="currentColor" /> Deploy to GPU cluster</>}
               </button>
             </div>
           </div>

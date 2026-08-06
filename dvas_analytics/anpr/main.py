@@ -2,15 +2,16 @@
 """
 ANPR Analyzer Service — FastAPI on port 8104.
 License plate recognition, watchlist management, theft alerts.
-Stores plate crops in MinIO. Links plates to vehicle tracker via Redis.
+Stores annotated frames (with plate bounding boxes + OCR text) in memory for dashboard.
 """
 import asyncio
 import base64
+import io
 import logging
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Dict
 
 import cv2
 import numpy as np
@@ -61,6 +62,85 @@ _stream_task: Optional[asyncio.Task] = None
 _stream_running = False
 _frames_processed = 0
 
+# ── Annotated frame cache ─────────────────────────────────────────────────────
+# Stores latest JPEG with plate bboxes + OCR text drawn, per drone_id
+_last_annotated: Dict[str, bytes] = {}
+_last_annotated_ts: Dict[str, float] = {}
+
+# Most recently detected plate info per drone for the ANPR window
+_recent_plate_cache: Dict[str, dict] = {}  # drone_id -> {plate_text, vehicle_image_b64, ...}
+
+
+def _draw_anpr_annotations(frame: np.ndarray, plate_reads: list, drone_id: str) -> bytes:
+    """
+    Draw vehicle bounding boxes + green plate bounding boxes with OCR text on frame.
+    Returns JPEG-encoded bytes.
+    """
+    annotated = frame.copy()
+    h, w = annotated.shape[:2]
+
+    for plate in plate_reads:
+        # Vehicle bounding box (blue)
+        veh_bbox = plate.get("vehicle_bbox")
+        if veh_bbox and len(veh_bbox) >= 4:
+            vx1, vy1, vx2, vy2 = [int(v) for v in veh_bbox]
+            vx1, vy1 = max(0, vx1), max(0, vy1)
+            vx2, vy2 = min(w-1, vx2), min(h-1, vy2)
+            cv2.rectangle(annotated, (vx1, vy1), (vx2, vy2), (255, 140, 0), 2)
+
+        # Plate bounding box (bright green)
+        plate_bbox = plate.get("plate_bbox")
+        if plate_bbox and len(plate_bbox) >= 4:
+            px1, py1, px2, py2 = [int(v) for v in plate_bbox]
+            px1, py1 = max(0, px1), max(0, py1)
+            px2, py2 = min(w-1, px2), min(h-1, py2)
+            # Thick green box for plate
+            cv2.rectangle(annotated, (px1, py1), (px2, py2), (0, 255, 80), 3)
+
+            # OCR text above plate box
+            plate_text = plate.get("plate_text", "")
+            conf       = plate.get("ocr_confidence", 0.0)
+            watchlisted = plate.get("is_watchlisted", False)
+
+            if plate_text:
+                label      = f" {plate_text}  {conf:.2f} "
+                font       = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.6
+                thickness  = 2
+                text_color = (0, 50, 255) if watchlisted else (0, 255, 80)
+                bg_color   = (0, 0, 180) if watchlisted else (0, 100, 0)
+
+                (lw, lh), _ = cv2.getTextSize(label, font, font_scale, thickness)
+                label_y = max(py1 - 6, lh + 8)
+                cv2.rectangle(annotated,
+                              (px1, label_y - lh - 6),
+                              (px1 + lw + 4, label_y + 2),
+                              bg_color, -1)
+                cv2.putText(annotated, label,
+                            (px1 + 2, label_y - 2),
+                            font, font_scale, text_color, thickness, cv2.LINE_AA)
+
+                # ALERT badge for watchlisted plates
+                if watchlisted:
+                    alert_label = "  !! WATCHLIST HIT !!  "
+                    (aw, ah), _ = cv2.getTextSize(alert_label, font, 0.7, 2)
+                    cv2.rectangle(annotated, (px1, py2 + 4), (px1 + aw + 4, py2 + ah + 10),
+                                  (0, 0, 200), -1)
+                    cv2.putText(annotated, alert_label,
+                                (px1 + 2, py2 + ah + 6),
+                                font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # Watermark
+    ts_str   = datetime.now().strftime("%H:%M:%S")
+    plate_ct = sum(1 for p in plate_reads if p.get("plate_text"))
+    wm = f"DVAS  {drone_id}  ANPR  {ts_str}  {plate_ct} plates"
+    cv2.putText(annotated, wm,
+                (8, h - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (160, 160, 160), 1, cv2.LINE_AA)
+
+    ok, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 82])
+    return buf.tobytes() if ok else b""
+
 
 @app.on_event("startup")
 async def startup():
@@ -86,19 +166,22 @@ async def shutdown():
     await close_client()
 
 
+# ── Health ─────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {
-        "status":           "ok",
-        "service":          "anpr-analyzer",
-        "model_loaded":     analyzer.ready if analyzer else False,
-        "ocr_ready":        analyzer.ocr_engine is not None if analyzer else False,
-        "stream_running":   _stream_running,
-        "frames_processed": _frames_processed,
-        "watchlist_count":  len(analyzer.watchlist) if analyzer else 0,
+        "status":             "ok",
+        "service":            "anpr-analyzer",
+        "model_loaded":       analyzer.ready if analyzer else False,
+        "ocr_ready":          analyzer.ocr_engine is not None if analyzer else False,
+        "stream_running":     _stream_running,
+        "frames_processed":   _frames_processed,
+        "watchlist_count":    len(analyzer.watchlist) if analyzer else 0,
+        "cached_drone_feeds": list(_last_annotated.keys()),
     }
 
 
+# ── Single frame analysis ──────────────────────────────────────────────────────
 @app.post("/analyze/frame")
 async def analyze_frame(
     file: UploadFile = File(...),
@@ -114,21 +197,19 @@ async def analyze_frame(
         raise HTTPException(400, "Cannot decode image")
 
     result = analyzer.analyze_frame(frame, drone_id=drone_id)
-    ts = datetime.now(timezone.utc)
+    ts     = datetime.now(timezone.utc)
 
     for plate in result["plate_reads"]:
         if not plate["plate_text"]:
             continue
 
         tracker_id = plate.get("tracker_id")
-        track_id = await upsert_track(
-            drone_id, None, "vehicle", ts, ts, tracker_id=tracker_id
-        )
+        track_id   = await upsert_track(drone_id, None, "vehicle", ts, ts, tracker_id=tracker_id)
         plate["track_id"] = track_id
 
-        # Upload plate image to MinIO
-        plate_image_key = None
+        plate_image_key   = None
         vehicle_image_key = None
+
         veh_img_b64 = plate.get("vehicle_image_b64")
         if veh_img_b64:
             veh_img_bytes = base64.b64decode(veh_img_b64)
@@ -138,7 +219,6 @@ async def analyze_frame(
                 cfg.BUCKET_VEHICLES, key, veh_img_bytes, "image/jpeg"
             )
 
-        # Write plate crop separately if available (from analyzer)
         plate_crop_b64 = plate.pop("plate_crop_b64", None)
         if plate_crop_b64:
             plate_bytes = base64.b64decode(plate_crop_b64)
@@ -152,8 +232,7 @@ async def analyze_frame(
             drone_id=drone_id,
             event_type="intrusion" if plate["is_watchlisted"] else "vehicle_detected",
             confidence=plate["ocr_confidence"],
-            ts=ts,
-            track_id=track_id,
+            ts=ts, track_id=track_id,
             attributes={
                 "plate_text":   plate["plate_text"],
                 "vehicle_type": plate["vehicle_type"],
@@ -162,8 +241,7 @@ async def analyze_frame(
         )
 
         await write_plate_read(
-            track_id=track_id,
-            event_id=event_id,
+            track_id=track_id, event_id=event_id,
             plate_text=plate["plate_text"],
             ocr_confidence=plate["ocr_confidence"],
             is_reliable=plate["is_reliable"],
@@ -171,15 +249,11 @@ async def analyze_frame(
             vehicle_image_key=vehicle_image_key,
         )
 
-        # Write vehicle-plate link to DB
         if tracker_id is not None:
-            # Get colour from Redis vehicle tracker
             veh_data = await hget_vehicle_track(tracker_id, drone_id)
-            colour = veh_data.get("colour")
-
+            colour   = veh_data.get("colour")
             await write_vehicle_plate_link(
-                tracker_id=tracker_id,
-                drone_id=drone_id,
+                tracker_id=tracker_id, drone_id=drone_id,
                 plate_text=plate["plate_text"],
                 plate_conf=plate["ocr_confidence"],
                 vehicle_type=plate["vehicle_type"],
@@ -187,14 +261,11 @@ async def analyze_frame(
                 plate_image_key=plate_image_key,
                 vehicle_image_key=vehicle_image_key or veh_data.get("vehicle_image_key"),
             )
-
-            # Update Redis with plate info so vehicle service can read it
             await hset_vehicle_track(
-                tracker_id=tracker_id,
-                drone_id=drone_id,
+                tracker_id=tracker_id, drone_id=drone_id,
                 data={
-                    "plate_text": plate["plate_text"],
-                    "plate_conf": plate["ocr_confidence"],
+                    "plate_text":      plate["plate_text"],
+                    "plate_conf":      plate["ocr_confidence"],
                     "plate_image_key": plate_image_key or "",
                 },
                 ttl=cfg.VEHICLE_TRACK_TTL,
@@ -202,10 +273,8 @@ async def analyze_frame(
 
         if plate["is_watchlisted"]:
             await publish_confirmed_event({
-                "event_id":    event_id,
-                "event_type":  "theft_alert",
-                "drone_id":    drone_id,
-                "ts":          ts.isoformat(),
+                "event_id":    event_id, "event_type": "theft_alert",
+                "drone_id":    drone_id, "ts": ts.isoformat(),
                 "plate_text":  plate["plate_text"],
                 "vehicle_type": plate["vehicle_type"],
                 "confidence":  plate["ocr_confidence"],
@@ -214,8 +283,7 @@ async def analyze_frame(
             await pool.execute(
                 """
                 INSERT INTO theft_alerts
-                    (plate_text, track_id, drone_id, detected_at, frame_ts,
-                     confidence, vehicle_type)
+                    (plate_text, track_id, drone_id, detected_at, frame_ts, confidence, vehicle_type)
                 VALUES ($1, $2::uuid, $3, $4, $4, $5, $6)
                 ON CONFLICT DO NOTHING
                 """,
@@ -227,9 +295,12 @@ async def analyze_frame(
     return result
 
 
+# ── Continuous stream loop ─────────────────────────────────────────────────────
 async def _stream_loop():
     global _stream_running, _frames_processed
     last_ids = {d: "0" for d in cfg.DRONE_IDS}
+    log.info("ANPR stream loop started for drones: %s", cfg.DRONE_IDS)
+
     while _stream_running:
         for drone_id in cfg.DRONE_IDS:
             try:
@@ -237,59 +308,108 @@ async def _stream_loop():
                     drone_id, last_ids[drone_id], count=2, block_ms=100
                 )
                 last_ids[drone_id] = new_id
+
                 for f in frames:
                     raw = f.get("jpeg_b64", "")
                     if not raw:
                         continue
                     img_bytes = base64.b64decode(raw)
-                    nparr = np.frombuffer(img_bytes, np.uint8)
-                    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    nparr  = np.frombuffer(img_bytes, np.uint8)
+                    frame  = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     if frame is None:
                         continue
 
                     result = analyzer.analyze_frame(frame, drone_id=drone_id)
-                    ts = datetime.now(timezone.utc)
+                    ts     = datetime.now(timezone.utc)
 
-                    for plate in result["plate_reads"]:
-                        if plate["plate_text"] and plate["is_reliable"]:
-                            tracker_id = plate.get("tracker_id")
-                            track_id = await upsert_track(
-                                drone_id, None, "vehicle", ts, ts,
-                                tracker_id=tracker_id
+                    # ── Annotate frame and cache for dashboard ─────────────────
+                    import time as _time
+                    annotated_bytes = _draw_anpr_annotations(
+                        frame, result.get("plate_reads", []), drone_id
+                    )
+                    if annotated_bytes:
+                        _last_annotated[drone_id]    = annotated_bytes
+                        _last_annotated_ts[drone_id] = _time.monotonic()
+
+                    # ── Persist plates ─────────────────────────────────────────
+                    for plate in result.get("plate_reads", []):
+                        if not (plate.get("plate_text") and plate.get("is_reliable")):
+                            continue
+                        tracker_id = plate.get("tracker_id")
+                        track_id   = await upsert_track(
+                            drone_id, None, "vehicle", ts, ts, tracker_id=tracker_id
+                        )
+                        plate_image_key = None
+                        plate_crop_b64  = plate.pop("plate_crop_b64", None)
+                        if plate_crop_b64:
+                            plate_bytes_data = base64.b64decode(plate_crop_b64)
+                            key = minio.make_key(
+                                "plates", drone_id,
+                                f"plate_{plate['plate_text']}_{int(ts.timestamp()*1000)}.jpg"
                             )
-                            plate_image_key = None
-                            plate_crop_b64 = plate.pop("plate_crop_b64", None)
-                            if plate_crop_b64:
-                                plate_bytes = base64.b64decode(plate_crop_b64)
-                                key = minio.make_key(
-                                    "plates", drone_id,
-                                    f"plate_{plate['plate_text']}_{int(ts.timestamp()*1000)}.jpg"
-                                )
-                                plate_image_key = await minio.upload_bytes(
-                                    cfg.BUCKET_PLATES, key, plate_bytes, "image/jpeg"
-                                )
-
-                            await write_plate_read(
-                                track_id=track_id,
-                                event_id=None,
-                                plate_text=plate["plate_text"],
-                                ocr_confidence=plate["ocr_confidence"],
-                                is_reliable=plate["is_reliable"],
-                                plate_image_key=plate_image_key,
+                            plate_image_key = await minio.upload_bytes(
+                                cfg.BUCKET_PLATES, key, plate_bytes_data, "image/jpeg"
                             )
 
-                            if tracker_id is not None:
-                                await hset_vehicle_track(
-                                    tracker_id=tracker_id,
-                                    drone_id=drone_id,
-                                    data={
-                                        "plate_text": plate["plate_text"],
-                                        "plate_conf": plate["ocr_confidence"],
-                                    },
-                                    ttl=cfg.VEHICLE_TRACK_TTL,
-                                )
+                        # Upload vehicle image if available
+                        vehicle_image_key = None
+                        veh_img_b64 = plate.pop("vehicle_image_b64", None)
+                        if veh_img_b64:
+                            veh_bytes_data = base64.b64decode(veh_img_b64)
+                            key = minio.make_key(
+                                "vehicles", drone_id,
+                                f"anpr_veh_{tracker_id}_{int(ts.timestamp()*1000)}.jpg"
+                            )
+                            vehicle_image_key = await minio.upload_bytes(
+                                cfg.BUCKET_VEHICLES, key, veh_bytes_data, "image/jpeg"
+                            )
 
-                    await publish_analytics_result("anpr", result)
+                        await write_plate_read(
+                            track_id=track_id, event_id=None,
+                            plate_text=plate["plate_text"],
+                            ocr_confidence=plate["ocr_confidence"],
+                            is_reliable=plate["is_reliable"],
+                            plate_image_key=plate_image_key,
+                            vehicle_image_key=vehicle_image_key,
+                        )
+
+                        if tracker_id is not None:
+                            await hset_vehicle_track(
+                                tracker_id=tracker_id, drone_id=drone_id,
+                                data={
+                                    "plate_text":      plate["plate_text"],
+                                    "plate_conf":      plate["ocr_confidence"],
+                                    "plate_image_key": plate_image_key or "",
+                                },
+                                ttl=cfg.VEHICLE_TRACK_TTL,
+                            )
+
+                        if plate.get("is_watchlisted"):
+                            pool = await get_pool()
+                            await pool.execute(
+                                """
+                                INSERT INTO theft_alerts
+                                    (plate_text, track_id, drone_id, detected_at, frame_ts,
+                                     confidence, vehicle_type)
+                                VALUES ($1, $2::uuid, $3, $4, $4, $5, $6)
+                                ON CONFLICT DO NOTHING
+                                """,
+                                plate["plate_text"], track_id, drone_id, ts,
+                                plate["ocr_confidence"], plate.get("vehicle_type", "unknown"),
+                            )
+                            await publish_confirmed_event({
+                                "event_type":  "theft_alert",
+                                "drone_id":    drone_id,
+                                "ts":          ts.isoformat(),
+                                "plate_text":  plate["plate_text"],
+                            })
+
+                    await publish_analytics_result("anpr", {
+                        **result,
+                        "drone_id":    drone_id,
+                        "ts":          ts.isoformat(),
+                        "frame_count": _frames_processed,
+                    })
                     _frames_processed += 1
 
             except asyncio.CancelledError:
@@ -299,13 +419,15 @@ async def _stream_loop():
                 await asyncio.sleep(1)
 
 
+# ── Stream control ─────────────────────────────────────────────────────────────
 @app.get("/stream/start")
 async def stream_start():
     global _stream_running, _stream_task
     if _stream_running:
-        return {"status": "already_running"}
+        return {"status": "already_running", "frames_processed": _frames_processed}
     _stream_running = True
     _stream_task = asyncio.create_task(_stream_loop())
+    log.info("ANPR stream loop STARTED")
     return {"status": "started"}
 
 
@@ -316,14 +438,81 @@ async def stream_stop():
     if _stream_task:
         _stream_task.cancel()
         _stream_task = None
-    return {"status": "stopped"}
+    log.info("ANPR stream loop STOPPED")
+    return {"status": "stopped", "frames_processed": _frames_processed}
 
 
-# ── Plate queries ──────────────────────────────────────────────────────────────
+# ── Annotated frame endpoint ───────────────────────────────────────────────────
+@app.get("/annotated/latest")
+async def annotated_latest(drone_id: str = ""):
+    """
+    Returns the most recently annotated JPEG frame with plate bounding boxes + OCR text.
+    """
+    frame_bytes = None
+    if drone_id and drone_id in _last_annotated:
+        frame_bytes = _last_annotated[drone_id]
+    else:
+        import time as _time
+        best_drone = max(_last_annotated_ts, key=_last_annotated_ts.get, default=None)
+        if best_drone:
+            frame_bytes = _last_annotated.get(best_drone)
+
+    if not frame_bytes:
+        raise HTTPException(404, "No annotated frame available yet — start detection first")
+
+    return StreamingResponse(
+        io.BytesIO(frame_bytes),
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma":        "no-cache",
+            "Expires":       "0",
+        },
+    )
+
+
+# ── Plate query endpoints ──────────────────────────────────────────────────────
 @app.get("/plates/recent")
-async def recent_plates(limit: int = 50):
-    rows = await get_recent_plates(limit=min(limit, 200))
-    return {"count": len(rows), "plates": rows}
+async def recent_plates(limit: int = 50, drone_id: str = ""):
+    pool  = await get_pool()
+    query = """
+        SELECT
+            pr.id, pr.plate_text, pr.ocr_confidence, pr.is_reliable,
+            pr.plate_image_key, pr.vehicle_image_key,
+            pr.created_at, t.drone_id, t.tracker_id
+        FROM plate_reads pr
+        JOIN tracks t ON t.id = pr.track_id
+        WHERE pr.is_reliable = true
+    """
+    params = []
+    if drone_id:
+        query += f" AND t.drone_id = ${len(params)+1}"
+        params.append(drone_id)
+    query += f" ORDER BY pr.created_at DESC LIMIT ${len(params)+1}"
+    params.append(min(limit, 200))
+
+    rows = await pool.fetch(query, *params)
+    plates = []
+    for r in rows:
+        d = {k: (str(v) if hasattr(v, "isoformat") else v) for k, v in dict(r).items()}
+        # Generate presigned URLs for images
+        if d.get("plate_image_key"):
+            try:
+                d["plate_image_url"] = await minio.get_presigned_url(
+                    cfg.BUCKET_PLATES, d["plate_image_key"], cfg.MINIO_URL_EXPIRY
+                )
+            except Exception:
+                d["plate_image_url"] = None
+        if d.get("vehicle_image_key"):
+            try:
+                d["vehicle_image_url"] = await minio.get_presigned_url(
+                    cfg.BUCKET_VEHICLES, d["vehicle_image_key"], cfg.MINIO_URL_EXPIRY
+                )
+            except Exception:
+                d["vehicle_image_url"] = None
+        plates.append(d)
+
+    return {"count": len(plates), "plates": plates}
 
 
 @app.get("/plates/{plate_text}")
@@ -338,7 +527,6 @@ async def plate_history(plate_text: str):
 
 @app.get("/plates/{plate_text}/image")
 async def plate_image_url(plate_text: str):
-    """Get presigned MinIO URL for the latest plate crop image."""
     pool = await get_pool()
     row = await pool.fetchrow(
         """
@@ -391,29 +579,31 @@ async def theft_alerts(limit: int = 50):
     rows = await pool.fetch(
         "SELECT * FROM theft_alerts ORDER BY detected_at DESC LIMIT $1", limit
     )
-    return {"count": len(rows), "alerts": [dict(r) for r in rows]}
+    return {"count": len(rows), "alerts": [{k: (str(v) if hasattr(v, 'isoformat') else v)
+                                              for k, v in dict(r).items()} for r in rows]}
 
 
 @app.get("/alerts/theft/live")
 async def theft_alerts_live():
-    """SSE stream of live theft alerts from confirmed events stream."""
+    """SSE stream of live theft/watchlist alerts from confirmed events."""
     from shared.redis_client import get_client
     import json
 
     async def event_gen():
-        client = get_client()
+        client  = get_client()
         last_id = "$"
         try:
             while True:
                 results = await client.xread(
-                    {"drone:events:confirmed": last_id},
-                    count=5, block=5000,
+                    {"drone:events:confirmed": last_id}, count=5, block=5000,
                 )
                 if results:
                     for _stream, entries in results:
                         for entry_id, fields in entries:
-                            last_id = entry_id
+                            last_id  = entry_id
                             data_str = fields.get("data", "{}")
+                            if isinstance(data_str, bytes):
+                                data_str = data_str.decode()
                             try:
                                 data = json.loads(data_str)
                             except Exception:

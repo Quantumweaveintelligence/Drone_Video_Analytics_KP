@@ -887,6 +887,12 @@ async def infra_health(user: dict = Depends(require_roles("system_administrator"
 
 
 # ---------- Detection Models (GPU) ----------
+
+# Maps each model key → (service_base_url, stream_key_used_in_health)
+# Note: 'face' shares the person-analyzer service (same container)
+# Note: 'plate' is the anpr-analyzer service
+SERVICE_MAP: dict = {}  # populated after URL constants are defined (see below)
+
 AVAILABLE_MODELS = [
     {"key": "person",       "label": "Person Detection",             "gpu_pct": 18, "throughput_fps": 90, "default": True},
     {"key": "face",         "label": "Face Detection",               "gpu_pct": 14, "throughput_fps": 72, "default": False},
@@ -894,6 +900,87 @@ AVAILABLE_MODELS = [
     {"key": "crowd",        "label": "Crowd Count & Heatmap",        "gpu_pct": 26, "throughput_fps": 45, "default": True},
     {"key": "plate",        "label": "Number-Plate (ANPR)",          "gpu_pct": 20, "throughput_fps": 40, "default": False},
 ]
+
+
+def _build_service_map():
+    """Build SERVICE_MAP after analytics URL constants are defined."""
+    return {
+        "person":  PERSON_URL,
+        "face":    PERSON_URL,   # face detection runs inside person-analyzer
+        "vehicle": VEHICLE_URL,
+        "crowd":   CROWD_URL,
+        "plate":   ANPR_URL,
+    }
+
+
+async def _get_service_stream_status() -> dict:
+    """
+    Query each analytics service health endpoint and return
+    {model_key: stream_running bool} for all 4 services.
+    face shares person-analyzer status.
+    """
+    urls = {
+        "crowd":   f"{CROWD_URL}/health",
+        "person":  f"{PERSON_URL}/health",
+        "vehicle": f"{VEHICLE_URL}/health",
+        "plate":   f"{ANPR_URL}/health",
+    }
+    status = {}
+    async with httpx.AsyncClient(timeout=4.0) as client:
+        for key, url in urls.items():
+            try:
+                r = await client.get(url)
+                data = r.json() if r.status_code == 200 else {}
+                status[key] = bool(data.get("stream_running", False))
+            except Exception:
+                status[key] = False
+    status["face"] = status.get("person", False)  # face shares person-analyzer
+    return status
+
+
+async def _apply_stream_changes(requested_active: list) -> dict:
+    """
+    Start/stop analytics stream loops based on the requested active model list.
+    Returns dict of {model_key: action_taken} e.g. {"crowd": "started", "plate": "already_stopped"}
+    """
+    # Unique services to act on (face→person, plate→anpr, deduplicate)
+    service_keys = {"crowd", "person", "vehicle", "plate"}
+    # face uses person-analyzer — if face OR person is active, person runs
+    effective_active = set(requested_active)
+    if "face" in effective_active:
+        effective_active.add("person")
+
+    current_status = await _get_service_stream_status()
+    results = {}
+
+    smap = {
+        "crowd":   CROWD_URL,
+        "person":  PERSON_URL,
+        "vehicle": VEHICLE_URL,
+        "plate":   ANPR_URL,
+    }
+
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        for svc_key, base_url in smap.items():
+            should_run = svc_key in effective_active
+            is_running  = current_status.get(svc_key, False)
+
+            if should_run and not is_running:
+                try:
+                    r = await client.get(f"{base_url}/stream/start")
+                    results[svc_key] = "started" if r.status_code == 200 else f"start_failed({r.status_code})"
+                except Exception as e:
+                    results[svc_key] = f"start_error({e})"
+            elif not should_run and is_running:
+                try:
+                    r = await client.get(f"{base_url}/stream/stop")
+                    results[svc_key] = "stopped" if r.status_code == 200 else f"stop_failed({r.status_code})"
+                except Exception as e:
+                    results[svc_key] = f"stop_error({e})"
+            else:
+                results[svc_key] = "already_running" if is_running else "already_stopped"
+
+    return results
 
 
 async def _get_model_config(scope: str):
@@ -915,14 +1002,27 @@ async def list_models(user: dict = Depends(get_current_user)):
     scope = user.get("jurisdiction") or "State HQ"
     cfg = await _get_model_config(scope)
     gpu_total = sum(m["gpu_pct"] for m in AVAILABLE_MODELS if m["key"] in cfg["active"])
+
+    # Fetch real stream_running status from each analytics service
+    stream_status = await _get_service_stream_status()
+
+    # Annotate each model with its real running state
+    available_with_status = [
+        {
+            **m,
+            "stream_running": stream_status.get(m["key"], False),
+        }
+        for m in AVAILABLE_MODELS
+    ]
+
     return {
-        "available": AVAILABLE_MODELS,
+        "available": available_with_status,
         "active": cfg["active"],
+        "stream_status": stream_status,   # {"crowd": True, "person": False, ...}
         "scope": scope,
         "gpu_total_pct": gpu_total,
         "updated_at": cfg.get("updated_at"),
         "updated_by": cfg.get("updated_by"),
-        # CRO now has full write access (inherits former field_supervisor model-config capability)
         "read_only": False,
     }
 
@@ -963,7 +1063,19 @@ async def update_models(
             ))
         await session.commit()
     await write_audit(user, "model_config_update", scope, f"active={','.join(body.active)}")
-    return await _get_model_config(scope)
+
+    # Actually start/stop the analytics stream loops based on what was toggled
+    stream_results = await _apply_stream_changes(body.active)
+    log.info("model_deploy", extra={"stream_results": stream_results, "active": body.active, "by": user["email"]})
+
+    updated_cfg = await _get_model_config(scope)
+    stream_status = await _get_service_stream_status()
+    return {
+        **updated_cfg,
+        "stream_status": stream_status,
+        "stream_actions": stream_results,   # what was started/stopped/unchanged
+        "deploy_ok": True,
+    }
 
 
 @api.get("/infra/overview")
@@ -1403,7 +1515,33 @@ async def person_reid_trigger(user: dict = Depends(get_current_user)):
     return await _analytics_post(f"{PERSON_URL}/reid/trigger", {})
 
 
+# ── Analytics Service Health Proxies ─────────────────────────────────────────
+@api.get("/analytics/vehicle/health")
+async def vehicle_health(user: dict = Depends(get_current_user)):
+    """Proxy vehicle-analyzer health including stream_running status."""
+    return await _analytics_get(f"{VEHICLE_URL}/health")
+
+
+@api.get("/analytics/anpr/health")
+async def anpr_health(user: dict = Depends(get_current_user)):
+    """Proxy anpr-analyzer health including stream_running status."""
+    return await _analytics_get(f"{ANPR_URL}/health")
+
+
+@api.get("/analytics/crowd/health")
+async def crowd_health(user: dict = Depends(get_current_user)):
+    """Proxy crowd-analyzer health including stream_running status."""
+    return await _analytics_get(f"{CROWD_URL}/health")
+
+
+@api.get("/analytics/person/health")
+async def person_health_proxy(user: dict = Depends(get_current_user)):
+    """Proxy person-analyzer health including stream_running status."""
+    return await _analytics_get(f"{PERSON_URL}/health")
+
+
 # ── Vehicle Analytics ─────────────────────────────────────────────────────────
+
 @api.get("/analytics/vehicle/tracks")
 async def vehicle_tracks(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 100):
     if user["role"] in ("drone_operator", "system_administrator"):
@@ -1431,6 +1569,14 @@ async def vehicle_stats(user: dict = Depends(get_current_user)):
     return await _analytics_get(f"{VEHICLE_URL}/stats/summary")
 
 
+@api.get("/analytics/vehicle/stats/flow")
+async def vehicle_stats_flow(user: dict = Depends(get_current_user)):
+    """24-hour vehicle flow time series broken down by type."""
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{VEHICLE_URL}/stats/flow/24h")
+
+
 @api.get("/analytics/vehicle/by-colour")
 async def vehicle_by_colour(user: dict = Depends(get_current_user)):
     if user["role"] in ("drone_operator", "system_administrator"):
@@ -1456,6 +1602,60 @@ async def vehicle_image_url(tracker_id: str, user: dict = Depends(get_current_us
     if drone_id:
         url += f"?drone_id={drone_id}"
     return await _analytics_get(url)
+
+
+@api.get("/analytics/vehicle/annotated")
+async def vehicle_annotated_frame(user: dict = Depends(get_current_user), drone_id: str = ""):
+    """
+    Proxy the latest annotated JPEG frame (vehicle bounding boxes + labels)
+    from vehicle-analyzer. Used by the dashboard live feed window.
+    Returns binary JPEG — NOT JSON.
+    """
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    try:
+        params = {"drone_id": drone_id} if drone_id else {}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{VEHICLE_URL}/annotated/latest", params=params)
+        if r.status_code == 200:
+            return Response(
+                content=r.content,
+                media_type="image/jpeg",
+                headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma":        "no-cache",
+                },
+            )
+        raise HTTPException(r.status_code, "No annotated frame available")
+    except httpx.RequestError:
+        raise HTTPException(503, "Vehicle analyzer unavailable")
+
+
+@api.get("/analytics/anpr/annotated")
+async def anpr_annotated_frame(user: dict = Depends(get_current_user), drone_id: str = ""):
+    """
+    Proxy the latest annotated JPEG frame (plate bboxes + OCR text)
+    from anpr-analyzer. Used by the ANPR window in the dashboard.
+    Returns binary JPEG — NOT JSON.
+    """
+    if user["role"] in ("drone_operator", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    try:
+        params = {"drone_id": drone_id} if drone_id else {}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{ANPR_URL}/annotated/latest", params=params)
+        if r.status_code == 200:
+            return Response(
+                content=r.content,
+                media_type="image/jpeg",
+                headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma":        "no-cache",
+                },
+            )
+        raise HTTPException(r.status_code, "No annotated frame available")
+    except httpx.RequestError:
+        raise HTTPException(503, "ANPR analyzer unavailable")
 
 
 # ── ANPR Analytics ────────────────────────────────────────────────────────────

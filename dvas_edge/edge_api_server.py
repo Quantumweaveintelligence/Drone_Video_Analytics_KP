@@ -62,12 +62,35 @@ from ingest.offline_buffer import OfflineBuffer
 # ---------------------------------------------------------------------------
 # Drone ID → video file mapping
 # ---------------------------------------------------------------------------
-DRONE_VIDEO_MAP = {
+# Maps drone IDs to their assigned MP4 simulation files.
+# Keys are checked case-insensitively. Add DRONE_KL_xxx entries here OR
+# set VIDEO_MAP env var as JSON: '{"DRONE_KL_001": "DJI_0110.MP4", ...}'
+# ---------------------------------------------------------------------------
+import json as _json
+
+_DEFAULT_VIDEO_MAP = {
+    # Legacy test IDs
     "DRN-001": "DJI_0110.MP4",
     "DRN-002": "DJI_0111.MP4",
     "DRN-003": "DJI_0112.MP4",
     "DRN-004": "DJI_0113.mp4",
+    # Production drone IDs (Kerala Police)
+    "DRONE_KL_001": "DJI_0110.MP4",
+    "DRONE_KL_002": "DJI_0111.MP4",
+    "DRONE_KL_003": "DJI_0112.MP4",
+    "DRONE_KL_004": "DJI_0113.mp4",
+    "DRONE_KL_005": "DJI_0110.MP4",
 }
+
+# Allow runtime override via env var (JSON string)
+try:
+    _env_map = os.environ.get("VIDEO_MAP", "")
+    if _env_map:
+        _DEFAULT_VIDEO_MAP.update(_json.loads(_env_map))
+except Exception:
+    pass
+
+DRONE_VIDEO_MAP = _DEFAULT_VIDEO_MAP
 
 
 # ---------------------------------------------------------------------------

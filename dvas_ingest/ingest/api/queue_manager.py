@@ -9,10 +9,20 @@ Events stream      : drone:events:confirmed
 
 All behaviour (publish, declare, stats) is identical to the RabbitMQ version
 from the consumer's perspective.
+
+Field layout in every stream entry
+-----------------------------------
+  jpeg_b64   : base64-encoded JPEG string  — read by analytics services
+  frame      : raw JPEG bytes              — read by ingest /latest endpoint
+  metadata   : JSON string of full FrameMetadata
+  drone_id   : plain string copy           — analytics fast-path
+  change_score: plain float string         — analytics fast-path
+  ts         : epoch milliseconds string
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -138,15 +148,37 @@ class QueueManager:
         """
         Publish a frame to the per-drone Redis Stream.
         Returns the Redis stream entry ID (acts as message_id).
+
+        Field layout
+        ------------
+        jpeg_b64     — base64-encoded JPEG (analytics services read this)
+        frame        — raw JPEG bytes     (ingest /latest endpoint reads this)
+        metadata     — full JSON metadata string
+        drone_id     — plain string, analytics fast-path
+        change_score — plain float string, analytics fast-path
+        timestamp    — ISO-8601 timestamp string
+        frame_sequence — integer as string
+        ts           — epoch milliseconds string
         """
         if not self._connected:
             await self.connect()
 
+        # Base64-encode the JPEG so analytics services can decode it with
+        # base64.b64decode(f["jpeg_b64"]).  Raw bytes are kept as "frame"
+        # for the ingest server's own /ingest/frame/{id}/latest endpoint.
+        jpeg_b64 = base64.b64encode(frame_bytes).decode("ascii")
+
         key = self._stream_key(drone_id)
-        fields: Dict[bytes, Any] = {
-            b"frame":    frame_bytes,
-            b"metadata": json.dumps(metadata).encode(),
-            b"ts":       str(int(time.time() * 1000)).encode(),
+        fields: Dict[str, Any] = {
+            "jpeg_b64":       jpeg_b64,
+            "frame":          frame_bytes,
+            "metadata":       json.dumps(metadata),
+            # Individual fields for analytics fast-path (no JSON parsing needed)
+            "drone_id":       drone_id,
+            "change_score":   str(metadata.get("change_score", 0.0)),
+            "timestamp":      metadata.get("timestamp", ""),
+            "frame_sequence": str(metadata.get("frame_sequence", 0)),
+            "ts":             str(int(time.time() * 1000)),
         }
 
         entry_id: str = await self._client.xadd(

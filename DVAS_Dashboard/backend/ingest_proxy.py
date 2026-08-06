@@ -186,7 +186,64 @@ async def ingest_telemetry():
     drone that has sent at least one frame to the ingest server.
     Open to any authenticated role — used by the command dashboard map and
     multi-drone view, and by the backend telemetry pump to sync real drone data.
+    NOTE: This is in-memory on the ingest server and clears on restart.
+          Prefer /streams/active which reads directly from Valkey.
     """
+    try:
+        return await _proxy_get("/ingest/telemetry", timeout=3.0)
+    except HTTPException:
+        return {"drones": [], "count": 0}
+
+
+@ingest_api.get("/streams/active", summary="Proxy: active drone streams from Valkey (restart-safe)")
+async def ingest_streams_active():
+    """
+    Returns active drones with frames in the ingest pipeline.
+
+    Fallback chain (most reliable → least):
+      1. /ingest/streams/active  — Valkey-scan, restart-safe (new ingest server)
+      2. /ingest/status          — in-memory, but live while server runs; filtered
+                                   to drones with frames_received > 0
+      3. /ingest/telemetry       — in-memory latest metadata (may be empty after restart)
+    """
+    # ── 1. New Valkey-scan endpoint ───────────────────────────────────────────
+    try:
+        result = await _proxy_get("/ingest/streams/active", timeout=5.0)
+        if result.get("count", 0) > 0:
+            return result
+    except HTTPException:
+        pass
+
+    # ── 2. /ingest/status — filtered to online drones ────────────────────────
+    try:
+        status_data = await _proxy_get("/ingest/status", timeout=3.0)
+        all_drones  = status_data.get("drones", [])
+        # Filter by online=True (Valkey-backed) OR frames_received>0 (in-memory).
+        # online=True is more reliable across multiple uvicorn workers since it
+        # reflects Valkey stream existence rather than per-worker in-memory stats.
+        active = [
+            d for d in all_drones
+            if d.get("online") is True or (d.get("frames_received") or 0) > 0
+        ]
+        if active:
+            return {
+                "drones": [
+                    {
+                        "drone_id":       d["drone_id"],
+                        "frames_received": d.get("frames_received", 0),
+                        "frame_count":     d.get("frames_received", 0),
+                        "mission_id":      d.get("mission_id"),
+                        "last_seen":       d.get("last_frame_at"),
+                    }
+                    for d in active
+                ],
+                "count": len(active),
+            }
+    except HTTPException:
+        pass
+
+
+    # ── 3. In-memory telemetry (may be empty after restart) ───────────────────
     try:
         return await _proxy_get("/ingest/telemetry", timeout=3.0)
     except HTTPException:
