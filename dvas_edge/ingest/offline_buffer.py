@@ -114,6 +114,21 @@ class OfflineBuffer:
             self._conn.execute("DELETE FROM frames WHERE id = ?", (frame_id,))
             self._conn.commit()
 
+    def clear(self) -> None:
+        """Delete all buffered frames (DB records + JPEG files on disk).
+        Called at the start of a new mission so stale frames from a
+        previous mission are not sent with the new mission's metadata."""
+        with self._lock:
+            cursor = self._conn.execute("SELECT frame_path FROM frames")
+            for (frame_path,) in cursor.fetchall():
+                try:
+                    os.remove(frame_path)
+                except OSError:
+                    pass
+            self._conn.execute("DELETE FROM frames")
+            self._conn.commit()
+            log.info("offline_buffer_cleared")
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()

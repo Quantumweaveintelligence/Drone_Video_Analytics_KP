@@ -122,6 +122,7 @@ class EdgeSenderThread(threading.Thread):
         super().__init__(name="EdgeSenderThread", daemon=True)
         self._client   = client
         self._buffer   = OfflineBuffer()
+        self._buffer.clear()  # Purge stale frames from previous missions
         self._loop:    Optional[asyncio.AbstractEventLoop] = None
         self._running  = True
         self._mission_name: Optional[str] = None
