@@ -331,6 +331,28 @@ async def _stream_loop():
                         _last_annotated[drone_id]    = annotated_bytes
                         _last_annotated_ts[drone_id] = _time.monotonic()
 
+                    # ── Update live in-memory plate cache (for /plates/live) ────
+                    import time as _time2
+                    if result.get("plate_reads"):
+                        log.info("Stream loop: caching %d plates/vehicles for %s", len(result["plate_reads"]), drone_id)
+                    for plate in result.get("plate_reads", []):
+                        cache_key = f"{drone_id}:{plate['tracker_id']}"
+                        existing  = _recent_plate_cache.get(cache_key, {})
+                        plate_text = plate.get("plate_text") or existing.get("plate_text", "")
+                        _recent_plate_cache[cache_key] = {
+                            "plate_text":        plate_text,
+                            "ocr_confidence":    plate.get("ocr_confidence") or existing.get("ocr_confidence", 0.0),
+                            "is_reliable":       plate.get("is_reliable", False),
+                            "drone_id":          drone_id,
+                            "tracker_id":        plate.get("tracker_id"),
+                            "vehicle_type":      plate.get("vehicle_type", "vehicle"),
+                            "vehicle_image_b64": plate.get("vehicle_image_b64") or existing.get("vehicle_image_b64"),
+                            "plate_crop_b64":    plate.get("plate_crop_b64") or existing.get("plate_crop_b64"),
+                            "is_watchlisted":    plate.get("is_watchlisted", False),
+                            "created_at":        existing.get("created_at") or ts.isoformat(),
+                            "_cache_ts":         _time2.monotonic(),
+                        }
+
                     # ── Persist plates ─────────────────────────────────────────
                     for plate in result.get("plate_reads", []):
                         if not (plate.get("plate_text") and plate.get("is_reliable")):
@@ -479,14 +501,13 @@ async def recent_plates(limit: int = 50, drone_id: str = ""):
         SELECT
             pr.id, pr.plate_text, pr.ocr_confidence, pr.is_reliable,
             pr.plate_image_key, pr.vehicle_image_key,
-            pr.created_at, t.drone_id, t.tracker_id
+            pr.created_at, t.drone_id, t.metadata->>'tracker_id' AS tracker_id
         FROM plate_reads pr
-        JOIN tracks t ON t.id = pr.track_id
-        WHERE pr.is_reliable = true
+        JOIN tracks t ON t.track_id = pr.track_id
     """
     params = []
     if drone_id:
-        query += f" AND t.drone_id = ${len(params)+1}"
+        query += f" WHERE t.drone_id = ${len(params)+1}"
         params.append(drone_id)
     query += f" ORDER BY pr.created_at DESC LIMIT ${len(params)+1}"
     params.append(min(limit, 200))
@@ -513,6 +534,35 @@ async def recent_plates(limit: int = 50, drone_id: str = ""):
         plates.append(d)
 
     return {"count": len(plates), "plates": plates}
+
+
+@app.get("/plates/live")
+async def live_plates(drone_id: str = "", limit: int = 50):
+    """
+    Return in-memory plate detections from the active stream loop.
+    Includes base64 images directly — no MinIO required.
+    Useful when DB/MinIO writes are lagging behind live detections.
+    """
+    import time as _t
+    now = _t.monotonic()
+    MAX_AGE = 30.0  # drop entries older than 30 seconds
+
+    results = []
+    for entry in _recent_plate_cache.values():
+        age = now - entry.get("_cache_ts", 0)
+        if age > MAX_AGE:
+            continue
+        if drone_id and entry.get("drone_id") != drone_id:
+            continue
+        results.append(entry)
+
+    # Sort by cache timestamp descending, newest first
+    results.sort(key=lambda e: e.get("_cache_ts", 0), reverse=True)
+    results = results[:min(limit, 200)]
+
+    # Strip internal cache field before returning
+    cleaned = [{k: v for k, v in e.items() if k != "_cache_ts"} for e in results]
+    return {"count": len(cleaned), "plates": cleaned, "source": "live_cache"}
 
 
 @app.get("/plates/{plate_text}")

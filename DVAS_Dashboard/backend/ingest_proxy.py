@@ -307,6 +307,7 @@ ALL_INGEST_CONTAINERS = [
     "drone_person_analyzer",
     "drone_vehicle_analyzer",
     "drone_anpr_analyzer",
+    "drone_analytics_gateway",
     # Evidence storage
     "drone_seaweed_master",
     "drone_seaweed_volume",

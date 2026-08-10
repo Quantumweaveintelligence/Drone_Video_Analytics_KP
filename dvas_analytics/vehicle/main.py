@@ -434,10 +434,10 @@ async def active_tracks(limit: int = 100, drone_id: str = ""):
     """Return active vehicle tracks enriched with latest Redis data."""
     pool = await get_pool()
     query = """
-        SELECT t.id, t.drone_id, t.tracker_id, t.first_seen, t.last_seen,
+        SELECT t.track_id, t.drone_id, t.metadata->>'tracker_id' AS tracker_id, t.first_seen, t.last_seen,
                va.vehicle_type, va.colour_top3, va.speed_kph
         FROM tracks t
-        LEFT JOIN vehicle_attributes va ON va.track_id = t.id
+        LEFT JOIN vehicle_attributes va ON va.track_id = t.track_id
         WHERE t.track_type = 'vehicle'
           AND t.last_seen > now() - interval '10 minutes'
     """
@@ -479,10 +479,10 @@ async def recent_vehicles(limit: int = 50):
     pool = await get_pool()
     rows = await pool.fetch(
         """
-        SELECT t.id, t.drone_id, t.tracker_id, t.last_seen,
+        SELECT t.track_id, t.drone_id, t.metadata->>'tracker_id' AS tracker_id, t.last_seen,
                va.vehicle_type, va.colour_top3, va.speed_kph
         FROM tracks t
-        LEFT JOIN vehicle_attributes va ON va.track_id = t.id
+        LEFT JOIN vehicle_attributes va ON va.track_id = t.track_id
         WHERE t.track_type = 'vehicle'
         ORDER BY t.last_seen DESC
         LIMIT $1
@@ -573,7 +573,7 @@ async def stats_flow_24h():
             va.vehicle_type,
             COUNT(*) AS cnt
         FROM tracks t
-        LEFT JOIN vehicle_attributes va ON va.track_id = t.id
+        LEFT JOIN vehicle_attributes va ON va.track_id = t.track_id
         WHERE t.track_type = 'vehicle'
           AND t.last_seen > now() - interval '24 hours'
         GROUP BY hour_ts, va.vehicle_type

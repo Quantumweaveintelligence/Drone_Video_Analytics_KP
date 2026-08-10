@@ -315,7 +315,7 @@ async def list_drones(user: dict = Depends(get_current_user)):
 
 @api.get("/alerts")
 async def list_alerts(user: dict = Depends(get_current_user)):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     f = scope_filter_for(user)
     if "__deny__" in f:
@@ -355,7 +355,7 @@ async def ack_alert(
 
 @api.get("/evidence")
 async def list_evidence(user: dict = Depends(get_current_user)):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     f = scope_filter_for(user)
     if "__deny__" in f:
@@ -1228,7 +1228,7 @@ async def edge_status(user: dict = Depends(require_roles("drone_operator"))):
 # ---------- Command dashboard: aggregate KPIs ----------
 @api.get("/command/kpis")
 async def command_kpis(user: dict = Depends(get_current_user)):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     f = scope_filter_for(user)
     if "__deny__" in f:
@@ -1335,7 +1335,7 @@ async def analytics_health(user: dict = Depends(get_current_user)):
 @api.get("/analytics/summary")
 async def analytics_summary(user: dict = Depends(get_current_user)):
     """Unified stats snapshot from gateway."""
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     return await _analytics_get(f"{ANALYTICS_BASE}/summary")
 
@@ -1404,7 +1404,7 @@ async def analytics_events_stream(request: Request, drone_id: str = ""):
 @api.get("/analytics/crowd")
 async def crowd_analytics(user: dict = Depends(get_current_user)):
     """Crowd density timeline — proxied from crowd-analyzer with fallback."""
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     result = await _analytics_get(f"{CROWD_URL}/density/timeline")
     if "error" in result:
@@ -1417,7 +1417,7 @@ async def crowd_analytics(user: dict = Depends(get_current_user)):
 
 @api.get("/analytics/crowd/readings")
 async def crowd_readings(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 50):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{CROWD_URL}/readings/latest?limit={limit}"
     if drone_id:
@@ -1427,7 +1427,7 @@ async def crowd_readings(user: dict = Depends(get_current_user), drone_id: str =
 
 @api.get("/analytics/crowd/timeline")
 async def crowd_timeline(user: dict = Depends(get_current_user), drone_id: str = "", hours: int = 24):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{CROWD_URL}/density/timeline?hours={hours}"
     if drone_id:
@@ -1437,7 +1437,7 @@ async def crowd_timeline(user: dict = Depends(get_current_user), drone_id: str =
 
 @api.get("/analytics/crowd/heatmap")
 async def crowd_heatmap(user: dict = Depends(get_current_user), drone_id: str = ""):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{CROWD_URL}/density/heatmap/latest"
     if drone_id:
@@ -1453,7 +1453,7 @@ async def crowd_health(user: dict = Depends(get_current_user)):
 # ── Person Analytics ──────────────────────────────────────────────────────────
 @api.get("/analytics/person/identities")
 async def person_identities(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 50):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{PERSON_URL}/persons/identities?limit={limit}"
     if drone_id:
@@ -1463,7 +1463,7 @@ async def person_identities(user: dict = Depends(get_current_user), drone_id: st
 
 @api.get("/analytics/person/gallery")
 async def person_gallery(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 60):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{PERSON_URL}/faces/gallery?limit={limit}"
     if drone_id:
@@ -1473,7 +1473,7 @@ async def person_gallery(user: dict = Depends(get_current_user), drone_id: str =
 
 @api.get("/analytics/person/count")
 async def person_count(user: dict = Depends(get_current_user), drone_id: str = ""):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{PERSON_URL}/persons/count"
     if drone_id:
@@ -1483,7 +1483,7 @@ async def person_count(user: dict = Depends(get_current_user), drone_id: str = "
 
 @api.get("/analytics/person/tracks")
 async def person_tracks(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 100):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{PERSON_URL}/tracks/active?limit={limit}"
     if drone_id:
@@ -1493,14 +1493,14 @@ async def person_tracks(user: dict = Depends(get_current_user), drone_id: str = 
 
 @api.get("/analytics/person/dedup")
 async def person_dedup(user: dict = Depends(get_current_user)):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     return await _analytics_get(f"{PERSON_URL}/faces/deduplicate")
 
 
 @api.get("/analytics/person/detections")
 async def person_detections(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 50):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{PERSON_URL}/detections/recent?limit={limit}"
     if drone_id:
@@ -1510,7 +1510,7 @@ async def person_detections(user: dict = Depends(get_current_user), drone_id: st
 
 @api.post("/analytics/person/reid")
 async def person_reid_trigger(user: dict = Depends(get_current_user)):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     return await _analytics_post(f"{PERSON_URL}/reid/trigger", {})
 
@@ -1528,10 +1528,53 @@ async def anpr_health(user: dict = Depends(get_current_user)):
     return await _analytics_get(f"{ANPR_URL}/health")
 
 
-@api.get("/analytics/crowd/health")
-async def crowd_health(user: dict = Depends(get_current_user)):
-    """Proxy crowd-analyzer health including stream_running status."""
-    return await _analytics_get(f"{CROWD_URL}/health")
+# ── Analytics Stream Start/Stop Proxies ──────────────────────────────────────
+@api.get("/analytics/vehicle/stream/start")
+async def vehicle_stream_start(user: dict = Depends(get_current_user)):
+    """Start the vehicle detection stream loop."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{VEHICLE_URL}/stream/start")
+
+
+@api.get("/analytics/vehicle/stream/stop")
+async def vehicle_stream_stop(user: dict = Depends(get_current_user)):
+    """Stop the vehicle detection stream loop."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{VEHICLE_URL}/stream/stop")
+
+
+@api.get("/analytics/anpr/stream/start")
+async def anpr_stream_start(user: dict = Depends(get_current_user)):
+    """Start the ANPR detection stream loop."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{ANPR_URL}/stream/start")
+
+
+@api.get("/analytics/anpr/stream/stop")
+async def anpr_stream_stop(user: dict = Depends(get_current_user)):
+    """Stop the ANPR detection stream loop."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{ANPR_URL}/stream/stop")
+
+
+@api.get("/analytics/crowd/stream/start")
+async def crowd_stream_start(user: dict = Depends(get_current_user)):
+    """Start the crowd analysis stream loop."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{CROWD_URL}/stream/start")
+
+
+@api.get("/analytics/person/stream/start")
+async def person_stream_start(user: dict = Depends(get_current_user)):
+    """Start the person detection stream loop."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{PERSON_URL}/stream/start")
 
 
 @api.get("/analytics/person/health")
@@ -1544,7 +1587,7 @@ async def person_health_proxy(user: dict = Depends(get_current_user)):
 
 @api.get("/analytics/vehicle/tracks")
 async def vehicle_tracks(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 100):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{VEHICLE_URL}/tracks/active?limit={limit}"
     if drone_id:
@@ -1554,7 +1597,7 @@ async def vehicle_tracks(user: dict = Depends(get_current_user), drone_id: str =
 
 @api.get("/analytics/vehicle/recent")
 async def vehicle_recent(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 50):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{VEHICLE_URL}/vehicles/recent?limit={limit}"
     if drone_id:
@@ -1564,7 +1607,7 @@ async def vehicle_recent(user: dict = Depends(get_current_user), drone_id: str =
 
 @api.get("/analytics/vehicle/stats")
 async def vehicle_stats(user: dict = Depends(get_current_user)):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     return await _analytics_get(f"{VEHICLE_URL}/stats/summary")
 
@@ -1572,21 +1615,21 @@ async def vehicle_stats(user: dict = Depends(get_current_user)):
 @api.get("/analytics/vehicle/stats/flow")
 async def vehicle_stats_flow(user: dict = Depends(get_current_user)):
     """24-hour vehicle flow time series broken down by type."""
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     return await _analytics_get(f"{VEHICLE_URL}/stats/flow/24h")
 
 
 @api.get("/analytics/vehicle/by-colour")
 async def vehicle_by_colour(user: dict = Depends(get_current_user)):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     return await _analytics_get(f"{VEHICLE_URL}/stats/by-colour")
 
 
 @api.get("/analytics/vehicle/{tracker_id}/plate")
 async def vehicle_plate(tracker_id: str, user: dict = Depends(get_current_user), drone_id: str = ""):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{VEHICLE_URL}/vehicles/{tracker_id}/plate"
     if drone_id:
@@ -1596,7 +1639,7 @@ async def vehicle_plate(tracker_id: str, user: dict = Depends(get_current_user),
 
 @api.get("/analytics/vehicle/{tracker_id}/image")
 async def vehicle_image_url(tracker_id: str, user: dict = Depends(get_current_user), drone_id: str = ""):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{VEHICLE_URL}/vehicles/{tracker_id}/image"
     if drone_id:
@@ -1611,7 +1654,7 @@ async def vehicle_annotated_frame(user: dict = Depends(get_current_user), drone_
     from vehicle-analyzer. Used by the dashboard live feed window.
     Returns binary JPEG — NOT JSON.
     """
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     try:
         params = {"drone_id": drone_id} if drone_id else {}
@@ -1638,7 +1681,7 @@ async def anpr_annotated_frame(user: dict = Depends(get_current_user), drone_id:
     from anpr-analyzer. Used by the ANPR window in the dashboard.
     Returns binary JPEG — NOT JSON.
     """
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     try:
         params = {"drone_id": drone_id} if drone_id else {}
@@ -1661,7 +1704,7 @@ async def anpr_annotated_frame(user: dict = Depends(get_current_user), drone_id:
 # ── ANPR Analytics ────────────────────────────────────────────────────────────
 @api.get("/analytics/plates/recent")
 async def plates_recent(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 50):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{ANPR_URL}/plates/recent?limit={limit}"
     if drone_id:
@@ -1669,23 +1712,34 @@ async def plates_recent(user: dict = Depends(get_current_user), drone_id: str = 
     return await _analytics_get(url)
 
 
+@api.get("/analytics/plates/live")
+async def plates_live(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 50):
+    """In-memory live plate detections from the stream loop — no DB/MinIO required."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    url = f"{ANPR_URL}/plates/live?limit={limit}"
+    if drone_id:
+        url += f"&drone_id={drone_id}"
+    return await _analytics_get(url)
+
+
 @api.get("/analytics/plates/{plate_text}")
 async def plate_lookup(plate_text: str, user: dict = Depends(get_current_user)):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     return await _analytics_get(f"{ANPR_URL}/plates/{plate_text}")
 
 
 @api.get("/analytics/plates/{plate_text}/image")
 async def plate_image_url(plate_text: str, user: dict = Depends(get_current_user)):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     return await _analytics_get(f"{ANPR_URL}/plates/{plate_text}/image")
 
 
 @api.get("/analytics/watchlist")
 async def watchlist_get(user: dict = Depends(get_current_user)):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     return await _analytics_get(f"{ANPR_URL}/watchlist")
 
@@ -1704,7 +1758,10 @@ async def watchlist_add(
 ):
     if user["role"] not in ("control_room_officer", "senior_officer"):
         raise HTTPException(403, "Not permitted")
-    result = await _analytics_post(f"{ANPR_URL}/watchlist/add", body.model_dump())
+    result = await _analytics_post(f"{ANPR_URL}/watchlist/add", {
+        "plate_text": body.plate,
+        "reason":     body.reason,
+    })
     await write_audit(user, "watchlist_add", body.plate, body.reason,
                       request.client.host if request and request.client else "-")
     return result
@@ -1726,7 +1783,7 @@ async def watchlist_remove(
 
 @api.get("/analytics/alerts/theft")
 async def theft_alerts(user: dict = Depends(get_current_user), limit: int = 20):
-    if user["role"] in ("drone_operator", "system_administrator"):
+    if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     return await _analytics_get(f"{ANPR_URL}/alerts/theft?limit={limit}")
 

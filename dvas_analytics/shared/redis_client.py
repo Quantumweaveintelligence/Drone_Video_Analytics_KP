@@ -13,6 +13,7 @@ from shared.config import cfg
 log = logging.getLogger(__name__)
 
 _client: Optional[aioredis.Redis] = None
+_raw_client: Optional[aioredis.Redis] = None
 
 
 def get_client() -> aioredis.Redis:
@@ -22,11 +23,28 @@ def get_client() -> aioredis.Redis:
     return _client
 
 
+def _get_raw_client() -> aioredis.Redis:
+    """Return a Redis client without decode_responses for binary-safe reads.
+
+    The ingest server stores raw JPEG bytes in the 'frame' field alongside
+    the base64-encoded 'jpeg_b64' field.  A client with decode_responses=True
+    would attempt to UTF-8-decode the binary 'frame' field, raising
+    ``UnicodeDecodeError``.  This raw client avoids that.
+    """
+    global _raw_client
+    if _raw_client is None:
+        _raw_client = aioredis.from_url(cfg.REDIS_URL, decode_responses=False)
+    return _raw_client
+
+
 async def close_client():
-    global _client
+    global _client, _raw_client
     if _client:
         await _client.aclose()
         _client = None
+    if _raw_client:
+        await _raw_client.aclose()
+        _raw_client = None
 
 
 async def xread_frames(
@@ -39,11 +57,15 @@ async def xread_frames(
     Read up to `count` frames from drone:frames:{drone_id}.
     Returns (new_last_id, list_of_frame_dicts).
     Each frame dict has: frame_id, jpeg_b64, timestamp, drone_id
+
+    Uses a raw (non-decoding) Redis client because the ingest server
+    stores raw JPEG bytes in the 'frame' field.  Text fields are
+    manually decoded; binary fields are skipped.
     """
-    client = get_client()
+    raw_client = _get_raw_client()
     stream_key = f"drone:frames:{drone_id}"
-    results = await client.xread(
-        {stream_key: last_id},
+    results = await raw_client.xread(
+        {stream_key.encode(): last_id.encode()},
         count=count,
         block=block_ms,
     )
@@ -54,12 +76,25 @@ async def xread_frames(
     new_last_id = last_id
     for _stream_name, entries in results:
         for entry_id, fields in entries:
-            new_last_id = entry_id
-            frames.append({
-                "entry_id": entry_id,
-                "drone_id": drone_id,
-                **fields,
-            })
+            # entry_id comes back as bytes from raw client
+            eid = entry_id.decode() if isinstance(entry_id, bytes) else entry_id
+            new_last_id = eid
+            # Decode text fields, skip binary fields (e.g. 'frame')
+            decoded = {"entry_id": eid, "drone_id": drone_id}
+            for k, v in fields.items():
+                key = k.decode() if isinstance(k, bytes) else k
+                if key == "frame":
+                    # Skip raw binary JPEG — analytics uses jpeg_b64 instead
+                    continue
+                if isinstance(v, bytes):
+                    try:
+                        decoded[key] = v.decode("utf-8")
+                    except UnicodeDecodeError:
+                        # Binary field that isn't UTF-8 — skip it
+                        continue
+                else:
+                    decoded[key] = v
+            frames.append(decoded)
 
     return new_last_id, frames
 
