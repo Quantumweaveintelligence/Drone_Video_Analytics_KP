@@ -115,7 +115,8 @@ function useJpegPoller(url, intervalMs, enabled) {
     if (!enabled || !url) return;
     try {
       const token = localStorage.getItem('dvas_token') || '';
-      const res = await fetch(`${url}&_t=${Date.now()}`, {
+      const sep = url.includes('?') ? '&' : '?';
+      const res = await fetch(`${url}${sep}_t=${Date.now()}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) {
@@ -195,9 +196,11 @@ function AnnotatedFrameViewer({ droneId, mode = 'vehicle', streamRunning }) {
   // Layer 1: raw ingest feed — only when a drone is known
   const { blobUrl: rawSrc, ok: rawOk } = useJpegPoller(rawUrl, 1500, hasDrone);
 
-  // Layer 2: annotated overlay — only when detection is running
+  // Layer 2: annotated overlay — polls whenever a drone is known
+  // (the endpoint returns 404 gracefully when no annotated frame is available yet;
+  // useJpegPoller handles this with exponential backoff)
   const { blobUrl: annotatedSrc, ok: annotatedOk } = useJpegPoller(
-    annotatedUrl, FRAME_INTERVAL, streamRunning
+    annotatedUrl, FRAME_INTERVAL, hasDrone
   );
 
   // FPS counter — ticks whenever a new annotated blob URL appears
@@ -281,11 +284,11 @@ function AnnotatedFrameViewer({ droneId, mode = 'vehicle', streamRunning }) {
         </div>
       )}
 
-      {!streamRunning && hasAnyFeed && (
+      {!streamRunning && !isAnnotated && hasAnyFeed && (
         <div className="absolute bottom-3 left-0 right-0 flex justify-center z-10 pointer-events-none">
-          <div className="mono text-[10px] bg-black/85 px-3 py-1.5 rounded-full text-slate-500 flex items-center gap-2">
-            <Camera size={10} />
-            Detection not started — start from the Detection Models page
+          <div className="mono text-[10px] bg-black/85 px-3 py-1.5 rounded-full text-amber-400 flex items-center gap-2">
+            <RefreshCw size={10} className="animate-spin" />
+            Waiting for detection — starting analytics stream…
           </div>
         </div>
       )}
@@ -396,12 +399,12 @@ function VehicleLedger({ tracks, loading }) {
                 </span>
               </div>
               <div className="shrink-0 w-14 text-center">
-                <span className="mono text-sm font-bold" style={{ color }}>{speed}</span>
+                <span className="mono text-sm font-bold" style={{ color: colour }}>{speed}</span>
                 <span className="mono text-[9px]" style={{ color:'var(--dvas-text-dim)' }}> km/h</span>
               </div>
               <div className="shrink-0 w-16">
                 <span className="mono text-[10px] px-1.5 py-0.5 rounded"
-                  style={{ background:`${colour}18`, color, border:`1px solid ${colour}33` }}>
+                  style={{ background:`${colour}18`, color: colour, border:`1px solid ${colour}33` }}>
                   {state}
                 </span>
               </div>
@@ -501,8 +504,46 @@ function FlowChart({ data }) {
 
 /* ─── ANPR Window ─────────────────────────────────────────────────── */
 function ANPRWindow({ plates, activeDrone, anprStreamRunning }) {
-  const arr = plates?.plates || [];
   const [view, setView] = useState('grid');
+  // Also poll /plates/live for in-memory detections that haven't hit DB yet
+  const { data: livePlates } = usePoll(
+    activeDrone
+      ? `/analytics/plates/live?drone_id=${activeDrone}&limit=30`
+      : '/analytics/plates/live?limit=30',
+    3000
+  );
+
+  // Merge DB plates (from /plates/recent) with live in-memory plates.
+  // Live plates fill the gallery immediately; DB plates add MinIO image URLs once available.
+  const dbArr   = plates?.plates  || [];
+  const liveArr = livePlates?.plates || [];
+
+  // Build a merged deduplicated list, keyed by plate_text.
+  // DB entries take precedence (they have presigned image URLs).
+  const mergedMap = new Map();
+  // Add live entries first (lower priority — no MinIO URLs yet)
+  for (const p of liveArr) {
+    const key = `${p.drone_id}:${p.tracker_id ?? p.plate_text}`;
+    mergedMap.set(key, p);
+  }
+  // Overlay DB entries (higher priority — have presigned URLs)
+  for (const p of dbArr) {
+    const key = `${p.drone_id}:${p.tracker_id ?? p.plate_text}`;
+    mergedMap.set(key, { ...mergedMap.get(key), ...p });
+  }
+  const arr = Array.from(mergedMap.values())
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+    .slice(0, 50);
+
+  // Helper: resolve an image source — prefer presigned URL, fall back to base64 data URI
+  const imgSrc = (url, b64) => {
+    if (url) return url;
+    if (b64) return `data:image/jpeg;base64,${b64}`;
+    return null;
+  };
+
+  const vehicleSrc = (p) => imgSrc(p.vehicle_image_url, p.vehicle_image_b64);
+  const plateSrc   = (p) => imgSrc(p.plate_image_url,   p.plate_crop_b64);
 
   return (
     <div className="flex flex-col gap-3">
@@ -518,6 +559,13 @@ function ANPRWindow({ plates, activeDrone, anprStreamRunning }) {
             }}>{l}</button>
         ))}
         <span className="ml-auto mono text-[10px] text-teal-400 font-bold">{arr.length} plates</span>
+        {liveArr.length > 0 && (
+          <span className="mono text-[9px] px-1.5 py-0.5 rounded-full flex items-center gap-1"
+            style={{ background:'rgba(52,211,153,0.1)', color:'#34d399', border:'1px solid rgba(52,211,153,0.25)' }}>
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 dvas-live-dot" />
+            {liveArr.length} live
+          </span>
+        )}
       </div>
 
       {view === 'annotated' ? (
@@ -531,40 +579,92 @@ function ANPRWindow({ plates, activeDrone, anprStreamRunning }) {
           <span className="mono text-[10px] text-slate-500">ANPR service will populate this when plates are detected</span>
         </div>
       ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[400px] overflow-y-auto pr-1">
-          {arr.map((p, i) => (
-            <div key={p.id || i} className="rounded-xl overflow-hidden flex flex-col"
-              style={{ background:'var(--dvas-surface-2)', border:'1px solid var(--dvas-border)' }}>
-              <div className="relative bg-black" style={{ height: 110 }}>
-                {p.vehicle_image_url
-                  ? <img src={p.vehicle_image_url} alt="vehicle" className="w-full h-full object-cover" />
-                  : <div className="w-full h-full flex items-center justify-center"><Car size={28} className="text-slate-600 opacity-40" /></div>
-                }
-                <div className="absolute bottom-2 left-2 right-2 flex justify-center">
-                  <span className="mono text-sm font-black tracking-[0.18em] px-3 py-1 rounded"
-                    style={{ background:'rgba(0,0,0,0.85)', color:'#2dd4bf', border:'1px solid #2dd4bf66' }}>
-                    {p.plate_text}
-                  </span>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[480px] overflow-y-auto pr-1">
+          {arr.map((p, i) => {
+            const vSrc = vehicleSrc(p);
+            const pSrc = plateSrc(p);
+            return (
+              <div key={p.id || `${p.plate_text}-${i}`}
+                className="rounded-xl overflow-hidden flex flex-col"
+                style={{
+                  background:'var(--dvas-surface-2)',
+                  border: p.is_watchlisted
+                    ? '1px solid rgba(239,68,68,0.5)'
+                    : '1px solid var(--dvas-border)',
+                }}>
+                {/* Side-by-side: vehicle crop LEFT + plate crop RIGHT */}
+                <div className="flex bg-black" style={{ height: 128 }}>
+                  {/* Vehicle crop */}
+                  <div className="flex-1 relative overflow-hidden"
+                    style={{ borderRight: '1px solid rgba(255,255,255,0.07)' }}>
+                    {vSrc
+                      ? <img src={vSrc} alt="vehicle" className="w-full h-full object-cover" />
+                      : <div className="w-full h-full flex items-center justify-center">
+                          <Car size={28} className="text-slate-700 opacity-50" />
+                        </div>
+                    }
+                    <span className="absolute top-1 left-1 mono text-[8px] bg-black/75 text-slate-400 px-1 py-0.5 rounded">
+                      VEHICLE
+                    </span>
+                    {!p.vehicle_image_url && p.vehicle_image_b64 && (
+                      <span className="absolute bottom-1 right-1 mono text-[7px] bg-amber-900/70 text-amber-300 px-1 py-0.5 rounded">
+                        LIVE
+                      </span>
+                    )}
+                  </div>
+                  {/* Plate crop */}
+                  <div className="flex-1 relative flex items-center justify-center bg-black/90">
+                    {pSrc
+                      ? <img src={pSrc} alt="plate" className="w-full h-full object-contain p-1" />
+                      : <div className="w-full h-full flex flex-col items-center justify-center gap-1">
+                          <Hash size={18} className="text-teal-700 opacity-40" />
+                          <span className="mono text-[8px] text-slate-600">no crop yet</span>
+                        </div>
+                    }
+                    <span className="absolute top-1 left-1 mono text-[8px] bg-black/75 text-teal-400 px-1 py-0.5 rounded">
+                      PLATE
+                    </span>
+                  </div>
+                </div>
+
+                {/* Plate text + meta */}
+                <div className="p-2.5 flex flex-col gap-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="mono font-black tracking-[0.2em]"
+                      style={{
+                        fontSize: 13,
+                        color: p.is_watchlisted ? '#f87171' : '#2dd4bf',
+                      }}>
+                      {p.plate_text}
+                    </span>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {p.is_watchlisted && (
+                        <span className="mono text-[8px] px-1 py-0.5 rounded font-bold"
+                          style={{ background:'rgba(239,68,68,0.15)', color:'#f87171', border:'1px solid rgba(239,68,68,0.3)' }}>
+                          ⚠ WATCHLIST
+                        </span>
+                      )}
+                      <span className="mono text-[10px]"
+                        style={{ color: p.ocr_confidence > 0.8 ? '#34d399' : p.ocr_confidence > 0.5 ? '#fbbf24' : '#94a3b8' }}>
+                        {p.ocr_confidence ? `${(p.ocr_confidence * 100).toFixed(0)}%` : '—'}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="mono text-[10px] text-slate-400">
+                      {p.vehicle_type ? nvt(p.vehicle_type) : '—'} · {p.drone_id || '—'}
+                    </span>
+                    <span className="mono text-[10px]" style={{ color:'var(--dvas-text-dim)' }}>
+                      <Clock size={8} className="inline mr-1" />{fmtAge(p.created_at)}
+                    </span>
+                  </div>
+                  {!p.is_reliable && (
+                    <span className="mono text-[9px] text-amber-500/70">Low confidence — pending confirmation</span>
+                  )}
                 </div>
               </div>
-              {p.plate_image_url && (
-                <div className="bg-black" style={{ height: 48 }}>
-                  <img src={p.plate_image_url} alt="plate crop" className="w-full h-full object-contain" />
-                </div>
-              )}
-              <div className="p-2 flex flex-col gap-0.5">
-                <div className="flex items-center justify-between">
-                  <span className="mono text-[10px] text-slate-300">{p.drone_id || '—'}</span>
-                  <span className="mono text-[10px]" style={{ color: p.ocr_confidence > 0.8 ? '#34d399':'#fbbf24' }}>
-                    {p.ocr_confidence ? `${(p.ocr_confidence * 100).toFixed(0)}%` : '—'}
-                  </span>
-                </div>
-                <div className="mono text-[10px]" style={{ color:'var(--dvas-text-dim)' }}>
-                  <Clock size={9} className="inline mr-1" />{fmtAge(p.created_at)}
-                </div>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
@@ -724,6 +824,20 @@ export default function TrafficAnalytics() {
   const { data: alerts }                          = usePoll('/analytics/alerts/theft', POLL_ALERTS);
   const { data: watchlist }                       = usePoll('/analytics/watchlist', POLL_WATCHLIST);
 
+  // Auto-start vehicle + anpr detection stream loops on page mount
+  // so the user doesn't need to go to Detection Models page first
+  useEffect(() => {
+    const autoStart = async () => {
+      try {
+        await Promise.allSettled([
+          api.get('/analytics/vehicle/stream/start'),
+          api.get('/analytics/anpr/stream/start'),
+        ]);
+      } catch { /* ignore — services may be offline */ }
+    };
+    autoStart();
+  }, []);
+
   useEffect(() => {
     const check = async () => {
       try {
@@ -738,7 +852,7 @@ export default function TrafficAnalytics() {
       } catch { /* ignore */ }
     };
     check();
-    const id = setInterval(check, 15000);
+    const id = setInterval(check, 5000);
     return () => clearInterval(id);
   }, []);
 

@@ -31,6 +31,7 @@ class Config:
 
     # Presigned URL expiry (seconds) for dashboard image display
     MINIO_URL_EXPIRY: int = int(os.getenv("MINIO_URL_EXPIRY", "3600"))
+    MINIO_PUBLIC_URL: str = os.getenv("MINIO_PUBLIC_URL", "")  # e.g. http://10.51.27.250:9000
 
     # ── Drone registry ─────────────────────────────────────────────────────
     DRONE_IDS: List[str] = [

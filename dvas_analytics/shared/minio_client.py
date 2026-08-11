@@ -108,6 +108,7 @@ async def get_presigned_url(
     """
     Generate a presigned GET URL for an object.
     Returns URL string on success, None on failure.
+    Rewrites internal Docker hostname to public-facing URL if MINIO_PUBLIC_URL is set.
     """
     client = get_client()
     if client is None:
@@ -119,6 +120,14 @@ async def get_presigned_url(
             object_name=key,
             expires=timedelta(seconds=expires),
         )
+        # Rewrite internal Docker hostname (e.g. minio:9000) to public-facing URL
+        # so the browser can actually reach the MinIO server.
+        import os
+        public_url = os.getenv("MINIO_PUBLIC_URL", "")
+        if public_url and url:
+            internal = f"http://{cfg.MINIO_ENDPOINT}"
+            if url.startswith(internal):
+                url = url.replace(internal, public_url, 1)
         return url
     except Exception as exc:
         log.warning("MinIO presigned URL failed (%s/%s): %s", bucket, key, exc)

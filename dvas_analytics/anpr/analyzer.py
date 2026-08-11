@@ -56,6 +56,7 @@ class TrackRecord:
     last_ocr_frame:   int = -999
     theft_alerted:    bool = False
     best_crop_b64:    Optional[str] = None
+    best_plate_crop_b64: Optional[str] = None  # plate crop image for gallery
 
     def register_detection(self, frame_idx, class_name, center):
         if self.first_seen_frame is None:
@@ -117,45 +118,57 @@ def enhance_plate_crop(crop_bgr: np.ndarray) -> np.ndarray:
 
 
 def build_ocr_engine(use_gpu: bool):
-    """Build PaddleOCR engine — try 3.x API, then 2.x."""
-    device = "gpu:0" if use_gpu else "cpu"
+    """
+    Build PaddleOCR 2.x engine (requires paddleocr==2.9.x + paddlepaddle 2.6.x).
+    Fast, accurate, GPU-capable — the standard production choice.
+    """
     try:
         from paddleocr import PaddleOCR
-        return PaddleOCR(use_textline_orientation=True, lang="en", device=device)
-    except Exception:
-        pass
-    try:
-        from paddleocr import PaddleOCR
-        return PaddleOCR(use_angle_cls=True, lang="en", use_gpu=use_gpu, show_log=False)
-    except Exception:
-        pass
-    from paddleocr import PaddleOCR
-    return PaddleOCR(use_angle_cls=True, lang="en")
+        engine = PaddleOCR(
+            use_angle_cls=True,
+            lang="en",
+            use_gpu=use_gpu,
+            show_log=False,
+            enable_mkldnn=True,   # CPU acceleration
+            cpu_threads=4,
+            det_db_score_mode="slow",   # more accurate plate boundary detection
+            rec_algorithm="SVTR_LCNet", # lightweight+fast recognition model
+        )
+        log.info("PaddleOCR 2.x engine ready (gpu=%s)", use_gpu)
+        return engine
+    except Exception as exc:
+        log.error("PaddleOCR init failed: %s", exc)
+        return None
 
 
 def run_ocr(ocr_engine, crop_bgr: np.ndarray) -> List[Tuple[str, float]]:
-    """Run PaddleOCR — handles both 2.x and 3.x APIs."""
+    """
+    Run PaddleOCR 2.x inference on a BGR crop.
+    Returns list of (text, confidence) tuples.
+    """
+    if ocr_engine is None:
+        return []
     try:
-        results = ocr_engine.predict(crop_bgr)
-    except AttributeError:
-        results = ocr_engine.ocr(crop_bgr)
+        results = ocr_engine.ocr(crop_bgr, cls=True)
+    except Exception as exc:
+        log.debug("OCR run error: %s", exc)
+        return []
+
     if not results:
         return []
+
     lines = []
-    for res in results:
-        if res is None:
+    for page in results:
+        if page is None:
             continue
-        if hasattr(res, "get"):
-            for t, s in zip(res.get("rec_texts", []), res.get("rec_scores", [])):
-                if t:
-                    lines.append((t, float(s)))
-        elif isinstance(res, (list, tuple)):
-            for item in res:
-                try:
-                    text, conf = item[1]
-                    lines.append((text, float(conf)))
-                except (TypeError, IndexError, ValueError):
-                    continue
+        for item in page:
+            try:
+                # PaddleOCR 2.x: item = [[pts], (text, conf)]
+                text, conf = item[1]
+                if text:
+                    lines.append((text.strip(), float(conf)))
+            except (TypeError, IndexError, ValueError):
+                continue
     return lines
 
 
@@ -312,6 +325,10 @@ class ANPRAnalyzer:
                                                 clean    = clean_plate_text(raw_txt)
                                                 if avg_conf >= MIN_OCR_CONFIDENCE and is_plausible_plate(clean):
                                                     rec.register_plate_read(frame_idx, clean, avg_conf)
+                                                    # Store plate crop as b64 for MinIO upload
+                                                    _, pbuf = cv2.imencode(".jpg", plate_crop,
+                                                                            [cv2.IMWRITE_JPEG_QUALITY, 90])
+                                                    rec.best_plate_crop_b64 = base64.b64encode(pbuf).decode()
                                         else:
                                             rec.last_ocr_frame = frame_idx
                         except Exception as exc:
@@ -328,6 +345,12 @@ class ANPRAnalyzer:
                     rec.theft_alerted = True
                     theft_alerts += 1
 
+                # Compute vehicle bbox scaled back to original frame coords for annotation
+                veh_bbox_orig = [
+                    round(tx1 * scale_x, 2), round(ty1 * scale_y, 2),
+                    round(tx2 * scale_x, 2), round(ty2 * scale_y, 2),
+                ]
+
                 plate_reads.append({
                     "tracker_id":        track_id,
                     "vehicle_type":      class_name,
@@ -338,6 +361,8 @@ class ANPRAnalyzer:
                     "times_read":        plate_reads_count,
                     "is_watchlisted":    is_theft,
                     "vehicle_image_b64": rec.best_crop_b64,
+                    "plate_crop_b64":    rec.best_plate_crop_b64,
+                    "vehicle_bbox":      veh_bbox_orig,
                     "first_seen_frame":  rec.first_seen_frame,
                     "last_seen_frame":   rec.last_seen_frame,
                 })

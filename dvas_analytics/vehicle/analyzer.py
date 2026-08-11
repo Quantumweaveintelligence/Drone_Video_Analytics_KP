@@ -194,6 +194,7 @@ class VehicleAnalyzer:
                         "tracker_id":  tracker_id,
                         "vehicle_type": vtype,
                         "confidence":  round(conf, 4),
+                        "bbox":        [round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)],
                         "bbox_x":      round(bx, 2),
                         "bbox_y":      round(by, 2),
                         "bbox_w":      round(bw, 2),
