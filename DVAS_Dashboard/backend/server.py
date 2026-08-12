@@ -49,6 +49,15 @@ api = APIRouter(prefix="/api")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dvas")
 
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+# Initialize the limiter using the client's IP address
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # ---------- Auth helpers ----------
 # RBAC: 4-role model (field_supervisor → control_room_officer,
 #        supervisory_officer → senior_officer — see migrate_roles.py)
@@ -202,6 +211,7 @@ class ExportDecisionIn(BaseModel):
 
 # ---------- Auth endpoints ----------
 @api.post("/auth/login")
+@limiter.limit("5/minute")
 async def login(body: LoginIn, response: Response, request: Request):
     email = body.email.lower()
     async with async_session_factory() as session:
