@@ -127,11 +127,13 @@ class EdgeSenderThread(threading.Thread):
         self._running  = True
         self._mission_name: Optional[str] = None
         self._location:     Optional[str] = None
+        self._operator:     Optional[str] = None
 
-    def set_mission_details(self, mission_name: str = None, location: str = None) -> None:
+    def set_mission_details(self, mission_name: str = None, location: str = None, operator: str = None) -> None:
         """Store mission details so they can be sent at start_mission time."""
         self._mission_name = mission_name
         self._location = location
+        self._operator = operator
 
     def put_frame(self, frame: SelectedFrame, telemetry: dict = None) -> None:
         """Queue a SelectedFrame (from cognitive pipeline) with optional telemetry."""
@@ -166,6 +168,7 @@ class EdgeSenderThread(threading.Thread):
             await self._client.start_mission(
                 mission_name=self._mission_name,
                 location=self._location,
+                operator=self._operator,
             )
         except Exception:
             pass
@@ -408,6 +411,7 @@ class PipelineManager:
             self.sender_thread.set_mission_details(
                 mission_name=req.mission_name,
                 location=req.location,
+                operator=req.operator,
             )
             self.sender_thread.start()
 

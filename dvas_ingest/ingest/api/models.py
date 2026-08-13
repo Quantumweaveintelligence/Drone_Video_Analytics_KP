@@ -125,6 +125,8 @@ class SystemStatusResponse(BaseModel):
 class MissionStartRequest(BaseModel):
     drone_id:   str   = Field(..., description="Drone ID starting the mission")
     mission_id: str   = Field(..., description="Unique mission identifier")
+    mission_name: Optional[str] = None
+    location:   Optional[str] = None
     operator:   Optional[str] = None
     latitude:   Optional[float] = None
     longitude:  Optional[float] = None

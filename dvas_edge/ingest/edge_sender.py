@@ -341,6 +341,7 @@ class IngestClient:
         self,
         mission_name: Optional[str] = None,
         location:     Optional[str] = None,
+        operator:     Optional[str] = None,
     ) -> None:
         """Register mission start with the ingest server."""
         mission_start_url = os.getenv(
@@ -351,7 +352,7 @@ class IngestClient:
         payload = {
             "drone_id":     self.drone_id,
             "mission_id":   self.mission_id,
-            "operator":     self.username,
+            "operator":     operator or self.username,
         }
         if mission_name:
             payload["mission_name"] = mission_name
