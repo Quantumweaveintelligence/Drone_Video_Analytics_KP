@@ -15,7 +15,7 @@ WORKDIR /app
 # ── Dependency layer (cached separately from source) ──────────────────────
 FROM base AS deps
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --default-timeout=100 --no-cache-dir -r requirements.txt
 
 # ── Final image ───────────────────────────────────────────────────────────
 FROM base AS final

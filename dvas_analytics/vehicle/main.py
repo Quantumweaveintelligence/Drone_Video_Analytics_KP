@@ -303,6 +303,18 @@ async def _stream_loop():
                     result = analyzer.analyze_frame(frame, drone_id=drone_id, save_crops=True)
                     ts     = datetime.now(timezone.utc)
 
+                    # Extract mission_id from stream frame metadata
+                    import json as _json
+                    frame_mission_id = None
+                    raw_meta = f.get("metadata", "")
+                    if raw_meta:
+                        if isinstance(raw_meta, bytes):
+                            raw_meta = raw_meta.decode()
+                        try:
+                            frame_mission_id = _json.loads(raw_meta).get("mission_id")
+                        except Exception:
+                            pass
+
                     # ── Annotate frame and cache for dashboard ────────────────
                     import time as _time
                     annotated_bytes = _draw_vehicle_annotations(
@@ -316,7 +328,8 @@ async def _stream_loop():
                     for veh in result.get("vehicles", []):
                         tracker_id   = veh.get("tracker_id")
                         track_id     = await upsert_track(
-                            drone_id, None, "vehicle", ts, ts, tracker_id=tracker_id
+                            drone_id, None, "vehicle", ts, ts,
+                            tracker_id=tracker_id, mission_id=frame_mission_id
                         )
                         await write_confirmed_event(
                             drone_id=drone_id, event_type="vehicle_detected",
@@ -328,7 +341,8 @@ async def _stream_loop():
                         veh_image_key = None
                         if crop_bytes:
                             key = minio.make_key("vehicles", drone_id,
-                                                 f"v_{tracker_id}_{int(ts.timestamp()*1000)}.jpg")
+                                                 f"v_{tracker_id}_{int(ts.timestamp()*1000)}.jpg",
+                                                 mission_id=frame_mission_id or "")
                             veh_image_key = await minio.upload_bytes(
                                 cfg.BUCKET_VEHICLES, key, crop_bytes, "image/jpeg"
                             )

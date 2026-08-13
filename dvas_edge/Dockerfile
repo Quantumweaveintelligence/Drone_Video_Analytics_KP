@@ -19,7 +19,7 @@ RUN sed 's/\r$//' requirements.txt \
     | grep -v 'cupy-cuda' \
     | grep -v 'nvidia-ml-py3' \
     > /tmp/requirements_docker.txt && \
-    pip install --no-cache-dir -r /tmp/requirements_docker.txt && \
+    pip install --default-timeout=100 --no-cache-dir -r /tmp/requirements_docker.txt && \
     rm /tmp/requirements_docker.txt
 
 # Copy source code (video files excluded via .dockerignore)

@@ -557,114 +557,116 @@ class ANPRAnalyzer:
                 rec = self.tracks.setdefault(track_id, TrackRecord(track_id=track_id))
                 rec.register_detection(frame_idx, class_name, (cx, cy))
 
-                # ── 2. Plate OCR on full-res crop ───────────────────────────
+                # ── 2. Always capture vehicle crop on first sight ────────────
+                # Compute full-res coordinates for vehicle bounding box
+                ox1 = int(tx1 * scale_x) - VEHICLE_CROP_PAD
+                oy1 = int(ty1 * scale_y) - VEHICLE_CROP_PAD
+                ox2 = int(tx2 * scale_x) + VEHICLE_CROP_PAD
+                oy2 = int(ty2 * scale_y) + VEHICLE_CROP_PAD
+                ox1, oy1, ox2, oy2 = clamp_box(ox1, oy1, ox2, oy2, orig_w, orig_h)
+                vehicle_crop = frame_orig[oy1:oy2, ox1:ox2]
+
+                # Always capture vehicle crop if we don't have one yet
+                if vehicle_crop.size > 0 and rec.best_crop_b64 is None:
+                    _, buf = cv2.imencode(".jpg", vehicle_crop,
+                                          [cv2.IMWRITE_JPEG_QUALITY, 90])
+                    rec.best_crop_b64 = base64.b64encode(buf).decode()
+
+                # ── 3. Plate OCR on full-res crop ───────────────────────────
                 due_for_ocr = (frame_idx - rec.last_ocr_frame) >= OCR_EVERY_N_FRAMES
-                if self.lp_model and self.ocr_engine and due_for_ocr:
-                    ox1 = int(tx1 * scale_x) - VEHICLE_CROP_PAD
-                    oy1 = int(ty1 * scale_y) - VEHICLE_CROP_PAD
-                    ox2 = int(tx2 * scale_x) + VEHICLE_CROP_PAD
-                    oy2 = int(ty2 * scale_y) + VEHICLE_CROP_PAD
-                    ox1, oy1, ox2, oy2 = clamp_box(ox1, oy1, ox2, oy2, orig_w, orig_h)
-                    vehicle_crop = frame_orig[oy1:oy2, ox1:ox2]
+                if self.lp_model and self.ocr_engine and due_for_ocr and vehicle_crop.size > 0:
+                    try:
+                        lp_res = self.lp_model.predict(
+                            vehicle_crop, imgsz=IMG_SIZE, conf=CONF_LP,
+                            device=self.device, verbose=False,
+                        )
+                        lp_found = False
+                        if lp_res and lp_res[0].boxes and len(lp_res[0].boxes) > 0:
+                            confs    = lp_res[0].boxes.conf.tolist()
+                            best_idx = confs.index(max(confs))
+                            bx1, by1, bx2, by2 = lp_res[0].boxes.xyxy[best_idx].tolist()
+                            ch, cw = vehicle_crop.shape[:2]
+                            lx1, ly1, lx2, ly2 = clamp_box(bx1, by1, bx2, by2, cw, ch)
+                            plate_area = (lx2 - lx1) * (ly2 - ly1)
 
-                    if vehicle_crop.size > 0:
-                        if rec.best_crop_b64 is None:
-                            _, buf = cv2.imencode(".jpg", vehicle_crop,
-                                                  [cv2.IMWRITE_JPEG_QUALITY, 90])
-                            rec.best_crop_b64 = base64.b64encode(buf).decode()
+                            if plate_area >= MIN_PLATE_AREA_PX:
+                                plate_crop = vehicle_crop[ly1:ly2, lx1:lx2]
+                                if plate_crop.size > 0:
+                                    gray_check = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
+                                    sharpness = sharpness_laplacian(gray_check)
+                                    log.info("Track %d: LP model found %d boxes, best conf=%.2f area=%d",
+                                      track_id, len(lp_res[0].boxes),
+                                      max(confs), plate_area)
+                                    if sharpness >= MIN_PLATE_SHARPNESS:
+                                        enhanced = enhance_plate_crop(plate_crop)
+                                        lines    = run_ocr(self.ocr_engine, enhanced)
+                                        if lines:
+                                            raw_txt  = "".join(t for t, _ in lines)
+                                            avg_conf = sum(c for _, c in lines) / len(lines)
+                                            clean    = clean_plate_text(raw_txt)
+                                            if avg_conf >= MIN_OCR_CONFIDENCE and is_plausible_plate(clean):
+                                                rec.register_plate_read(frame_idx, clean, avg_conf)
+                                                lp_found = True
+                                        # Always store the plate crop if LP model found it,
+                                        # even if OCR couldn't read the text yet
+                                        _, pbuf = cv2.imencode(".jpg", plate_crop,
+                                                                [cv2.IMWRITE_JPEG_QUALITY, 90])
+                                        rec.best_plate_crop_b64 = base64.b64encode(pbuf).decode()
+                                        # Store plate bbox in full-frame coords for annotation
+                                        pfx1 = round(ox1 + lx1, 2)
+                                        pfy1 = round(oy1 + ly1, 2)
+                                        pfx2 = round(ox1 + lx2, 2)
+                                        pfy2 = round(oy1 + ly2, 2)
+                                        rec.best_plate_bbox = [pfx1, pfy1, pfx2, pfy2]
+                                    else:
+                                        log.info("Track %d: plate sharpness %.1f < %.1f, skipping",
+                                                  track_id, sharpness, MIN_PLATE_SHARPNESS)
+                                        rec.last_ocr_frame = frame_idx
+                            else:
+                                log.info("Track %d: plate area %d < %d, skipping",
+                                          track_id, plate_area, MIN_PLATE_AREA_PX)
 
-                        try:
-                            lp_res = self.lp_model.predict(
-                                vehicle_crop, imgsz=IMG_SIZE, conf=CONF_LP,
-                                device=self.device, verbose=False,
-                            )
-                            lp_found = False
-                            if lp_res and lp_res[0].boxes and len(lp_res[0].boxes) > 0:
-                                confs    = lp_res[0].boxes.conf.tolist()
-                                best_idx = confs.index(max(confs))
-                                bx1, by1, bx2, by2 = lp_res[0].boxes.xyxy[best_idx].tolist()
-                                ch, cw = vehicle_crop.shape[:2]
-                                lx1, ly1, lx2, ly2 = clamp_box(bx1, by1, bx2, by2, cw, ch)
-                                plate_area = (lx2 - lx1) * (ly2 - ly1)
+                        # ── OCR-direct fallback ──────────────────────────
+                        # If the LP model failed, try running PaddleOCR
+                        # directly on the vehicle crop. PaddleOCR has its
+                        # own text detector that may find plate text even
+                        # when the dedicated LP YOLO model misses.
+                        if not lp_found and rec.best_plate_crop_b64 is None:
+                            try:
+                                enhanced_vc = enhance_plate_crop(vehicle_crop)
+                                ocr_results = self.ocr_engine.ocr(enhanced_vc, cls=True)
+                                if ocr_results and ocr_results[0]:
+                                    for line in ocr_results[0]:
+                                        box_pts, (text, conf) = line
+                                        clean = clean_plate_text(text)
+                                        if conf >= MIN_OCR_CONFIDENCE and is_plausible_plate(clean):
+                                            # Extract plate region from OCR box
+                                            xs = [pt[0] for pt in box_pts]
+                                            ys = [pt[1] for pt in box_pts]
+                                            bx1o, by1o = int(min(xs)), int(min(ys))
+                                            bx2o, by2o = int(max(xs)), int(max(ys))
+                                            ch, cw = vehicle_crop.shape[:2]
+                                            bx1o, by1o, bx2o, by2o = clamp_box(bx1o, by1o, bx2o, by2o, cw, ch)
+                                            ocr_plate_crop = vehicle_crop[by1o:by2o, bx1o:bx2o]
+                                            if ocr_plate_crop.size > 0:
+                                                rec.register_plate_read(frame_idx, clean, conf)
+                                                _, pbuf = cv2.imencode(".jpg", ocr_plate_crop,
+                                                                        [cv2.IMWRITE_JPEG_QUALITY, 90])
+                                                rec.best_plate_crop_b64 = base64.b64encode(pbuf).decode()
+                                                pfx1 = round(ox1 + bx1o, 2)
+                                                pfy1 = round(oy1 + by1o, 2)
+                                                pfx2 = round(ox1 + bx2o, 2)
+                                                pfy2 = round(oy1 + by2o, 2)
+                                                rec.best_plate_bbox = [pfx1, pfy1, pfx2, pfy2]
+                                                log.info("Track %d: OCR fallback found plate '%s' conf=%.2f",
+                                                         track_id, clean, conf)
+                                                break  # use first valid plate
+                            except Exception as ocr_exc:
+                                log.debug("OCR fallback error: %s", ocr_exc)
 
-                                if plate_area >= MIN_PLATE_AREA_PX:
-                                    plate_crop = vehicle_crop[ly1:ly2, lx1:lx2]
-                                    if plate_crop.size > 0:
-                                        gray_check = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
-                                        sharpness = sharpness_laplacian(gray_check)
-                                        log.info("Track %d: LP model found %d boxes, best conf=%.2f area=%d",
-                                          track_id, len(lp_res[0].boxes),
-                                          max(confs), plate_area)
-                                        if sharpness >= MIN_PLATE_SHARPNESS:
-                                            enhanced = enhance_plate_crop(plate_crop)
-                                            lines    = run_ocr(self.ocr_engine, enhanced)
-                                            if lines:
-                                                raw_txt  = "".join(t for t, _ in lines)
-                                                avg_conf = sum(c for _, c in lines) / len(lines)
-                                                clean    = clean_plate_text(raw_txt)
-                                                if avg_conf >= MIN_OCR_CONFIDENCE and is_plausible_plate(clean):
-                                                    rec.register_plate_read(frame_idx, clean, avg_conf)
-                                                    lp_found = True
-                                            # Always store the plate crop if LP model found it,
-                                            # even if OCR couldn't read the text yet
-                                            _, pbuf = cv2.imencode(".jpg", plate_crop,
-                                                                    [cv2.IMWRITE_JPEG_QUALITY, 90])
-                                            rec.best_plate_crop_b64 = base64.b64encode(pbuf).decode()
-                                            # Store plate bbox in full-frame coords for annotation
-                                            pfx1 = round(ox1 + lx1, 2)
-                                            pfy1 = round(oy1 + ly1, 2)
-                                            pfx2 = round(ox1 + lx2, 2)
-                                            pfy2 = round(oy1 + ly2, 2)
-                                            rec.best_plate_bbox = [pfx1, pfy1, pfx2, pfy2]
-                                        else:
-                                            log.info("Track %d: plate sharpness %.1f < %.1f, skipping",
-                                                      track_id, sharpness, MIN_PLATE_SHARPNESS)
-                                            rec.last_ocr_frame = frame_idx
-                                else:
-                                    log.info("Track %d: plate area %d < %d, skipping",
-                                              track_id, plate_area, MIN_PLATE_AREA_PX)
-
-                            # ── OCR-direct fallback ──────────────────────────
-                            # If the LP model failed, try running PaddleOCR
-                            # directly on the vehicle crop. PaddleOCR has its
-                            # own text detector that may find plate text even
-                            # when the dedicated LP YOLO model misses.
-                            if not lp_found and rec.best_plate_crop_b64 is None:
-                                try:
-                                    enhanced_vc = enhance_plate_crop(vehicle_crop)
-                                    ocr_results = self.ocr_engine.ocr(enhanced_vc, cls=True)
-                                    if ocr_results and ocr_results[0]:
-                                        for line in ocr_results[0]:
-                                            box_pts, (text, conf) = line
-                                            clean = clean_plate_text(text)
-                                            if conf >= MIN_OCR_CONFIDENCE and is_plausible_plate(clean):
-                                                # Extract plate region from OCR box
-                                                xs = [pt[0] for pt in box_pts]
-                                                ys = [pt[1] for pt in box_pts]
-                                                bx1o, by1o = int(min(xs)), int(min(ys))
-                                                bx2o, by2o = int(max(xs)), int(max(ys))
-                                                ch, cw = vehicle_crop.shape[:2]
-                                                bx1o, by1o, bx2o, by2o = clamp_box(bx1o, by1o, bx2o, by2o, cw, ch)
-                                                ocr_plate_crop = vehicle_crop[by1o:by2o, bx1o:bx2o]
-                                                if ocr_plate_crop.size > 0:
-                                                    rec.register_plate_read(frame_idx, clean, conf)
-                                                    _, pbuf = cv2.imencode(".jpg", ocr_plate_crop,
-                                                                            [cv2.IMWRITE_JPEG_QUALITY, 90])
-                                                    rec.best_plate_crop_b64 = base64.b64encode(pbuf).decode()
-                                                    pfx1 = round(ox1 + bx1o, 2)
-                                                    pfy1 = round(oy1 + by1o, 2)
-                                                    pfx2 = round(ox1 + bx2o, 2)
-                                                    pfy2 = round(oy1 + by2o, 2)
-                                                    rec.best_plate_bbox = [pfx1, pfy1, pfx2, pfy2]
-                                                    log.info("Track %d: OCR fallback found plate '%s' conf=%.2f",
-                                                             track_id, clean, conf)
-                                                    break  # use first valid plate
-                                except Exception as ocr_exc:
-                                    log.debug("OCR fallback error: %s", ocr_exc)
-
-                        except Exception as exc:
-                            log.debug("LP inference error: %s", exc)
-                            rec.last_ocr_frame = frame_idx
+                    except Exception as exc:
+                        log.debug("LP inference error: %s", exc)
+                        rec.last_ocr_frame = frame_idx
 
                 # ── 3. Build result for this track ──────────────────────────
                 plate_text, plate_conf, plate_reads_count = rec.best_plate()

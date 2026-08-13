@@ -387,25 +387,21 @@ async def list_missions(user: dict = Depends(get_current_user)):
             # operator_ids is JSONB array — use contains operator
             stmt = select(Mission).where(
                 Mission.operator_ids.contains([user["id"]])
-            ).limit(50)
+            ).order_by(Mission.started_at.desc()).limit(100)
             result = await session.execute(stmt)
             return [_row_to_dict(r) for r in result.scalars().all()]
 
-        if user["role"] == "system_administrator":
-            raise HTTPException(403, "Not permitted")
-
-        f = scope_filter_for(user)
-        if "__deny__" in f:
-            raise HTTPException(403, "Not permitted")
-
+        # All other roles (senior_officer, control_room_officer, system_administrator)
+        # can see all missions — filtered by jurisdiction if set
         stmt = select(Mission)
-        if "jurisdiction" in f:
-            stmt = stmt.where(Mission.jurisdiction == f["jurisdiction"])
-        if "mission_id" in f:
-            in_list = f["mission_id"].get("$in", [])
-            if in_list:
-                stmt = stmt.where(Mission.mission_id.in_(in_list))
-        stmt = stmt.order_by(Mission.started_at.desc()).limit(50)
+        if user["role"] == "control_room_officer":
+            jur = user.get("jurisdiction")
+            if jur:
+                # Show missions in their jurisdiction OR missions with no jurisdiction set
+                stmt = stmt.where(
+                    or_(Mission.jurisdiction == jur, Mission.jurisdiction == None, Mission.jurisdiction == "")
+                )
+        stmt = stmt.order_by(Mission.started_at.desc()).limit(100)
         result = await session.execute(stmt)
         return [_row_to_dict(r) for r in result.scalars().all()]
 
@@ -1713,22 +1709,36 @@ async def anpr_annotated_frame(user: dict = Depends(get_current_user), drone_id:
 
 # ── ANPR Analytics ────────────────────────────────────────────────────────────
 @api.get("/analytics/plates/recent")
-async def plates_recent(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 50):
+async def plates_recent(
+    user: dict = Depends(get_current_user),
+    drone_id: str = "",
+    mission_id: str = "",
+    limit: int = 50,
+):
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{ANPR_URL}/plates/recent?limit={limit}"
-    if drone_id:
+    if mission_id:
+        url += f"&mission_id={mission_id}"
+    elif drone_id:
         url += f"&drone_id={drone_id}"
     return await _analytics_get(url)
 
 
 @api.get("/analytics/plates/live")
-async def plates_live(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 50):
+async def plates_live(
+    user: dict = Depends(get_current_user),
+    drone_id: str = "",
+    mission_id: str = "",
+    limit: int = 50,
+):
     """In-memory live plate detections from the stream loop — no DB/MinIO required."""
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{ANPR_URL}/plates/live?limit={limit}"
-    if drone_id:
+    if mission_id:
+        url += f"&mission_id={mission_id}"
+    elif drone_id:
         url += f"&drone_id={drone_id}"
     return await _analytics_get(url)
 
@@ -1811,34 +1821,37 @@ async def mission_vehicles(
 ):
     """
     Retrieve vehicle/plate detection history for a specific mission.
-    Looks up the mission record to get drone_id and time range,
-    then queries the ANPR service for plate reads in that window.
+    Passes mission_id directly to the ANPR service for accurate per-mission filtering.
     """
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
 
-    # Look up mission from dashboard DB
+    # Look up mission from dashboard DB — soft lookup, not required
+    mission_name = mission_id
+    drone_id = ""
+    started_at = ""
+    ended_at = ""
+    status = "unknown"
     async with AsyncSession(engine) as session:
         mission = await session.get(Mission, mission_id)
-        if not mission:
-            raise HTTPException(404, f"Mission {mission_id} not found")
+        if mission:
+            mission_name = mission.name or mission_id
+            drone_id = mission.drone_id or ""
+            started_at = mission.started_at or ""
+            ended_at = mission.ended_at or ""
+            status = mission.status or "unknown"
 
-    drone_id = mission.drone_id or ""
-    started_at = mission.started_at or ""
-    ended_at = mission.ended_at or ""
-
-    # Build query string for ANPR service
-    qs_parts = [f"limit={min(limit, 200)}", f"offset={offset}"]
-    if drone_id:
-        qs_parts.append(f"drone_id={drone_id}")
-    if started_at:
-        qs_parts.append(f"start={started_at}")
-    if ended_at:
-        qs_parts.append(f"end={ended_at}")
+    # Build query string for ANPR service — use mission_id as primary filter
+    from urllib.parse import quote
+    qs_parts = [
+        f"mission_id={quote(mission_id)}",
+        f"limit={min(limit, 200)}",
+        f"offset={offset}",
+    ]
     if plate_search:
-        qs_parts.append(f"plate_search={plate_search}")
-    if vehicle_type:
-        qs_parts.append(f"vehicle_type={vehicle_type}")
+        qs_parts.append(f"plate_search={quote(plate_search)}")
+    if vehicle_type and vehicle_type != "all":
+        qs_parts.append(f"vehicle_type={quote(vehicle_type)}")
     if sort:
         qs_parts.append(f"sort={sort}")
 
@@ -1848,9 +1861,9 @@ async def mission_vehicles(
     # Enrich with mission metadata
     if isinstance(result, dict) and "error" not in result:
         result["mission_id"] = mission_id
-        result["mission_name"] = mission.name
+        result["mission_name"] = mission_name
         result["drone_id"] = drone_id
-        result["status"] = mission.status
+        result["status"] = status
         result["time_range"] = {
             "start": started_at,
             "end": ended_at,
@@ -1866,7 +1879,11 @@ async def mission_vehicles(
                 result["duration"] = f"{h}h {m}m" if h > 0 else f"{m}m"
             except Exception:
                 result["duration"] = None
-
+                
+        # The ANPR service returns `plates`, but the frontend expects `vehicles`
+        if "plates" in result:
+            result["vehicles"] = result.pop("plates")
+            
     return result
 
 
@@ -1879,25 +1896,15 @@ async def mission_stats(
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
 
-    # Reuse the vehicles endpoint with limit=1 to get totals
     async with AsyncSession(engine) as session:
         mission = await session.get(Mission, mission_id)
         if not mission:
             raise HTTPException(404, f"Mission {mission_id} not found")
 
     drone_id = mission.drone_id or ""
-    started_at = mission.started_at or ""
-    ended_at = mission.ended_at or ""
 
-    qs_parts = ["limit=1", "offset=0"]
-    if drone_id:
-        qs_parts.append(f"drone_id={drone_id}")
-    if started_at:
-        qs_parts.append(f"start={started_at}")
-    if ended_at:
-        qs_parts.append(f"end={ended_at}")
-
-    url = f"{ANPR_URL}/plates/by-mission?{'&'.join(qs_parts)}"
+    from urllib.parse import quote
+    url = f"{ANPR_URL}/plates/by-mission?mission_id={quote(mission_id)}&limit=1&offset=0"
     result = await _analytics_get(url, timeout=15.0)
 
     return {

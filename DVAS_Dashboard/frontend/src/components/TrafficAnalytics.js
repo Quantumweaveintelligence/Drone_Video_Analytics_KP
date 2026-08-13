@@ -503,21 +503,31 @@ function FlowChart({ data }) {
 }
 
 /* ─── ANPR Window ─────────────────────────────────────────────────── */
-function ANPRWindow({ plates, activeDrone, anprStreamRunning }) {
+function ANPRWindow({ plates, activeDrone, activeMissionId, anprStreamRunning }) {
   const [view, setView] = useState('grid');
   const [selectedId, setSelectedId] = useState(null);
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState('all');
-  
-  // Also poll /plates/live for in-memory detections that haven't hit DB yet
-  const { data: livePlates } = usePoll(
-    activeDrone
+
+  // Clear selection and search when mission changes — no leftover data across missions
+  useEffect(() => {
+    setSelectedId(null);
+    setSearch('');
+    setTypeFilter('all');
+  }, [activeMissionId, activeDrone]);
+
+  // Poll /plates/live filtered by mission_id (preferred) or drone_id
+  const liveUrl = activeMissionId
+    ? `/analytics/plates/live?mission_id=${encodeURIComponent(activeMissionId)}&limit=30`
+    : activeDrone
       ? `/analytics/plates/live?drone_id=${activeDrone}&limit=30`
-      : '/analytics/plates/live?limit=30',
-    3000
-  );
+      : '/analytics/plates/live?limit=30';
+
+  const { data: livePlates } = usePoll(liveUrl, 3000);
 
   // Merge DB plates (from /plates/recent) with live in-memory plates.
+  // Live cache has b64 images; DB has presigned URLs.
+  // When merging, never let null/empty DB fields overwrite existing live data.
   const dbArr   = plates?.plates  || [];
   const liveArr = livePlates?.plates || [];
 
@@ -528,7 +538,13 @@ function ANPRWindow({ plates, activeDrone, anprStreamRunning }) {
   }
   for (const p of dbArr) {
     const key = `${p.drone_id}:${p.tracker_id ?? p.plate_text}`;
-    mergedMap.set(key, { ...mergedMap.get(key), ...p });
+    const existing = mergedMap.get(key) || {};
+    // Only spread non-null, non-empty values from DB record
+    const cleaned = {};
+    for (const [k, v] of Object.entries(p)) {
+      if (v !== null && v !== undefined && v !== '') cleaned[k] = v;
+    }
+    mergedMap.set(key, { ...existing, ...cleaned });
   }
   let arr = Array.from(mergedMap.values())
     .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
@@ -786,11 +802,33 @@ function ANPRWindow({ plates, activeDrone, anprStreamRunning }) {
 function WatchlistPanel({ alerts, watchlist, onAdd, onRemove, adding }) {
   const [inputPlate, setInputPlate] = useState('');
   const [inputReason, setInputReason] = useState('');
+  const [searchPlate, setSearchPlate] = useState('');
+  const [searchResult, setSearchResult] = useState(null); // null | 'loading' | {} | 'notfound'
+  const [searchError, setSearchError] = useState(null);
   const alertsArr    = alerts?.alerts || [];
   const watchlistArr = watchlist?.watchlist || [];
 
+  const handleSearch = async () => {
+    const q = searchPlate.trim().toUpperCase();
+    if (!q) return;
+    setSearchResult('loading');
+    setSearchError(null);
+    try {
+      const res = await api.get(`/analytics/plates/${encodeURIComponent(q)}`);
+      setSearchResult(res.data || 'notfound');
+    } catch (e) {
+      if (e?.response?.status === 404) {
+        setSearchResult('notfound');
+      } else {
+        setSearchError('Search failed — ANPR service may be offline');
+        setSearchResult(null);
+      }
+    }
+  };
+
   return (
     <div className="flex flex-col gap-4">
+      {/* ── Active Theft Alerts ── */}
       {alertsArr.length > 0 && (
         <div className="rounded-lg p-3 flex flex-col gap-2"
           style={{ background:'rgba(239,68,68,0.07)', border:'1px solid rgba(239,68,68,0.2)' }}>
@@ -798,12 +836,36 @@ function WatchlistPanel({ alerts, watchlist, onAdd, onRemove, adding }) {
             !! Watchlist Hits — {alertsArr.length} alert{alertsArr.length > 1 ? 's':''}
           </div>
           {alertsArr.map((a, i) => (
-            <div key={i} className="flex items-center gap-3 px-2 py-1.5 rounded"
+            <div key={i} className="flex flex-col rounded overflow-hidden"
               style={{ background:'rgba(239,68,68,0.06)', border:'1px solid rgba(239,68,68,0.15)' }}>
-              <AlertTriangle size={12} className="text-red-400 shrink-0" />
-              <span className="mono text-sm font-black tracking-widest text-red-300">{a.plate_text}</span>
-              <span className="mono text-[10px] text-slate-400">{a.vehicle_type || '—'}</span>
-              <span className="ml-auto mono text-[10px]" style={{ color:'var(--dvas-text-dim)' }}>{fmtAge(a.detected_at)}</span>
+              {/* Alert header row */}
+              <div className="flex items-center gap-3 px-2 py-1.5">
+                <AlertTriangle size={12} className="text-red-400 shrink-0" />
+                <span className="mono text-sm font-black tracking-widest text-red-300">{a.plate_text}</span>
+                <span className="mono text-[10px] text-slate-400">{a.vehicle_type || '—'}</span>
+                <span className="ml-auto mono text-[10px]" style={{ color:'var(--dvas-text-dim)' }}>{fmtAge(a.detected_at)}</span>
+              </div>
+              {/* Vehicle + Plate image pair if available */}
+              {(a.vehicle_image_url || a.plate_image_url) && (
+                <div className="flex gap-1 px-2 pb-2">
+                  {a.vehicle_image_url && (
+                    <div className="relative rounded overflow-hidden bg-black" style={{ flex:'2', paddingTop:'40%' }}>
+                      <img src={a.vehicle_image_url} alt="vehicle" loading="lazy"
+                        className="absolute inset-0 w-full h-full object-cover" />
+                      <span className="absolute bottom-0.5 left-0.5 mono text-[7px] px-1 rounded"
+                        style={{ background:'rgba(0,0,0,0.7)', color:'#94a3b8' }}>VEHICLE</span>
+                    </div>
+                  )}
+                  {a.plate_image_url && (
+                    <div className="relative rounded overflow-hidden bg-black" style={{ flex:'1', paddingTop:'40%' }}>
+                      <img src={a.plate_image_url} alt="plate" loading="lazy"
+                        className="absolute inset-0 w-full h-full object-contain" />
+                      <span className="absolute bottom-0.5 left-0.5 mono text-[7px] px-1 rounded"
+                        style={{ background:'rgba(0,0,0,0.7)', color:'#94a3b8' }}>PLATE</span>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -815,6 +877,83 @@ function WatchlistPanel({ alerts, watchlist, onAdd, onRemove, adding }) {
         </div>
       )}
 
+      {/* ── Plate DB Search ── */}
+      <div className="flex flex-col gap-2">
+        <div className="mono text-[10px] text-slate-400 font-semibold uppercase tracking-widest">Search Plate in DB</div>
+        <div className="flex gap-2">
+          <input
+            value={searchPlate}
+            onChange={e => setSearchPlate(e.target.value.toUpperCase())}
+            onKeyDown={e => e.key === 'Enter' && handleSearch()}
+            placeholder="e.g. KL01AB1234"
+            className="flex-1 mono text-xs px-2 py-1.5 rounded outline-none uppercase"
+            style={{ background:'var(--dvas-surface-2)', border:'1px solid var(--dvas-border)', color:'var(--dvas-text)' }} />
+          <button
+            onClick={handleSearch}
+            disabled={!searchPlate.trim()}
+            className="px-3 py-1.5 rounded mono text-xs font-semibold transition-colors flex items-center gap-1 disabled:opacity-40"
+            style={{ background:'rgba(20,184,166,0.12)', color:'#14b8a6', border:'1px solid rgba(20,184,166,0.3)' }}>
+            <Search size={11} /> Search
+          </button>
+        </div>
+        {/* Search results */}
+        {searchResult === 'loading' && (
+          <div className="flex items-center gap-2 mono text-[10px] text-slate-400">
+            <RefreshCw size={10} className="animate-spin" /> Searching…
+          </div>
+        )}
+        {searchResult === 'notfound' && (
+          <div className="mono text-[10px] text-slate-500 px-1">
+            No records found for <span className="text-slate-300 font-bold">{searchPlate}</span>
+          </div>
+        )}
+        {searchError && (
+          <div className="mono text-[10px] text-red-400 px-1">{searchError}</div>
+        )}
+        {searchResult && searchResult !== 'loading' && searchResult !== 'notfound' && !searchError && (() => {
+          const r = searchResult;
+          return (
+            <div className="rounded-lg overflow-hidden"
+              style={{ background:'var(--dvas-surface-2)', border:'1px solid rgba(20,184,166,0.25)' }}>
+              {/* Images */}
+              {(r.vehicle_image_url || r.plate_image_url) && (
+                <div className="flex gap-1 p-1.5">
+                  {r.vehicle_image_url && (
+                    <div className="relative rounded overflow-hidden bg-black" style={{ flex:'2', paddingTop:'40%' }}>
+                      <img src={r.vehicle_image_url} alt="vehicle" className="absolute inset-0 w-full h-full object-cover" />
+                      <span className="absolute bottom-0.5 left-0.5 mono text-[7px] px-1 rounded"
+                        style={{ background:'rgba(0,0,0,0.7)', color:'#94a3b8' }}>VEHICLE</span>
+                    </div>
+                  )}
+                  {r.plate_image_url && (
+                    <div className="relative rounded overflow-hidden bg-black" style={{ flex:'1', paddingTop:'40%' }}>
+                      <img src={r.plate_image_url} alt="plate" className="absolute inset-0 w-full h-full object-contain" />
+                      <span className="absolute bottom-0.5 left-0.5 mono text-[7px] px-1 rounded"
+                        style={{ background:'rgba(0,0,0,0.7)', color:'#94a3b8' }}>PLATE</span>
+                    </div>
+                  )}
+                </div>
+              )}
+              {/* Metadata */}
+              <div className="flex items-center gap-3 px-3 py-2">
+                <span className="mono text-sm font-black tracking-widest text-teal-300">{r.plate_text || searchPlate}</span>
+                <span className="mono text-[10px] text-slate-400">{r.vehicle_type || '—'}</span>
+                {r.ocr_confidence != null && (
+                  <span className={`mono text-[10px] font-bold ${r.ocr_confidence > 0.8 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                    {(r.ocr_confidence * 100).toFixed(1)}%
+                  </span>
+                )}
+                <span className="ml-auto mono text-[9px] text-slate-500">{r.last_seen ? fmtAge(r.last_seen) : (r.created_at ? fmtAge(r.created_at) : '')}</span>
+              </div>
+              {r.mission_id_str && (
+                <div className="px-3 pb-2 mono text-[9px] text-violet-400">Mission: {r.mission_id_str}</div>
+              )}
+            </div>
+          );
+        })()}
+      </div>
+
+      {/* ── Add to Watchlist ── */}
       <div className="flex flex-col gap-2">
         <div className="mono text-[10px] text-slate-400 font-semibold uppercase tracking-widest">Add Plate to Watchlist</div>
         <div className="flex gap-2">
@@ -835,6 +974,7 @@ function WatchlistPanel({ alerts, watchlist, onAdd, onRemove, adding }) {
         </div>
       </div>
 
+      {/* ── Current Watchlist ── */}
       <div>
         <div className="mono text-[10px] text-slate-400 font-semibold uppercase tracking-widest mb-2">
           WATCHLIST ({watchlistArr.length} plates)
@@ -917,6 +1057,11 @@ function MissionHistory() {
   const [showMissionDropdown, setShowMissionDropdown] = useState(false);
   const dropdownRef = useRef(null);
 
+  // New filters
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo]   = useState('');
+  const [operatorFilter, setOperatorFilter] = useState('');
+
   const [plateSearch, setPlateSearch] = useState('');
   const [debouncedPlateSearch, setDebouncedPlateSearch] = useState('');
   const [vehicleType, setVehicleType] = useState('all');
@@ -972,9 +1117,26 @@ function MissionHistory() {
   }, []);
 
   const filteredMissions = (missions || []).filter(m => {
-    if (!missionSearch) return true;
     const q = missionSearch.toLowerCase();
-    return (m.name?.toLowerCase().includes(q) || m.mission_id?.toLowerCase().includes(q));
+    if (q && !(m.name?.toLowerCase().includes(q) || m.mission_id?.toLowerCase().includes(q))) return false;
+    // Date range filter on started_at
+    if (dateFrom) {
+      const mStart = m.started_at ? new Date(m.started_at) : null;
+      if (!mStart || mStart < new Date(dateFrom)) return false;
+    }
+    if (dateTo) {
+      const mStart = m.started_at ? new Date(m.started_at) : null;
+      // add 1 day so "to" date is inclusive
+      const toDate = new Date(dateTo);
+      toDate.setDate(toDate.getDate() + 1);
+      if (!mStart || mStart > toDate) return false;
+    }
+    // Operator name filter
+    if (operatorFilter) {
+      const op = (m.operator_name || '').toLowerCase();
+      if (!op.includes(operatorFilter.toLowerCase())) return false;
+    }
+    return true;
   });
 
   const handleDownloadCsv = () => {
@@ -1035,13 +1197,62 @@ function MissionHistory() {
                     }}
                   >
                     <div className="mono text-[11px] font-bold text-violet-300">{m.mission_id}</div>
-                    <div className="mono text-[10px] text-slate-400">{m.name} · {m.drone_id}</div>
+                    <div className="mono text-[10px] text-slate-400">
+                      {m.name} · {m.drone_id}
+                      {m.operator_name && <span className="text-slate-500"> · {m.operator_name}</span>}
+                      {m.started_at && <span className="text-slate-600"> · {new Date(m.started_at).toLocaleDateString()}</span>}
+                    </div>
                   </div>
                 ))
               )}
             </div>
           )}
         </div>
+
+        {/* Date From */}
+        <div className="flex items-center gap-1">
+          <span className="mono text-[10px] text-slate-500">From</span>
+          <input
+            type="date"
+            value={dateFrom}
+            onChange={e => { setDateFrom(e.target.value); setSelectedMission(null); setOffset(0); }}
+            className="mono text-xs px-2 py-1.5 rounded outline-none"
+            style={{ background: 'var(--dvas-surface-2)', border: '1px solid var(--dvas-border)', color: 'var(--dvas-text)' }}
+          />
+        </div>
+
+        {/* Date To */}
+        <div className="flex items-center gap-1">
+          <span className="mono text-[10px] text-slate-500">To</span>
+          <input
+            type="date"
+            value={dateTo}
+            onChange={e => { setDateTo(e.target.value); setSelectedMission(null); setOffset(0); }}
+            className="mono text-xs px-2 py-1.5 rounded outline-none"
+            style={{ background: 'var(--dvas-surface-2)', border: '1px solid var(--dvas-border)', color: 'var(--dvas-text)' }}
+          />
+        </div>
+
+        {/* Operator Filter */}
+        <input
+          type="text"
+          value={operatorFilter}
+          onChange={e => setOperatorFilter(e.target.value)}
+          placeholder="Operator..."
+          className="mono text-xs px-2 py-1.5 rounded outline-none w-32"
+          style={{ background: 'var(--dvas-surface-2)', border: '1px solid var(--dvas-border)', color: 'var(--dvas-text)' }}
+        />
+
+        {/* Clear date/operator filters */}
+        {(dateFrom || dateTo || operatorFilter) && (
+          <button
+            onClick={() => { setDateFrom(''); setDateTo(''); setOperatorFilter(''); }}
+            className="mono text-[10px] px-2 py-1.5 rounded flex items-center gap-1 transition-colors"
+            style={{ background: 'rgba(239,68,68,0.08)', color: '#f87171', border: '1px solid rgba(239,68,68,0.2)' }}
+          >
+            ✕ Clear
+          </button>
+        )}
 
         {/* Plate Search */}
         <div className="relative">
@@ -1287,6 +1498,7 @@ function MissionHistory() {
 export default function TrafficAnalytics() {
   const { drones: activeDrones, loading: dronesLoading } = useActiveDrones();
   const [activeDrone, setActiveDrone] = useState(null);
+  const [activeMissionId, setActiveMissionId] = useState(null); // current mission_id for selected drone
   const [feedMode, setFeedMode]       = useState('vehicle');
   const [serviceStatus, setServiceStatus] = useState({ vehicle: false, anpr: false });
   const [adding, setAdding] = useState(false);
@@ -1302,11 +1514,26 @@ export default function TrafficAnalytics() {
     });
   }, [activeDrones]);
 
+  // Track the current mission_id for the selected drone from ingest telemetry
+  useEffect(() => {
+    if (!activeDrone || !activeDrones.length) return;
+    const drone = activeDrones.find(d => d.drone_id === activeDrone);
+    const missionId = drone?.mission_id || null;
+    setActiveMissionId(prev => {
+      if (prev !== missionId) return missionId;
+      return prev;
+    });
+  }, [activeDrone, activeDrones]);
+
   const { data: tracks, loading: tracksLoading } = usePoll('/analytics/vehicle/tracks', POLL_TRACKS);
   const { data: colourData }                      = usePoll('/analytics/vehicle/by-colour', POLL_COLOUR);
   const { data: flowData }                        = usePoll('/analytics/vehicle/stats/flow', POLL_FLOW);
   const { data: stats }                           = usePoll('/analytics/vehicle/stats', 30000);
-  const { data: plates }                          = usePoll('/analytics/plates/recent', POLL_PLATES);
+  // Scope recent plates to the active mission if available, else fall back to unfiltered
+  const platesUrl = activeMissionId
+    ? `/analytics/plates/recent?mission_id=${encodeURIComponent(activeMissionId)}&limit=50`
+    : '/analytics/plates/recent?limit=50';
+  const { data: plates }                          = usePoll(platesUrl, POLL_PLATES);
   const { data: alerts }                          = usePoll('/analytics/alerts/theft', POLL_ALERTS);
   const { data: watchlist }                       = usePoll('/analytics/watchlist', POLL_WATCHLIST);
 
@@ -1464,7 +1691,7 @@ export default function TrafficAnalytics() {
             {serviceStatus.anpr ? 'Live':'Offline'}
           </span>
         }>
-        <ANPRWindow plates={plates} activeDrone={activeDrone} anprStreamRunning={serviceStatus.anpr} />
+        <ANPRWindow plates={plates} activeDrone={activeDrone} activeMissionId={activeMissionId} anprStreamRunning={serviceStatus.anpr} />
       </Panel>
 
       {/* Watchlist & Alerts */}

@@ -64,10 +64,13 @@ async def upsert_track(
     first_seen,
     last_seen,
     tracker_id: Optional[int] = None,
+    mission_id: Optional[str] = None,
 ) -> str:
     """
     Insert or update a track row. Returns track_id (UUID string).
     Deduplication: if tracker_id is provided, upsert by (drone_id, tracker_id, track_type).
+    mission_id is stored as TEXT in mission_id_str column for string-format mission IDs
+    (e.g. MSN-20260813-1530-01-ALPHA).
     """
     pool = await get_pool()
     track_id = str(uuid.uuid4())
@@ -75,17 +78,18 @@ async def upsert_track(
         row = await pool.fetchrow(
             """
             INSERT INTO tracks (track_id, drone_id, track_type, first_seen, last_seen,
-                                metadata)
-            VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb)
+                                metadata, mission_id_str)
+            VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb, $7)
             ON CONFLICT DO NOTHING
             RETURNING track_id::text
             """,
             track_id, drone_id, track_type, first_seen, last_seen,
             json.dumps({"tracker_id": tracker_id}),
+            mission_id,
         )
         if row:
             return str(row["track_id"])
-        # Already exists — fetch it
+        # Already exists — fetch it and update mission_id_str if now available
         existing = await pool.fetchrow(
             """
             SELECT track_id::text FROM tracks
@@ -96,20 +100,26 @@ async def upsert_track(
             drone_id, track_type, str(tracker_id),
         )
         if existing:
-            # Update last_seen
+            # Update last_seen and mission_id_str
             await pool.execute(
-                "UPDATE tracks SET last_seen=$1 WHERE track_id=$2::uuid",
-                last_seen, existing["track_id"],
+                """
+                UPDATE tracks SET last_seen=$1,
+                    mission_id_str = COALESCE(mission_id_str, $2)
+                WHERE track_id=$3::uuid
+                """,
+                last_seen, mission_id, existing["track_id"],
             )
             return existing["track_id"]
     # Plain insert
     await pool.execute(
         """
-        INSERT INTO tracks (track_id, drone_id, track_type, first_seen, last_seen)
-        VALUES ($1::uuid, $2, $3, $4, $5)
-        ON CONFLICT (track_id) DO UPDATE SET last_seen = EXCLUDED.last_seen
+        INSERT INTO tracks (track_id, drone_id, track_type, first_seen, last_seen, mission_id_str)
+        VALUES ($1::uuid, $2, $3, $4, $5, $6)
+        ON CONFLICT (track_id) DO UPDATE SET
+            last_seen = EXCLUDED.last_seen,
+            mission_id_str = COALESCE(tracks.mission_id_str, EXCLUDED.mission_id_str)
         """,
-        track_id, drone_id, track_type, first_seen, last_seen,
+        track_id, drone_id, track_type, first_seen, last_seen, mission_id,
     )
     return track_id
 
@@ -255,6 +265,7 @@ async def write_vehicle_plate_link(
     colour: Optional[str] = None,
     plate_image_key: Optional[str] = None,
     vehicle_image_key: Optional[str] = None,
+    mission_id: Optional[str] = None,
 ) -> str:
     pool = await get_pool()
     link_id = str(uuid.uuid4())
@@ -262,18 +273,19 @@ async def write_vehicle_plate_link(
         """
         INSERT INTO vehicle_plate_links
             (id, tracker_id, drone_id, plate_text, plate_conf,
-             vehicle_type, colour, plate_image_key, vehicle_image_key)
-        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9)
+             vehicle_type, colour, plate_image_key, vehicle_image_key, mission_id_str)
+        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (tracker_id, drone_id, plate_text)
         DO UPDATE SET
             plate_conf        = GREATEST(vehicle_plate_links.plate_conf, EXCLUDED.plate_conf),
             colour            = COALESCE(EXCLUDED.colour, vehicle_plate_links.colour),
             plate_image_key   = COALESCE(EXCLUDED.plate_image_key, vehicle_plate_links.plate_image_key),
             vehicle_image_key = COALESCE(EXCLUDED.vehicle_image_key, vehicle_plate_links.vehicle_image_key),
+            mission_id_str    = COALESCE(vehicle_plate_links.mission_id_str, EXCLUDED.mission_id_str),
             linked_at         = now()
         """,
         link_id, tracker_id, drone_id, plate_text, plate_conf,
-        vehicle_type, colour, plate_image_key, vehicle_image_key,
+        vehicle_type, colour, plate_image_key, vehicle_image_key, mission_id,
     )
     return link_id
 
@@ -307,6 +319,7 @@ async def write_plate_read(
     vehicle_image_b64: Optional[str] = None,  # deprecated — use vehicle_image_key
     plate_image_key: Optional[str] = None,
     vehicle_image_key: Optional[str] = None,
+    mission_id: Optional[str] = None,
 ) -> str:
     pool = await get_pool()
     plate_id = str(uuid.uuid4())
@@ -314,8 +327,8 @@ async def write_plate_read(
         """
         INSERT INTO plate_reads
             (id, track_id, event_id, plate_text, ocr_confidence, is_reliable,
-             vehicle_image_b64, plate_image_key, vehicle_image_key)
-        VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9)
+             vehicle_image_b64, plate_image_key, vehicle_image_key, mission_id_str)
+        VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (track_id) DO UPDATE SET
             plate_text        = EXCLUDED.plate_text,
             ocr_confidence    = EXCLUDED.ocr_confidence,
@@ -323,27 +336,120 @@ async def write_plate_read(
             vehicle_image_b64 = COALESCE(EXCLUDED.vehicle_image_b64, plate_reads.vehicle_image_b64),
             plate_image_key   = COALESCE(EXCLUDED.plate_image_key,   plate_reads.plate_image_key),
             vehicle_image_key = COALESCE(EXCLUDED.vehicle_image_key, plate_reads.vehicle_image_key),
+            mission_id_str    = COALESCE(plate_reads.mission_id_str, EXCLUDED.mission_id_str),
             updated_at        = now()
         """,
         plate_id, track_id, event_id, plate_text, ocr_confidence, is_reliable,
-        vehicle_image_b64, plate_image_key, vehicle_image_key,
+        vehicle_image_b64, plate_image_key, vehicle_image_key, mission_id,
     )
     return plate_id
 
 
-async def get_recent_plates(limit: int = 50) -> List[Dict]:
+async def get_recent_plates(limit: int = 50, drone_id: Optional[str] = None, mission_id: Optional[str] = None) -> List[Dict]:
     pool = await get_pool()
+    conditions = []
+    params: List = []
+    idx = 1
+    if drone_id:
+        conditions.append(f"t.drone_id = ${idx}")
+        params.append(drone_id)
+        idx += 1
+    if mission_id:
+        conditions.append(f"pr.mission_id_str = ${idx}")
+        params.append(mission_id)
+        idx += 1
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(min(limit, 200))
     rows = await pool.fetch(
-        """
-        SELECT pr.*, t.drone_id, t.first_seen, t.last_seen
+        f"""
+        SELECT pr.*, t.drone_id, t.first_seen, t.last_seen, t.mission_id_str AS track_mission_id
         FROM plate_reads pr
         LEFT JOIN tracks t ON pr.track_id = t.track_id
+        {where}
         ORDER BY pr.created_at DESC
-        LIMIT $1
+        LIMIT ${idx}
         """,
-        limit,
+        *params,
     )
     return [dict(r) for r in rows]
+
+
+async def get_plates_by_mission(
+    mission_id: str,
+    plate_search: str = "",
+    vehicle_type: str = "",
+    sort: str = "newest",
+    limit: int = 24,
+    offset: int = 0,
+) -> Dict:
+    """
+    Query historical plate reads scoped directly to a mission_id string.
+    Returns pagination metadata + vehicles with presigned image URLs.
+    """
+    pool = await get_pool()
+    limit = min(limit, 200)
+
+    conditions = ["pr.mission_id_str = $1"]
+    params: List = [mission_id]
+    idx = 2
+
+    if plate_search:
+        conditions.append(f"pr.plate_text ILIKE ${idx}")
+        params.append(f"%{plate_search.upper().strip()}%")
+        idx += 1
+
+    if vehicle_type and vehicle_type.lower() != "all":
+        conditions.append(f"LOWER(va.vehicle_type) = ${idx}")
+        params.append(vehicle_type.lower().strip())
+        idx += 1
+
+    where_clause = "WHERE " + " AND ".join(conditions)
+
+    sort_map = {
+        "newest":     "pr.created_at DESC",
+        "oldest":     "pr.created_at ASC",
+        "confidence": "pr.ocr_confidence DESC NULLS LAST",
+        "plate_az":   "pr.plate_text ASC NULLS LAST",
+    }
+    order_by = sort_map.get(sort, "pr.created_at DESC")
+
+    count_row = await pool.fetchrow(
+        f"""
+        SELECT COUNT(*) AS total
+        FROM plate_reads pr
+        JOIN tracks t ON t.track_id = pr.track_id
+        LEFT JOIN vehicle_attributes va ON va.track_id = t.track_id
+        {where_clause}
+        """,
+        *params,
+    )
+    total = count_row["total"] if count_row else 0
+
+    params.extend([limit, offset])
+    rows = await pool.fetch(
+        f"""
+        SELECT
+            pr.id, pr.plate_text, pr.ocr_confidence, pr.is_reliable,
+            pr.plate_image_key, pr.vehicle_image_key, pr.created_at, pr.mission_id_str,
+            t.drone_id, t.first_seen, t.last_seen,
+            t.metadata->>'tracker_id' AS tracker_id,
+            va.vehicle_type, va.colour_top3, va.speed_kph
+        FROM plate_reads pr
+        JOIN tracks t ON t.track_id = pr.track_id
+        LEFT JOIN vehicle_attributes va ON va.track_id = t.track_id
+        {where_clause}
+        ORDER BY {order_by}
+        LIMIT ${idx} OFFSET ${idx + 1}
+        """,
+        *params,
+    )
+    return {
+        "total": total,
+        "rows": [dict(r) for r in rows],
+        "offset": offset,
+        "limit": limit,
+        "has_more": (offset + limit) < total,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
