@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir \
     miniopy-async httpx
 
 # PaddleOCR 2.9.1 — fully compatible with PaddlePaddle 2.6.2 (fast, accurate)
-RUN pip install --no-cache-dir "paddleocr==2.9.1"
+RUN pip install --default-timeout=1000 --no-cache-dir "paddleocr==2.9.1"
 
 COPY shared/ /analytics/shared/
 COPY anpr/ /analytics/anpr/

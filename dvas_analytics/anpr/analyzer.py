@@ -3,6 +3,8 @@
 ANPR Analyzer — adapted from number-plate-detection.py.
 Two-resolution pipeline: track on 720p, OCR on full-res crop.
 Uses PaddleOCR + CLAHE + unsharp masking for aerial footage.
+Includes VehicleReIDTracker for appearance-based re-identification
+to prevent duplicate tracker IDs when ByteTrack loses/re-acquires vehicles.
 """
 import base64
 import logging
@@ -25,16 +27,16 @@ TRACK_RESIZE_WIDTH  = 1280
 TRACK_RESIZE_HEIGHT = 720
 IMG_SIZE            = 640
 CONF_VEHICLE        = 0.25
-CONF_LP             = 0.20
-VEHICLE_CROP_PAD    = 20
-OCR_EVERY_N_FRAMES  = 8
-MIN_PLATE_AREA_PX   = 250
-MIN_PLATE_SHARPNESS = 25.0
-MIN_OCR_CONFIDENCE  = 0.5
-PLATE_TEXT_MINLEN   = 5
+CONF_LP             = 0.15          # lowered for aerial footage
+VEHICLE_CROP_PAD    = 30           # wider crop to capture more context
+OCR_EVERY_N_FRAMES  = 5            # OCR more frequently
+MIN_PLATE_AREA_PX   = 50           # lowered: plates are tiny from aerial view
+MIN_PLATE_SHARPNESS = 6.0          # lowered: aerial footage is naturally soft
+MIN_OCR_CONFIDENCE  = 0.4          # slightly lower to catch partial reads
+PLATE_TEXT_MINLEN   = 4
 PLATE_TEXT_MAXLEN   = 12
-SUPER_RES_MIN_WIDTH = 160
-SUPER_RES_SCALE     = 2
+SUPER_RES_MIN_WIDTH = 80           # lowered to upscale even small plates
+SUPER_RES_SCALE     = 3            # upscale more aggressively
 MAX_TRAJECTORY_LEN  = 30
 
 VEHICLE_CLASS_MAP = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
@@ -57,6 +59,7 @@ class TrackRecord:
     theft_alerted:    bool = False
     best_crop_b64:    Optional[str] = None
     best_plate_crop_b64: Optional[str] = None  # plate crop image for gallery
+    best_plate_bbox: Optional[list] = None      # plate bbox in full-frame coords [x1,y1,x2,y2]
 
     def register_detection(self, frame_idx, class_name, center):
         if self.first_seen_frame is None:
@@ -82,6 +85,248 @@ class TrackRecord:
         total_conf = self.plate_votes[text]
         reads      = self.plate_read_count[text]
         return text, (total_conf / reads if reads else 0.0), reads
+
+
+# ── Vehicle Re-ID Tracker ────────────────────────────────────────────────────
+
+@dataclass
+class _ReIDFeatures:
+    """Visual + spatial features for a tracked vehicle."""
+    hist: np.ndarray          # HSV colour histogram (flattened, normalised)
+    aspect_ratio: float       # width / height of bounding box
+    centroid: Tuple[float, float]  # (cx, cy) in tracking-resolution coords
+    frame_idx: int            # last frame this vehicle was seen
+
+
+class VehicleReIDTracker:
+    """
+    Appearance-based vehicle re-identification layer.
+
+    Sits between ByteTrack's raw IDs and the ANPR TrackRecord dict.
+    When ByteTrack assigns a new ID (due to occlusion, edge exit, etc.),
+    this tracker checks if the vehicle visually matches a recently-lost
+    track and remaps the ID to the original stable ID.
+
+    Feature vector: HSV colour histogram + aspect ratio + spatial proximity.
+    Zero external dependencies — uses OpenCV histogram comparison.
+    """
+
+    # HSV histogram bins — coarse enough to be noise-tolerant
+    H_BINS, S_BINS, V_BINS = 16, 16, 8
+
+    def __init__(
+        self,
+        match_threshold: float = 0.55,
+        max_lost_frames: int = 90,
+        hist_weight: float = 0.5,
+        aspect_weight: float = 0.2,
+        spatial_weight: float = 0.3,
+        frame_width: int = TRACK_RESIZE_WIDTH,
+        frame_height: int = TRACK_RESIZE_HEIGHT,
+    ):
+        self.match_threshold = match_threshold
+        self.max_lost_frames = max_lost_frames
+        self.hist_weight     = hist_weight
+        self.aspect_weight   = aspect_weight
+        self.spatial_weight  = spatial_weight
+        self.frame_diag      = (frame_width ** 2 + frame_height ** 2) ** 0.5
+
+        # ByteTrack ID → stable ID mapping
+        self._bt_to_stable: Dict[int, int] = {}
+
+        # Stable ID → current features  (currently visible vehicles)
+        self._active: Dict[int, _ReIDFeatures] = {}
+
+        # Stable ID → features at time of disappearance
+        self._lost: Dict[int, _ReIDFeatures] = {}
+
+        # Monotonic stable-ID counter
+        self._next_stable_id: int = 1
+
+        # ByteTrack IDs seen in the *current* frame (reset each frame)
+        self._frame_bt_ids: set = set()
+
+        # Statistics
+        self.total_remaps: int = 0
+        self.total_new_ids: int = 0
+
+    # ── Feature extraction ─────────────────────────────────────────────────
+
+    def _extract_hist(self, crop_bgr: np.ndarray) -> np.ndarray:
+        """Compute normalised HSV colour histogram from a BGR crop."""
+        hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist(
+            [hsv], [0, 1, 2],
+            None,
+            [self.H_BINS, self.S_BINS, self.V_BINS],
+            [0, 180, 0, 256, 0, 256],
+        )
+        cv2.normalize(hist, hist)
+        return hist.flatten()
+
+    def _extract_features(
+        self,
+        crop_bgr: np.ndarray,
+        cx: float, cy: float,
+        bw: float, bh: float,
+        frame_idx: int,
+    ) -> _ReIDFeatures:
+        """Build feature vector for a detected vehicle."""
+        hist = self._extract_hist(crop_bgr)
+        aspect = bw / max(bh, 1.0)
+        return _ReIDFeatures(
+            hist=hist,
+            aspect_ratio=aspect,
+            centroid=(cx, cy),
+            frame_idx=frame_idx,
+        )
+
+    # ── Similarity scoring ─────────────────────────────────────────────────
+
+    def _similarity(self, a: _ReIDFeatures, b: _ReIDFeatures) -> float:
+        """
+        Weighted similarity score between two feature sets.
+        Returns a value in [0, 1] where 1 = perfect match.
+        """
+        # 1. Histogram similarity (correlation: -1..1, mapped to 0..1)
+        hist_sim = cv2.compareHist(
+            a.hist.astype(np.float32),
+            b.hist.astype(np.float32),
+            cv2.HISTCMP_CORREL,
+        )
+        hist_sim = max(0.0, (hist_sim + 1.0) / 2.0)  # map [-1,1] → [0,1]
+
+        # 2. Aspect ratio similarity (penalise large differences)
+        ar_diff = abs(a.aspect_ratio - b.aspect_ratio) / max(a.aspect_ratio, b.aspect_ratio, 0.01)
+        aspect_sim = max(0.0, 1.0 - ar_diff)
+
+        # 3. Spatial proximity (normalised by frame diagonal)
+        dx = a.centroid[0] - b.centroid[0]
+        dy = a.centroid[1] - b.centroid[1]
+        dist = (dx ** 2 + dy ** 2) ** 0.5
+        spatial_sim = max(0.0, 1.0 - dist / (self.frame_diag * 0.5))
+
+        return (
+            self.hist_weight    * hist_sim
+            + self.aspect_weight  * aspect_sim
+            + self.spatial_weight * spatial_sim
+        )
+
+    # ── Core resolve method ────────────────────────────────────────────────
+
+    def resolve_id(
+        self,
+        bt_id: int,
+        crop_bgr: np.ndarray,
+        cx: float, cy: float,
+        bw: float, bh: float,
+        frame_idx: int,
+    ) -> int:
+        """
+        Resolve a ByteTrack ID to a stable Re-ID.
+
+        Args:
+            bt_id:     Raw ByteTrack tracker ID
+            crop_bgr:  Vehicle crop (BGR, from tracking resolution)
+            cx, cy:    Centroid in tracking-resolution coords
+            bw, bh:    Bounding box width/height
+            frame_idx: Current frame index
+
+        Returns:
+            Stable vehicle ID (int) that persists across track losses.
+        """
+        self._frame_bt_ids.add(bt_id)
+
+        # Fast path: ByteTrack ID already mapped to a stable ID
+        if bt_id in self._bt_to_stable:
+            stable_id = self._bt_to_stable[bt_id]
+            # Update features for this active track
+            if crop_bgr is not None and crop_bgr.size > 0:
+                self._active[stable_id] = self._extract_features(
+                    crop_bgr, cx, cy, bw, bh, frame_idx
+                )
+            return stable_id
+
+        # New ByteTrack ID — try to match against lost tracks
+        features = None
+        if crop_bgr is not None and crop_bgr.size > 0:
+            features = self._extract_features(crop_bgr, cx, cy, bw, bh, frame_idx)
+
+        best_match_id = None
+        best_score = 0.0
+
+        if features is not None and self._lost:
+            for lost_id, lost_feat in self._lost.items():
+                score = self._similarity(features, lost_feat)
+                if score > best_score:
+                    best_score = score
+                    best_match_id = lost_id
+
+        if best_match_id is not None and best_score >= self.match_threshold:
+            # Re-identified! Remap new ByteTrack ID to old stable ID
+            stable_id = best_match_id
+            self._bt_to_stable[bt_id] = stable_id
+            del self._lost[best_match_id]
+            self._active[stable_id] = features
+            self.total_remaps += 1
+            log.info(
+                "Re-ID MATCH: ByteTrack %d → stable %d (score=%.3f)",
+                bt_id, stable_id, best_score,
+            )
+            return stable_id
+
+        # No match — assign new stable ID
+        stable_id = self._next_stable_id
+        self._next_stable_id += 1
+        self._bt_to_stable[bt_id] = stable_id
+        if features is not None:
+            self._active[stable_id] = features
+        self.total_new_ids += 1
+        return stable_id
+
+    # ── End-of-frame housekeeping ──────────────────────────────────────────
+
+    def end_frame(self, frame_idx: int):
+        """
+        Call at the end of each frame.
+        Moves disappeared tracks from active → lost, prunes stale lost tracks.
+        """
+        # Find ByteTrack IDs that were active last frame but not this frame
+        disappeared_bt_ids = [
+            bt_id for bt_id in self._bt_to_stable
+            if bt_id not in self._frame_bt_ids
+        ]
+
+        for bt_id in disappeared_bt_ids:
+            stable_id = self._bt_to_stable.pop(bt_id)
+            if stable_id in self._active:
+                self._lost[stable_id] = self._active.pop(stable_id)
+
+        # Prune lost tracks that are too old
+        stale = [
+            sid for sid, feat in self._lost.items()
+            if (frame_idx - feat.frame_idx) > self.max_lost_frames
+        ]
+        for sid in stale:
+            del self._lost[sid]
+
+        # Reset frame tracking
+        self._frame_bt_ids.clear()
+
+    # ── Stats ──────────────────────────────────────────────────────────────
+
+    def get_stats(self) -> dict:
+        """Return tracker statistics for the /tracking/stats endpoint."""
+        return {
+            "total_stable_ids_assigned": self._next_stable_id - 1,
+            "total_remaps":             self.total_remaps,
+            "total_new_ids":            self.total_new_ids,
+            "active_tracks":            len(self._active),
+            "lost_tracks":              len(self._lost),
+            "bt_id_mappings":           len(self._bt_to_stable),
+            "match_threshold":          self.match_threshold,
+            "max_lost_frames":          self.max_lost_frames,
+        }
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -124,17 +369,19 @@ def build_ocr_engine(use_gpu: bool):
     """
     try:
         from paddleocr import PaddleOCR
+        # Force use_gpu=False because the PyTorch CUDA 12.1 container is incompatible 
+        # with PaddlePaddle's expected CUDNN version, causing silent crashes.
         engine = PaddleOCR(
             use_angle_cls=True,
             lang="en",
-            use_gpu=use_gpu,
+            use_gpu=False,
             show_log=False,
             enable_mkldnn=True,   # CPU acceleration
             cpu_threads=4,
             det_db_score_mode="slow",   # more accurate plate boundary detection
             rec_algorithm="SVTR_LCNet", # lightweight+fast recognition model
         )
-        log.info("PaddleOCR 2.x engine ready (gpu=%s)", use_gpu)
+        log.info("PaddleOCR 2.x engine ready (forced cpu to avoid cudnn error)")
         return engine
     except Exception as exc:
         log.error("PaddleOCR init failed: %s", exc)
@@ -185,6 +432,11 @@ class ANPRAnalyzer:
         vehicle_model_path: str,
         lp_model_path: str,
         watchlist: Optional[Set[str]] = None,
+        reid_match_threshold: float = 0.55,
+        reid_max_lost_frames: int = 90,
+        reid_hist_weight: float = 0.5,
+        reid_aspect_weight: float = 0.2,
+        reid_spatial_weight: float = 0.3,
     ):
         self.use_gpu    = torch.cuda.is_available()
         self.device     = 0 if self.use_gpu else "cpu"
@@ -215,6 +467,19 @@ class ANPRAnalyzer:
         self.watchlist: Set[str] = watchlist or set()
         self.tracks: Dict[int, TrackRecord] = {}
         self._frame_idx = 0
+
+        # Vehicle Re-ID tracker for deduplication
+        self.reid_tracker = VehicleReIDTracker(
+            match_threshold=reid_match_threshold,
+            max_lost_frames=reid_max_lost_frames,
+            hist_weight=reid_hist_weight,
+            aspect_weight=reid_aspect_weight,
+            spatial_weight=reid_spatial_weight,
+        )
+        log.info(
+            "Vehicle Re-ID tracker initialised (threshold=%.2f, max_lost=%d)",
+            reid_match_threshold, reid_max_lost_frames,
+        )
 
     @property
     def ready(self) -> bool:
@@ -271,7 +536,7 @@ class ANPRAnalyzer:
                 if box.id is None:
                     continue
 
-                track_id   = int(box.id[0])
+                bt_id      = int(box.id[0])   # raw ByteTrack ID
                 cls_id     = int(box.cls[0])
                 class_name = VEHICLE_CLASS_MAP.get(cls_id, "vehicle")
 
@@ -279,6 +544,15 @@ class ANPRAnalyzer:
                     *box.xyxy[0].tolist(), TRACK_RESIZE_WIDTH, TRACK_RESIZE_HEIGHT
                 )
                 cx, cy = (tx1 + tx2) // 2, (ty1 + ty2) // 2
+                bw, bh = tx2 - tx1, ty2 - ty1
+
+                # ── Re-ID: extract crop at tracking resolution for matching ──
+                reid_crop = frame_track[ty1:ty2, tx1:tx2]
+
+                # Resolve ByteTrack ID → stable Re-ID
+                track_id = self.reid_tracker.resolve_id(
+                    bt_id, reid_crop, cx, cy, bw, bh, frame_idx
+                )
 
                 rec = self.tracks.setdefault(track_id, TrackRecord(track_id=track_id))
                 rec.register_detection(frame_idx, class_name, (cx, cy))
@@ -304,6 +578,7 @@ class ANPRAnalyzer:
                                 vehicle_crop, imgsz=IMG_SIZE, conf=CONF_LP,
                                 device=self.device, verbose=False,
                             )
+                            lp_found = False
                             if lp_res and lp_res[0].boxes and len(lp_res[0].boxes) > 0:
                                 confs    = lp_res[0].boxes.conf.tolist()
                                 best_idx = confs.index(max(confs))
@@ -316,7 +591,11 @@ class ANPRAnalyzer:
                                     plate_crop = vehicle_crop[ly1:ly2, lx1:lx2]
                                     if plate_crop.size > 0:
                                         gray_check = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
-                                        if sharpness_laplacian(gray_check) >= MIN_PLATE_SHARPNESS:
+                                        sharpness = sharpness_laplacian(gray_check)
+                                        log.info("Track %d: LP model found %d boxes, best conf=%.2f area=%d",
+                                          track_id, len(lp_res[0].boxes),
+                                          max(confs), plate_area)
+                                        if sharpness >= MIN_PLATE_SHARPNESS:
                                             enhanced = enhance_plate_crop(plate_crop)
                                             lines    = run_ocr(self.ocr_engine, enhanced)
                                             if lines:
@@ -325,12 +604,64 @@ class ANPRAnalyzer:
                                                 clean    = clean_plate_text(raw_txt)
                                                 if avg_conf >= MIN_OCR_CONFIDENCE and is_plausible_plate(clean):
                                                     rec.register_plate_read(frame_idx, clean, avg_conf)
-                                                    # Store plate crop as b64 for MinIO upload
-                                                    _, pbuf = cv2.imencode(".jpg", plate_crop,
+                                                    lp_found = True
+                                            # Always store the plate crop if LP model found it,
+                                            # even if OCR couldn't read the text yet
+                                            _, pbuf = cv2.imencode(".jpg", plate_crop,
+                                                                    [cv2.IMWRITE_JPEG_QUALITY, 90])
+                                            rec.best_plate_crop_b64 = base64.b64encode(pbuf).decode()
+                                            # Store plate bbox in full-frame coords for annotation
+                                            pfx1 = round(ox1 + lx1, 2)
+                                            pfy1 = round(oy1 + ly1, 2)
+                                            pfx2 = round(ox1 + lx2, 2)
+                                            pfy2 = round(oy1 + ly2, 2)
+                                            rec.best_plate_bbox = [pfx1, pfy1, pfx2, pfy2]
+                                        else:
+                                            log.info("Track %d: plate sharpness %.1f < %.1f, skipping",
+                                                      track_id, sharpness, MIN_PLATE_SHARPNESS)
+                                            rec.last_ocr_frame = frame_idx
+                                else:
+                                    log.info("Track %d: plate area %d < %d, skipping",
+                                              track_id, plate_area, MIN_PLATE_AREA_PX)
+
+                            # ── OCR-direct fallback ──────────────────────────
+                            # If the LP model failed, try running PaddleOCR
+                            # directly on the vehicle crop. PaddleOCR has its
+                            # own text detector that may find plate text even
+                            # when the dedicated LP YOLO model misses.
+                            if not lp_found and rec.best_plate_crop_b64 is None:
+                                try:
+                                    enhanced_vc = enhance_plate_crop(vehicle_crop)
+                                    ocr_results = self.ocr_engine.ocr(enhanced_vc, cls=True)
+                                    if ocr_results and ocr_results[0]:
+                                        for line in ocr_results[0]:
+                                            box_pts, (text, conf) = line
+                                            clean = clean_plate_text(text)
+                                            if conf >= MIN_OCR_CONFIDENCE and is_plausible_plate(clean):
+                                                # Extract plate region from OCR box
+                                                xs = [pt[0] for pt in box_pts]
+                                                ys = [pt[1] for pt in box_pts]
+                                                bx1o, by1o = int(min(xs)), int(min(ys))
+                                                bx2o, by2o = int(max(xs)), int(max(ys))
+                                                ch, cw = vehicle_crop.shape[:2]
+                                                bx1o, by1o, bx2o, by2o = clamp_box(bx1o, by1o, bx2o, by2o, cw, ch)
+                                                ocr_plate_crop = vehicle_crop[by1o:by2o, bx1o:bx2o]
+                                                if ocr_plate_crop.size > 0:
+                                                    rec.register_plate_read(frame_idx, clean, conf)
+                                                    _, pbuf = cv2.imencode(".jpg", ocr_plate_crop,
                                                                             [cv2.IMWRITE_JPEG_QUALITY, 90])
                                                     rec.best_plate_crop_b64 = base64.b64encode(pbuf).decode()
-                                        else:
-                                            rec.last_ocr_frame = frame_idx
+                                                    pfx1 = round(ox1 + bx1o, 2)
+                                                    pfy1 = round(oy1 + by1o, 2)
+                                                    pfx2 = round(ox1 + bx2o, 2)
+                                                    pfy2 = round(oy1 + by2o, 2)
+                                                    rec.best_plate_bbox = [pfx1, pfy1, pfx2, pfy2]
+                                                    log.info("Track %d: OCR fallback found plate '%s' conf=%.2f",
+                                                             track_id, clean, conf)
+                                                    break  # use first valid plate
+                                except Exception as ocr_exc:
+                                    log.debug("OCR fallback error: %s", ocr_exc)
+
                         except Exception as exc:
                             log.debug("LP inference error: %s", exc)
                             rec.last_ocr_frame = frame_idx
@@ -363,9 +694,13 @@ class ANPRAnalyzer:
                     "vehicle_image_b64": rec.best_crop_b64,
                     "plate_crop_b64":    rec.best_plate_crop_b64,
                     "vehicle_bbox":      veh_bbox_orig,
+                    "plate_bbox":        rec.best_plate_bbox,
                     "first_seen_frame":  rec.first_seen_frame,
                     "last_seen_frame":   rec.last_seen_frame,
                 })
+
+        # ── End-of-frame Re-ID housekeeping ──────────────────────────────
+        self.reid_tracker.end_frame(frame_idx)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
         return {
@@ -376,6 +711,7 @@ class ANPRAnalyzer:
             "plates_read":    sum(1 for p in plate_reads if p["plate_text"]),
             "theft_alerts":   theft_alerts,
             "inference_ms":   round(elapsed_ms, 1),
+            "reid_stats":     self.reid_tracker.get_stats(),
         }
 
     def get_all_tracks(self) -> List[dict]:
