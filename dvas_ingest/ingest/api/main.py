@@ -372,9 +372,13 @@ async def ingest_frame(
     INGEST_LATENCY.labels(drone_id=drone_id).observe(elapsed)
 
     # ── Cache latest telemetry ────────────────────────────────────────────────
+    active_m = _active_missions.get(drone_id, {})
     _latest_metadata[drone_id] = {
         "drone_id":    drone_id,
         "mission_id":  mission_id,
+        "mission_name": active_m.get("mission_name"),
+        "operator":    active_m.get("operator", extract_username(claims)),
+        "location":    active_m.get("location"),
         "latitude":    meta.latitude,
         "longitude":   meta.longitude,
         "altitude_m":  meta.altitude_m,

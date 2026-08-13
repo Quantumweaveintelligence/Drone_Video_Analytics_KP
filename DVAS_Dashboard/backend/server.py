@@ -2540,6 +2540,9 @@ async def _telemetry_pump():
                     altitude = telem.get("altitude_m") or 120.0
                     speed_mps = telem.get("speed_mps") or 0.0
                     mission_id = telem.get("mission_id") or "LIVE"
+                    mission_name = telem.get("mission_name") or "Patrol"
+                    operator_name = telem.get("operator") or "Edge Operator"
+                    jurisdiction = telem.get("location") or "Thiruvananthapuram"
 
                     # Check if drone already exists in DB
                     result = await session.execute(
@@ -2557,6 +2560,9 @@ async def _telemetry_pump():
                                 altitude_m=round(altitude, 1),
                                 status="live",
                                 mission_id=mission_id,
+                                mission_name=mission_name,
+                                operator_name=operator_name,
+                                jurisdiction=jurisdiction,
                             )
                         )
                     else:
@@ -2564,14 +2570,16 @@ async def _telemetry_pump():
                         session.add(Drone(
                             id=drone_id,
                             operator_id=None,
-                            operator_name="Edge Operator",
+                            operator_name=operator_name,
                             mission_id=mission_id,
-                            jurisdiction="Thiruvananthapuram",
+                            mission_name=mission_name,
+                            jurisdiction=jurisdiction,
                             status="live",
                             lat=round(lat, 6),
                             lng=round(lng, 6),
                             altitude_m=round(altitude, 1),
                             battery_pct=round(battery, 1),
+                            speed_mps=round(speed_mps, 2),
                             signal_pct=90.0,
                             last_analytics=None,
                         ))
@@ -2597,7 +2605,9 @@ async def _telemetry_pump():
                             "speed_mps": round(telem.get("speed_mps") or 0, 2),
                             "status": "live",
                             "mission_id": telem.get("mission_id") or d.mission_id,
-                            "jurisdiction": d.jurisdiction,
+                            "mission_name": telem.get("mission_name") or d.mission_name,
+                            "operator_name": telem.get("operator") or d.operator_name,
+                            "jurisdiction": telem.get("location") or d.jurisdiction,
                             "is_real": True,
                         })
                     else:

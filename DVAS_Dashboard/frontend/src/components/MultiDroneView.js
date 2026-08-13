@@ -410,22 +410,40 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect }) {
         ))}
 
         {/* Drone ID badge (top-left) */}
-        <div className="absolute top-3 left-3 z-10 flex items-center gap-1.5">
-          <div
-            className="mono text-[11px] font-bold px-2 py-0.5 rounded"
-            style={{
-              background: "rgba(6,14,26,0.82)",
-              color: isDegraded ? "#fbbf24" : "#2dd4bf",
-              border: `1px solid ${isDegraded ? "rgba(245,158,11,0.3)" : "rgba(20,184,166,0.3)"}`,
-            }}
-          >
-            {drone.id}
+        <div className="absolute top-3 left-3 z-10 flex flex-col gap-1.5">
+          <div className="flex items-center gap-1.5">
+            <div
+              className="mono text-[11px] font-bold px-2 py-0.5 rounded"
+              style={{
+                background: "rgba(6,14,26,0.82)",
+                color: isDegraded ? "#fbbf24" : "#2dd4bf",
+                border: `1px solid ${isDegraded ? "rgba(245,158,11,0.3)" : "rgba(20,184,166,0.3)"}`,
+              }}
+            >
+              {drone.id}
+            </div>
+            <div
+              className="mono text-[9px] px-1.5 py-0.5 rounded"
+              style={{ background: "rgba(6,14,26,0.70)", color: "#94a3b8" }}
+            >
+              {drone.mission_id}
+            </div>
           </div>
-          <div
-            className="mono text-[9px] px-1.5 py-0.5 rounded"
-            style={{ background: "rgba(6,14,26,0.70)", color: "#94a3b8" }}
-          >
-            {drone.mission_id}
+          <div className="flex items-center gap-1.5">
+            <div
+              className="mono text-[9px] px-1.5 py-0.5 rounded border border-slate-700/50 truncate max-w-[100px]"
+              style={{ background: "rgba(6,14,26,0.70)", color: "#e2e8f0" }}
+              title={drone.mission_name || "Unknown Mission"}
+            >
+              {drone.mission_name || "Unknown Mission"}
+            </div>
+            <div
+              className="mono text-[9px] px-1.5 py-0.5 rounded border border-slate-700/50 flex items-center gap-1 truncate max-w-[100px]"
+              style={{ background: "rgba(6,14,26,0.70)", color: "#38bdf8" }}
+              title={drone.operator_name || "Unknown Operator"}
+            >
+              <Users size={8} /> {drone.operator_name || "Unknown Operator"}
+            </div>
           </div>
         </div>
 
