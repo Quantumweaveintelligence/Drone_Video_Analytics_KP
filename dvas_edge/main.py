@@ -120,7 +120,8 @@ class EdgeSenderThread(threading.Thread):
             "lat": frame.location.lat if frame.location.lat != 0.0 else None,
             "lon": frame.location.lon if frame.location.lon != 0.0 else None,
             "alt": frame.location.altitude_m if frame.location.altitude_m != 0.0 else None,
-            "change_score": frame.change_score
+            "change_score": frame.change_score,
+            "frames_total": frame.frame_index
         }
         self._buffer.put("selected", jpeg_bytes, tel)
 
@@ -163,6 +164,7 @@ class EdgeSenderThread(threading.Thread):
                     lat          = tel.get("lat"),
                     lon          = tel.get("lon"),
                     alt          = tel.get("alt"),
+                    frames_total = tel.get("frames_total")
                 )
                 self._buffer.commit(frame_id)
             except Exception as exc:

@@ -224,7 +224,7 @@ async def login(body: LoginIn, response: Response, request: Request):
     user = _user_to_dict(user_obj)
     token = create_access_token(user["id"], user["email"], user["role"])
     response.set_cookie(
-        "access_token", token, httponly=True, samesite="lax", max_age=28800, path="/"
+        "access_token", token, httponly=True, samesite="lax", secure=True, max_age=28800, path="/"
     )
     await write_audit(
         user,

@@ -252,6 +252,7 @@ class IngestClient:
         alt:          Optional[float] = None,
         speed_mps:    Optional[float] = None,
         battery_pct:  Optional[float] = None,
+        frames_total: Optional[int]   = None,
         retries:      int = 3,
     ) -> dict:
         """
@@ -267,6 +268,7 @@ class IngestClient:
             lat/lon/alt:  Optional GPS telemetry.
             speed_mps:    Optional drone speed in meters per second.
             battery_pct:  Optional drone battery percentage.
+            frames_total: Optional total frames captured by the edge so far.
             retries:      Number of retry attempts on 5xx.
 
         Returns:
@@ -286,6 +288,7 @@ class IngestClient:
             "altitude_m":     alt,
             "speed_mps":      speed_mps,
             "battery_pct":    battery_pct,
+            "frames_total":   frames_total,
         }
 
         last_exc: Optional[Exception] = None

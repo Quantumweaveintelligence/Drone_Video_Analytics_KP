@@ -36,6 +36,7 @@ class FrameMetadata(BaseModel):
     speed_kmh:    Optional[float] = Field(None, ge=0.0)
     speed_mps:    Optional[float] = Field(None, ge=0.0)          # m/s from edge device
     battery_pct:  Optional[float] = Field(None, ge=0.0, le=100.0)  # 0–100% from edge device
+    frames_total: Optional[int]   = Field(None, ge=0)            # Total frames processed by edge
 
     @field_validator("drone_id")
     @classmethod
@@ -99,6 +100,7 @@ class IngestStats(BaseModel):
     frames_queued:     int
     frames_rejected:   int
     bytes_ingested:    int
+    frames_total:      Optional[int] = 0
     last_frame_at:     Optional[str] = None   # ISO 8601 string or None
 
 
