@@ -320,15 +320,16 @@ export default function MissionControl() {
                 />
               </div>
               <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Mission ID</label>
-                  <input 
-                    type="text" 
-                    value={form.id} onChange={e => setForm({...form, id: e.target.value})}
-                    className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm font-mono text-slate-200 placeholder-slate-600"
-                    placeholder="Auto-generated"
-                  />
-                </div>
+                  <div>
+                    <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Mission ID</label>
+                    <input 
+                      type="text" 
+                      value={form.id}
+                      readOnly
+                      className="w-full bg-slate-950/50 border border-slate-700 outline-none px-3 py-2 text-sm font-mono text-slate-400 cursor-not-allowed"
+                      placeholder="Auto-generated"
+                    />
+                  </div>
                 <div>
                   <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Drone ID *</label>
                   <select 
