@@ -98,15 +98,18 @@ _ingest_stats: dict = {}   # drone_id → {frames_received, frames_queued, bytes
 _rejections:   dict = {}   # drone_id → int
 _latest_metadata: dict = {}  # drone_id → {lat, lng, battery_pct, speed_mps, altitude_m, ...}
 
-def _record_frame(drone_id, n_bytes, mission_id=None):
+def _record_frame(drone_id, n_bytes, mission_id=None, frames_total=None):
     s = _ingest_stats.setdefault(drone_id, {
         "frames_received": 0, "frames_queued": 0,
         "frames_rejected": 0, "bytes_ingested": 0,
+        "frames_total": 0,
         "last_frame_at": None, "mission_id": None,
     })
     s["frames_received"] += 1
     s["frames_queued"]   += 1
     s["bytes_ingested"]  += n_bytes
+    if frames_total is not None:
+        s["frames_total"] = frames_total
     # Store as ISO 8601 string (model expects Optional[str])
     s["last_frame_at"]    = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
     if mission_id:
@@ -362,7 +365,7 @@ async def ingest_frame(
         )
 
     # ── Record stats ──────────────────────────────────────────────────────────
-    _record_frame(drone_id, len(data), mission_id)
+    _record_frame(drone_id, len(data), mission_id, meta.frames_total)
     FRAMES_RECEIVED.labels(drone_id=drone_id, status="queued").inc()
     FRAMES_BYTES.labels(drone_id=drone_id).inc(len(data))
     elapsed = time.monotonic() - t_start
@@ -541,6 +544,10 @@ async def mission_start(
     to the `drone.events.confirmed` queue and broadcasts to WS clients.
     """
     ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+
+    # Reset ingest statistics for the new mission
+    if req.drone_id in _ingest_stats:
+        del _ingest_stats[req.drone_id]
 
     _active_missions[req.drone_id] = {
         "mission_id":  req.mission_id,

@@ -5,13 +5,12 @@ WORKDIR /app
 # Copy package files first for better layer caching
 COPY package.json yarn.lock* package-lock.json* ./
 
-# Use yarn so the "resolutions" field in package.json is respected
-# (pins core-js-compat to avoid babel-preset-react-app build errors)
-RUN yarn install --network-timeout 300000
+# Use npm since package-lock.json is present and yarn has DNS issues
+RUN npm install --legacy-peer-deps
 
-RUN echo "cache bust 14"
+RUN echo "cache bust 15"
 COPY . .
-RUN yarn build
+RUN npm run build
 
 FROM nginx:alpine
 COPY --from=build /app/build /usr/share/nginx/html

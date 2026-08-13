@@ -1,34 +1,122 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import AppShell from '@/components/layout/AppShell';
 import { 
   AreaChart, Area, LineChart, Line, PieChart, Pie, Cell, 
   ResponsiveContainer, XAxis, YAxis, Tooltip, Legend 
 } from "recharts";
 import { Image as ImageIcon } from 'lucide-react';
-
-const generateData = (count) => {
-  return Array.from({ length: count }).map((_, i) => {
-    const selected = Math.round(200 + (Math.random() - 0.5) * 50);
-    const discarded = Math.round(500 + (Math.random() - 0.5) * 100);
-    return {
-      time: `-${(count - i) * 2}m`,
-      selected,
-      discarded,
-      total: selected + discarded
-    };
-  });
-};
-
-const timelineData = generateData(20);
-
-const donutData = [
-  { name: 'Selected', value: 12800 },
-  { name: 'Discarded', value: 32200 }
-];
+import { api } from '@/lib/api';
 
 const COLORS = ['#1e3a8a', '#94a3b8']; // navy blue, light blue-grey
 
 export default function FrameSelection() {
+  const [timelineData, setTimelineData] = useState(Array.from({ length: 20 }).map((_, i) => ({
+    time: `-${(20 - i) * 3}s`,
+    selected: 0,
+    discarded: 0,
+    total: 0
+  })));
+  
+  const [stats, setStats] = useState({
+    framesReceived: 0, // This is frames_total from the edge
+    framesSelected: 0, // This is frames_received by the ingest server
+    framesDiscarded: 0,
+  });
+
+  const [activeDrone, setActiveDrone] = useState(null);
+
+  // Fetch the first available drone to monitor
+  useEffect(() => {
+    const fetchDrones = async () => {
+      try {
+        const data = await api.get('/ingest-server/status');
+        if (data && data.drones && data.drones.length > 0) {
+          setActiveDrone(data.drones[0].drone_id);
+        }
+      } catch (err) {
+        console.error("Failed to fetch drones:", err);
+      }
+    };
+    fetchDrones();
+  }, []);
+
+  // Poll for live stats
+  useEffect(() => {
+    if (!activeDrone) return;
+
+    let previousStats = {
+      framesReceived: 0,
+      framesSelected: 0
+    };
+
+    const fetchStats = async () => {
+      try {
+        const data = await api.get(`/ingest-server/status/${activeDrone}`);
+        if (data && data.ingest_stats) {
+          const s = data.ingest_stats;
+          
+          const totalEdgeFrames = s.frames_total || 0; // The new field added from edge metadata
+          const ingestFrames = s.frames_received || 0;
+          const discarded = Math.max(0, totalEdgeFrames - ingestFrames);
+
+          setStats({
+            framesReceived: totalEdgeFrames,
+            framesSelected: ingestFrames,
+            framesDiscarded: discarded
+          });
+
+          // Calculate delta for the timeline
+          const deltaTotal = totalEdgeFrames - previousStats.framesReceived;
+          const deltaSelected = ingestFrames - previousStats.framesSelected;
+          const deltaDiscarded = Math.max(0, deltaTotal - deltaSelected);
+          
+          if (previousStats.framesReceived > 0) {
+            setTimelineData(prev => {
+              const newData = [...prev.slice(1), {
+                time: new Date().toLocaleTimeString([], { hour12: false, second: '2-digit', minute: '2-digit' }),
+                selected: deltaSelected,
+                discarded: deltaDiscarded,
+                total: deltaTotal
+              }];
+              return newData;
+            });
+          }
+
+          previousStats = {
+            framesReceived: totalEdgeFrames,
+            framesSelected: ingestFrames
+          };
+        }
+      } catch (err) {
+        console.error("Failed to fetch drone stats:", err);
+      }
+    };
+
+    fetchStats();
+    const interval = setInterval(fetchStats, 3000);
+    return () => clearInterval(interval);
+  }, [activeDrone]);
+
+  const txReduction = stats.framesReceived > 0 
+    ? ((stats.framesDiscarded / stats.framesReceived) * 100).toFixed(1) 
+    : "0.0";
+
+  const selectionRatio = stats.framesReceived > 0
+    ? ((stats.framesSelected / stats.framesReceived) * 100).toFixed(1)
+    : "0.0";
+
+  const compressionRatio = stats.framesSelected > 0
+    ? (stats.framesReceived / stats.framesSelected).toFixed(2)
+    : "0.00";
+
+  const donutData = [
+    { name: 'Selected', value: stats.framesSelected },
+    { name: 'Discarded', value: stats.framesDiscarded }
+  ];
+
+  const sumSelected = timelineData.reduce((acc, curr) => acc + curr.selected, 0);
+  const avgSelectionPerMin = Math.round((sumSelected / timelineData.length) * (60 / 3));
+
   return (
     <AppShell title="Frame Selection Analytics" subtitle="Cognitive frame selector efficiency metrics">
       <div className="space-y-4">
@@ -37,19 +125,19 @@ export default function FrameSelection() {
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-5 flex flex-col justify-center items-start">
             <div className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider mb-2">Frames Received</div>
-            <div className="text-3xl font-bold font-mono text-cyan-400">45,000</div>
+            <div className="text-3xl font-bold font-mono text-cyan-400">{stats.framesReceived.toLocaleString()}</div>
           </div>
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-5 flex flex-col justify-center items-start">
             <div className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider mb-2">Frames Selected</div>
-            <div className="text-3xl font-bold font-mono text-emerald-400">12,800</div>
+            <div className="text-3xl font-bold font-mono text-emerald-400">{stats.framesSelected.toLocaleString()}</div>
           </div>
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-5 flex flex-col justify-center items-start">
             <div className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider mb-2">Frames Discarded</div>
-            <div className="text-3xl font-bold font-mono text-slate-400">32,200</div>
+            <div className="text-3xl font-bold font-mono text-slate-400">{stats.framesDiscarded.toLocaleString()}</div>
           </div>
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-5 flex flex-col justify-center items-start">
             <div className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider mb-2">TX Reduction</div>
-            <div className="text-3xl font-bold font-mono text-amber-500">71.6%</div>
+            <div className="text-3xl font-bold font-mono text-amber-500">{txReduction}%</div>
           </div>
         </div>
 
@@ -90,11 +178,11 @@ export default function FrameSelection() {
             <div className="w-full grid grid-cols-2 gap-4 mt-4 pt-4 border-t border-slate-800 text-center">
               <div>
                 <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Selection Ratio</div>
-                <div className="text-lg font-mono font-bold text-emerald-400">28.4%</div>
+                <div className="text-lg font-mono font-bold text-emerald-400">{selectionRatio}%</div>
               </div>
               <div>
                 <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Compression</div>
-                <div className="text-lg font-mono font-bold text-amber-500">3.52x</div>
+                <div className="text-lg font-mono font-bold text-amber-500">{compressionRatio}x</div>
               </div>
             </div>
           </div>
@@ -125,15 +213,15 @@ export default function FrameSelection() {
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6 pb-6 border-b border-slate-800">
             <div>
               <div className="text-[10px] text-slate-500 uppercase font-semibold tracking-wider mb-1">Bandwidth Saved</div>
-              <div className="text-2xl font-bold font-mono text-amber-500">71.6%</div>
+              <div className="text-2xl font-bold font-mono text-amber-500">{txReduction}%</div>
             </div>
             <div>
               <div className="text-[10px] text-slate-500 uppercase font-semibold tracking-wider mb-1">Avg Selection / Min</div>
-              <div className="text-2xl font-bold font-mono text-emerald-400">213 <span className="text-sm text-slate-500 font-sans">frames</span></div>
+              <div className="text-2xl font-bold font-mono text-emerald-400">{avgSelectionPerMin} <span className="text-sm text-slate-500 font-sans">frames</span></div>
             </div>
             <div>
               <div className="text-[10px] text-slate-500 uppercase font-semibold tracking-wider mb-1">Compression Ratio</div>
-              <div className="text-2xl font-bold font-mono text-cyan-400">3.52x</div>
+              <div className="text-2xl font-bold font-mono text-cyan-400">{compressionRatio}x</div>
             </div>
           </div>
           
