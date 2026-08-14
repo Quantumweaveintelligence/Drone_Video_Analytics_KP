@@ -449,6 +449,45 @@ async def list_evidence(user: dict = Depends(get_current_user)):
 
 @api.get("/missions")
 async def list_missions(user: dict = Depends(get_current_user)):
+    # Synchronize missing missions from ANPR microservice
+    try:
+        anpr_res = await _analytics_get(f"{ANPR_URL}/missions", timeout=5.0)
+        if anpr_res and "missions" in anpr_res:
+            active_mission_ids = set(anpr_res["missions"])
+            async with async_session_factory() as session:
+                existing = await session.execute(select(Mission.mission_id).where(Mission.mission_id.in_(active_mission_ids)))
+                existing_ids = {row[0] for row in existing.all()}
+                
+                missing_ids = active_mission_ids - existing_ids
+                if missing_ids:
+                    logger.info(f"Synchronizing {len(missing_ids)} missing missions from ANPR")
+                    for mid in missing_ids:
+                        # Extract timestamp from mission_id like MSN-20260813-2204-52-ALPHA
+                        # Parts: MSN, YYYYMMDD, HHMM, SS, SUFFIX
+                        started_at = ""
+                        parts = mid.split("-")
+                        if len(parts) >= 4 and parts[1].isdigit() and parts[2].isdigit():
+                            try:
+                                d = parts[1]
+                                t = parts[2]
+                                s = parts[3] if parts[3].isdigit() else "00"
+                                started_at = f"{d[:4]}-{d[4:6]}-{d[6:8]}T{t[:2]}:{t[2:4]}:{s[:2]}+00:00"
+                            except Exception:
+                                pass
+                                
+                        session.add(Mission(
+                            mission_id=mid,
+                            name=mid,  # Fallback name
+                            status="recovered",
+                            drone_id="",
+                            operator_name="System Recovered",
+                            operator_ids=[], # Recovered missions will be visible to officers
+                            started_at=started_at
+                        ))
+                    await session.commit()
+    except Exception as e:
+        logger.warning(f"Could not synchronize missions from ANPR: {e}")
+
     async with async_session_factory() as session:
         if user["role"] == "drone_operator":
             # operator_ids is JSONB array — use contains operator

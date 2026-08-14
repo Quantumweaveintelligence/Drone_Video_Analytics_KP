@@ -564,6 +564,17 @@ async def annotated_latest(drone_id: str = ""):
 
 
 # ── Plate query endpoints ──────────────────────────────────────────────────────
+@app.get("/missions")
+async def get_missions():
+    """Return all unique mission IDs that have plate reads."""
+    try:
+        from shared.db import get_all_missions
+        missions = await get_all_missions()
+        return {"missions": missions}
+    except Exception as e:
+        logger.error(f"Error fetching missions: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
+
 @app.get("/plates/recent")
 async def recent_plates(limit: int = 50, drone_id: str = "", mission_id: str = ""):
     pool  = await get_pool()

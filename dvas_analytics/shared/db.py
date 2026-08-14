@@ -374,6 +374,19 @@ async def get_recent_plates(limit: int = 50, drone_id: Optional[str] = None, mis
     return [dict(r) for r in rows]
 
 
+async def get_all_missions() -> List[str]:
+    """Get all distinct mission IDs from the plate_reads table."""
+    pool = await get_pool()
+    query = """
+        SELECT DISTINCT mission_id_str 
+        FROM plate_reads 
+        WHERE mission_id_str IS NOT NULL 
+        ORDER BY mission_id_str DESC
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(query)
+        return [r["mission_id_str"] for r in rows]
+
 async def get_plates_by_mission(
     mission_id: str,
     plate_search: str = "",
