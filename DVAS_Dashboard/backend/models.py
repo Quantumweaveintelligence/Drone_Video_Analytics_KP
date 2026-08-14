@@ -21,20 +21,6 @@ class Base(DeclarativeBase):
     pass
 
 
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(String, primary_key=True)
-    email = Column(String, unique=True, nullable=False, index=True)
-    name = Column(String, nullable=False)
-    role = Column(String, nullable=False)
-    jurisdiction = Column(String, default="")
-    mission_scope = Column(JSONB, default=list)  # list of mission IDs
-    password_hash = Column(String, nullable=False)
-    suspended = Column(Boolean, default=False)
-    created_at = Column(String)
-
-
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 

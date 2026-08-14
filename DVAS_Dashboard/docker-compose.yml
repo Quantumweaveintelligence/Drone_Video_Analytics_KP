@@ -41,6 +41,10 @@ services:
       - PERSON_ANALYTICS_URL=http://host.docker.internal:8102
       - VEHICLE_ANALYTICS_URL=http://host.docker.internal:8103
       - ANPR_ANALYTICS_URL=http://host.docker.internal:8104
+      - KEYCLOAK_URL=http://172.23.46.250:8080
+      - KC_REALM=kerala-police-drone
+      - ADMIN_CLIENT_ID=dvas-admin-service
+      - ADMIN_CLIENT_SECRET=MvusAlJk9DMnfe6GVOwuni8ODQbES938
     depends_on:
       postgres:
         condition: service_healthy
