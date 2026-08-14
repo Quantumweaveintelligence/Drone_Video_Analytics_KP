@@ -408,7 +408,10 @@ async def list_missions(user: dict = Depends(get_current_user)):
 
 # ---------- Mission create / end (wired to Edge Mission Control) ----------
 @api.post("/missions")
-async def create_mission(payload: dict = Body(...)):
+async def create_mission(
+    payload: dict = Body(...),
+    user: dict = Depends(get_current_user)
+):
     """
     Save a new mission record to the database.
     Called by the frontend after the edge node confirms mission start.
@@ -437,6 +440,8 @@ async def create_mission(payload: dict = Body(...)):
             operator_name=operator_name,
             zone=location,
             started_at=started_at,
+            operator_ids=[user["id"]],  # IMPORTANT: save current user ID so they can see this mission
+            jurisdiction=user.get("jurisdiction", "")
         )
         session.add(mission)
         await session.commit()
@@ -1286,6 +1291,80 @@ PERSON_URL  = os.getenv("PERSON_ANALYTICS_URL",  "http://host.docker.internal:81
 VEHICLE_URL = os.getenv("VEHICLE_ANALYTICS_URL", "http://host.docker.internal:8103")
 ANPR_URL    = os.getenv("ANPR_ANALYTICS_URL",    "http://host.docker.internal:8104")
 
+# ---------- MinIO Image Proxy ----------
+# Serve MinIO images through the backend so MinIO is never exposed to browsers.
+# Frontend requests: /api/minio/image?bucket=dvas-plates&key=plates/MSN-.../file.jpg
+MINIO_PROXY_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
+MINIO_PROXY_ACCESS   = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_PROXY_SECRET   = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+MINIO_PROXY_SECURE   = os.getenv("MINIO_SECURE", "false").lower() == "true"
+
+_minio_proxy_client = None
+
+def _get_minio_client():
+    global _minio_proxy_client
+    if _minio_proxy_client is None:
+        try:
+            from minio import Minio
+            _minio_proxy_client = Minio(
+                MINIO_PROXY_ENDPOINT,
+                access_key=MINIO_PROXY_ACCESS,
+                secret_key=MINIO_PROXY_SECRET,
+                secure=MINIO_PROXY_SECURE,
+            )
+            logger.info("MinIO proxy client initialised: %s", MINIO_PROXY_ENDPOINT)
+        except Exception as exc:
+            logger.error("MinIO proxy client init failed: %s", exc)
+            return None
+    return _minio_proxy_client
+
+
+@api.get("/minio/image")
+async def minio_image_proxy(bucket: str, key: str, _user=Depends(get_current_user)):
+    """
+    Securely proxy MinIO object downloads through the backend.
+    Requires authentication — no direct MinIO exposure to browsers.
+    """
+    if not bucket or not key:
+        raise HTTPException(status_code=400, detail="bucket and key are required")
+
+    # Security: only allow known buckets
+    ALLOWED_BUCKETS = {"dvas-plates", "dvas-vehicles", "dvas-evidence", "dvas-faces", "dvas-heatmaps"}
+    if bucket not in ALLOWED_BUCKETS:
+        raise HTTPException(status_code=403, detail=f"Bucket '{bucket}' not allowed")
+
+    # Sanitize key to prevent path traversal
+    if ".." in key or key.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid key")
+
+    client = _get_minio_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="MinIO not available")
+
+    try:
+        response = client.get_object(bucket, key)
+        img_bytes = response.read()
+        response.close()
+        response.release_conn()
+
+        # Determine content type from key extension
+        ct = "image/jpeg"
+        if key.endswith(".png"):
+            ct = "image/png"
+        elif key.endswith(".webp"):
+            ct = "image/webp"
+
+        return Response(
+            content=img_bytes,
+            media_type=ct,
+            headers={
+                "Cache-Control": "public, max-age=86400",  # cache images for 24h
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    except Exception as exc:
+        logger.debug("MinIO proxy fetch failed (%s/%s): %s", bucket, key, exc)
+        raise HTTPException(status_code=404, detail="Image not found")
 
 async def _analytics_get(url: str, timeout: float = 8.0) -> dict:
     """Forward GET to analytics service; return response JSON or error envelope."""

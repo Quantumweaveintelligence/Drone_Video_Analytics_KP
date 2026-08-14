@@ -59,9 +59,22 @@ function usePoll(path, interval, transform) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+
+  const doFetch = useCallback(async () => {
+    try {
+      const res = await api.get(path);
+      setData(transform ? transform(res.data) : res.data);
+      setError(null);
+    } catch (e) {
+      setError(e?.message || 'Error');
+    } finally {
+      setLoading(false);
+    }
+  }, [path, transform]);
+
   useEffect(() => {
     let mounted = true;
-    const doFetch = async () => {
+    const fetchWrapper = async () => {
       try {
         const res = await api.get(path);
         if (mounted) {
@@ -74,12 +87,13 @@ function usePoll(path, interval, transform) {
         if (mounted) setLoading(false);
       }
     };
-    doFetch();
-    const id = setInterval(doFetch, interval);
+    fetchWrapper();
+    const id = setInterval(fetchWrapper, interval);
     return () => { mounted = false; clearInterval(id); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path]);
-  return { data, loading, error };
+
+  return { data, loading, error, mutate: doFetch };
 }
 
 /* ─── Panel wrapper ──────────────────────────────────────────────── */
@@ -559,13 +573,19 @@ function ANPRWindow({ plates, activeDrone, activeMissionId, anprStreamRunning })
     arr = arr.filter(p => nvt(p.vehicle_type).toLowerCase() === typeFilter);
   }
 
-  const imgSrc = (url, b64) => {
-    if (url) return url;
+  // Build image URL: prefer proxy (key-based), fallback to b64, then to presigned URL
+  const proxyUrl = (bucket, key) => {
+    if (!key) return null;
+    return `/api/minio/image?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(key)}`;
+  };
+  const imgSrc = (bucket, key, url, b64) => {
+    if (key) return proxyUrl(bucket, key);
     if (b64) return `data:image/jpeg;base64,${b64}`;
+    if (url) return url;  // last resort: direct presigned URL
     return null;
   };
-  const vehicleSrc = (p) => imgSrc(p.vehicle_image_url, p.vehicle_image_b64);
-  const plateSrc   = (p) => imgSrc(p.plate_image_url,   p.plate_crop_b64);
+  const vehicleSrc = (p) => imgSrc('dvas-vehicles', p.vehicle_image_key, p.vehicle_image_url, p.vehicle_image_b64);
+  const plateSrc   = (p) => imgSrc('dvas-plates',   p.plate_image_key,   p.plate_image_url,   p.plate_crop_b64);
 
   const handleContainerClick = (e) => {
     if (e.target === e.currentTarget) setSelectedId(null);
@@ -846,19 +866,19 @@ function WatchlistPanel({ alerts, watchlist, onAdd, onRemove, adding }) {
                 <span className="ml-auto mono text-[10px]" style={{ color:'var(--dvas-text-dim)' }}>{fmtAge(a.detected_at)}</span>
               </div>
               {/* Vehicle + Plate image pair if available */}
-              {(a.vehicle_image_url || a.plate_image_url) && (
+              {(a.vehicle_image_key || a.vehicle_image_url || a.plate_image_key || a.plate_image_url) && (
                 <div className="flex gap-1 px-2 pb-2">
-                  {a.vehicle_image_url && (
+                  {(a.vehicle_image_key || a.vehicle_image_url) && (
                     <div className="relative rounded overflow-hidden bg-black" style={{ flex:'2', paddingTop:'40%' }}>
-                      <img src={a.vehicle_image_url} alt="vehicle" loading="lazy"
+                      <img src={a.vehicle_image_key ? `/api/minio/image?bucket=dvas-vehicles&key=${encodeURIComponent(a.vehicle_image_key)}` : a.vehicle_image_url} alt="vehicle" loading="lazy"
                         className="absolute inset-0 w-full h-full object-cover" />
                       <span className="absolute bottom-0.5 left-0.5 mono text-[7px] px-1 rounded"
                         style={{ background:'rgba(0,0,0,0.7)', color:'#94a3b8' }}>VEHICLE</span>
                     </div>
                   )}
-                  {a.plate_image_url && (
+                  {(a.plate_image_key || a.plate_image_url) && (
                     <div className="relative rounded overflow-hidden bg-black" style={{ flex:'1', paddingTop:'40%' }}>
-                      <img src={a.plate_image_url} alt="plate" loading="lazy"
+                      <img src={a.plate_image_key ? `/api/minio/image?bucket=dvas-plates&key=${encodeURIComponent(a.plate_image_key)}` : a.plate_image_url} alt="plate" loading="lazy"
                         className="absolute inset-0 w-full h-full object-contain" />
                       <span className="absolute bottom-0.5 left-0.5 mono text-[7px] px-1 rounded"
                         style={{ background:'rgba(0,0,0,0.7)', color:'#94a3b8' }}>PLATE</span>
@@ -916,18 +936,18 @@ function WatchlistPanel({ alerts, watchlist, onAdd, onRemove, adding }) {
             <div className="rounded-lg overflow-hidden"
               style={{ background:'var(--dvas-surface-2)', border:'1px solid rgba(20,184,166,0.25)' }}>
               {/* Images */}
-              {(r.vehicle_image_url || r.plate_image_url) && (
+              {(r.vehicle_image_key || r.vehicle_image_url || r.plate_image_key || r.plate_image_url) && (
                 <div className="flex gap-1 p-1.5">
-                  {r.vehicle_image_url && (
+                  {(r.vehicle_image_key || r.vehicle_image_url) && (
                     <div className="relative rounded overflow-hidden bg-black" style={{ flex:'2', paddingTop:'40%' }}>
-                      <img src={r.vehicle_image_url} alt="vehicle" className="absolute inset-0 w-full h-full object-cover" />
+                      <img src={r.vehicle_image_key ? `/api/minio/image?bucket=dvas-vehicles&key=${encodeURIComponent(r.vehicle_image_key)}` : r.vehicle_image_url} alt="vehicle" className="absolute inset-0 w-full h-full object-cover" />
                       <span className="absolute bottom-0.5 left-0.5 mono text-[7px] px-1 rounded"
                         style={{ background:'rgba(0,0,0,0.7)', color:'#94a3b8' }}>VEHICLE</span>
                     </div>
                   )}
-                  {r.plate_image_url && (
+                  {(r.plate_image_key || r.plate_image_url) && (
                     <div className="relative rounded overflow-hidden bg-black" style={{ flex:'1', paddingTop:'40%' }}>
-                      <img src={r.plate_image_url} alt="plate" className="absolute inset-0 w-full h-full object-contain" />
+                      <img src={r.plate_image_key ? `/api/minio/image?bucket=dvas-plates&key=${encodeURIComponent(r.plate_image_key)}` : r.plate_image_url} alt="plate" className="absolute inset-0 w-full h-full object-contain" />
                       <span className="absolute bottom-0.5 left-0.5 mono text-[7px] px-1 rounded"
                         style={{ background:'rgba(0,0,0,0.7)', color:'#94a3b8' }}>PLATE</span>
                     </div>
@@ -1051,7 +1071,7 @@ function useActiveDrones() {
 /* ─── Main Component ──────────────────────────────────────────────── */
 /* ─── MissionHistory ──────────────────────────────────────────────────────── */
 function MissionHistory() {
-  const { data: missions } = usePoll('/missions', 60000);
+  const { data: missions, mutate: refreshMissions } = usePoll('/missions', 60000);
   const [selectedMission, setSelectedMission] = useState(null);
   const [missionSearch, setMissionSearch] = useState('');
   const [showMissionDropdown, setShowMissionDropdown] = useState(false);
@@ -1169,6 +1189,16 @@ function MissionHistory() {
     <div className="flex flex-col gap-4">
       {/* Filters Toolbar */}
       <div className="flex flex-wrap items-center gap-3">
+        <button
+          onClick={() => refreshMissions()}
+          className="px-2 py-1.5 rounded mono text-xs font-semibold flex items-center gap-1 transition-colors hover:bg-violet-900/40"
+          style={{ background: 'rgba(139, 92, 246, 0.15)', color: '#a78bfa', border: '1px solid rgba(139, 92, 246, 0.3)' }}
+          title="Refresh Mission List"
+        >
+          <RefreshCw size={12} className={loading ? 'animate-spin' : ''} />
+          Refresh
+        </button>
+
         {/* Mission Dropdown */}
         <div className="relative" ref={dropdownRef}>
           <input
@@ -1363,8 +1393,12 @@ function MissionHistory() {
             }}
           >
             {missionData.vehicles.map((p, i) => {
-              const vSrc = p.vehicle_image_url;
-              const pSrc = p.plate_image_url;
+              const vSrc = p.vehicle_image_key
+                ? `/api/minio/image?bucket=dvas-vehicles&key=${encodeURIComponent(p.vehicle_image_key)}`
+                : p.vehicle_image_url || null;
+              const pSrc = p.plate_image_key
+                ? `/api/minio/image?bucket=dvas-plates&key=${encodeURIComponent(p.plate_image_key)}`
+                : p.plate_image_url || null;
               const vType = (p.vehicle_type || 'VEHICLE').toUpperCase();
               
               return (
