@@ -20,8 +20,8 @@ export function AuthProvider({ children }) {
     })();
   }, []);
 
-  const login = async (email, password, role) => {
-    const { data } = await api.post("/auth/login", { email, password, role });
+  const login = async (email, password) => {
+    const { data } = await api.post("/auth/login", { email, password });
     if (data.access_token) localStorage.setItem("dvas_token", data.access_token);
     setUser(data);
     return data;

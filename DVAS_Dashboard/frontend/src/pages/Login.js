@@ -16,7 +16,6 @@ function fmt(detail) {
 export default function Login() {
   const { user, ready, login } = useAuth();
   const { t } = useI18n();
-  const [role, setRole] = useState("drone_operator");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [err, setErr] = useState("");
@@ -30,7 +29,7 @@ export default function Login() {
     e.preventDefault();
     setErr(""); setBusy(true);
     try {
-      const u = await login(email.trim().toLowerCase(), password, role);
+      const u = await login(email.trim().toLowerCase(), password);
       nav(ROLE_HOME[u.role] || "/command", { replace: true });
     } catch (ex) {
       setErr(fmt(ex.response?.data?.detail) || ex.message);
@@ -77,24 +76,6 @@ export default function Login() {
           <h2 className="text-2xl font-semibold tracking-tight mb-6">{t("login.signIn")}</h2>
 
           <form onSubmit={submit} className="space-y-4">
-            <label className="block">
-              <div className="dvas-label mb-1.5">Role</div>
-              <div className="relative">
-                <Shield size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
-                <select
-                  data-testid="input-role"
-                  required
-                  value={role}
-                  onChange={(e) => setRole(e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-700 focus:border-sky-500 outline-none px-9 py-2.5 text-sm mono appearance-none cursor-pointer"
-                >
-                  {Object.entries(ROLE_LABELS).map(([k, v]) => (
-                    <option key={k} value={k}>{v}</option>
-                  ))}
-                </select>
-                <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none" />
-              </div>
-            </label>
             <label className="block">
               <div className="dvas-label mb-1.5">{t("login.email")}</div>
               <div className="relative">

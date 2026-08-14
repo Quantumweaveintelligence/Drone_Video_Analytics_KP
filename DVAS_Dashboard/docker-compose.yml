@@ -45,6 +45,10 @@ services:
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin
       - MINIO_SECURE=false
+      - KEYCLOAK_URL=http://172.23.46.250:8080
+      - KC_REALM=kerala-police-drone
+      - ADMIN_CLIENT_ID=dvas-admin-service
+      - ADMIN_CLIENT_SECRET=MvusAlJk9DMnfe6GVOwuni8ODQbES938
     depends_on:
       postgres:
         condition: service_healthy

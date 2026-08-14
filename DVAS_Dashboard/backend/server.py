@@ -10,7 +10,7 @@ import logging
 import random
 import hashlib
 import bcrypt
-import jwt
+from jose import jwt
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Literal
 import asyncio
@@ -37,12 +37,33 @@ from pydantic import BaseModel, EmailStr
 from fpdf import FPDF
 
 from database import engine, async_session_factory, get_db
-from models import Base, User, AuditLog, Mission, Drone, Alert, Evidence, Export, ModelConfig
-from ingest_proxy import ingest_api
+from models import Base, AuditLog, Mission, Drone, Alert, Evidence, Export, ModelConfig
+from ingest_proxy import ingest_api, _proxy_get
 
-# ---------- Setup ----------
-JWT_ALGORITHM = "HS256"
-JWT_SECRET = os.environ["JWT_SECRET"]
+# ---------- Keycloak Setup ----------
+# ---------- Keycloak Setup ----------
+KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "http://172.23.46.250:8080")
+KEYCLOAK_REALM = os.environ.get("KC_REALM", "kerala-police-drone")
+KEYCLOAK_CLIENT_ID = os.environ.get("KC_CLIENT_ID", "drone-ingest-client")
+KEYCLOAK_CLIENT_SECRET = os.environ.get("KC_CLIENT_SECRET", "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn")
+KEYCLOAK_ADMIN = os.environ.get("KEYCLOAK_ADMIN", "admin")
+KEYCLOAK_ADMIN_PASSWORD = os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "Admin@KP2025!")
+JWKS_CACHE = {}
+
+def fetch_jwks():
+    global JWKS_CACHE
+    url = f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/certs"
+    try:
+        import requests
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            JWKS_CACHE = resp.json()
+            logger.info("Successfully fetched JWKS from Keycloak")
+        else:
+            logger.error(f"Failed to fetch JWKS: {resp.status_code} {resp.text}")
+    except Exception as e:
+        logger.error(f"Failed to fetch JWKS: {e}")
+
 
 app = FastAPI(title="DVAS API")
 api = APIRouter(prefix="/api")
@@ -58,6 +79,12 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+@app.on_event("startup")
+async def startup_event():
+    fetch_jwks()
+
+
+
 # ---------- Auth helpers ----------
 # RBAC: 4-role model (field_supervisor → control_room_officer,
 #        supervisory_officer → senior_officer — see migrate_roles.py)
@@ -69,27 +96,15 @@ Role = Literal[
 ]
 
 
-def hash_password(p: str) -> str:
-    return bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
-
-
-def verify_password(p: str, h: str) -> bool:
-    return bcrypt.checkpw(p.encode(), h.encode())
-
-
-def create_access_token(user_id: str, email: str, role: str) -> str:
-    payload = {
-        "sub": user_id,
-        "email": email,
-        "role": role,
-        "exp": datetime.now(timezone.utc) + timedelta(hours=8),
-        "type": "access",
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
+ROLE_MAP = {
+    "sys-admin": "system_administrator",
+    "supervisor": "senior_officer",
+    "control-room": "control_room_officer",
+    "drone-operator": "drone_operator",
+}
 
 async def get_current_user(request: Request) -> dict:
-    token = request.cookies.get("access_token")
+    token = request.cookies.get("dvas_access_token")
     if not token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
@@ -97,22 +112,33 @@ async def get_current_user(request: Request) -> dict:
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        async with async_session_factory() as session:
-            result = await session.execute(
-                select(User).where(User.id == payload["sub"])
-            )
-            user_obj = result.scalar_one_or_none()
-            if not user_obj:
-                raise HTTPException(status_code=401, detail="User not found")
-            return _user_to_dict(user_obj, exclude_password=True)
+        options = {"verify_aud": False}
+        payload = jwt.decode(token, JWKS_CACHE, algorithms=["RS256"], options=options)
+        
+        realm_access = payload.get("realm_access", {})
+        roles = realm_access.get("roles", [])
+        
+        user_role = "drone_operator"
+        for kc_role, mapped_role in ROLE_MAP.items():
+            if kc_role in roles:
+                user_role = mapped_role
+                if user_role == "system_administrator":
+                    break
+                    
+        return {
+            "id": payload.get("sub"),
+            "email": payload.get("email", ""),
+            "name": payload.get("name") or payload.get("preferred_username", ""),
+            "role": user_role,
+        }
     except jwt.ExpiredSignatureError:
+        logger.error("get_current_user: Token expired")
         raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-
-def _user_to_dict(u: User, exclude_password: bool = False) -> dict:
+    except jwt.JWTError as e:
+        logger.error(f"get_current_user: Invalid token: {e}")
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+        
+def _user_to_dict(u, exclude_password: bool = False) -> dict:
     """Convert a User ORM object to a plain dict."""
     d = {
         "id": u.id,
@@ -210,39 +236,80 @@ class ExportDecisionIn(BaseModel):
 
 
 # ---------- Auth endpoints ----------
+# ---------- Auth endpoints ----------
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str
+
 @api.post("/auth/login")
 @limiter.limit("5/minute")
 async def login(body: LoginIn, response: Response, request: Request):
     email = body.email.lower()
-    async with async_session_factory() as session:
-        result = await session.execute(select(User).where(User.email == email))
-        user_obj = result.scalar_one_or_none()
-    if not user_obj or not verify_password(body.password, user_obj.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    if user_obj.role != body.role:
-        raise HTTPException(status_code=401, detail="Role mismatch — select the correct role for this account")
-    user = _user_to_dict(user_obj)
-    token = create_access_token(user["id"], user["email"], user["role"])
-    response.set_cookie(
-        "access_token", token, httponly=True, samesite="lax", secure=True, max_age=28800, path="/"
-    )
-    await write_audit(
-        user,
-        "login",
-        user["email"],
-        "login success",
-        request.client.host if request.client else "-",
-    )
-    return {
-        "id": user["id"],
-        "email": user["email"],
-        "name": user["name"],
-        "role": user["role"],
-        "jurisdiction": user.get("jurisdiction"),
-        "mission_scope": user.get("mission_scope", []),
-        "access_token": token,
+    
+    url = f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token"
+    
+    USERNAME_MAP = {
+        "admin@dvas.kp": "admin_dvas",
+        "control@dvas.kp": "control_001",
+        "senior@dvas.kp": "senior_001",
+        "operator@dvas.kp": "operator_001"
     }
-
+    # Keycloak username from email mapping, or fallback to email itself
+    username = USERNAME_MAP.get(email, email.split("@")[0] if "@" in email else email)
+    
+    data = {
+        "client_id": KEYCLOAK_CLIENT_ID,
+        "client_secret": KEYCLOAK_CLIENT_SECRET,
+        "grant_type": "password",
+        "username": username,
+        "password": body.password
+    }
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.post(url, data=data, timeout=5)
+            if r.status_code != 200:
+                raise HTTPException(status_code=401, detail="Invalid email or password")
+            
+            token_data = r.json()
+            access_token = token_data["access_token"]
+            
+            options = {"verify_aud": False}
+            payload = jwt.decode(access_token, JWKS_CACHE, algorithms=["RS256"], options=options)
+            
+            realm_access = payload.get("realm_access", {})
+            roles = realm_access.get("roles", [])
+            user_role = "drone_operator"
+            for kc_role, mapped_role in ROLE_MAP.items():
+                if kc_role in roles:
+                    user_role = mapped_role
+                    if user_role == "system_administrator":
+                        break
+                        
+            user_dict = {
+                "id": payload.get("sub"),
+                "email": payload.get("email", email),
+                "name": payload.get("name") or payload.get("preferred_username", ""),
+                "role": user_role,
+            }
+            
+            response.set_cookie(
+                "dvas_access_token",
+                access_token,
+                httponly=True,
+                secure=False,
+                samesite="lax",
+                max_age=token_data.get("expires_in", 3600),
+                path="/"
+            )
+            
+            await write_audit(user_dict, "login", email, "login success via Keycloak", request.client.host if request.client else "-")
+            
+            user_dict["access_token"] = access_token
+            return user_dict
+            
+        except httpx.RequestError:
+            raise HTTPException(status_code=503, detail="Authentication server unreachable")
 
 @api.get("/auth/me")
 async def me(user: dict = Depends(get_current_user)):
@@ -253,7 +320,7 @@ async def me(user: dict = Depends(get_current_user)):
 async def logout(
     response: Response, user: dict = Depends(get_current_user), request: Request = None
 ):
-    response.delete_cookie("access_token", path="/")
+    response.delete_cookie("dvas_access_token", path="/")
     await write_audit(
         user,
         "logout",
@@ -689,16 +756,14 @@ async def edge_shift_summary(request: Request, token: str = ""):
     # Support Authorization header, cookie, OR query token for direct <a> downloads
     if token:
         try:
-            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-            async with async_session_factory() as session:
-                result = await session.execute(
-                    select(User).where(User.id == payload["sub"])
-                )
-                user_obj = result.scalar_one_or_none()
-                if not user_obj:
-                    raise HTTPException(401, "User not found")
-                user = _user_to_dict(user_obj, exclude_password=True)
-        except jwt.PyJWTError:
+            options = {"verify_aud": False}
+            payload = jwt.decode(token, JWKS_CACHE, algorithms=["RS256"], options=options)
+            user = {
+                "id": payload.get("sub"),
+                "email": payload.get("email", ""),
+                "role": "control_room_officer", # Assuming higher role for exports
+            }
+        except jwt.JWTError:
             raise HTTPException(401, "Invalid token")
     else:
         user = await get_current_user(request)
@@ -749,12 +814,17 @@ async def edge_shift_summary(request: Request, token: str = ""):
     )
 
 
-# ---------- Users (admin) ----------
+# ---------- Users (admin) — Keycloak-backed ----------
+from keycloak_service import (
+    list_users_from_keycloak,
+    provision_user_in_keycloak,
+    disable_user_in_keycloak,
+)
+
+
 @api.get("/users")
 async def list_users(user: dict = Depends(require_roles("system_administrator"))):
-    async with async_session_factory() as session:
-        result = await session.execute(select(User))
-        return [_user_to_dict(r, exclude_password=True) for r in result.scalars().all()]
+    return await list_users_from_keycloak()
 
 
 class UserCreateIn(BaseModel):
@@ -776,29 +846,27 @@ class UserPatchIn(BaseModel):
 
 @api.post("/users")
 async def create_user(
-    body: UserCreateIn, user: dict = Depends(require_roles("system_administrator"))
+    body: UserCreateIn, user: dict = Depends(require_roles("system_administrator")),
+    request: Request = None,
 ):
-    email = body.email.lower()
-    async with async_session_factory() as session:
-        result = await session.execute(select(User).where(User.email == email))
-        if result.scalar_one_or_none():
-            raise HTTPException(400, "Email already exists")
-        doc = {
-            "id": str(uuid.uuid4()),
-            "email": email,
-            "name": body.name,
-            "role": body.role,
-            "jurisdiction": body.jurisdiction,
-            "mission_scope": body.mission_scope,
-            "password_hash": hash_password(body.password),
-            "suspended": False,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        session.add(User(**doc))
-        await session.commit()
-    await write_audit(user, "user_create", email, f"role={body.role}")
-    doc.pop("password_hash", None)
-    return doc
+    # Password complexity check (min 8 chars)
+    if len(body.password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+
+    result = await provision_user_in_keycloak(
+        name=body.name,
+        email=body.email.lower(),
+        role=body.role,
+        jurisdiction=body.jurisdiction,
+        mission_scope=body.mission_scope,
+        password=body.password,
+    )
+    await write_audit(
+        user, "user_create", body.email.lower(),
+        f"role={body.role}, jurisdiction={body.jurisdiction}",
+        request.client.host if request and request.client else "-",
+    )
+    return result
 
 
 @api.patch("/users/{user_id}")
@@ -807,32 +875,19 @@ async def patch_user(
     body: UserPatchIn,
     user: dict = Depends(require_roles("system_administrator")),
 ):
-    updates = {k: v for k, v in body.model_dump().items() if v is not None}
-    if not updates:
-        raise HTTPException(400, "No updates")
-    async with async_session_factory() as session:
-        result = await session.execute(
-            update(User).where(User.id == user_id).values(**updates)
-        )
-        if result.rowcount == 0:
-            raise HTTPException(404, "User not found")
-        await session.commit()
-    await write_audit(user, "user_update", user_id, str(updates))
-    return {"ok": True}
+    raise HTTPException(501, "User modification is managed via Keycloak Admin Console.")
 
 
 @api.delete("/users/{user_id}")
 async def delete_user(
-    user_id: str, user: dict = Depends(require_roles("system_administrator"))
+    user_id: str, user: dict = Depends(require_roles("system_administrator")),
+    request: Request = None,
 ):
-    async with async_session_factory() as session:
-        result = await session.execute(
-            update(User).where(User.id == user_id).values(suspended=True)
-        )
-        if result.rowcount == 0:
-            raise HTTPException(404, "User not found")
-        await session.commit()
-    await write_audit(user, "user_suspend", user_id, "suspended")
+    await disable_user_in_keycloak(user_id)
+    await write_audit(
+        user, "user_suspend", user_id, "disabled via Keycloak",
+        request.client.host if request and request.client else "-",
+    )
     return {"ok": True}
 
 
@@ -1456,7 +1511,7 @@ async def analytics_events_stream(request: Request, drone_id: str = ""):
         raise HTTPException(401, "Not authenticated")
     try:
         jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-    except jwt.PyJWTError:
+    except jwt.JWTError:
         raise HTTPException(401, "Invalid token")
 
     upstream_url = f"{ANALYTICS_BASE}/events/stream"
@@ -2076,25 +2131,8 @@ async def seed_data():
             await session.commit()
             logger.info(f"Cleared {legacy_count} legacy audit logs (missing hash chain).")
 
-        # users
-        user_ids_by_email = {}
-        for u in SEED_USERS:
-            result = await session.execute(
-                select(User).where(User.email == u["email"])
-            )
-            existing = result.scalar_one_or_none()
-            if not existing:
-                uid = str(uuid.uuid4())
-                session.add(User(
-                    **u,
-                    id=uid,
-                    password_hash=hash_password("dvas1234"),
-                    created_at=datetime.now(timezone.utc).isoformat(),
-                ))
-                user_ids_by_email[u["email"]] = uid
-            else:
-                user_ids_by_email[u["email"]] = existing.id
-        await session.commit()
+        # users are now seeded in Keycloak via setup script
+        user_ids_by_email = {u["email"]: "seed-id" for u in SEED_USERS}
 
         # If missions already seeded, ensure audit chain exists then return
         mission_count = (await session.execute(
@@ -2452,16 +2490,14 @@ async def download_65b_bundle(export_id: str, request: Request, token: str = "")
     # Support Authorization header, cookie, OR query token for direct <a> downloads
     if token:
         try:
-            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-            async with async_session_factory() as session:
-                result = await session.execute(
-                    select(User).where(User.id == payload["sub"])
-                )
-                user_obj = result.scalar_one_or_none()
-                if not user_obj:
-                    raise HTTPException(401, "User not found")
-                user = _user_to_dict(user_obj, exclude_password=True)
-        except jwt.PyJWTError:
+            options = {"verify_aud": False}
+            payload = jwt.decode(token, JWKS_CACHE, algorithms=["RS256"], options=options)
+            user = {
+                "id": payload.get("sub"),
+                "email": payload.get("email", ""),
+                "role": "control_room_officer", # Assuming higher role for exports
+            }
+        except jwt.JWTError:
             raise HTTPException(401, "Invalid token")
     else:
         user = await get_current_user(request)
@@ -2555,8 +2591,20 @@ hub = WSHub()
 
 def _authz_ws(token: str) -> Optional[dict]:
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-    except Exception:
+        options = {"verify_aud": False}
+        payload = jwt.decode(token, JWKS_CACHE, algorithms=["RS256"], options=options)
+        
+        realm_access = payload.get("realm_access", {})
+        roles = realm_access.get("roles", [])
+        user_role = "drone_operator"
+        for kc_role, mapped_role in ROLE_MAP.items():
+            if kc_role in roles:
+                user_role = mapped_role
+                if user_role == "system_administrator":
+                    break
+        return {"role": user_role}
+    except Exception as e:
+        logger.error(f"_authz_ws: Token error: {e}")
         return None
 
 
