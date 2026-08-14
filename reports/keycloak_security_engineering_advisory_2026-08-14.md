@@ -236,3 +236,8 @@ Surveillance integrity requires distinguishing between **identity authentication
 - [ ] **Strict Redirect URIs:** Client redirect settings in Keycloak use exact destination URLs with zero wildcards (`*`).
 - [ ] **Audit Logging Enabled:** Both User Event Logging and Admin Event Logging are active in Keycloak with retention set for a minimum of 90 days.
 - [ ] **Secret Hygiene:** Master admin passwords and database credentials are changed from repository defaults and managed via environment secrets.
+
+> ⚠️ **VAPT Re-Verification Note on Host Port Isolation & Test Methodology:**  
+> Phase 1 penetration testing specifically relied on sending test requests directly to the unauthenticated backend host port (`http://<SERVER_IP>:8000/ingest/frame` and `http://<SERVER_IP>:8080/`). Once host port isolation is applied, direct external TCP connections to ports `8000` and `8080` will be rejected by the firewall/host (`Connection Refused`).  
+> * **Important for QA / Retest Teams:** When executing re-verification suites, test traffic must target the public ingress through **NGINX HTTPS (`https://ingest.dvas.internal/ingest/frame` on Port 443)**. Do not confuse a closed raw port with an application-level auth fix—both the network perimeter (Port 443 only) and application JWT validation must be verified independently.
+
