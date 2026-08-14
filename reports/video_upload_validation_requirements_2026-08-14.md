@@ -3,7 +3,6 @@
 **Date:** 2026-08-14  
 **Project:** Kerala Police Drone Video Analytics System (DVAS)  
 **Target Systems:** `dvas_ingest`, `dvas_edge`, `DVAS_Dashboard`  
-**Classification:** Security Architecture & Engineering Advisory (Vulnerability Assessment and Penetration Testing — VAPT Perspective)  
 
 ---
 
