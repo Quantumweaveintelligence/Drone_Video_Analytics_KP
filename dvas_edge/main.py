@@ -105,9 +105,19 @@ class EdgeSenderThread(threading.Thread):
     Frames are JPEG-encoded in memory — no temp files are written.
     """
 
-    def __init__(self, client: IngestClient, max_queue: int = 64) -> None:
+    def __init__(
+        self,
+        client: IngestClient,
+        max_queue: int = 64,
+        mission_name: Optional[str] = None,
+        operator: Optional[str] = None,
+        location: Optional[str] = None,
+    ) -> None:
         super().__init__(name="EdgeSenderThread", daemon=True)
         self._client   = client
+        self._mission_name = mission_name
+        self._operator = operator
+        self._location = location
         self._buffer   = OfflineBuffer()
         self._loop:    Optional[asyncio.AbstractEventLoop] = None
         self._started  = threading.Event()
@@ -140,7 +150,11 @@ class EdgeSenderThread(threading.Thread):
     async def _async_run(self) -> None:
         # Start mission lifecycle
         try:
-            await self._client.start_mission()
+            await self._client.start_mission(
+                mission_name=self._mission_name,
+                operator=self._operator,
+                location=self._location,
+            )
         except Exception as exc:
             log.error("edge_sender_mission_start_failed", error=str(exc))
             # Continue anyway — individual frames will still be attempted
@@ -278,6 +292,31 @@ def _make_change_event_handler(
         # ── Pass to CognitiveFrameSelector (Task 1.5) if enabled ───────────
         if cognitive_selector is not None:
             cognitive_selector.evaluate(event)
+        else:
+            # Bypass mode: send all change events directly
+            from src.cognitive_frame_selector.selected_frame import SelectedFrame, GpsLocation
+            frame = SelectedFrame.create(
+                drone_id=event.drone_id,
+                mission_id=cfg.ingest.mission_id,
+                utc_timestamp_ms=event.timestamp_ms,
+                frame_index=event.frame_index,
+                raw_frame=event.frame,
+                change_score=event.motion_score,
+                cognitive_score=1.0,
+                selection_reason="bypass_cfs",
+                location=GpsLocation(lat=0.0, lon=0.0, altitude_m=0.0),
+                motion_regions=[
+                    {
+                        "x": event.largest_region.x,
+                        "y": event.largest_region.y,
+                        "w": event.largest_region.w,
+                        "h": event.largest_region.h,
+                        "area": event.largest_region.area,
+                        "persistence": event.largest_region.persistence,
+                    }
+                ] if event.largest_region else []
+            )
+            _on_selected_frame(frame)
 
     return _on_change_event
 
@@ -350,13 +389,27 @@ def main() -> None:
             username   = ing_cfg.username,
             password   = ing_cfg.password,
         )
-        _edge_sender_thread = EdgeSenderThread(client=ingest_client, max_queue=64)
+        
+        # Check if the config has these new fields (backward compatibility if missing)
+        mission_name = getattr(ing_cfg, "mission_name", "Vehicle Tracking")
+        operator = getattr(ing_cfg, "operator", "K Rajan")
+        location = getattr(ing_cfg, "location", "Trivandrum")
+        
+        _edge_sender_thread = EdgeSenderThread(
+            client=ingest_client, 
+            max_queue=64,
+            mission_name=mission_name,
+            operator=operator,
+            location=location,
+        )
         _edge_sender_thread.start()
         log.info(
             "edge_sender_started",
             ingest_url  = ing_cfg.url,
             drone_id    = ing_cfg.drone_id,
             mission_id  = ing_cfg.mission_id,
+            mission_name= mission_name,
+            operator    = operator,
             tls_verify  = ing_cfg.tls_verify,
         )
     else:

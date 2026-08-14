@@ -133,10 +133,12 @@ class IngestConfig:
     password: str = ""
     drone_id: str = "DRONE_KL_001"
     mission_id: str = "MISSION_DEFAULT"
+    mission_name: str = "Vehicle Tracking"
+    operator: str = "K Rajan"
+    location: str = "Trivandrum"
     tls_verify: bool = False
     ca_cert: str = ""   # path to CA cert file; used when tls_verify=True
     enabled: bool = True
-
 
 @dataclass
 class AppConfig:

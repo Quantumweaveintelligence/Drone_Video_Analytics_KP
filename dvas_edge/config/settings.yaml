@@ -89,8 +89,11 @@ ingest:
   password: "Operator@001"   # rotate after pilot
 
   # Drone / mission identifiers embedded in every frame payload
-  drone_id:   "DRONE_KL_001"
-  mission_id: "MISSION_DEFAULT"
+  drone_id:   "DRN-001"
+  mission_id: "MSN-20260813-1530-01-ALPHA"
+  mission_name: "Vehicle Tracking"
+  operator: "K Rajan"
+  location: "Trivandrum"
 
   # TLS verification: disabled for LAN demo (plain HTTP)
   tls_verify: false
@@ -190,7 +193,7 @@ change_detection:
 
 cognitive_frame_selector:
   # Set to false to disable (ChangeEvents still logged, just not scored further)
-  enabled: true
+  enabled: false
 
   # Mission identifier embedded in every SelectedFrame payload
   mission_id: "MISSION_DEFAULT"
