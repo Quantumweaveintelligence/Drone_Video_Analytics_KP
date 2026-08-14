@@ -4,11 +4,9 @@
 - `51e1c19` — *feat: Add rate limiting brute force protection for login*  
 - `a775317` — *feat: implement VPN-less RunPod deployment and JWT security fixes*  
 **Branch:** `testing` (up to date with `origin/testing`)  
-**Scope:** Strict evaluation of code changes introduced in these two commits vs. intended security & operational behavior.
-
 ---
 
-## 📋 Summary of Targeted Changes in Commits `51e1c19` & `a775317`
+##  Summary of Targeted Changes in Commits `51e1c19` & `a775317`
 
 The two commits introduced targeted updates across 4 specific areas:
 1. **Dashboard Login Rate Limiting** (`51e1c19`): Added `slowapi` rate limiter on POST `/api/auth/login`.
@@ -18,7 +16,7 @@ The two commits introduced targeted updates across 4 specific areas:
 
 ---
 
-## 🔍 Detailed Verification of Commit Changes
+## Detailed Verification of Commit Changes
 
 ### 1. Dashboard Login Brute Force Protection (`51e1c19`)
 
