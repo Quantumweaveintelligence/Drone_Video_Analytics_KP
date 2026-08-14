@@ -37,6 +37,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+import httpx
 
 # ── GPU monitoring (optional) ────────────────────────────────────────────────
 try:
@@ -127,11 +128,13 @@ class EdgeSenderThread(threading.Thread):
         self._running  = True
         self._mission_name: Optional[str] = None
         self._location:     Optional[str] = None
+        self._operator:     Optional[str] = None
 
-    def set_mission_details(self, mission_name: str = None, location: str = None) -> None:
+    def set_mission_details(self, mission_name: str = None, location: str = None, operator: str = None) -> None:
         """Store mission details so they can be sent at start_mission time."""
         self._mission_name = mission_name
         self._location = location
+        self._operator = operator
 
     def put_frame(self, frame: SelectedFrame, telemetry: dict = None) -> None:
         """Queue a SelectedFrame (from cognitive pipeline) with optional telemetry."""
@@ -166,6 +169,7 @@ class EdgeSenderThread(threading.Thread):
             await self._client.start_mission(
                 mission_name=self._mission_name,
                 location=self._location,
+                operator=self._operator,
             )
         except Exception:
             pass
@@ -408,6 +412,7 @@ class PipelineManager:
             self.sender_thread.set_mission_details(
                 mission_name=req.mission_name,
                 location=req.location,
+                operator=req.operator,
             )
             self.sender_thread.start()
 
@@ -683,6 +688,33 @@ async def stream_live():
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
+
+# ---------------------------------------------------------------------------
+# Ingest Server Proxy
+# ---------------------------------------------------------------------------
+INGEST_BASE_URL = os.getenv("INGEST_URL", "http://172.23.46.250/ingest").replace("/frame", "")
+
+@app.get("/api/ingest-server/status")
+async def proxy_ingest_status():
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        try:
+            resp = await client.get(f"{INGEST_BASE_URL}/status")
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as e:
+            log.warning(f"Failed to fetch ingest status: {e}")
+    return {}
+
+@app.get("/api/ingest-server/status/{drone_id}")
+async def proxy_ingest_drone_status(drone_id: str):
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        try:
+            resp = await client.get(f"{INGEST_BASE_URL}/status/{drone_id}")
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as e:
+            log.warning(f"Failed to fetch ingest drone status for {drone_id}: {e}")
+    return {}
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":

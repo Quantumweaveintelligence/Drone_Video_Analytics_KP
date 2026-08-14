@@ -49,3 +49,40 @@ step_data/
 prometheus_data/
 grafana_data/
 dvas_ingest/output_documents/
+
+# Archives
+*.zip
+*.tar.gz
+
+# Logs and Secrets
+token.txt
+*logs.txt
+
+# Large Documents
+*.docx
+*.pptx
+*.pdf
+
+# Test Media
+*.jpg
+*.jpeg
+*.png
+
+# Untracked Data/External Repos
+Crowd_Density/
+police_drone_person/
+vehicle-tracking/
+vehicle_detection_tracker-main/
+compose_dump.yml
+DVAS_Dashboard_Frontend_Backend_Integration_Plan.md
+DVAS_Dashboard.zip
+DVAS_Dashboards_Roles_Access_Architecture (1).md
+DVAS_Postgres_Schema.md
+DVAS_V1_TwoLaptop_Plan.md
+test_lp.py
+test_ocr_cpu.py
+test_ocr_fallback.py
+dvas_ingest/plan (2).md
+dvas_ingest/proposal-docuement-drone-video-analytics-kerala-police.docx (1).pdf
+dvas_ingest/walkthrough.md
+dvas_ingest/output_documents/

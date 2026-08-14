@@ -75,6 +75,7 @@ class Drone(Base):
     operator_id = Column(String)
     operator_name = Column(String)
     mission_id = Column(String)
+    mission_name = Column(String)
     jurisdiction = Column(String)
     status = Column(String)
     lat = Column(Float)

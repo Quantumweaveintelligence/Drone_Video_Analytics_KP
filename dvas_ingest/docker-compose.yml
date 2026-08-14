@@ -172,7 +172,7 @@ services:
     volumes:
       - step_data:/home/step
     ports:
-      - "127.0.0.1:9000:9000"   # Only accessible locally (admin use)
+      - "127.0.0.1:9002:9000"   # Changed to 9002 to avoid conflict with MinIO (9000)
     environment:
       DOCKER_STEPCA_INIT_NAME:      "DVAS Internal CA"
       DOCKER_STEPCA_INIT_DNS_NAMES: "ingest.dvas.internal,localhost"

@@ -60,6 +60,13 @@ class Config:
     VEHICLE_TRACK_KEY_PREFIX: str = os.getenv("VEHICLE_TRACK_KEY_PREFIX", "vehicle:track")
     VEHICLE_TRACK_TTL:        int = int(os.getenv("VEHICLE_TRACK_TTL", "300"))  # 5 min TTL
 
+    # ── Vehicle Re-ID tracking (ANPR deduplication) ────────────────────────
+    ANPR_REID_MATCH_THRESHOLD: float = float(os.getenv("ANPR_REID_MATCH_THRESHOLD", "0.55"))
+    ANPR_REID_MAX_LOST_FRAMES:   int = int(os.getenv("ANPR_REID_MAX_LOST_FRAMES", "90"))
+    ANPR_REID_HIST_WEIGHT:     float = float(os.getenv("ANPR_REID_HIST_WEIGHT", "0.5"))
+    ANPR_REID_ASPECT_WEIGHT:   float = float(os.getenv("ANPR_REID_ASPECT_WEIGHT", "0.2"))
+    ANPR_REID_SPATIAL_WEIGHT:  float = float(os.getenv("ANPR_REID_SPATIAL_WEIGHT", "0.3"))
+
     # ── Evidence storage (local fallback) ──────────────────────────────────
     EVIDENCE_OUTPUT_DIR: str = os.getenv("EVIDENCE_OUTPUT_DIR", "/data/evidence")
 

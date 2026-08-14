@@ -9,13 +9,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # PaddlePaddle GPU (CUDA 12.x), fall back to CPU if GPU build fails
-RUN pip install --no-cache-dir paddlepaddle-gpu==2.6.2 \
+RUN pip install --default-timeout=100 --no-cache-dir paddlepaddle-gpu==2.6.2 \
     -f https://www.paddlepaddle.org.cn/whl/linux/mkl/avx/stable.html 2>/dev/null \
  || \
-    pip install --no-cache-dir paddlepaddle==2.6.2
+    pip install --default-timeout=100 --no-cache-dir paddlepaddle==2.6.2
 
 # Core ML and API deps
-RUN pip install --no-cache-dir \
+RUN pip install --default-timeout=100 --no-cache-dir \
     torch torchvision ultralytics \
     fastapi "uvicorn[standard]" \
     python-multipart pydantic \
@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir \
     miniopy-async httpx
 
 # PaddleOCR 2.9.1 — fully compatible with PaddlePaddle 2.6.2 (fast, accurate)
-RUN pip install --no-cache-dir "paddleocr==2.9.1"
+RUN pip install --default-timeout=100 --default-timeout=1000 --no-cache-dir "paddleocr==2.9.1"
 
 COPY shared/ /analytics/shared/
 COPY anpr/ /analytics/anpr/

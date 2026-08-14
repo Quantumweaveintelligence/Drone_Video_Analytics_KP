@@ -372,9 +372,13 @@ async def ingest_frame(
     INGEST_LATENCY.labels(drone_id=drone_id).observe(elapsed)
 
     # ── Cache latest telemetry ────────────────────────────────────────────────
+    active_m = _active_missions.get(drone_id, {})
     _latest_metadata[drone_id] = {
         "drone_id":    drone_id,
         "mission_id":  mission_id,
+        "mission_name": active_m.get("mission_name"),
+        "operator":    active_m.get("operator", extract_username(claims)),
+        "location":    active_m.get("location"),
         "latitude":    meta.latitude,
         "longitude":   meta.longitude,
         "altitude_m":  meta.altitude_m,
@@ -551,8 +555,10 @@ async def mission_start(
 
     _active_missions[req.drone_id] = {
         "mission_id":  req.mission_id,
+        "mission_name": req.mission_name,
         "started_at":  ts,
         "operator":    req.operator or extract_username(claims),
+        "location":    req.location,
         "latitude":    req.latitude,
         "longitude":   req.longitude,
     }
@@ -562,7 +568,9 @@ async def mission_start(
 
     await _publish_event("mission_start", req.drone_id, {
         "mission_id": req.mission_id,
+        "mission_name": req.mission_name,
         "operator":   req.operator or extract_username(claims),
+        "location":   req.location,
         "notes":      req.notes,
     })
 
@@ -570,7 +578,9 @@ async def mission_start(
         "event":      "mission_start",
         "drone_id":   req.drone_id,
         "mission_id": req.mission_id,
+        "mission_name": req.mission_name,
         "operator":   req.operator or extract_username(claims),
+        "location":   req.location,
         "timestamp":  ts,
         "data":       {"latitude": req.latitude, "longitude": req.longitude},
     }))
@@ -580,7 +590,9 @@ async def mission_start(
         extra={
             "drone_id":   req.drone_id,
             "mission_id": req.mission_id,
-            "operator":   extract_username(claims),
+            "mission_name": req.mission_name,
+            "operator":   req.operator or extract_username(claims),
+            "location":   req.location,
         },
     )
     return MissionResponse(

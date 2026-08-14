@@ -25,7 +25,7 @@ from shared.config import cfg
 from shared.db import (
     close_pool, ensure_drone, get_pool, upsert_track,
     write_confirmed_event, write_plate_read,
-    get_recent_plates, add_to_watchlist, remove_from_watchlist,
+    get_recent_plates, get_plates_by_mission, add_to_watchlist, remove_from_watchlist,
     get_watchlist, is_watchlisted, write_vehicle_plate_link,
 )
 from shared.redis_client import (
@@ -152,6 +152,11 @@ async def startup():
     analyzer = ANPRAnalyzer(
         vehicle_model_path=VEHICLE_MODEL,
         lp_model_path=LP_MODEL,
+        reid_match_threshold=cfg.ANPR_REID_MATCH_THRESHOLD,
+        reid_max_lost_frames=cfg.ANPR_REID_MAX_LOST_FRAMES,
+        reid_hist_weight=cfg.ANPR_REID_HIST_WEIGHT,
+        reid_aspect_weight=cfg.ANPR_REID_ASPECT_WEIGHT,
+        reid_spatial_weight=cfg.ANPR_REID_SPATIAL_WEIGHT,
     )
     log.info("ANPR Analyzer ready. Watchlist: %d entries", len(analyzer.watchlist))
 
@@ -178,7 +183,19 @@ async def health():
         "frames_processed":   _frames_processed,
         "watchlist_count":    len(analyzer.watchlist) if analyzer else 0,
         "cached_drone_feeds": list(_last_annotated.keys()),
+        "reid_stats":         analyzer.reid_tracker.get_stats() if analyzer else {},
     }
+
+
+# ── Re-ID tracking stats ───────────────────────────────────────────────────────
+@app.get("/tracking/stats")
+async def tracking_stats():
+    """Return vehicle Re-ID tracker statistics for debugging deduplication."""
+    if not analyzer:
+        raise HTTPException(503, "Analyzer not loaded")
+    stats = analyzer.reid_tracker.get_stats()
+    stats["frames_processed"] = _frames_processed
+    return stats
 
 
 # ── Single frame analysis ──────────────────────────────────────────────────────
@@ -298,8 +315,13 @@ async def analyze_frame(
 # ── Continuous stream loop ─────────────────────────────────────────────────────
 async def _stream_loop():
     global _stream_running, _frames_processed
-    last_ids = {d: "0" for d in cfg.DRONE_IDS}
-    log.info("ANPR stream loop started for drones: %s", cfg.DRONE_IDS)
+    try:
+        last_ids = {d: "0" for d in cfg.DRONE_IDS}
+        log.info("ANPR stream loop started for drones: %s", cfg.DRONE_IDS)
+    except Exception as exc:
+        log.error("ANPR stream loop FAILED to initialize: %s", exc, exc_info=True)
+        _stream_running = False
+        return
 
     while _stream_running:
         for drone_id in cfg.DRONE_IDS:
@@ -319,8 +341,24 @@ async def _stream_loop():
                     if frame is None:
                         continue
 
+                    log.info("ANPR: processing frame for %s size=%s", drone_id, frame.shape if frame is not None else None)
                     result = analyzer.analyze_frame(frame, drone_id=drone_id)
+                    log.info("ANPR: frame done — vehicles=%d plates_read=%d inference_ms=%.0f",
+                             result.get("total_vehicles", 0), result.get("plates_read", 0), result.get("inference_ms", 0))
                     ts     = datetime.now(timezone.utc)
+
+                    # Extract mission_id from stream frame metadata
+                    import json as _json
+                    frame_mission_id = None
+                    raw_meta = f.get("metadata", "")
+                    if raw_meta:
+                        if isinstance(raw_meta, bytes):
+                            raw_meta = raw_meta.decode()
+                        try:
+                            meta_dict = _json.loads(raw_meta)
+                            frame_mission_id = meta_dict.get("mission_id")
+                        except Exception:
+                            pass
 
                     # ── Annotate frame and cache for dashboard ─────────────────
                     import time as _time
@@ -339,15 +377,21 @@ async def _stream_loop():
                         cache_key = f"{drone_id}:{plate['tracker_id']}"
                         existing  = _recent_plate_cache.get(cache_key, {})
                         plate_text = plate.get("plate_text") or existing.get("plate_text", "")
+                        
+                        log.info(f"CACHE UPDATE tracker {plate['tracker_id']}: veh_bbox={plate.get('vehicle_bbox')} existing_veh_bbox={existing.get('vehicle_bbox')} plate_bbox={plate.get('plate_bbox')} existing_plate_bbox={existing.get('plate_bbox')}")
+                        
                         _recent_plate_cache[cache_key] = {
                             "plate_text":        plate_text,
                             "ocr_confidence":    plate.get("ocr_confidence") or existing.get("ocr_confidence", 0.0),
                             "is_reliable":       plate.get("is_reliable", False),
                             "drone_id":          drone_id,
+                            "mission_id":        frame_mission_id or existing.get("mission_id"),
                             "tracker_id":        plate.get("tracker_id"),
                             "vehicle_type":      plate.get("vehicle_type", "vehicle"),
                             "vehicle_image_b64": plate.get("vehicle_image_b64") or existing.get("vehicle_image_b64"),
                             "plate_crop_b64":    plate.get("plate_crop_b64") or existing.get("plate_crop_b64"),
+                            "vehicle_bbox":      plate.get("vehicle_bbox") or existing.get("vehicle_bbox"),
+                            "plate_bbox":        plate.get("plate_bbox") or existing.get("plate_bbox"),
                             "is_watchlisted":    plate.get("is_watchlisted", False),
                             "created_at":        existing.get("created_at") or ts.isoformat(),
                             "_cache_ts":         _time2.monotonic(),
@@ -359,7 +403,8 @@ async def _stream_loop():
                             continue
                         tracker_id = plate.get("tracker_id")
                         track_id   = await upsert_track(
-                            drone_id, None, "vehicle", ts, ts, tracker_id=tracker_id
+                            drone_id, None, "vehicle", ts, ts,
+                            tracker_id=tracker_id, mission_id=frame_mission_id
                         )
                         plate_image_key = None
                         plate_crop_b64  = plate.pop("plate_crop_b64", None)
@@ -367,7 +412,8 @@ async def _stream_loop():
                             plate_bytes_data = base64.b64decode(plate_crop_b64)
                             key = minio.make_key(
                                 "plates", drone_id,
-                                f"plate_{plate['plate_text']}_{int(ts.timestamp()*1000)}.jpg"
+                                f"plate_{plate['plate_text']}_{int(ts.timestamp()*1000)}.jpg",
+                                mission_id=frame_mission_id or "",
                             )
                             plate_image_key = await minio.upload_bytes(
                                 cfg.BUCKET_PLATES, key, plate_bytes_data, "image/jpeg"
@@ -380,7 +426,8 @@ async def _stream_loop():
                             veh_bytes_data = base64.b64decode(veh_img_b64)
                             key = minio.make_key(
                                 "vehicles", drone_id,
-                                f"anpr_veh_{tracker_id}_{int(ts.timestamp()*1000)}.jpg"
+                                f"anpr_veh_{tracker_id}_{int(ts.timestamp()*1000)}.jpg",
+                                mission_id=frame_mission_id or "",
                             )
                             vehicle_image_key = await minio.upload_bytes(
                                 cfg.BUCKET_VEHICLES, key, veh_bytes_data, "image/jpeg"
@@ -393,6 +440,7 @@ async def _stream_loop():
                             is_reliable=plate["is_reliable"],
                             plate_image_key=plate_image_key,
                             vehicle_image_key=vehicle_image_key,
+                            mission_id=frame_mission_id,
                         )
 
                         if tracker_id is not None:
@@ -402,8 +450,21 @@ async def _stream_loop():
                                     "plate_text":      plate["plate_text"],
                                     "plate_conf":      plate["ocr_confidence"],
                                     "plate_image_key": plate_image_key or "",
+                                    "mission_id":      frame_mission_id or "",
                                 },
                                 ttl=cfg.VEHICLE_TRACK_TTL,
+                            )
+                            veh_data = await hget_vehicle_track(tracker_id, drone_id)
+                            colour   = veh_data.get("colour", "")
+                            await write_vehicle_plate_link(
+                                tracker_id=tracker_id, drone_id=drone_id,
+                                plate_text=plate["plate_text"],
+                                plate_conf=plate["ocr_confidence"],
+                                vehicle_type=plate.get("vehicle_type"),
+                                colour=colour,
+                                plate_image_key=plate_image_key,
+                                vehicle_image_key=vehicle_image_key,
+                                mission_id=frame_mission_id,
                             )
 
                         if plate.get("is_watchlisted"):
@@ -422,6 +483,7 @@ async def _stream_loop():
                             await publish_confirmed_event({
                                 "event_type":  "theft_alert",
                                 "drone_id":    drone_id,
+                                "mission_id":  frame_mission_id,
                                 "ts":          ts.isoformat(),
                                 "plate_text":  plate["plate_text"],
                             })
@@ -449,6 +511,14 @@ async def stream_start():
         return {"status": "already_running", "frames_processed": _frames_processed}
     _stream_running = True
     _stream_task = asyncio.create_task(_stream_loop())
+
+    def _task_done_cb(task):
+        if not task.cancelled():
+            exc = task.exception()
+            if exc:
+                log.error("ANPR stream loop CRASHED: %s", exc, exc_info=exc)
+    _stream_task.add_done_callback(_task_done_cb)
+
     log.info("ANPR stream loop STARTED")
     return {"status": "started"}
 
@@ -495,20 +565,27 @@ async def annotated_latest(drone_id: str = ""):
 
 # ── Plate query endpoints ──────────────────────────────────────────────────────
 @app.get("/plates/recent")
-async def recent_plates(limit: int = 50, drone_id: str = ""):
+async def recent_plates(limit: int = 50, drone_id: str = "", mission_id: str = ""):
     pool  = await get_pool()
     query = """
         SELECT
             pr.id, pr.plate_text, pr.ocr_confidence, pr.is_reliable,
             pr.plate_image_key, pr.vehicle_image_key,
-            pr.created_at, t.drone_id, t.metadata->>'tracker_id' AS tracker_id
+            pr.created_at, pr.mission_id_str,
+            t.drone_id, t.metadata->>'tracker_id' AS tracker_id
         FROM plate_reads pr
         JOIN tracks t ON t.track_id = pr.track_id
     """
     params = []
-    if drone_id:
-        query += f" WHERE t.drone_id = ${len(params)+1}"
+    conditions = []
+    if mission_id:
+        conditions.append(f"pr.mission_id_str = ${len(params)+1}")
+        params.append(mission_id)
+    elif drone_id:
+        conditions.append(f"t.drone_id = ${len(params)+1}")
         params.append(drone_id)
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
     query += f" ORDER BY pr.created_at DESC LIMIT ${len(params)+1}"
     params.append(min(limit, 200))
 
@@ -537,10 +614,11 @@ async def recent_plates(limit: int = 50, drone_id: str = ""):
 
 
 @app.get("/plates/live")
-async def live_plates(drone_id: str = "", limit: int = 50):
+async def live_plates(drone_id: str = "", mission_id: str = "", limit: int = 50):
     """
     Return in-memory plate detections from the active stream loop.
     Includes base64 images directly — no MinIO required.
+    Filters by mission_id if provided (preferred), otherwise by drone_id.
     Useful when DB/MinIO writes are lagging behind live detections.
     """
     import time as _t
@@ -552,7 +630,9 @@ async def live_plates(drone_id: str = "", limit: int = 50):
         age = now - entry.get("_cache_ts", 0)
         if age > MAX_AGE:
             continue
-        if drone_id and entry.get("drone_id") != drone_id:
+        if mission_id and entry.get("mission_id") != mission_id:
+            continue
+        if not mission_id and drone_id and entry.get("drone_id") != drone_id:
             continue
         results.append(entry)
 
@@ -563,6 +643,202 @@ async def live_plates(drone_id: str = "", limit: int = 50):
     # Strip internal cache field before returning
     cleaned = [{k: v for k, v in e.items() if k != "_cache_ts"} for e in results]
     return {"count": len(cleaned), "plates": cleaned, "source": "live_cache"}
+
+
+# ── Mission vehicle history ────────────────────────────────────────────────────
+@app.get("/plates/by-mission")
+async def plates_by_mission(
+    mission_id: str = "",
+    drone_id: str = "",
+    start: str = "",
+    end: str = "",
+    plate_search: str = "",
+    vehicle_type: str = "",
+    sort: str = "newest",
+    limit: int = 24,
+    offset: int = 0,
+):
+    """
+    Query historical plate reads for a given mission or drone + time window.
+    When mission_id is provided it filters directly by mission_id_str (accurate per-mission data).
+    Falls back to drone_id + time range for backward compatibility.
+    Supports plate text search, vehicle type filter, sorting, and pagination.
+    """
+    pool = await get_pool()
+    limit = min(limit, 200)
+
+    # ── Fast path: filter directly by mission_id ──────────────────────────────
+    if mission_id:
+        result = await get_plates_by_mission(
+            mission_id=mission_id,
+            plate_search=plate_search,
+            vehicle_type=vehicle_type,
+            sort=sort,
+            limit=limit,
+            offset=offset,
+        )
+        vehicles = []
+        plates_read_count = 0
+        for r in result["rows"]:
+            d = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in r.items()}
+            # Parse colour_top3
+            if d.get("colour_top3") and isinstance(d["colour_top3"], str):
+                import json as _json
+                try:
+                    d["colour_top3"] = _json.loads(d["colour_top3"])
+                except Exception:
+                    pass
+            colour = ""
+            if isinstance(d.get("colour_top3"), list) and d["colour_top3"]:
+                colour = d["colour_top3"][0].get("colour", "") if isinstance(d["colour_top3"][0], dict) else ""
+            d["colour"] = colour
+            if d.get("plate_text"):
+                plates_read_count += 1
+            # Presigned URLs
+            if d.get("plate_image_key"):
+                try:
+                    d["plate_image_url"] = await minio.get_presigned_url(
+                        cfg.BUCKET_PLATES, d["plate_image_key"], cfg.MINIO_URL_EXPIRY
+                    )
+                except Exception:
+                    d["plate_image_url"] = None
+            if d.get("vehicle_image_key"):
+                try:
+                    d["vehicle_image_url"] = await minio.get_presigned_url(
+                        cfg.BUCKET_VEHICLES, d["vehicle_image_key"], cfg.MINIO_URL_EXPIRY
+                    )
+                except Exception:
+                    d["vehicle_image_url"] = None
+            vehicles.append(d)
+        return {
+            "total": result["total"],
+            "total_plates_read": plates_read_count,
+            "vehicles": vehicles,
+            "offset": offset,
+            "limit": limit,
+            "has_more": result["has_more"],
+            "mission_id": mission_id,
+        }
+
+    # ── Fallback: drone_id + time range (backward compat) ─────────────────────
+    # Build WHERE clauses dynamically
+    conditions = []
+    params = []
+    idx = 1
+
+    if drone_id:
+        conditions.append(f"t.drone_id = ${idx}")
+        params.append(drone_id)
+        idx += 1
+
+    if start:
+        conditions.append(f"t.first_seen >= ${idx}::timestamptz")
+        params.append(start)
+        idx += 1
+
+    if end:
+        conditions.append(f"t.first_seen <= ${idx}::timestamptz")
+        params.append(end)
+        idx += 1
+
+    if plate_search:
+        conditions.append(f"pr.plate_text ILIKE ${idx}")
+        params.append(f"%{plate_search.upper().strip()}%")
+        idx += 1
+
+    if vehicle_type and vehicle_type.lower() != "all":
+        conditions.append(f"LOWER(va.vehicle_type) = ${idx}")
+        params.append(vehicle_type.lower().strip())
+        idx += 1
+
+    where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    # Sort mapping
+    sort_map = {
+        "newest":     "pr.created_at DESC",
+        "oldest":     "pr.created_at ASC",
+        "confidence": "pr.ocr_confidence DESC NULLS LAST",
+        "plate_az":   "pr.plate_text ASC NULLS LAST",
+    }
+    order_by = sort_map.get(sort, "pr.created_at DESC")
+
+    # Count query (for pagination metadata)
+    count_query = f"""
+        SELECT COUNT(*) AS total
+        FROM plate_reads pr
+        JOIN tracks t ON t.track_id = pr.track_id
+        LEFT JOIN vehicle_attributes va ON va.track_id = t.track_id
+        {where_clause}
+    """
+    count_row = await pool.fetchrow(count_query, *params)
+    total = count_row["total"] if count_row else 0
+
+    # Data query
+    data_query = f"""
+        SELECT
+            pr.id, pr.plate_text, pr.ocr_confidence, pr.is_reliable,
+            pr.plate_image_key, pr.vehicle_image_key, pr.created_at, pr.mission_id_str,
+            t.drone_id, t.first_seen, t.last_seen,
+            t.metadata->>'tracker_id' AS tracker_id,
+            va.vehicle_type, va.colour_top3, va.speed_kph
+        FROM plate_reads pr
+        JOIN tracks t ON t.track_id = pr.track_id
+        LEFT JOIN vehicle_attributes va ON va.track_id = t.track_id
+        {where_clause}
+        ORDER BY {order_by}
+        LIMIT ${idx} OFFSET ${idx + 1}
+    """
+    params.extend([limit, offset])
+
+    rows = await pool.fetch(data_query, *params)
+    vehicles = []
+    plates_read_count = 0
+    for r in rows:
+        d = {k: (v.isoformat() if hasattr(v, "isoformat") else v)
+             for k, v in dict(r).items()}
+
+        # Parse colour_top3 JSON
+        if d.get("colour_top3") and isinstance(d["colour_top3"], str):
+            import json as _json
+            try:
+                d["colour_top3"] = _json.loads(d["colour_top3"])
+            except Exception:
+                pass
+        colour = ""
+        if isinstance(d.get("colour_top3"), list) and d["colour_top3"]:
+            colour = d["colour_top3"][0].get("colour", "") if isinstance(d["colour_top3"][0], dict) else ""
+        d["colour"] = colour
+
+        if d.get("plate_text"):
+            plates_read_count += 1
+
+        # Generate presigned URLs for images
+        if d.get("plate_image_key"):
+            try:
+                d["plate_image_url"] = await minio.get_presigned_url(
+                    cfg.BUCKET_PLATES, d["plate_image_key"], cfg.MINIO_URL_EXPIRY
+                )
+            except Exception:
+                d["plate_image_url"] = None
+        if d.get("vehicle_image_key"):
+            try:
+                d["vehicle_image_url"] = await minio.get_presigned_url(
+                    cfg.BUCKET_VEHICLES, d["vehicle_image_key"], cfg.MINIO_URL_EXPIRY
+                )
+            except Exception:
+                d["vehicle_image_url"] = None
+
+        vehicles.append(d)
+
+    return {
+        "total": total,
+        "total_plates_read": plates_read_count,
+        "vehicles": vehicles,
+        "offset": offset,
+        "limit": limit,
+        "has_more": (offset + limit) < total,
+    }
+
 
 
 @app.get("/plates/{plate_text}")
@@ -626,11 +902,46 @@ async def watchlist_get():
 @app.get("/alerts/theft")
 async def theft_alerts(limit: int = 50):
     pool = await get_pool()
+    # Join with plate_reads to get the latest images for each alert
     rows = await pool.fetch(
-        "SELECT * FROM theft_alerts ORDER BY detected_at DESC LIMIT $1", limit
+        """
+        SELECT
+            ta.id, ta.plate_text, ta.drone_id, ta.detected_at, ta.frame_ts,
+            ta.confidence, ta.vehicle_type, ta.is_confirmed, ta.notes,
+            pr.plate_image_key, pr.vehicle_image_key, pr.mission_id_str
+        FROM theft_alerts ta
+        LEFT JOIN LATERAL (
+            SELECT plate_image_key, vehicle_image_key, mission_id_str
+            FROM plate_reads
+            WHERE plate_text = ta.plate_text
+              AND (plate_image_key IS NOT NULL OR vehicle_image_key IS NOT NULL)
+            ORDER BY created_at DESC
+            LIMIT 1
+        ) pr ON true
+        ORDER BY ta.detected_at DESC
+        LIMIT $1
+        """,
+        limit,
     )
-    return {"count": len(rows), "alerts": [{k: (str(v) if hasattr(v, 'isoformat') else v)
-                                              for k, v in dict(r).items()} for r in rows]}
+    alerts = []
+    for r in rows:
+        d = {k: (str(v) if hasattr(v, "isoformat") else v) for k, v in dict(r).items()}
+        if d.get("plate_image_key"):
+            try:
+                d["plate_image_url"] = await minio.get_presigned_url(
+                    cfg.BUCKET_PLATES, d["plate_image_key"], cfg.MINIO_URL_EXPIRY
+                )
+            except Exception:
+                d["plate_image_url"] = None
+        if d.get("vehicle_image_key"):
+            try:
+                d["vehicle_image_url"] = await minio.get_presigned_url(
+                    cfg.BUCKET_VEHICLES, d["vehicle_image_key"], cfg.MINIO_URL_EXPIRY
+                )
+            except Exception:
+                d["vehicle_image_url"] = None
+        alerts.append(d)
+    return {"count": len(alerts), "alerts": alerts}
 
 
 @app.get("/alerts/theft/live")
@@ -670,6 +981,7 @@ async def theft_alerts_live():
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
 
 
 if __name__ == "__main__":

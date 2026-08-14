@@ -147,11 +147,14 @@ async def delete_object(bucket: str, key: str) -> bool:
         return False
 
 
-def make_key(prefix: str, drone_id: str, suffix: str) -> str:
+def make_key(prefix: str, drone_id: str, suffix: str, mission_id: str = "") -> str:
     """
     Build a consistent MinIO object key.
-    Format: {prefix}/{drone_id}/{timestamp_ms}/{suffix}
-    Example: faces/DRONE_KL_001/1722245000123/face_001.jpg
+    When mission_id is provided, objects are grouped per mission for easy retrieval.
+    Format: {prefix}/{mission_id}/{timestamp_ms}/{suffix}
+    Fallback: {prefix}/{drone_id}/{timestamp_ms}/{suffix}
+    Example: plates/MSN-20260813-2009-02-DONE/1722245000123/plate_KL01AB1234.jpg
     """
     ts_ms = int(time.time() * 1000)
-    return f"{prefix}/{drone_id}/{ts_ms}/{suffix}"
+    folder = mission_id if mission_id else drone_id
+    return f"{prefix}/{folder}/{ts_ms}/{suffix}"

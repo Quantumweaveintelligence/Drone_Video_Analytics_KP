@@ -7,7 +7,7 @@ export default function MissionControl() {
   const [serverSend, setServerSend] = useState(false);
   const [pipelineEnabled, setPipelineEnabled] = useState(true);
 
-  const [form, setForm] = useState({ name: '', id: '', drone: '', operator: '', location: '' });
+  const [form, setForm] = useState({ name: '', id: '', drone: '', operator: '', location: '', squadron: 'ALPHA' });
 
   const [missionLog, setMissionLog] = useState(() => {
     const saved = localStorage.getItem('dvas_mission_log');
@@ -30,11 +30,15 @@ export default function MissionControl() {
 
   const [loading, setLoading] = useState(false);
 
-  const generateMissionId = () => {
-    const num = Math.floor(1000 + Math.random() * 9000);
-    const suffixes = ['ALPHA', 'BRAVO', 'CHARLIE', 'DELTA', 'ECHO', 'FOXTROT'];
-    const suffix = suffixes[Math.floor(Math.random() * suffixes.length)];
-    return `MSN-${num}-${suffix}`;
+  const generateMissionId = (squadron = form.squadron || 'ALPHA') => {
+    const now = new Date();
+    const yyyy = now.getFullYear();
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    const dd = String(now.getDate()).padStart(2, '0');
+    const hh = String(now.getHours()).padStart(2, '0');
+    const min = String(now.getMinutes()).padStart(2, '0');
+    const ss = String(now.getSeconds()).padStart(2, '0');
+    return `MSN-${yyyy}${mm}${dd}-${hh}${min}-${ss}-${squadron.toUpperCase()}`;
   };
 
   const handleNameChange = (e) => {
@@ -42,7 +46,16 @@ export default function MissionControl() {
     setForm(prev => ({
       ...prev,
       name,
-      id: prev.id && !prev.id.startsWith('MSN-') ? prev.id : generateMissionId()
+      id: prev.id && !prev.id.startsWith('MSN-') ? prev.id : generateMissionId(prev.squadron)
+    }));
+  };
+
+  const handleSquadronChange = (e) => {
+    const squadron = e.target.value;
+    setForm(prev => ({
+      ...prev,
+      squadron,
+      id: prev.id && !prev.id.startsWith('MSN-') ? prev.id : generateMissionId(squadron)
     }));
   };
 
@@ -54,7 +67,7 @@ export default function MissionControl() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          mission_id: form.id || generateMissionId(),
+          mission_id: form.id || generateMissionId(form.squadron),
           mission_name: form.name,
           drone_id: form.drone,
           operator: form.operator,
@@ -83,7 +96,7 @@ export default function MissionControl() {
           end: '--:--:--',
           status: 'active',
         }, ...prev]);
-        setForm({ name: '', id: '', drone: '', operator: '', location: '' });
+        setForm({ name: '', id: '', drone: '', operator: '', location: '', squadron: 'ALPHA' });
 
         // Save to backend database
         try {
@@ -307,15 +320,16 @@ export default function MissionControl() {
                 />
               </div>
               <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Mission ID</label>
-                  <input 
-                    type="text" 
-                    value={form.id} onChange={e => setForm({...form, id: e.target.value})}
-                    className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm font-mono text-slate-200 placeholder-slate-600"
-                    placeholder="Auto-generated"
-                  />
-                </div>
+                  <div>
+                    <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Mission ID</label>
+                    <input 
+                      type="text" 
+                      value={form.id}
+                      readOnly
+                      className="w-full bg-slate-950/50 border border-slate-700 outline-none px-3 py-2 text-sm font-mono text-slate-400 cursor-not-allowed"
+                      placeholder="Auto-generated"
+                    />
+                  </div>
                 <div>
                   <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Drone ID *</label>
                   <select 
@@ -341,13 +355,22 @@ export default function MissionControl() {
                   />
                 </div>
                 <div>
-                  <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Location / Grid</label>
+                  <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Squadron</label>
                   <input 
                     type="text" 
-                    value={form.location} onChange={e => setForm({...form, location: e.target.value})}
-                    className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm text-slate-200"
+                    value={form.squadron} onChange={handleSquadronChange}
+                    className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm font-mono text-slate-200 uppercase"
+                    placeholder="e.g. ALPHA"
                   />
                 </div>
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Location / Grid</label>
+                <input 
+                  type="text" 
+                  value={form.location} onChange={e => setForm({...form, location: e.target.value})}
+                  className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm text-slate-200"
+                />
               </div>
             </div>
 
@@ -360,7 +383,7 @@ export default function MissionControl() {
                 <Play size={16} fill="currentColor" /> {loading ? 'Starting...' : 'Start Mission'}
               </button>
               <button 
-                onClick={() => setForm({ name: '', id: '', drone: '', operator: '', location: '' })}
+                onClick={() => setForm({ name: '', id: '', drone: '', operator: '', location: '', squadron: 'ALPHA' })}
                 className="px-6 border border-slate-700 hover:bg-slate-800 text-slate-300 py-2.5 text-sm font-semibold tracking-wide rounded transition-colors"
               >
                 Clear
