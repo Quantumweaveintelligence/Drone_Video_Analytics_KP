@@ -174,51 +174,73 @@ class EdgeSenderThread(threading.Thread):
         except Exception:
             pass
 
+        semaphore = asyncio.Semaphore(5)
+        in_flight_ids = set()
+        tasks = set()
+
+        async def _send_task(frame_id, kind, jpeg_bytes, tel):
+            async with semaphore:
+                try:
+                    speed   = tel.get("speed_mps")
+                    battery = tel.get("battery_pct")
+                    
+                    if kind == "selected":
+                        await self._client.send_frame_bytes(
+                            frame_bytes  = jpeg_bytes,
+                            change_score = tel.get("change_score", 0.0),
+                            lat          = tel.get("lat"),
+                            lon          = tel.get("lon"),
+                            alt          = tel.get("alt"),
+                            speed_mps    = speed,
+                            battery_pct  = battery,
+                        )
+                    elif kind == "raw":
+                        await self._client.send_frame_bytes(
+                            frame_bytes  = jpeg_bytes,
+                            change_score = 0.0,
+                            lat          = tel.get("latitude"),
+                            lon          = tel.get("longitude"),
+                            alt          = tel.get("altitude_m"),
+                            speed_mps    = speed,
+                            battery_pct  = battery,
+                        )
+                        
+                    # Success! Remove from buffer
+                    self._buffer.commit(frame_id)
+                except Exception as exc:
+                    log.error(f"edge_sender_frame_failed_buffering id={frame_id} error={exc}")
+                    # Do NOT commit, meaning it will be retried on next loop.
+                    await asyncio.sleep(2.0)
+                finally:
+                    in_flight_ids.remove(frame_id)
+
         while self._running:
+            # Clean up finished tasks
+            done_tasks = {t for t in tasks if t.done()}
+            tasks.difference_update(done_tasks)
+            
+            # Throttle fetching if we have hit max concurrency
+            if len(in_flight_ids) >= 5:
+                await asyncio.sleep(0.1)
+                continue
+
             item = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self._buffer.get(timeout=1.0)
+                None, lambda: self._buffer.get(timeout=1.0, exclude_ids=list(in_flight_ids))
             )
             
             if item is None:
                 continue
                 
             frame_id, kind, jpeg_bytes, tel = item
+            in_flight_ids.add(frame_id)
             
-            try:
-                speed   = tel.get("speed_mps")
-                battery = tel.get("battery_pct")
-                
-                if kind == "selected":
-                    await self._client.send_frame_bytes(
-                        frame_bytes  = jpeg_bytes,
-                        change_score = tel.get("change_score", 0.0),
-                        lat          = tel.get("lat"),
-                        lon          = tel.get("lon"),
-                        alt          = tel.get("alt"),
-                        speed_mps    = speed,
-                        battery_pct  = battery,
-                    )
-                elif kind == "raw":
-                    await self._client.send_frame_bytes(
-                        frame_bytes  = jpeg_bytes,
-                        change_score = 0.0,
-                        lat          = tel.get("latitude"),
-                        lon          = tel.get("longitude"),
-                        alt          = tel.get("altitude_m"),
-                        speed_mps    = speed,
-                        battery_pct  = battery,
-                    )
-                    
-                # Success! Remove from buffer
-                self._buffer.commit(frame_id)
-                
-            except Exception as exc:
-                log.error(f"edge_sender_frame_failed_buffering id={frame_id} error={exc}")
-                # Do NOT commit, meaning it will be retried on next loop.
-                # Sleep briefly to avoid hammering the network while offline
-                await asyncio.sleep(2.0)
+            task = asyncio.create_task(_send_task(frame_id, kind, jpeg_bytes, tel))
+            tasks.add(task)
                 
         # Graceful shutdown cleanup
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            
         self._buffer.close()
         try:
             await self._client.end_mission()
@@ -366,16 +388,24 @@ class PipelineManager:
                 except Exception:
                     pass
 
-                # Pipeline bypass: send frames directly at source FPS (usually ~30 fps)
+                # Pipeline bypass: send frames directly at target FPS (~5 fps)
                 if self.pipeline_bypass:
                     self._bypass_frame_counter += 1
-                    sample_interval = 1  # 1 = send every frame (~30+ fps)
+                    sample_interval = 6  # 6 = target ~5 fps from a 30 fps source
                     if (self._bypass_frame_counter % sample_interval == 0
                             and self.server_send_enabled
                             and self.sender_thread is not None):
                         try:
                             import cv2 as _cv2
-                            ok, buf = _cv2.imencode(".jpg", vf.frame, [_cv2.IMWRITE_JPEG_QUALITY, 80])
+                            
+                            # Downscale to 1080p if frame is larger, saving upload bandwidth
+                            h, w = vf.frame.shape[:2]
+                            if w > 1920:
+                                resized_frame = _cv2.resize(vf.frame, (1920, 1080), interpolation=_cv2.INTER_AREA)
+                            else:
+                                resized_frame = vf.frame
+                                
+                            ok, buf = _cv2.imencode(".jpg", resized_frame, [_cv2.IMWRITE_JPEG_QUALITY, 80])
                             if ok:
                                 tel = vf.telemetry or {}
                                 self.sender_thread.put_raw_frame(bytes(buf), telemetry=tel)

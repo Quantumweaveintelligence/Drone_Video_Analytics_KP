@@ -61,21 +61,25 @@ class OfflineBuffer:
             # Notify waiting consumers that a new frame is available
             self._cond.notify_all()
             
-    def get(self, timeout: float = 1.0) -> Optional[Tuple[int, str, bytes, dict]]:
+    def get(self, timeout: float = 1.0, exclude_ids: list = None) -> Optional[Tuple[int, str, bytes, dict]]:
         """
         Returns (frame_id, kind, jpeg_bytes, telemetry_dict) or None if timeout.
         """
         with self._cond:
-            cursor = self._conn.execute(
-                "SELECT id, kind, telemetry_json, frame_path FROM frames ORDER BY created_at ASC LIMIT 1"
-            )
+            query = "SELECT id, kind, telemetry_json, frame_path FROM frames "
+            args = ()
+            if exclude_ids:
+                placeholders = ','.join('?' * len(exclude_ids))
+                query += f"WHERE id NOT IN ({placeholders}) "
+                args = tuple(exclude_ids)
+            query += "ORDER BY created_at ASC LIMIT 1"
+
+            cursor = self._conn.execute(query, args)
             row = cursor.fetchone()
             
             if not row:
                 self._cond.wait(timeout=timeout)
-                cursor = self._conn.execute(
-                    "SELECT id, kind, telemetry_json, frame_path FROM frames ORDER BY created_at ASC LIMIT 1"
-                )
+                cursor = self._conn.execute(query, args)
                 row = cursor.fetchone()
                 
             if not row:

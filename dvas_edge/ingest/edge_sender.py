@@ -236,10 +236,10 @@ class IngestClient:
             except Exception as exc:
                 last_exc = exc
                 log.warning(
-                    "send_failed_retrying",
+                    f"send_failed_retrying attempt={attempt} error={exc}",
                     extra={"attempt": attempt, "error": str(exc)},
                 )
-                await asyncio.sleep(2 ** attempt)   # exponential back-off
+                await asyncio.sleep(0.1)   # fast retry instead of exponential backoff
 
         raise RuntimeError(f"Failed after {retries} attempts: {last_exc}")
 
@@ -327,10 +327,10 @@ class IngestClient:
             except Exception as exc:
                 last_exc = exc
                 log.warning(
-                    "send_failed_retrying",
+                    f"send_failed_retrying attempt={attempt} error={exc}",
                     extra={"attempt": attempt, "error": str(exc)},
                 )
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(0.1)
 
         raise RuntimeError(f"Failed after {retries} attempts: {last_exc}")
 
