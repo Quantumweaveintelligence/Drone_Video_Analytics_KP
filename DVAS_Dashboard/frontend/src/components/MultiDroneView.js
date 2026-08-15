@@ -40,9 +40,10 @@ import {
   Camera,
   ShieldCheck,
   User as UserIcon,
+  RefreshCw,
 } from "lucide-react";
 
-import LiveFrame from "./LiveFrame";
+import { useActiveStreams } from "@/hooks/useActiveStreams";
 
 /* ─────────────────────────────────────────────
    STATIC / FALLBACK DATA
@@ -338,16 +339,69 @@ function SignalBars({ strength }) {
 
 /* ─────────────────────────────────────────────
    DRONE FEED CARD
+   Uses fetch-based JPEG polling (same auth pattern as TrafficAnalytics)
+   so live frames load reliably with or without cookie support.
    ───────────────────────────────────────────── */
-function DroneFeedCard({ drone, isSelected, hasSelection, onSelect }) {
-  const spark = useRef(
-    Array.from({ length: 14 }, () => 30 + Math.random() * 60)
-  );
-  const [sparkData] = useState(spark.current);
 
+const FEED_BACKOFF = [500, 1000, 2000, 4000, 8000, 16000, 30000];
+const FEED_WATCHDOG_MS = 6000;
+
+function useDroneFeed(droneId, disabled, intervalMs = 700) {
+  const [blobUrl,  setBlobUrl]  = useState(null);
+  const [hasFrame, setHasFrame] = useState(false);
+  const [feedDead, setFeedDead] = useState(false);
+  const timerRef    = useRef(null);
+  const watchRef    = useRef(null);
+  const errRef      = useRef(0);
+  const prevRef     = useRef(null);
+  const mountedRef  = useRef(true);
+
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; clearTimeout(timerRef.current); clearTimeout(watchRef.current); if (prevRef.current) URL.revokeObjectURL(prevRef.current); }; }, []);
+
+  useEffect(() => {
+    clearTimeout(timerRef.current); clearTimeout(watchRef.current);
+    if (prevRef.current) { URL.revokeObjectURL(prevRef.current); prevRef.current = null; }
+    errRef.current = 0; setBlobUrl(null); setHasFrame(false); setFeedDead(!!disabled);
+    if (disabled) return;
+
+    const schedule = (d) => { if (mountedRef.current) timerRef.current = setTimeout(doFetch, d); };
+    const doFetch = async () => {
+      if (!mountedRef.current) return;
+      const token = localStorage.getItem("dvas_token") || "";
+      const url = `${API}/ingest-server/frame/${encodeURIComponent(droneId)}/latest?_t=${Date.now()}`;
+      try {
+        const res = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {}, credentials: "include" });
+        if (!mountedRef.current) return;
+        if (res.ok) {
+          const next = URL.createObjectURL(await res.blob());
+          setBlobUrl((prev) => {
+            if (prev) URL.revokeObjectURL(prev);
+            return next;
+          });
+          setHasFrame(true); setFeedDead(false); errRef.current = 0;
+          clearTimeout(watchRef.current);
+          watchRef.current = setTimeout(() => { if (mountedRef.current) setFeedDead(true); }, FEED_WATCHDOG_MS);
+          schedule(intervalMs);
+        } else { throw new Error(`HTTP ${res.status}`); }
+      } catch {
+        if (!mountedRef.current) return;
+        errRef.current++; if (errRef.current > 6) setFeedDead(true);
+        schedule(FEED_BACKOFF[Math.min(errRef.current - 1, FEED_BACKOFF.length - 1)]);
+      }
+    };
+    doFetch();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [droneId, disabled, intervalMs]);
+
+  return { blobUrl, hasFrame, feedDead };
+}
+
+function DroneFeedCard({ drone, isSelected, hasSelection, onSelect }) {
   const isDegraded = drone.status === "degraded";
-  const isOffline = drone.status === "offline";
+  const isOffline  = drone.status === "offline";
   const isOtherSelected = hasSelection && !isSelected;
+
+  const { blobUrl, hasFrame, feedDead } = useDroneFeed(drone.id, isOffline);
 
   const borderColor = isDegraded
     ? "border-amber-500/40"
@@ -363,20 +417,20 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect }) {
     ? { boxShadow: "0 0 0 1px rgba(245,158,11,0.2)" }
     : {};
 
-  const focusClass = isOtherSelected 
-    ? "opacity-40 blur-[2px] scale-[0.98] hover:opacity-80 hover:blur-none" 
-    : isSelected 
-    ? "scale-100 ring-1 ring-teal-500/50" 
+  const focusClass = isOtherSelected
+    ? "opacity-40 blur-[2px] scale-[0.98] hover:opacity-80 hover:blur-none"
+    : isSelected
+    ? "scale-100 ring-1 ring-teal-500/50"
     : "hover:scale-[1.012] hover:border-teal-500/40";
+
+  const missionLabel  = drone.mission_name  || (drone.mission_id ? `Mission ${drone.mission_id}` : null);
+  const operatorLabel = drone.operator_name || null;
 
   return (
     <div
       className={`relative flex flex-col rounded-xl border ${borderColor} overflow-hidden cursor-pointer transition-all duration-500 ease-in-out ${focusClass} h-full`}
-      style={{
-        background: "var(--dvas-surface)",
-        ...glowStyle,
-      }}
-      onClick={() => onSelect(drone.id === isSelected ? null : drone.id)}
+      style={{ background: "var(--dvas-surface)", ...glowStyle }}
+      onClick={() => onSelect(isSelected ? null : drone.id)}
       data-testid={`multidrone-card-${drone.id}`}
     >
       {/* ── Video Viewport ── */}
@@ -384,10 +438,7 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect }) {
         {/* scan-line animation */}
         <div
           className="absolute inset-0 pointer-events-none"
-          style={{
-            backgroundImage:
-              "repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(20,184,166,0.015) 2px, rgba(20,184,166,0.015) 4px)",
-          }}
+          style={{ backgroundImage: "repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(20,184,166,0.015) 2px, rgba(20,184,166,0.015) 4px)" }}
         />
 
         {/* Corner brackets */}
@@ -397,71 +448,81 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect }) {
           "bottom-2 left-2 border-l-2 border-b-2",
           "bottom-2 right-2 border-r-2 border-b-2",
         ].map((cls, i) => (
-          <div
-            key={i}
-            className={`absolute w-4 h-4 ${cls} ${
-              isDegraded
-                ? "border-amber-400/60"
-                : isOffline
-                ? "border-red-400/60"
-                : "border-teal-400/60"
-            }`}
-          />
+          <div key={i} className={`absolute w-4 h-4 ${cls} ${isDegraded ? "border-amber-400/60" : isOffline ? "border-red-400/60" : "border-teal-400/60"}`} />
         ))}
 
-        {/* Drone ID badge (top-left) */}
+        {/* Live JPEG feed or placeholder */}
+        {!isOffline && hasFrame && blobUrl ? (
+          <img
+            src={blobUrl}
+            alt={`Live feed ${drone.id}`}
+            className="absolute inset-0 w-full h-full object-cover"
+            style={{ opacity: isDegraded ? 0.8 : 0.95 }}
+          />
+        ) : (
+          <div className="absolute inset-0 flex items-center justify-center">
+            {isOffline || feedDead ? (
+              <div className="flex flex-col items-center gap-2">
+                <WifiOff size={22} className="text-red-400/60" />
+                <span className="mono text-[10px] text-red-400/60">FEED OFFLINE</span>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center gap-2">
+                <div className="w-6 h-6 border-2 border-teal-500/30 border-t-teal-400 rounded-full animate-spin" />
+                <span className="mono text-[9px] text-slate-500">AWAITING FEED…</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Top-left: Drone ID + Mission ID + Mission Name + Operator */}
         <div className="absolute top-3 left-3 z-10 flex flex-col gap-1.5">
           <div className="flex items-center gap-1.5">
             <div
               className="mono text-[11px] font-bold px-2 py-0.5 rounded"
-              style={{
-                background: "rgba(6,14,26,0.82)",
-                color: isDegraded ? "#fbbf24" : "#2dd4bf",
-                border: `1px solid ${isDegraded ? "rgba(245,158,11,0.3)" : "rgba(20,184,166,0.3)"}`,
-              }}
+              style={{ background: "rgba(6,14,26,0.82)", color: isDegraded ? "#fbbf24" : "#2dd4bf", border: `1px solid ${isDegraded ? "rgba(245,158,11,0.3)" : "rgba(20,184,166,0.3)"}` }}
             >
               {drone.id}
             </div>
-            <div
-              className="mono text-[9px] px-1.5 py-0.5 rounded"
-              style={{ background: "rgba(6,14,26,0.70)", color: "#94a3b8" }}
-            >
-              {drone.mission_id}
-            </div>
+            {drone.mission_id && (
+              <div className="mono text-[9px] px-1.5 py-0.5 rounded" style={{ background: "rgba(6,14,26,0.70)", color: "#94a3b8" }}>
+                {drone.mission_id}
+              </div>
+            )}
           </div>
           <div className="flex items-center gap-1.5">
-            <div
-              className="mono text-[9px] px-1.5 py-0.5 rounded border border-slate-700/50 truncate max-w-[100px]"
-              style={{ background: "rgba(6,14,26,0.70)", color: "#e2e8f0" }}
-              title={drone.mission_name || "Unknown Mission"}
-            >
-              {drone.mission_name || "Unknown Mission"}
-            </div>
-            <div
-              className="mono text-[9px] px-1.5 py-0.5 rounded border border-slate-700/50 flex items-center gap-1 truncate max-w-[100px]"
-              style={{ background: "rgba(6,14,26,0.70)", color: "#38bdf8" }}
-              title={drone.operator_name || "Unknown Operator"}
-            >
-              <Users size={8} /> {drone.operator_name || "Unknown Operator"}
-            </div>
+            {missionLabel && (
+              <div
+                className="mono text-[9px] px-1.5 py-0.5 rounded border border-slate-700/50 truncate max-w-[110px]"
+                style={{ background: "rgba(6,14,26,0.70)", color: "#e2e8f0" }}
+                title={missionLabel}
+              >
+                {missionLabel}
+              </div>
+            )}
+            {operatorLabel && (
+              <div
+                className="mono text-[9px] px-1.5 py-0.5 rounded border border-slate-700/50 flex items-center gap-1 truncate max-w-[110px]"
+                style={{ background: "rgba(6,14,26,0.70)", color: "#38bdf8" }}
+                title={operatorLabel}
+              >
+                <Users size={8} /> {operatorLabel}
+              </div>
+            )}
+            {!missionLabel && !operatorLabel && (
+              <div className="mono text-[8px] px-1.5 py-0.5 rounded" style={{ background: "rgba(6,14,26,0.60)", color: "rgba(148,163,184,0.5)" }}>
+                No active mission
+              </div>
+            )}
           </div>
         </div>
 
-        {/* Status pill (top-right) */}
-        <div className="absolute top-3 right-3 z-10">
-          <StatusPill status={drone.status} />
-        </div>
-
-        {/* Center graphic: real live feed or placeholder */}
-        <div className="absolute inset-0 flex flex-col items-center justify-center">
-          {isOffline ? (
-            <div className="flex flex-col items-center gap-2">
-              <WifiOff size={22} className="text-red-400/60" />
-              <span className="mono text-[10px] text-red-400/60">FEED OFFLINE</span>
-            </div>
-          ) : (
-            <LiveFrame droneId={drone.id} isOffline={isOffline} isDegraded={isDegraded} />
+        {/* Top-right: Status pill + streaming dot */}
+        <div className="absolute top-3 right-3 z-10 flex items-center gap-1.5">
+          {hasFrame && !feedDead && !isOffline && (
+            <span className="w-2 h-2 rounded-full bg-teal-400" style={{ animation: "pulse 1.2s infinite" }} />
           )}
+          <StatusPill status={isOffline ? "offline" : feedDead ? "offline" : drone.status} />
         </div>
 
         {/* Altitude & speed HUD (bottom bar) */}
@@ -555,11 +616,25 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect }) {
           </div>
         </div>
 
-        {/* Row 3: Sparkline */}
-        <Sparkline
-          values={sparkData}
-          color={isDegraded ? "#f59e0b" : "#14b8a6"}
-        />
+        {/* Row 3: Mission Info */}
+        <div className="grid grid-cols-2 gap-2 mt-1">
+          <div className="flex flex-col gap-0.5">
+            <span className="mono text-[8px] uppercase tracking-wider" style={{ color: "var(--dvas-text-dim)" }}>Mission ID</span>
+            <span className="mono text-[10px] truncate" style={{ color: "var(--dvas-text)" }}>{drone.mission_id || "NONE"}</span>
+          </div>
+          <div className="flex flex-col gap-0.5">
+            <span className="mono text-[8px] uppercase tracking-wider" style={{ color: "var(--dvas-text-dim)" }}>Mission Name</span>
+            <span className="mono text-[10px] truncate" style={{ color: "var(--dvas-text)" }}>{drone.mission_name || "—"}</span>
+          </div>
+          <div className="flex flex-col gap-0.5">
+            <span className="mono text-[8px] uppercase tracking-wider" style={{ color: "var(--dvas-text-dim)" }}>Operator</span>
+            <span className="mono text-[10px] truncate" style={{ color: "var(--dvas-text)" }}>{drone.operator_name || "—"}</span>
+          </div>
+          <div className="flex flex-col gap-0.5">
+            <span className="mono text-[8px] uppercase tracking-wider" style={{ color: "var(--dvas-text-dim)" }}>Location</span>
+            <span className="mono text-[10px] truncate" style={{ color: "var(--dvas-text)" }}>{drone.jurisdiction || "—"}</span>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -1062,13 +1137,26 @@ function GlobalHeader({ drones, alerts, connected }) {
    MAIN EXPORT
    ───────────────────────────────────────────── */
 export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts, connected }) {
-  // Merge live API drones with mock fallback (by ID)
-  const drones = (liveDrones && liveDrones.length > 0 ? liveDrones : MOCK_DRONES).map(
-    (d) => {
-      const mock = MOCK_DRONES.find((m) => m.id === d.id) || {};
-      return { ...mock, ...d };
-    }
-  ).filter((d) => d.id.startsWith("DRN")).sort((a, b) => a.id.localeCompare(b.id)); // Fix auto-cycling / jumping order
+  // Use active ingest streams to discover real drones and enrich with live metadata
+  const { mergeWithDrones, streams } = useActiveStreams();
+
+  // Start with DB drones (from Postgres, telemetry-pumped)
+  // Then merge with real ingest streams (adds missing drones, enriches existing ones)
+  const baseList = liveDrones && liveDrones.length > 0 ? liveDrones : [];
+  let merged   = mergeWithDrones(baseList);
+
+  // Filter out offline drones whose stream queue is exhausted
+  merged = merged.filter(d => !(d.status === "offline" && d.messages_ready === 0));
+
+  // If neither DB nor ingest has any drones, fall back to MOCK_DRONES for UI demo
+  const drones = merged.length > 0
+    ? merged.sort((a, b) => {
+        const ord = { live: 0, degraded: 1, offline: 2 };
+        const ao = ord[a.status] ?? 3; const bo = ord[b.status] ?? 3;
+        if (ao !== bo) return ao - bo;
+        return (a.id || "").localeCompare(b.id || "");
+      })
+    : MOCK_DRONES;
 
   const events = liveAlerts && liveAlerts.length > 0
     ? liveAlerts.map((a) => ({
@@ -1103,34 +1191,31 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
       {/* ── 1. Global Header ── */}
       <GlobalHeader drones={drones} alerts={liveAlerts} connected={connected} />
 
-      {/* ── 2. Drone Cards Grid (flex row with transition) ── */}
-      <div
-        className="flex flex-col lg:flex-row gap-3 transition-all duration-500 ease-in-out min-h-[60vh] xl:min-h-[500px]"
-      >
-        {drones.map((d) => {
-          const isSelected = selectedDroneId === d.id;
-          const isOtherSelected = !!selectedDroneId && !isSelected;
-          
-          return (
-            <div 
-              key={d.id} 
-              className={`transition-all duration-500 ease-in-out ${
-                isSelected 
-                  ? "lg:flex-[4_4_0%]" 
-                  : isOtherSelected 
-                  ? "lg:flex-1" 
-                  : "lg:flex-1"
-              }`}
-            >
-              <DroneFeedCard
-                drone={d}
-                isSelected={isSelected}
-                hasSelection={!!selectedDroneId}
-                onSelect={setSelectedDroneId}
-              />
-            </div>
-          );
-        })}
+      {/* ── 2. Drone Cards Grid (tiled CSS grid format) ── */}
+      <div className="flex-1 overflow-y-auto dvas-scrollbar min-h-[60vh] xl:min-h-[500px]">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 transition-all duration-500 ease-in-out h-full content-start pb-4">
+          {drones.map((d) => {
+            const isSelected = selectedDroneId === d.id;
+            
+            return (
+              <div 
+                key={d.id} 
+                className={`transition-all duration-500 ease-in-out ${
+                  isSelected 
+                    ? "col-span-1 md:col-span-2 lg:col-span-2 xl:col-span-2 row-span-1 md:row-span-2" 
+                    : "col-span-1"
+                }`}
+              >
+                <DroneFeedCard
+                  drone={d}
+                  isSelected={isSelected}
+                  hasSelection={!!selectedDroneId}
+                  onSelect={setSelectedDroneId}
+                />
+              </div>
+            );
+          })}
+        </div>
       </div>
 
       {/* ── 3. Analytics Row (5 panels horizontal) ── */}

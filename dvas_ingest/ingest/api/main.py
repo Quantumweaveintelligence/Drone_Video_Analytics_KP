@@ -620,6 +620,12 @@ async def mission_end(
     ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
 
     _active_missions.pop(req.drone_id, None)
+    if req.drone_id in _latest_metadata:
+        _latest_metadata[req.drone_id].pop("mission_id", None)
+        _latest_metadata[req.drone_id].pop("mission_name", None)
+        _latest_metadata[req.drone_id].pop("operator", None)
+        _latest_metadata[req.drone_id].pop("location", None)
+
     if _qm:
         _qm.end_mission(req.drone_id, req.mission_id)
     ACTIVE_MISSIONS.set(len(_active_missions))

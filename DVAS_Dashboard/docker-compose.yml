@@ -60,6 +60,8 @@ services:
     build: ../dvas_edge
     container_name: dvas_edge
     restart: unless-stopped
+    stdin_open: true
+    tty: true
     ports:
       - "8765:8765"
     volumes:

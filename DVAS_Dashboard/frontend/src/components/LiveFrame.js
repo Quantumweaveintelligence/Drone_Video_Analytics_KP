@@ -1,27 +1,56 @@
+/**
+ * LiveFrame.js
+ * ─────────────────────────────────────────────────────────────
+ * Polls the ingest-server latest-JPEG endpoint for a given drone ID.
+ *
+ * Uses fetch() + explicit Authorization header (same pattern as
+ * TrafficAnalytics.js useJpegPoller) so authentication works reliably
+ * regardless of cookie state or cross-origin constraints.
+ *
+ * Props:
+ *   droneId    - string  - drone ID to stream
+ *   isOffline  - bool    - if true, show FEED OFFLINE immediately
+ *   isDegraded - bool    - amber colour mode
+ *   intervalMs - number  - poll interval (default 800 ms)
+ */
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { API } from "@/lib/api";
 
-// Backoff schedule (ms) for consecutive 404/error responses.
-// After BACKOFF_STEPS.length failures we stay at the last (max) interval.
+// Backoff schedule (ms) for consecutive failures.
 const BACKOFF_STEPS = [500, 1000, 2000, 4000, 8000, 16000, 30000];
 
-export default function LiveFrame({ droneId, isOffline, isDegraded }) {
-  const [imgSrc,   setImgSrc]   = useState(null);
+// How long to wait without a new frame before marking feed dead (ms)
+const WATCHDOG_MS = 6000;
+
+export default function LiveFrame({
+  droneId,
+  isOffline,
+  isDegraded,
+  intervalMs = 800,
+}) {
+  const [blobUrl,  setBlobUrl]  = useState(null);
   const [hasFrame, setHasFrame] = useState(false);
   const [feedDead, setFeedDead] = useState(false);
 
-  // Refs so callbacks always see current values without re-registering effects
-  const timerRef     = useRef(null);   // setTimeout handle (replaces setInterval)
-  const failCountRef = useRef(0);
-  const deadTimerRef = useRef(null);
+  const timerRef     = useRef(null);
+  const watchdogRef  = useRef(null);
+  const errCountRef  = useRef(0);
   const mountedRef   = useRef(true);
+  const prevBlobRef  = useRef(null);
 
-  // Clear all pending timers
   const clearTimers = useCallback(() => {
-    if (timerRef.current)     clearTimeout(timerRef.current);
-    if (deadTimerRef.current) clearTimeout(deadTimerRef.current);
-    timerRef.current     = null;
-    deadTimerRef.current = null;
+    clearTimeout(timerRef.current);
+    clearTimeout(watchdogRef.current);
+    timerRef.current    = null;
+    watchdogRef.current = null;
+  }, []);
+
+  // Revoke the previous blob URL to avoid memory leaks
+  const revokePrev = useCallback(() => {
+    if (prevBlobRef.current) {
+      URL.revokeObjectURL(prevBlobRef.current);
+      prevBlobRef.current = null;
+    }
   }, []);
 
   useEffect(() => {
@@ -29,78 +58,88 @@ export default function LiveFrame({ droneId, isOffline, isDegraded }) {
     return () => {
       mountedRef.current = false;
       clearTimers();
+      revokePrev();
     };
-  }, [clearTimers]);
+  }, [clearTimers, revokePrev]);
 
   useEffect(() => {
     if (isOffline) {
       clearTimers();
+      revokePrev();
+      setBlobUrl(null);
+      setHasFrame(false);
+      setFeedDead(true);
       return;
     }
 
-    // Reset state when droneId changes
-    failCountRef.current = 0;
-    setFeedDead(false);
-    setHasFrame(false);
-    setImgSrc(null);
+    // Reset on drone change
     clearTimers();
+    revokePrev();
+    errCountRef.current = 0;
+    setBlobUrl(null);
+    setHasFrame(false);
+    setFeedDead(false);
 
-    const scheduleNext = (delayMs) => {
+    const scheduleNext = (delay) => {
       if (!mountedRef.current) return;
-      timerRef.current = setTimeout(load, delayMs);
+      timerRef.current = setTimeout(doFetch, delay);
     };
 
-    const load = () => {
+    const doFetch = async () => {
       if (!mountedRef.current) return;
 
-      const ts  = Date.now();
-      const url = `${API}/ingest-server/frame/${droneId}/latest?t=${ts}`;
-      const img = new Image();
+      const token  = localStorage.getItem("dvas_token") || "";
+      const url    = `${API}/ingest-server/frame/${encodeURIComponent(droneId)}/latest?_t=${Date.now()}`;
 
-      img.onload = () => {
+      try {
+        const res = await fetch(url, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+          credentials: "include",  // also send cookies (belt + suspenders)
+        });
+
         if (!mountedRef.current) return;
-        failCountRef.current = 0;
-        setImgSrc(url);
-        setHasFrame(true);
-        setFeedDead(false);
 
-        // Arm a "feed died" watchdog — if no new frame arrives in 3 s, mark dead
-        if (deadTimerRef.current) clearTimeout(deadTimerRef.current);
-        deadTimerRef.current = setTimeout(() => {
-          if (mountedRef.current) setFeedDead(true);
-        }, 3000);
+        if (res.ok) {
+          const blob    = await res.blob();
+          const nextUrl = URL.createObjectURL(blob);
 
-        // Poll again at normal speed
-        scheduleNext(500);
-      };
+          revokePrev();
+          prevBlobRef.current = nextUrl;
 
-      img.onerror = () => {
-        if (!mountedRef.current) return;
-        failCountRef.current += 1;
+          setBlobUrl(nextUrl);
+          setHasFrame(true);
+          setFeedDead(false);
+          errCountRef.current = 0;
 
-        // After 6 failures show FEED OFFLINE and slow right down
-        if (failCountRef.current > 6) {
-          setFeedDead(true);
+          // Arm watchdog — if no new frame arrives within WATCHDOG_MS, mark dead
+          clearTimeout(watchdogRef.current);
+          watchdogRef.current = setTimeout(() => {
+            if (mountedRef.current) setFeedDead(true);
+          }, WATCHDOG_MS);
+
+          scheduleNext(intervalMs);
+        } else {
+          throw new Error(`HTTP ${res.status}`);
         }
-
-        // Exponential backoff — cap at last step
-        const stepIdx = Math.min(failCountRef.current - 1, BACKOFF_STEPS.length - 1);
-        const delay   = BACKOFF_STEPS[stepIdx];
-        scheduleNext(delay);
-      };
-
-      img.src = url;
+      } catch {
+        if (!mountedRef.current) return;
+        errCountRef.current += 1;
+        if (errCountRef.current > 6) setFeedDead(true);
+        const stepIdx = Math.min(errCountRef.current - 1, BACKOFF_STEPS.length - 1);
+        scheduleNext(BACKOFF_STEPS[stepIdx]);
+      }
     };
 
     // Kick off immediately
-    load();
+    doFetch();
 
     return () => {
       clearTimers();
     };
-  }, [droneId, isOffline, clearTimers]); // eslint-disable-line react-hooks/exhaustive-deps
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [droneId, isOffline, intervalMs]);
 
-  /* ── Render ────────────────────────────────────────────── */
+  /* ── Render ───────────────────────────────────────────────── */
 
   if (isOffline || feedDead) {
     return (
@@ -128,9 +167,13 @@ export default function LiveFrame({ droneId, isOffline, isDegraded }) {
         />
         <div className="absolute bottom-6 left-0 right-0 flex justify-center">
           <div
-            className="mono text-[8px] px-2 py-0.5 rounded"
+            className="mono text-[8px] px-2 py-0.5 rounded flex items-center gap-1"
             style={{ background: "rgba(6,14,26,0.65)", color: "rgba(148,163,184,0.5)" }}
           >
+            <span
+              className="inline-block w-1 h-1 rounded-full animate-pulse"
+              style={{ background: "rgba(148,163,184,0.4)" }}
+            />
             AWAITING FEED…
           </div>
         </div>
@@ -141,7 +184,7 @@ export default function LiveFrame({ droneId, isOffline, isDegraded }) {
   return (
     <>
       <img
-        src={imgSrc}
+        src={blobUrl}
         alt={`Live feed ${droneId}`}
         className="absolute inset-0 w-full h-full object-cover"
         style={{ opacity: 0.95 }}

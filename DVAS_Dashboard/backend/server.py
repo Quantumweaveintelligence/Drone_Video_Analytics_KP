@@ -64,6 +64,11 @@ def fetch_jwks():
     except Exception as e:
         logger.error(f"Failed to fetch JWKS: {e}")
 
+def get_jwks():
+    if not JWKS_CACHE:
+        fetch_jwks()
+    return JWKS_CACHE
+
 
 app = FastAPI(title="DVAS API")
 api = APIRouter(prefix="/api")
@@ -113,7 +118,7 @@ async def get_current_user(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
         options = {"verify_aud": False}
-        payload = jwt.decode(token, JWKS_CACHE, algorithms=["RS256"], options=options)
+        payload = jwt.decode(token, get_jwks(), algorithms=["RS256"], options=options)
         
         realm_access = payload.get("realm_access", {})
         roles = realm_access.get("roles", [])
@@ -275,7 +280,7 @@ async def login(body: LoginIn, response: Response, request: Request):
             access_token = token_data["access_token"]
             
             options = {"verify_aud": False}
-            payload = jwt.decode(access_token, JWKS_CACHE, algorithms=["RS256"], options=options)
+            payload = jwt.decode(access_token, get_jwks(), algorithms=["RS256"], options=options)
             
             realm_access = payload.get("realm_access", {})
             roles = realm_access.get("roles", [])
@@ -796,7 +801,7 @@ async def edge_shift_summary(request: Request, token: str = ""):
     if token:
         try:
             options = {"verify_aud": False}
-            payload = jwt.decode(token, JWKS_CACHE, algorithms=["RS256"], options=options)
+            payload = jwt.decode(token, get_jwks(), algorithms=["RS256"], options=options)
             user = {
                 "id": payload.get("sub"),
                 "email": payload.get("email", ""),
@@ -2530,7 +2535,7 @@ async def download_65b_bundle(export_id: str, request: Request, token: str = "")
     if token:
         try:
             options = {"verify_aud": False}
-            payload = jwt.decode(token, JWKS_CACHE, algorithms=["RS256"], options=options)
+            payload = jwt.decode(token, get_jwks(), algorithms=["RS256"], options=options)
             user = {
                 "id": payload.get("sub"),
                 "email": payload.get("email", ""),
@@ -2631,7 +2636,7 @@ hub = WSHub()
 def _authz_ws(token: str) -> Optional[dict]:
     try:
         options = {"verify_aud": False}
-        payload = jwt.decode(token, JWKS_CACHE, algorithms=["RS256"], options=options)
+        payload = jwt.decode(token, get_jwks(), algorithms=["RS256"], options=options)
         
         realm_access = payload.get("realm_access", {})
         roles = realm_access.get("roles", [])
@@ -2712,10 +2717,13 @@ async def _telemetry_pump():
                     battery = telem.get("battery_pct") or 85.0
                     altitude = telem.get("altitude_m") or 120.0
                     speed_mps = telem.get("speed_mps") or 0.0
-                    mission_id = telem.get("mission_id") or "LIVE"
-                    mission_name = telem.get("mission_name") or "Patrol"
-                    operator_name = telem.get("operator") or "Edge Operator"
-                    jurisdiction = telem.get("location") or "Thiruvananthapuram"
+                    # If mission_id is absent, the drone is not actively on a mission
+                    # and should be considered offline for the dashboard.
+                    mission_id = telem.get("mission_id")
+                    mission_name = telem.get("mission_name")
+                    operator_name = telem.get("operator")
+                    jurisdiction = telem.get("location")
+                    drone_status = "live" if mission_id else "offline"
 
                     # Check if drone already exists in DB
                     result = await session.execute(
@@ -2731,7 +2739,7 @@ async def _telemetry_pump():
                                 lng=round(lng, 6),
                                 battery_pct=round(battery, 1),
                                 altitude_m=round(altitude, 1),
-                                status="live",
+                                status=drone_status,
                                 mission_id=mission_id,
                                 mission_name=mission_name,
                                 operator_name=operator_name,
@@ -2747,7 +2755,7 @@ async def _telemetry_pump():
                             mission_id=mission_id,
                             mission_name=mission_name,
                             jurisdiction=jurisdiction,
-                            status="live",
+                            status=drone_status,
                             lat=round(lat, 6),
                             lng=round(lng, 6),
                             altitude_m=round(altitude, 1),

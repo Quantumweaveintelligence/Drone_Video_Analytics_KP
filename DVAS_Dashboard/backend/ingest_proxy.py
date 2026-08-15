@@ -210,6 +210,14 @@ async def ingest_streams_active():
     try:
         result = await _proxy_get("/ingest/streams/active", timeout=5.0)
         if result.get("count", 0) > 0:
+            # Fetch status to inject messages_ready
+            try:
+                status_data = await _proxy_get("/ingest/status", timeout=3.0)
+                status_map = {d["drone_id"]: d.get("queue", {}).get("messages_ready", 0) for d in status_data.get("drones", [])}
+                for d in result.get("drones", []):
+                    d["messages_ready"] = status_map.get(d["drone_id"], 0)
+            except Exception:
+                pass
             return result
     except HTTPException:
         pass

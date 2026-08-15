@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import AppShell from "@/components/layout/AppShell";
 import { api, API } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
@@ -9,12 +9,15 @@ import MultiDroneView from "@/components/MultiDroneView";
 import CrowdAnalytics from "@/components/CrowdAnalytics";
 import TrafficAnalytics from "@/components/TrafficAnalytics";
 import PersonTrackingAnalytics from "@/components/PersonTrackingAnalytics";
+import { useActiveStreams } from "@/hooks/useActiveStreams";
 import {
   MapPin, Radio as Broadcast, Bell, Film as FilmSlate,
   BarChart3 as ChartBar, AlertTriangle as Warning, CheckCircle, X,
   ExternalLink as ArrowSquareOut, Folder as FolderLock, Download,
   Cpu, ShieldCheck, User as UserIcon, Users as UsersIcon, Car, Hash,
   UserSearch, RefreshCw, Play, Square, CheckCircle2,
+  Activity, Battery, BatteryLow, BatteryMedium, BatteryFull,
+  Wifi, WifiOff, Clock, Radio,
 } from "lucide-react";
 import LiveFrame from "../components/LiveFrame";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, BarChart, Bar } from "recharts";
@@ -46,6 +49,278 @@ function KPI({ label, value, tone = "text-sky-400" }) {
     </div>
   );
 }
+
+/* ─────────────────────────────────────────────────────────────────
+   MINI STREAM CELL — one slot in the Tactical Map Multi-Drone Grid
+   ───────────────────────────────────────────────────────────────── */
+const MINI_BACKOFF = [600, 1200, 2400, 5000, 10000, 20000];
+const MINI_WATCHDOG_MS = 8000;
+
+function MiniStreamCell({ drone }) {
+  const [blobUrl, setBlobUrl]   = useState(null);
+  const [hasFrame, setHasFrame] = useState(false);
+  const [feedDead, setFeedDead] = useState(false);
+  const [lastSeen, setLastSeen] = useState(null);
+
+  const timerRef    = useRef(null);
+  const watchRef    = useRef(null);
+  const errRef      = useRef(0);
+  const prevBlobRef = useRef(null);
+  const mountedRef  = useRef(true);
+
+  const isOffline  = drone.status === "offline";
+  const isDegraded = drone.status === "degraded";
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      clearTimeout(timerRef.current);
+      clearTimeout(watchRef.current);
+      if (prevBlobRef.current) URL.revokeObjectURL(prevBlobRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    clearTimeout(timerRef.current);
+    clearTimeout(watchRef.current);
+    if (prevBlobRef.current) { URL.revokeObjectURL(prevBlobRef.current); prevBlobRef.current = null; }
+    errRef.current = 0;
+    setBlobUrl(null);
+    setHasFrame(false);
+    setFeedDead(isOffline);
+
+    if (isOffline) return;
+
+    const schedule = (delay) => {
+      if (!mountedRef.current) return;
+      timerRef.current = setTimeout(doFetch, delay);
+    };
+
+    const doFetch = async () => {
+      if (!mountedRef.current) return;
+      const token = localStorage.getItem("dvas_token") || "";
+      const url   = `${API}/ingest-server/frame/${encodeURIComponent(drone.id)}/latest?_t=${Date.now()}`;
+      try {
+        const res = await fetch(url, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+          credentials: "include",
+        });
+        if (!mountedRef.current) return;
+        if (res.ok) {
+          const blob = await res.blob();
+          const next = URL.createObjectURL(blob);
+          if (prevBlobRef.current) URL.revokeObjectURL(prevBlobRef.current);
+          prevBlobRef.current = next;
+          setBlobUrl(next);
+          setHasFrame(true);
+          setFeedDead(false);
+          setLastSeen(new Date());
+          errRef.current = 0;
+          clearTimeout(watchRef.current);
+          watchRef.current = setTimeout(() => { if (mountedRef.current) setFeedDead(true); }, MINI_WATCHDOG_MS);
+          schedule(800);
+        } else { throw new Error(`HTTP ${res.status}`); }
+      } catch {
+        if (!mountedRef.current) return;
+        errRef.current++;
+        if (errRef.current > 5) setFeedDead(true);
+        schedule(MINI_BACKOFF[Math.min(errRef.current - 1, MINI_BACKOFF.length - 1)]);
+      }
+    };
+
+    doFetch();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drone.id, isOffline]);
+
+  const statusColor = isDegraded ? "#f59e0b" : isOffline || feedDead ? "#ef4444" : "#10b981";
+  const borderColor = isDegraded
+    ? "border-amber-500/40"
+    : isOffline || feedDead
+    ? "border-red-500/30"
+    : hasFrame
+    ? "border-teal-500/40"
+    : "border-slate-700/60";
+
+  const relAge = (d) => {
+    if (!d) return null;
+    const s = Math.floor((Date.now() - d.getTime()) / 1000);
+    if (s < 60) return `${s}s ago`;
+    return `${Math.floor(s / 60)}m ago`;
+  };
+
+  const batColor = (pct) => {
+    if (pct == null) return "text-slate-500";
+    if (pct <= 20) return "text-red-400";
+    if (pct <= 50) return "text-amber-400";
+    return "text-emerald-400";
+  };
+
+  return (
+    <div
+      className={`relative rounded-lg overflow-hidden border ${borderColor} flex flex-col`}
+      style={{ background: "var(--dvas-surface-2)", aspectRatio: "16/10" }}
+      data-testid={`grid-drone-${drone.id}`}
+    >
+      {/* ── Video area ── */}
+      <div className="relative flex-1 overflow-hidden bg-[#060e1a]">
+        {/* Scan-line overlay */}
+        <div
+          className="absolute inset-0 pointer-events-none z-10"
+          style={{
+            backgroundImage: "repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(20,184,166,0.012) 2px, rgba(20,184,166,0.012) 4px)",
+          }}
+        />
+
+        {/* Live frame / placeholder */}
+        {!isOffline && hasFrame && blobUrl ? (
+          <img
+            src={blobUrl}
+            alt={`Feed ${drone.id}`}
+            className="absolute inset-0 w-full h-full object-cover"
+            style={{ opacity: isDegraded ? 0.75 : 0.92 }}
+          />
+        ) : (
+          <div className="absolute inset-0 flex items-center justify-center">
+            {isOffline || feedDead ? (
+              <div className="mono text-[9px] text-red-400 bg-black/70 px-2 py-1 rounded border border-red-500/30">
+                FEED OFFLINE
+              </div>
+            ) : (
+              <div className="flex flex-col items-center gap-1">
+                <div className="w-4 h-4 border-2 border-teal-500/40 border-t-teal-400 rounded-full animate-spin" />
+                <span className="mono text-[8px] text-slate-500">AWAITING…</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Top-left: Drone ID + Mission ID */}
+        <div className="absolute top-1.5 left-1.5 z-20 flex flex-col gap-0.5">
+          <div
+            className="mono text-[10px] font-bold px-1.5 py-0.5 rounded"
+            style={{
+              background: "rgba(6,14,26,0.85)",
+              color: isDegraded ? "#fbbf24" : "#2dd4bf",
+              border: `1px solid ${isDegraded ? "rgba(245,158,11,0.3)" : "rgba(20,184,166,0.3)"}`,
+            }}
+          >
+            {drone.id}
+          </div>
+          {drone.mission_id && (
+            <div
+              className="mono text-[8px] px-1 py-0.5 rounded"
+              style={{ background: "rgba(6,14,26,0.75)", color: "#94a3b8" }}
+            >
+              {drone.mission_id}
+            </div>
+          )}
+        </div>
+
+        {/* Top-right: Status + streaming dot */}
+        <div className="absolute top-1.5 right-1.5 z-20 flex items-center gap-1">
+          {hasFrame && !feedDead && (
+            <span
+              className="w-1.5 h-1.5 rounded-full"
+              style={{ background: "#10b981", animation: "pulse 1.2s infinite" }}
+            />
+          )}
+          <span
+            className="mono text-[8px] px-1.5 py-0.5 rounded font-bold uppercase"
+            style={{
+              background: "rgba(6,14,26,0.80)",
+              color: statusColor,
+              border: `1px solid ${statusColor}30`,
+            }}
+          >
+            {isOffline || feedDead ? "OFFLINE" : isDegraded ? "DEGRADED" : "LIVE"}
+          </span>
+        </div>
+      </div>
+
+      {/* ── Metadata strip ── */}
+      <div
+        className="px-2 py-1 flex flex-col gap-0.5 shrink-0"
+        style={{ background: "rgba(4,10,20,0.92)", borderTop: "1px solid rgba(255,255,255,0.05)" }}
+      >
+        {/* Operator name */}
+        <div className="flex items-center gap-1 min-w-0">
+          <UserIcon size={8} className="text-slate-500 shrink-0" />
+          <span className="mono text-[8px] text-slate-300 truncate">
+            {drone.operator_name || "—"}
+          </span>
+          {drone.battery_pct != null && (
+            <span className={`mono text-[8px] ml-auto shrink-0 font-bold ${batColor(drone.battery_pct)}`}>
+              {drone.battery_pct}%
+            </span>
+          )}
+        </div>
+        {/* Location + last seen */}
+        <div className="flex items-center gap-1 min-w-0">
+          <MapPin size={7} className="text-slate-600 shrink-0" />
+          <span className="mono text-[7px] text-slate-500 truncate">
+            {drone.jurisdiction || drone.mission_name || "—"}
+          </span>
+          {lastSeen && (
+            <span className="mono text-[7px] text-teal-600 ml-auto shrink-0">{relAge(lastSeen)}</span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────────────────────────
+   MULTI DRONE GRID — Tactical Map right panel
+   ───────────────────────────────────────────────────────────────── */
+function MultiDroneGrid({ dbDrones }) {
+  const { mergeWithDrones, loading, streams } = useActiveStreams();
+  const merged = mergeWithDrones(dbDrones);
+  const slots  = merged.slice(0, 4);
+
+  return (
+    <div className="p-2 flex flex-col gap-2 h-full">
+      {/* Header row with live count */}
+      <div className="flex items-center justify-between px-1">
+        <div className="flex items-center gap-1.5">
+          <Radio size={10} className="text-teal-400" style={{ animation: streams.length > 0 ? "pulse 1.5s infinite" : "none" }} />
+          <span className="mono text-[9px] text-teal-400 font-bold">
+            {streams.length} LIVE {streams.length === 1 ? "STREAM" : "STREAMS"}
+          </span>
+        </div>
+        {loading && <RefreshCw size={9} className="text-slate-500 animate-spin" />}
+      </div>
+
+      {/* 2×2 grid */}
+      <div className="grid grid-cols-2 gap-2 flex-1">
+        {slots.map((d) => (
+          <MiniStreamCell key={d.id} drone={d} />
+        ))}
+        {/* Fill empty slots */}
+        {Array.from({ length: Math.max(0, 4 - slots.length) }).map((_, i) => (
+          <div
+            key={`empty-${i}`}
+            className="rounded-lg border border-slate-800/60 flex flex-col items-center justify-center gap-2"
+            style={{ background: "var(--dvas-surface-2)", aspectRatio: "16/10" }}
+          >
+            <Broadcast size={16} className="text-slate-700" />
+            <span className="mono text-[8px] text-slate-600">AWAITING STREAM</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Footer: total frame count hint */}
+      {streams.length > 0 && (
+        <div className="flex justify-center">
+          <span className="mono text-[7px] text-slate-600 tracking-wider">
+            {streams.reduce((acc, s) => acc + (s.frame_count ?? s.frames_received ?? 0), 0).toLocaleString()} FRAMES INGESTED
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 
 function Pin({ d, onClick }) {
   const color = d.status === "live" ? "bg-emerald-500" : d.status === "degraded" ? "bg-amber-500" : "bg-red-500";
@@ -229,22 +504,17 @@ export default function CommandDashboard() {
             <LiveMap drones={drones} height={480} />
           </div>
 
-          <div className="col-span-12 lg:col-span-4 rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
-            <div className="p-3 text-sm flex items-center gap-2 font-semibold" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text)" }}><Broadcast size={14} className="text-emerald-500 dvas-live-dot" /> {t("cmd.multiDroneGrid")}</div>
-            <div className="p-3 grid grid-cols-2 gap-2">
-              {[...drones].sort((a, b) => (a.status === "live" ? -1 : b.status === "live" ? 1 : 0)).slice(0, 4).map(d => (
-                <div key={d.id} data-testid={`grid-drone-${d.id}`} className="aspect-video relative overflow-hidden rounded-md" style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border-strong)" }}>
-                  <LiveFrame droneId={d.id} isOffline={d.status === "offline"} isDegraded={d.status === "degraded"} />
-                  <div className="absolute top-1 left-1 mono text-[9px] bg-black/70 px-1">{d.id}</div>
-                  <div className={`absolute top-1 right-1 mono text-[9px] px-1 ${d.status === "live" ? "text-emerald-400" : d.status === "degraded" ? "text-amber-400" : "text-red-400"}`}>{d.status}</div>
-                  <div className="absolute bottom-1 left-1 mono text-[9px] text-slate-300 bg-black/60 px-1">crowd {d.last_analytics?.crowd_density ?? "—"}</div>
-                  <div className="absolute bottom-1 right-1 mono text-[9px] text-slate-400 bg-black/60 px-1">bat {d.battery_pct}%</div>
-                </div>
-              ))}
+          <div className="col-span-12 lg:col-span-4 rounded-xl overflow-hidden flex flex-col" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
+            <div className="p-3 text-sm flex items-center gap-2 font-semibold shrink-0" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text)" }}>
+              <Broadcast size={14} className="text-emerald-500 dvas-live-dot" /> {t("cmd.multiDroneGrid")}
+            </div>
+            <div className="flex-1 min-h-0">
+              <MultiDroneGrid dbDrones={drones} />
             </div>
           </div>
         </div>
       )}
+
 
       {tab === "alerts" && (
         <div className="rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
