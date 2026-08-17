@@ -61,6 +61,7 @@ reports/
 
 | Document | Date | Focus Area | Intended Audience | Summary |
 |:---|:---:|:---|:---|:---|
+| [**`LOCAL_TO_CLOUD_DEPLOYMENT_SECURITY_ARCHITECTURE_2026-08-17.md`**](file:///d:/DVPS/DVAS_KP/reports/security_architecture_advisories/LOCAL_TO_CLOUD_DEPLOYMENT_SECURITY_ARCHITECTURE_2026-08-17.md) | 2026-08-17 06:25:00 PM IST | Local to Cloud Migration | System Architecture & DevOps | Dual-stage deployment blueprint for dynamic local LAN testing and RunPod cloud hosting with zero-trust security. |
 | [**`SECURITY_FIXES_REPORT_2026-08-15.md`**](file:///d:/DVPS/DVAS_KP/reports/security_architecture_advisories/SECURITY_FIXES_REPORT_2026-08-15.md) | 2026-08-15 | Code-Level Fixes | System Implementation | Step-by-step diffs and instructions for IAM, cookies, client scoping, and JWKS. |
 | [**`KEYCLOAK_CUSTOM_UI_SECURITY_PLAN.md`**](file:///d:/DVPS/DVAS_KP/reports/security_architecture_advisories/KEYCLOAK_CUSTOM_UI_SECURITY_PLAN.md) | 2026-08-15 | User Admin Service Account | IAM & Backend Engineering | Architectural blueprint for managing users via a scoped service account (`manage-users`). |
 | [**`API_ARCHITECTURE_RECOMMENDATION.md`**](file:///d:/DVPS/DVAS_KP/reports/security_architecture_advisories/API_ARCHITECTURE_RECOMMENDATION.md) | 2026-08-15 | Backend Gateway Design | System Architecture | API routing, proxy decoupling, and rate limiter design guidelines. |
