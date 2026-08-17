@@ -326,6 +326,11 @@ def main() -> None:
         create_realm(base, token, args.realm)
         uuid   = create_client(base, token, args.realm, CLIENT_ID_NAME)
         secret = get_client_secret(base, token, args.realm, uuid)
+        
+        # Human Dashboard UI client
+        dash_uuid   = create_client(base, token, args.realm, "dvas-dashboard-client")
+        dash_secret = get_client_secret(base, token, args.realm, dash_uuid)
+
         r_ids  = create_roles(base, token, args.realm, ROLES)
         create_users(base, token, args.realm, OPERATORS, r_ids)
 
@@ -336,17 +341,19 @@ def main() -> None:
         print("=" * 62)
         log("Setup complete!", "OK")
         print()
-        print(f"  Realm:         {args.realm}")
-        print(f"  Client ID:     {CLIENT_ID_NAME}")
-        print(f"  Client Secret: {secret}")
+        print(f"  Realm:                  {args.realm}")
+        print(f"  Ingest M2M Client ID:   {CLIENT_ID_NAME}")
+        print(f"  Ingest Client Secret:   {secret}")
+        print(f"  Dashboard Client ID:    dvas-dashboard-client")
+        print(f"  Dashboard Client Secret:{dash_secret}")
         print()
-        print(f"  Admin Service Client:  {ADMIN_SERVICE_CLIENT_ID}")
-        print(f"  Admin Service Secret:  {admin_secret}")
+        print(f"  Admin Service Client:   {ADMIN_SERVICE_CLIENT_ID}")
+        print(f"  Admin Service Secret:   {admin_secret}")
         print()
         print("  ⚠  Copy these secrets into:")
-        print("       • docker-compose.yml → KC_CLIENT_SECRET (ingest client)")
+        print("       • docker-compose.yml → KC_CLIENT_SECRET (dashboard client)")
         print("       • docker-compose.yml → ADMIN_CLIENT_SECRET (admin service)")
-        print("       • ingest/edge_sender.py → CLIENT_SEC")
+        print("       • ingest/edge_sender.py → CLIENT_SEC (ingest client)")
         print("=" * 62)
         print()
 

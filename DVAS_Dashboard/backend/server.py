@@ -41,17 +41,17 @@ from models import Base, AuditLog, Mission, Drone, Alert, Evidence, Export, Mode
 from ingest_proxy import ingest_api, _proxy_get
 
 # ---------- Keycloak Setup ----------
-# ---------- Keycloak Setup ----------
 KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "http://172.23.46.250:8080")
 KEYCLOAK_REALM = os.environ.get("KC_REALM", "kerala-police-drone")
-KEYCLOAK_CLIENT_ID = os.environ.get("KC_CLIENT_ID", "drone-ingest-client")
+KEYCLOAK_CLIENT_ID = os.environ.get("KC_CLIENT_ID", "dvas-dashboard-client")
 KEYCLOAK_CLIENT_SECRET = os.environ.get("KC_CLIENT_SECRET", "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn")
 KEYCLOAK_ADMIN = os.environ.get("KEYCLOAK_ADMIN", "admin")
-KEYCLOAK_ADMIN_PASSWORD = os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "Admin@KP2025!")
 JWKS_CACHE = {}
 
-def fetch_jwks():
+def fetch_jwks(force: bool = False):
     global JWKS_CACHE
+    if JWKS_CACHE and not force:
+        return JWKS_CACHE
     url = f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/certs"
     try:
         import requests
@@ -59,12 +59,15 @@ def fetch_jwks():
         if resp.status_code == 200:
             JWKS_CACHE = resp.json()
             logger.info("Successfully fetched JWKS from Keycloak")
+            return JWKS_CACHE
         else:
             logger.error(f"Failed to fetch JWKS: {resp.status_code} {resp.text}")
     except Exception as e:
         logger.error(f"Failed to fetch JWKS: {e}")
+    return JWKS_CACHE
 
 def get_jwks():
+    global JWKS_CACHE
     if not JWKS_CACHE:
         fetch_jwks()
     return JWKS_CACHE
@@ -129,12 +132,25 @@ async def get_current_user(request: Request) -> dict:
                 user_role = mapped_role
                 if user_role == "system_administrator":
                     break
-                    
+
+        attrs_jurisdiction = payload.get("jurisdiction")
+        jurisdiction_val = ""
+        if isinstance(attrs_jurisdiction, list) and len(attrs_jurisdiction) > 0:
+            jurisdiction_val = str(attrs_jurisdiction[0])
+        elif isinstance(attrs_jurisdiction, str):
+            jurisdiction_val = attrs_jurisdiction
+
+        mission_scope_val = payload.get("mission_scope", [])
+        if isinstance(mission_scope_val, str):
+            mission_scope_val = [mission_scope_val]
+
         return {
             "id": payload.get("sub"),
             "email": payload.get("email", ""),
             "name": payload.get("name") or payload.get("preferred_username", ""),
             "role": user_role,
+            "jurisdiction": jurisdiction_val,
+            "mission_scope": mission_scope_val,
         }
     except jwt.ExpiredSignatureError:
         logger.error("get_current_user: Token expired")
@@ -291,28 +307,131 @@ async def login(body: LoginIn, response: Response, request: Request):
                     if user_role == "system_administrator":
                         break
                         
+            attrs_jurisdiction = payload.get("jurisdiction")
+            jurisdiction_val = ""
+            if isinstance(attrs_jurisdiction, list) and len(attrs_jurisdiction) > 0:
+                jurisdiction_val = str(attrs_jurisdiction[0])
+            elif isinstance(attrs_jurisdiction, str):
+                jurisdiction_val = attrs_jurisdiction
+
+            mission_scope_val = payload.get("mission_scope", [])
+            if isinstance(mission_scope_val, str):
+                mission_scope_val = [mission_scope_val]
+
             user_dict = {
                 "id": payload.get("sub"),
                 "email": payload.get("email", email),
                 "name": payload.get("name") or payload.get("preferred_username", ""),
                 "role": user_role,
+                "jurisdiction": jurisdiction_val,
+                "mission_scope": mission_scope_val,
             }
             
+            is_secure = (request.url.scheme == "https" or os.environ.get("ENV") == "production" or os.environ.get("SECURE_COOKIES", "false").lower() == "true")
             response.set_cookie(
                 "dvas_access_token",
                 access_token,
                 httponly=True,
-                secure=False,
+                secure=is_secure,
                 samesite="lax",
                 max_age=token_data.get("expires_in", 3600),
                 path="/"
             )
+            if "refresh_token" in token_data:
+                response.set_cookie(
+                    "dvas_refresh_token",
+                    token_data["refresh_token"],
+                    httponly=True,
+                    secure=is_secure,
+                    samesite="lax",
+                    max_age=token_data.get("refresh_expires_in", 86400),
+                    path="/"
+                )
             
             await write_audit(user_dict, "login", email, "login success via Keycloak", request.client.host if request.client else "-")
             
             user_dict["access_token"] = access_token
             return user_dict
             
+        except httpx.RequestError:
+            raise HTTPException(status_code=503, detail="Authentication server unreachable")
+
+@api.post("/auth/refresh")
+async def refresh_token(request: Request, response: Response):
+    """Silent token refresh using HttpOnly refresh_token cookie."""
+    refresh_tok = request.cookies.get("dvas_refresh_token")
+    if not refresh_tok:
+        raise HTTPException(status_code=401, detail="No refresh token found")
+
+    url = f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token"
+    data = {
+        "client_id": KEYCLOAK_CLIENT_ID,
+        "client_secret": KEYCLOAK_CLIENT_SECRET,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_tok,
+    }
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.post(url, data=data, timeout=5)
+            if r.status_code != 200:
+                raise HTTPException(status_code=401, detail="Session expired, please login again")
+            token_data = r.json()
+            new_access_token = token_data["access_token"]
+            
+            options = {"verify_aud": False}
+            payload = jwt.decode(new_access_token, get_jwks(), algorithms=["RS256"], options=options)
+            
+            realm_access = payload.get("realm_access", {})
+            roles = realm_access.get("roles", [])
+            user_role = "drone_operator"
+            for kc_role, mapped_role in ROLE_MAP.items():
+                if kc_role in roles:
+                    user_role = mapped_role
+                    if user_role == "system_administrator":
+                        break
+
+            attrs_jurisdiction = payload.get("jurisdiction")
+            jurisdiction_val = ""
+            if isinstance(attrs_jurisdiction, list) and len(attrs_jurisdiction) > 0:
+                jurisdiction_val = str(attrs_jurisdiction[0])
+            elif isinstance(attrs_jurisdiction, str):
+                jurisdiction_val = attrs_jurisdiction
+
+            mission_scope_val = payload.get("mission_scope", [])
+            if isinstance(mission_scope_val, str):
+                mission_scope_val = [mission_scope_val]
+
+            user_dict = {
+                "id": payload.get("sub"),
+                "email": payload.get("email", ""),
+                "name": payload.get("name") or payload.get("preferred_username", ""),
+                "role": user_role,
+                "jurisdiction": jurisdiction_val,
+                "mission_scope": mission_scope_val,
+            }
+
+            is_secure = (request.url.scheme == "https" or os.environ.get("ENV") == "production" or os.environ.get("SECURE_COOKIES", "false").lower() == "true")
+            response.set_cookie(
+                "dvas_access_token",
+                new_access_token,
+                httponly=True,
+                secure=is_secure,
+                samesite="lax",
+                max_age=token_data.get("expires_in", 3600),
+                path="/"
+            )
+            if "refresh_token" in token_data:
+                response.set_cookie(
+                    "dvas_refresh_token",
+                    token_data["refresh_token"],
+                    httponly=True,
+                    secure=is_secure,
+                    samesite="lax",
+                    max_age=token_data.get("refresh_expires_in", 86400),
+                    path="/"
+                )
+            user_dict["access_token"] = new_access_token
+            return user_dict
         except httpx.RequestError:
             raise HTTPException(status_code=503, detail="Authentication server unreachable")
 
@@ -326,6 +445,7 @@ async def logout(
     response: Response, user: dict = Depends(get_current_user), request: Request = None
 ):
     response.delete_cookie("dvas_access_token", path="/")
+    response.delete_cookie("dvas_refresh_token", path="/")
     await write_audit(
         user,
         "logout",

@@ -14,13 +14,15 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-DATABASE_URL = os.environ["DATABASE_URL"]
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./dvas.db")
+
+engine_kwargs = {"echo": False}
+if "sqlite" not in DATABASE_URL:
+    engine_kwargs.update({"pool_size": 10, "max_overflow": 20})
 
 engine = create_async_engine(
     DATABASE_URL,
-    echo=False,
-    pool_size=10,
-    max_overflow=20,
+    **engine_kwargs
 )
 
 async_session_factory = async_sessionmaker(

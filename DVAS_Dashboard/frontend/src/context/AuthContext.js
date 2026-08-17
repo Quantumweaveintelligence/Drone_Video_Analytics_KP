@@ -22,14 +22,12 @@ export function AuthProvider({ children }) {
 
   const login = async (email, password) => {
     const { data } = await api.post("/auth/login", { email, password });
-    if (data.access_token) localStorage.setItem("dvas_token", data.access_token);
     setUser(data);
     return data;
   };
 
   const logout = async () => {
     try { await api.post("/auth/logout"); } catch {}
-    localStorage.removeItem("dvas_token");
     setUser(false);
   };
 

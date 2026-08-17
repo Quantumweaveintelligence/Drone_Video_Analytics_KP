@@ -259,17 +259,25 @@ async def ingest_streams_active():
 
 
 @ingest_api.get("/frame/{drone_id}/latest", summary="Proxy: latest JPEG frame for a drone")
-async def ingest_latest_frame(drone_id: str):
+async def ingest_latest_frame(drone_id: str, request: Request):
     """
     Fetches the most recent JPEG frame stored in the ingest server's Valkey queue
     for the given drone and streams it back as image/jpeg.
-    Used by the command dashboard multi-drone view (<img> polling every 500 ms).
+    Used by the command dashboard multi-drone view.
     Open to any authenticated role.
     """
     url = f"{INGEST_SERVER_URL}/ingest/frame/{drone_id}/latest"
+    token = request.cookies.get("dvas_access_token")
+    auth_header = request.headers.get("Authorization")
+    headers = {}
+    if auth_header:
+        headers["Authorization"] = auth_header
+    elif token:
+        headers["Authorization"] = f"Bearer {token}"
+
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(url)
+            resp = await client.get(url, headers=headers)
             if resp.status_code == 404:
                 raise HTTPException(404, f"No frames yet for drone {drone_id}")
             resp.raise_for_status()

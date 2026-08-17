@@ -1,6 +1,6 @@
 # Keycloak Security Engineering Advisory & Practical Integration Guide
 
-**Date:** 2026-08-14  
+**Date & Time:** 2026-08-14 02:00:00 PM IST (+05:30)  
 **Project:** Kerala Police Drone Video Analytics System (DVAS)  
 **Target Systems:** `DVAS_Dashboard`, `dvas_ingest`, `dvas_edge`  
 **Classification:** Security Architecture & Engineering Advisory (Vulnerability Assessment and Penetration Testing — VAPT Perspective)  
@@ -206,7 +206,7 @@ Surveillance integrity requires distinguishing between **identity authentication
 
 ---
 
-## 11. 📋 Developer Checklists by Engineering Domain
+## 11. 📋 Implementation Checklists by Engineering Domain
 
 ### A. Backend Engineering Checklist (FastAPI & Ingest Services)
 - [ ] **Asymmetric Verification:** Validates tokens using Keycloak's public certificates discovered via the **JWKS (JSON Web Key Set)** endpoint.

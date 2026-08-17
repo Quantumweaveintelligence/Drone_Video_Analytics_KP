@@ -18,7 +18,7 @@ import time
 from typing import Optional
 
 import httpx
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 
@@ -29,12 +29,21 @@ from config import (
     JWKS_URL,
 )
 
-# ── Demo auth bypass ─────────────────────────────────────────────────────────
-# Set SKIP_AUTH=true in .env / docker-compose to bypass Keycloak JWT validation.
-# Useful for LAN demos where Keycloak realm may not be fully configured.
 import os
-SKIP_AUTH: bool = os.getenv("SKIP_AUTH", "false").lower() == "true"
 
+def is_skip_auth_allowed() -> bool:
+    """Check if SKIP_AUTH is allowed. Strictly disallowed in any production environment."""
+    env = os.getenv("ENV", os.getenv("ENVIRONMENT", "development")).strip().lower()
+    if env.startswith("prod") or env in ("production", "prod", "live"):
+        if os.getenv("SKIP_AUTH", "false").lower() == "true":
+            logging.getLogger(__name__).critical(
+                "SECURITY ALERT: SKIP_AUTH was set to true in production environment ('%s')! Forcing SKIP_AUTH=False.",
+                env
+            )
+        return False
+    return os.getenv("SKIP_AUTH", "false").lower() == "true"
+
+SKIP_AUTH: bool = is_skip_auth_allowed()
 log = logging.getLogger(__name__)
 
 # ── JWKS cache ────────────────────────────────────────────────────────────────
@@ -86,23 +95,9 @@ _bearer = HTTPBearer(
 )
 
 
-async def validate_token(
-    creds: HTTPAuthorizationCredentials = Depends(_bearer),
-) -> dict:
-    """
-    FastAPI dependency — validates the JWT and enforces role membership.
-
-    Returns:
-        Decoded JWT payload dict (sub, realm_access, etc.)
-
-    Raises:
-        401  if token is missing, expired, or signature invalid
-        403  if token is valid but the user lacks an allowed role
-    """
-    token = creds.credentials
-
-    # ── Demo bypass — skip all JWT validation ─────────────────────────────
-    if SKIP_AUTH:
+async def validate_token_string(token: str) -> dict:
+    """Validate a raw JWT token string against Keycloak JWKS and verify role."""
+    if is_skip_auth_allowed():
         log.info("skip_auth_enabled — bypassing JWT validation (demo mode)")
         return {
             "sub": "demo-operator",
@@ -111,7 +106,7 @@ async def validate_token(
         }
 
     try:
-        jwks    = await get_jwks()
+        jwks = await get_jwks()
         payload = jwt.decode(
             token,
             jwks,
@@ -120,14 +115,12 @@ async def validate_token(
         )
     except JWTError as exc:
         log.error("jwt_validation_failed details: %s", str(exc))
-        log.warning("jwt_validation_failed", extra={"error": str(exc)})
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Invalid or expired token: {exc}",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Role check ──────────────────────────────────────────────────────────────
     realm_roles: list[str] = payload.get("realm_access", {}).get("roles", [])
     if not ALLOWED_ROLES.intersection(realm_roles):
         log.warning(
@@ -142,15 +135,45 @@ async def validate_token(
     return payload
 
 
+async def validate_token(
+    creds: HTTPAuthorizationCredentials = Depends(_bearer),
+) -> dict:
+    """FastAPI dependency — validates the Bearer JWT and enforces role membership."""
+    return await validate_token_string(creds.credentials)
+
+
+async def validate_token_flexible(
+    request: Request,
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False)),
+) -> dict:
+    """
+    FastAPI dependency for endpoints (streams, snapshots) that accept authentication
+    via Bearer header, ?token= query parameter, or dvas_access_token cookie.
+    """
+    token: Optional[str] = None
+    if creds and creds.credentials:
+        token = creds.credentials
+    elif "token" in request.query_params:
+        token = request.query_params["token"]
+    elif "dvas_access_token" in request.cookies:
+        token = request.cookies["dvas_access_token"]
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication token required via Bearer header, query parameter, or cookie",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return await validate_token_string(token)
+
+
 async def validate_token_optional(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(
         HTTPBearer(auto_error=False)
     ),
 ) -> Optional[dict]:
-    """
-    Like validate_token but returns None if no token is provided.
-    Used for endpoints that are partially public (e.g. /health/ready).
-    """
+    """Like validate_token but returns None if no token is provided."""
     if creds is None:
         return None
     return await validate_token(creds)

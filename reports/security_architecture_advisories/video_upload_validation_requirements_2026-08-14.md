@@ -1,6 +1,6 @@
 # Video Upload Validation Requirements & Engineering Advisory
 
-**Date:** 2026-08-14  
+**Date & Time:** 2026-08-14 11:30:00 AM IST (+05:30)  
 **Project:** Kerala Police Drone Video Analytics System (DVAS)  
 **Target Systems:** `dvas_ingest`, `dvas_edge`, `DVAS_Dashboard`  
 

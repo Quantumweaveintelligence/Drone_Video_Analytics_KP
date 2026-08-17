@@ -1,6 +1,6 @@
 # DVAS Transport Security & NGINX HTTPS Architecture Assessment
 
-**Date:** 2026-08-14  
+**Date & Time:** 2026-08-14 09:15:00 AM IST (+05:30)  
 **Scope:** Edge-to-Command / Ingest Server Communication & NGINX TLS Termination  
 **Target Systems:** `dvas_edge`, `dvas_ingest`, `DVAS_Dashboard`  
 

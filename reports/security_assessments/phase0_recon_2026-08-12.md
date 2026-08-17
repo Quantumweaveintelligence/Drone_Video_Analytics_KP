@@ -1,6 +1,6 @@
-# Phase 0 Reconnaissance Report
-**Date:** 2026-08-12
-**Project:** DVAS (Drone Video Analytics System — Kerala Police)
+# Phase 0 Reconnaissance & Pre-Test Analysis Report
+**Date & Time:** 2026-08-12 11:00:00 AM IST (+05:30)  
+**Target Project:** DVAS (Drone Video Analytics System — Kerala Police)  
 **Scope:** Read-only passive reconnaissance. No code was modified.
 
 ---

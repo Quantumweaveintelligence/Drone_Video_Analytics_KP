@@ -53,7 +53,12 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST,
 )
 
-from auth import extract_username, validate_token
+from auth import (
+    extract_username,
+    validate_token,
+    validate_token_flexible,
+    validate_token_string,
+)
 from config import (
     ALLOWED_TYPES,
     API_DESC,
@@ -760,10 +765,13 @@ async def get_telemetry():
 
 @app.get(
     "/ingest/frame/{drone_id}/latest",
-    summary = "Latest raw JPEG frame for a drone",
+    summary = "Latest raw JPEG frame for a drone (JWT required)",
     tags    = ["Telemetry"],
 )
-async def get_latest_frame(drone_id: str):
+async def get_latest_frame(
+    drone_id: str,
+    claims: dict = Depends(validate_token_flexible),
+):
     """
     Reads the most recent entry from the Valkey stream for the given drone
     and returns the raw JPEG bytes. Used by the command dashboard multi-drone
@@ -885,36 +893,21 @@ async def _mjpeg_frame_generator(drone_id: str) -> AsyncGenerator[bytes, None]:
 
 @app.get(
     "/ingest/stream/{drone_id}",
-    summary="Live MJPEG frame stream for a drone",
+    summary="Live MJPEG frame stream for a drone (JWT required)",
     tags=["Streaming"],
     response_class=StreamingResponse,
 )
-async def live_stream(drone_id: str) -> StreamingResponse:
+async def live_stream(
+    drone_id: str,
+    claims: dict = Depends(validate_token_flexible),
+) -> StreamingResponse:
     """
     Live MJPEG stream that pumps real-time drone frames from the Valkey
     queue directly to the browser or dashboard.
 
-    **Usage in the dashboard:**
-
-    ```html
-    <img src="https://ingest.dvas.internal/ingest/stream/DRONE_KL_001"
-         style="width:100%;" />
-    ```
-
-    Or in JavaScript / fetch:
-    ```js
-    const img = document.getElementById('liveView');
-    img.src = `/ingest/stream/${droneId}`;
-    ```
-
-    **Notes:**
-    - Only frames received *after* the HTTP connection opens are delivered
-      (cursor starts at `$`). There is no replay of old frames.
-    - The stream stays open until the client disconnects.
-    - A keepalive boundary is sent every 2 seconds when no new frame
-      arrives, so the connection is not dropped by proxies/firewalls.
-    - No authentication required (internal network only).
-      Add JWT middleware here if the stream must be internet-facing.
+    Authentication:
+    - Bearer JWT in Authorization header, ?token=<JWT> query parameter,
+      or dvas_access_token HttpOnly cookie.
     """
     if not _qm:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Queue unavailable")
@@ -966,10 +959,20 @@ async def ws_status(ws: WebSocket) -> None:
     """
     WebSocket endpoint for the control-room live status dashboard.
 
-    On connect: sends a welcome message with current system snapshot.
-    On going: broadcasts frame_queued, mission_start/end events in real-time.
-    Client can send `ping` → server replies `pong`.
+    Authenticates token from query param (?token=<JWT>) before accepting connection.
     """
+    token = ws.query_params.get("token")
+    if not token:
+        await ws.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    try:
+        claims = await validate_token_string(token)
+    except Exception as exc:
+        log.warning("ws_auth_rejected: %s", exc)
+        await ws.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
     await ws_manager.connect(ws)
     try:
         # Send initial snapshot
