@@ -49,9 +49,11 @@ reports/
 
 | Document | Date | Severity | Target System | Summary |
 |:---|:---:|:---:|:---|:---|
-| [**`INGEST_STREAMING_SECURITY_VULNERABILITY_REPORT_2026-08-17.md`**](file:///d:/DVPS/DVAS_KP/reports/security_assessments/INGEST_STREAMING_SECURITY_VULNERABILITY_REPORT_2026-08-17.md) | 2026-08-17 | **HIGH (7.5)** | `dvas_ingest` / `dvas_edge` | Detailed vulnerability report on live MJPEG streams, frame snapshots, WebSockets, and `SKIP_AUTH`. |
-| [**`https_nginx_security_assessment_2026-08-14.md`**](file:///d:/DVPS/DVAS_KP/reports/security_assessments/https_nginx_security_assessment_2026-08-14.md) | 2026-08-14 | **MEDIUM (6.5)**| NGINX Ingress Proxy | TLS/SSL cipher suites, HTTP headers, and port isolation review. |
-| [**`phase0_recon_2026-08-12.md`**](file:///d:/DVPS/DVAS_KP/reports/security_assessments/phase0_recon_2026-08-12.md) | 2026-08-12 | **CRITICAL (9.1)**| Entire DVAS Stack | Baseline vulnerability discovery across IAM, Ingest, Dashboard, and Workers. |
+| [**`ENDPOINT_SECURITY_VULNERABILITY_REMEDIATION_REPORT_2026-08-17.md`**](file:///d:/DVPS/DVAS_KP/reports/security_assessments/ENDPOINT_SECURITY_VULNERABILITY_REMEDIATION_REPORT_2026-08-17.md) | 2026-08-17 01:10:00 PM IST | **CRITICAL (9.1)** | All 149 Endpoints / Entire DVAS | In-depth root-cause analysis, operational threat blast radius, code diffs, and verification for all endpoint vulnerabilities. |
+| [**`SYSTEM_WIDE_149_ENDPOINTS_SECURITY_AUDIT_2026-08-17.md`**](file:///d:/DVPS/DVAS_KP/reports/security_assessments/SYSTEM_WIDE_149_ENDPOINTS_SECURITY_AUDIT_2026-08-17.md) | 2026-08-17 12:55:00 PM IST | **ALL SECTORS** | Complete System (149 Endpoints) | Exhaustive security classification of all 149 endpoints across all 8 microservices. |
+| [**`INGEST_STREAMING_SECURITY_VULNERABILITY_REPORT_2026-08-17.md`**](file:///d:/DVPS/DVAS_KP/reports/security_assessments/INGEST_STREAMING_SECURITY_VULNERABILITY_REPORT_2026-08-17.md) | 2026-08-17 12:10:00 PM IST | **HIGH (7.5)** | `dvas_ingest` / `dvas_edge` | Detailed vulnerability report on live MJPEG streams, frame snapshots, WebSockets, and `SKIP_AUTH`. |
+| [**`https_nginx_security_assessment_2026-08-14.md`**](file:///d:/DVPS/DVAS_KP/reports/security_assessments/https_nginx_security_assessment_2026-08-14.md) | 2026-08-14 09:15:00 AM IST | **MEDIUM (6.5)**| NGINX Ingress Proxy | TLS/SSL cipher suites, HTTP headers, and port isolation review. |
+| [**`phase0_recon_2026-08-12.md`**](file:///d:/DVPS/DVAS_KP/reports/security_assessments/phase0_recon_2026-08-12.md) | 2026-08-12 11:00:00 AM IST | **CRITICAL (9.1)**| Entire DVAS Stack | Baseline vulnerability discovery across IAM, Ingest, Dashboard, and Workers. |
 
 ---
 

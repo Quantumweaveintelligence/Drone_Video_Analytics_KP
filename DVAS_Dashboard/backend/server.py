@@ -681,12 +681,15 @@ async def create_mission(
 
 
 @api.patch("/missions/{mission_id}/end")
-async def end_mission_record(mission_id: str):
+async def end_mission_record(mission_id: str, user: dict = Depends(get_current_user)):
     """Mark a mission as completed and record the end time."""
     async with async_session_factory() as session:
         mission = await session.get(Mission, mission_id)
         if not mission:
             raise HTTPException(404, f"Mission {mission_id} not found")
+        # Check jurisdiction / mission scope if scoped
+        if user.get("mission_scope") and mission_id not in user["mission_scope"]:
+            raise HTTPException(403, f"Not permitted to end mission {mission_id}")
         mission.status = "completed"
         mission.ended_at = datetime.now(timezone.utc).isoformat()
         await session.commit()
@@ -1666,17 +1669,9 @@ async def analytics_models_status(user: dict = Depends(get_current_user)):
 @api.get("/analytics/events/stream")
 async def analytics_events_stream(request: Request, drone_id: str = ""):
     """Proxy the gateway SSE stream to the browser with auth check."""
-    token = request.cookies.get("access_token")
-    if not token:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
-    if not token:
+    user = await get_current_user(request)
+    if not user:
         raise HTTPException(401, "Not authenticated")
-    try:
-        jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-    except jwt.JWTError:
-        raise HTTPException(401, "Invalid token")
 
     upstream_url = f"{ANALYTICS_BASE}/events/stream"
     if drone_id:

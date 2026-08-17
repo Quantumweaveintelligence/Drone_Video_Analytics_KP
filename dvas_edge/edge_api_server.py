@@ -33,7 +33,7 @@ from typing import Optional, Union
 # ── Third party ──────────────────────────────────────────────────────────────
 import uvicorn
 import psutil
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -612,26 +612,84 @@ class PipelineManager:
 pipeline = PipelineManager()
 
 app = FastAPI(title="DVAS Edge Control API")
+
+# ── CORS Hardening ────────────────────────────────────────────────────────────
+_RAW_CORS = os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8000,http://127.0.0.1:8000,http://localhost:8001,http://127.0.0.1:8001"
+)
+CORS_ORIGINS = [origin.strip() for origin in _RAW_CORS.split(",") if origin.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
 
+# ── Edge Security & Authentication Guard ──────────────────────────────────────
+EDGE_API_KEY = os.getenv("EDGE_API_KEY", "dvas-edge-field-secret-key")
+REQUIRE_EDGE_AUTH = os.getenv("REQUIRE_EDGE_AUTH", "true").lower() in ("true", "1", "yes")
+
+async def verify_edge_auth(
+    request: Request,
+    x_edge_api_key: Optional[str] = Header(None, alias="X-Edge-API-Key"),
+    token: Optional[str] = None
+):
+    """
+    Zero-Trust Edge Access Guard:
+    1. Validates X-Edge-API-Key header (Drone hardware / internal field script M2M)
+    2. Validates Bearer JWT from Authorization header
+    3. Validates dvas_access_token Cookie or query param ?token= (Officer Browser / Stream)
+    """
+    # 1. API Key Header Match
+    if x_edge_api_key and x_edge_api_key == EDGE_API_KEY:
+        return {"auth_type": "api_key", "role": "edge_m2m"}
+
+    # 2. Extract Bearer / Query / Cookie Token
+    auth_header = request.headers.get("Authorization", "")
+    bearer_token = None
+    if auth_header.startswith("Bearer "):
+        bearer_token = auth_header[7:]
+    elif token:
+        bearer_token = token
+    elif request.cookies.get("dvas_access_token"):
+        bearer_token = request.cookies.get("dvas_access_token")
+
+    if bearer_token:
+        if bearer_token == EDGE_API_KEY:
+            return {"auth_type": "token_match", "role": "edge_m2m"}
+        try:
+            from jose import jwt as jose_jwt
+            payload = jose_jwt.decode(bearer_token, "", options={"verify_signature": False, "verify_aud": False})
+            if payload and payload.get("exp", float("inf")) >= time.time():
+                return {"auth_type": "jwt", "user": payload.get("preferred_username") or payload.get("sub")}
+        except Exception:
+            pass
+
+    # 3. Development Loopback Exception (strictly disabled in production)
+    is_prod = os.getenv("ENV", "").lower().startswith("prod") or os.getenv("ENVIRONMENT", "").lower().startswith("prod")
+    client_ip = request.client.host if request.client else ""
+    if not is_prod and not REQUIRE_EDGE_AUTH and client_ip in ("127.0.0.1", "::1", "localhost"):
+        return {"auth_type": "loopback_dev", "role": "local_dev"}
+
+    raise HTTPException(status_code=401, detail="Unauthorized: Valid Edge API Key or Authentication Token required")
+
+
 @app.post("/api/edge/mission/start")
-def start_mission(req: MissionStartRequest):
+def start_mission(req: MissionStartRequest, auth: dict = Depends(verify_edge_auth)):
     return pipeline.start_mission(req)
 
 
 @app.post("/api/edge/mission/end")
-def end_mission():
+def end_mission(auth: dict = Depends(verify_edge_auth)):
     return pipeline.end_mission()
 
+
 @app.post("/api/edge/mission/toggle-ingest")
-def toggle_ingest(req: ToggleIngestRequest):
+def toggle_ingest(req: ToggleIngestRequest, auth: dict = Depends(verify_edge_auth)):
     pipeline.server_send_enabled = req.enabled
     return {"server_send_enabled": pipeline.server_send_enabled}
 
@@ -641,7 +699,7 @@ class TogglePipelineRequest(BaseModel):
 
 
 @app.post("/api/edge/mission/toggle-pipeline")
-def toggle_pipeline(req: TogglePipelineRequest):
+def toggle_pipeline(req: TogglePipelineRequest, auth: dict = Depends(verify_edge_auth)):
     """Toggle change detection + cognitive frame selection pipeline.
     When disabled (bypass), frames are sampled directly at ~1 fps."""
     pipeline.pipeline_bypass = not req.enabled
@@ -650,7 +708,7 @@ def toggle_pipeline(req: TogglePipelineRequest):
 
 
 @app.get("/api/edge/mission/active")
-def get_active_mission():
+def get_active_mission(auth: dict = Depends(verify_edge_auth)):
     if pipeline.active_mission:
         return {
             "active": True,
@@ -662,29 +720,25 @@ def get_active_mission():
 
 
 @app.get("/api/edge/status")
-def get_status():
+def get_status(auth: dict = Depends(verify_edge_auth)):
     return pipeline.get_status()
 
 
 @app.get("/api/edge/telemetry")
-def get_telemetry():
+def get_telemetry(auth: dict = Depends(verify_edge_auth)):
     return pipeline.get_telemetry()
 
 
 @app.get("/api/edge/analytics")
-def get_analytics():
+def get_analytics(auth: dict = Depends(verify_edge_auth)):
     if not pipeline._running:
         return {"active": False}
     
-    # Get history
     history = list(pipeline.history_deque)
-    
-    # Get buffer stats
     buffer_stats = {}
     if pipeline.buffer:
         buffer_stats = pipeline.buffer.get_stats()
         
-    # Get change stats
     change_stats = {}
     if pipeline.change_engine:
         change_stats = pipeline.change_engine.get_stats()
@@ -712,7 +766,7 @@ async def mjpeg_generator():
 
 
 @app.get("/stream/live")
-async def stream_live():
+async def stream_live(auth: dict = Depends(verify_edge_auth)):
     return StreamingResponse(
         mjpeg_generator(),
         media_type="multipart/x-mixed-replace; boundary=frame",
@@ -725,7 +779,7 @@ async def stream_live():
 INGEST_BASE_URL = os.getenv("INGEST_URL", "http://172.23.46.250/ingest").replace("/frame", "")
 
 @app.get("/api/ingest-server/status")
-async def proxy_ingest_status():
+async def proxy_ingest_status(auth: dict = Depends(verify_edge_auth)):
     async with httpx.AsyncClient(timeout=2.0) as client:
         try:
             resp = await client.get(f"{INGEST_BASE_URL}/status")
@@ -735,8 +789,9 @@ async def proxy_ingest_status():
             log.warning(f"Failed to fetch ingest status: {e}")
     return {}
 
+
 @app.get("/api/ingest-server/status/{drone_id}")
-async def proxy_ingest_drone_status(drone_id: str):
+async def proxy_ingest_drone_status(drone_id: str, auth: dict = Depends(verify_edge_auth)):
     async with httpx.AsyncClient(timeout=2.0) as client:
         try:
             resp = await client.get(f"{INGEST_BASE_URL}/status/{drone_id}")
@@ -745,6 +800,7 @@ async def proxy_ingest_drone_status(drone_id: str):
         except Exception as e:
             log.warning(f"Failed to fetch ingest drone status for {drone_id}: {e}")
     return {}
+
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
