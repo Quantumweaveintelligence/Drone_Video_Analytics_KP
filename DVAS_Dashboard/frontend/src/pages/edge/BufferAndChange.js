@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import AppShell from '@/components/layout/AppShell';
 import { AreaChart, Area, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
 import { Clock, Scan } from 'lucide-react';
+import { authFetch } from '@/lib/api';
 
 // Utility to generate initial blank timeline data
 const generateRealisticDummyHistory = () => {
@@ -68,7 +69,7 @@ export default function BufferAndChange() {
     let mounted = true;
     const poll = async () => {
       try {
-        const resp = await fetch('/edge-api/api/edge/analytics');
+        const resp = await authFetch('/edge-api/api/edge/analytics');
         if (resp.ok && mounted) {
           const json = await resp.json();
           setData(json);

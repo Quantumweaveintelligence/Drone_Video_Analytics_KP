@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import AppShell from "@/components/layout/AppShell";
 import { AreaChart, Area, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
 import { Send as Drone, AlertTriangle as Warning, Info } from "lucide-react";
+import { authFetch } from "@/lib/api";
 
 // Mock data generation for charts
 const generateChartData = (base, variance, count) => {
@@ -29,9 +30,9 @@ export default function Dashboard() {
     const poll = async () => {
       try {
         const [statusResp, telResp, missionResp] = await Promise.all([
-          fetch('/edge-api/api/edge/status'),
-          fetch('/edge-api/api/edge/telemetry'),
-          fetch('/edge-api/api/edge/mission/active'),
+          authFetch('/edge-api/api/edge/status'),
+          authFetch('/edge-api/api/edge/telemetry'),
+          authFetch('/edge-api/api/edge/mission/active'),
         ]);
         const status = await statusResp.json();
         const tel = await telResp.json();

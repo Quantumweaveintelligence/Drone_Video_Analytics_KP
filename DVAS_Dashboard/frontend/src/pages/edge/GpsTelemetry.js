@@ -5,6 +5,7 @@ import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { AreaChart, Area, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
 import { Compass, MapPin } from 'lucide-react';
+import { authFetch } from '@/lib/api';
 
 // Fix Leaflet's default icon path issues in React
 delete L.Icon.Default.prototype._getIconUrl;
@@ -42,7 +43,7 @@ export default function GpsTelemetry() {
   useEffect(() => {
     const timer = setInterval(async () => {
       try {
-        const resp = await fetch('/edge-api/api/edge/telemetry');
+        const resp = await authFetch('/edge-api/api/edge/telemetry');
         const tel = await resp.json();
         if (tel.latitude && tel.longitude) {
           setTelemetry(prev => ({

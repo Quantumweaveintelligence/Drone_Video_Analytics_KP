@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import AppShell from '@/components/layout/AppShell';
 import { Target, Play, Trash, XCircle, CheckCircle, Cpu } from 'lucide-react';
+import { authFetch } from '@/lib/api';
 
 export default function MissionControl() {
   const [activeMission, setActiveMission] = useState(null);
@@ -63,7 +64,7 @@ export default function MissionControl() {
     if (!form.name || !form.drone) return;
     setLoading(true);
     try {
-      const resp = await fetch('/edge-api/api/edge/mission/start', {
+      const resp = await authFetch('/edge-api/api/edge/mission/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -100,11 +101,10 @@ export default function MissionControl() {
 
         // Save to backend database
         try {
-          await fetch('/api/missions', {
+          await authFetch('/api/missions', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              'Authorization': `Bearer ${localStorage.getItem('token')}`
             },
             body: JSON.stringify({
               mission_id: data.mission_id,
@@ -128,7 +128,7 @@ export default function MissionControl() {
 
   const handleEndMission = async () => {
     try {
-      const resp = await fetch('/edge-api/api/edge/mission/end', { method: 'POST' });
+      const resp = await authFetch('/edge-api/api/edge/mission/end', { method: 'POST' });
       const data = await resp.json();
       if (data.status === 'ended') {
         setMissionLog(prev => prev.map(m => 
@@ -140,11 +140,8 @@ export default function MissionControl() {
         // Update backend database
         if (activeMission?.id) {
           try {
-            await fetch(`/api/missions/${activeMission.id}/end`, {
+            await authFetch(`/api/missions/${activeMission.id}/end`, {
               method: 'PATCH',
-              headers: {
-                'Authorization': `Bearer ${localStorage.getItem('token')}`
-              }
             });
           } catch (backendErr) {
             console.error("Failed to mark mission as ended in backend:", backendErr);
@@ -162,7 +159,7 @@ export default function MissionControl() {
   useEffect(() => {
     const poll = async () => {
       try {
-        const resp = await fetch('/edge-api/api/edge/mission/active');
+        const resp = await authFetch('/edge-api/api/edge/mission/active');
         const data = await resp.json();
         if (data.active) {
           setServerSend(data.server_send_enabled || false);
@@ -187,7 +184,7 @@ export default function MissionControl() {
 
   const handleToggleServerSend = async () => {
     try {
-      const resp = await fetch('/edge-api/api/edge/mission/toggle-ingest', {
+      const resp = await authFetch('/edge-api/api/edge/mission/toggle-ingest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled: !serverSend })
@@ -201,7 +198,7 @@ export default function MissionControl() {
 
   const handleTogglePipeline = async () => {
     try {
-      const resp = await fetch('/edge-api/api/edge/mission/toggle-pipeline', {
+      const resp = await authFetch('/edge-api/api/edge/mission/toggle-pipeline', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled: !pipelineEnabled })

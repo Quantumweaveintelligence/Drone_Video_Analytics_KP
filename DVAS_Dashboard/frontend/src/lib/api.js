@@ -8,6 +8,29 @@ export const api = axios.create({
   withCredentials: true,
 });
 
+export const getAuthToken = () => {
+  return localStorage.getItem("dvas_token") || localStorage.getItem("token") || "";
+};
+
+export const getAuthHeaders = () => {
+  const token = getAuthToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+};
+
+export const authFetch = async (url, options = {}) => {
+  const token = getAuthToken();
+  const headers = {
+    ...(options.headers || {}),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+
+  return fetch(url, {
+    ...options,
+    headers,
+    credentials: "include",
+  });
+};
+
 // Auto-refresh token on 401 response and replay original request transparently
 api.interceptors.response.use(
   (response) => response,

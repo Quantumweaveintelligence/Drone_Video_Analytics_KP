@@ -77,16 +77,20 @@ export function useIngestServer() {
 
   // ── WebSocket connection to ingest server relay ───────────────────────────
   useEffect(() => {
-    const token = localStorage.getItem("dvas_token");
-    if (!token) return;
-
-    const wsBase = API.replace(/^http/, "ws");
-    const url = `${wsBase}/ingest-server/ws?token=${encodeURIComponent(token)}`;
-
     let closed = false;
     let heartbeat;
 
-    const connect = () => {
+    const connect = async () => {
+      if (closed) return;
+      let token = localStorage.getItem("dvas_token") || localStorage.getItem("token") || "";
+      if (!token) {
+        if (!closed) setTimeout(connect, 4000);
+        return;
+      }
+
+      const wsBase = API.replace(/^http/, "ws");
+      const url = `${wsBase}/ingest-server/ws?token=${encodeURIComponent(token)}`;
+
       const ws = new WebSocket(url);
       wsRef.current = ws;
 
@@ -114,10 +118,18 @@ export function useIngestServer() {
         } catch {}
       };
 
-      ws.onclose = () => {
+      ws.onclose = async (ev) => {
         setWsConnected(false);
         clearInterval(heartbeat);
-        if (!closed) setTimeout(connect, 4000);
+        if (closed) return;
+
+        // If auth expired (code 4401/4403/1008), attempt silent token refresh
+        if (ev.code === 4401 || ev.code === 4403 || ev.code === 1008) {
+          try {
+            await api.post("/auth/refresh");
+          } catch {}
+        }
+        setTimeout(connect, 4000);
       };
 
       ws.onerror = () => {

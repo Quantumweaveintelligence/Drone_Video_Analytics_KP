@@ -2769,7 +2769,8 @@ def _authz_ws(token: str) -> Optional[dict]:
 
 @app.websocket("/api/ws")
 async def ws_endpoint(websocket: WebSocket, token: str = ""):
-    payload = _authz_ws(token)
+    raw_token = token or websocket.cookies.get("dvas_access_token", "")
+    payload = _authz_ws(raw_token)
     if not payload:
         await websocket.close(code=4401)
         return

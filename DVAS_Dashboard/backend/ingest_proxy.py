@@ -469,9 +469,9 @@ async def ingest_ws_relay(ws: WebSocket):
     """
     await ws.accept()
 
-    # Auth check — extract token from query param
+    # Auth check — extract token from query param or cookie
     from server import _authz_ws
-    token = ws.query_params.get("token", "")
+    token = ws.query_params.get("token", "") or ws.cookies.get("dvas_access_token", "")
     payload = _authz_ws(token)
     if not payload or payload.get("role") != "system_administrator":
         await ws.close(code=4403)

@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import AppShell from '@/components/layout/AppShell';
 import { Camera } from 'lucide-react';
 import { AreaChart, Area, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
+import { authFetch, getAuthToken } from '@/lib/api';
 
 export default function LiveMonitoring() {
   const [metrics, setMetrics] = useState({ fps: 0, decode_latency_ms: 0, connected: false });
@@ -14,8 +15,8 @@ export default function LiveMonitoring() {
     const poll = async () => {
       try {
         const [statusResp, missionResp] = await Promise.all([
-          fetch('/edge-api/api/edge/status'),
-          fetch('/edge-api/api/edge/mission/active'),
+          authFetch('/edge-api/api/edge/status'),
+          authFetch('/edge-api/api/edge/mission/active'),
         ]);
         const status = await statusResp.json();
         const missionData = await missionResp.json();
@@ -33,6 +34,9 @@ export default function LiveMonitoring() {
     const interval = setInterval(poll, 2000);
     return () => clearInterval(interval);
   }, []);
+
+  const token = getAuthToken();
+  const streamUrl = token ? `/edge-api/stream/live?token=${encodeURIComponent(token)}` : '/edge-api/stream/live';
 
   return (
     <AppShell title="Live Monitoring" subtitle="Real-time drone video feed with stream telemetry">
@@ -93,7 +97,7 @@ export default function LiveMonitoring() {
             <div className="relative w-full aspect-video bg-black rounded-lg overflow-hidden border border-slate-800 shadow-2xl">
               {/* MJPEG stream from dvas_edge */}
               <img
-                src="/edge-api/stream/live"
+                src={streamUrl}
                 alt="Live drone feed"
                 className="w-full h-full object-cover"
                 style={{ minHeight: '100%' }}
