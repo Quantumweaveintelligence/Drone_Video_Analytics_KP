@@ -34,7 +34,20 @@ export function AuthProvider({ children }) {
         const activeData = await activeResp.json();
         if (activeData.active && activeData.mission_id) {
           await authFetch('/edge-api/api/edge/mission/end', { method: 'POST' });
-          await api.patch(`/missions/${activeData.mission_id}/end`);
+          await authFetch(`/api/missions/${activeData.mission_id}/end`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' }
+          });
+          
+          // Update the local storage mission log so it reflects the change when logging back in
+          const savedLog = localStorage.getItem('dvas_mission_log');
+          if (savedLog) {
+            try {
+              let logs = JSON.parse(savedLog);
+              logs = logs.map(m => m.id === activeData.mission_id ? { ...m, status: 'completed', end: new Date().toLocaleTimeString('en-GB') } : m);
+              localStorage.setItem('dvas_mission_log', JSON.stringify(logs));
+            } catch(e) {}
+          }
         }
       }
     } catch (e) {
