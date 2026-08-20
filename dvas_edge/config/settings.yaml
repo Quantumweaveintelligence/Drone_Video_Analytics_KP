@@ -82,7 +82,7 @@ ingest:
 
   # Keycloak client credentials — match values configured in Keycloak on Ubuntu
   client_id:     "drone-ingest-client"
-  client_secret: "j2Icr4lPJHHlvcJBu04nIH7A74k3cl4c"   # rotate after pilot
+  client_secret: "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn"   # rotate after pilot
 
   # Operator credentials for Resource Owner Password Grant
   username: "operator_001"

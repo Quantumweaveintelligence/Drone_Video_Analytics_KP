@@ -78,13 +78,12 @@ services:
       - SIMULATION__ENABLED=true
       - INGEST__ENABLED=true
       - INGEST__DRONE_ID=DRN-004
-      - KC_CLIENT_SEC=yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn
+      - INGEST__CLIENT_SECRET=yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn
       - INGEST__URL=http://10.123.225.250/ingest/frame
-      - INGEST_URL=http://10.123.225.250/ingest/frame
-      - TOKEN_URL=http://10.123.225.250:8080/realms/kerala-police-drone/protocol/openid-connect/token
-      - MISSION_START_URL=http://10.123.225.250/ingest/mission/start
-      - MISSION_END_URL=http://10.123.225.250/ingest/mission/end
-      - TLS_VERIFY=false
+      - INGEST__TOKEN_URL=http://10.123.225.250:8080/realms/kerala-police-drone/protocol/openid-connect/token
+      - INGEST__MISSION_START_URL=http://10.123.225.250/ingest/mission/start
+      - INGEST__MISSION_END_URL=http://10.123.225.250/ingest/mission/end
+      - INGEST__TLS_VERIFY=false
     networks:
       - default
       - drone-net

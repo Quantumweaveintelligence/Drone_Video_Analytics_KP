@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useState } from "react";
-import { api } from "@/lib/api";
+import { api, authFetch } from "@/lib/api";
 
 const AuthCtx = createContext(null);
 
@@ -27,6 +27,20 @@ export function AuthProvider({ children }) {
   };
 
   const logout = async () => {
+    try {
+      // If there is an active mission on the edge, properly end it so frames stop sending
+      const activeResp = await authFetch('/edge-api/api/edge/mission/active');
+      if (activeResp.ok) {
+        const activeData = await activeResp.json();
+        if (activeData.active && activeData.mission_id) {
+          await authFetch('/edge-api/api/edge/mission/end', { method: 'POST' });
+          await api.patch(`/missions/${activeData.mission_id}/end`);
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to clean up edge mission on logout', e);
+    }
+
     try { await api.post("/auth/logout"); } catch {}
     setUser(false);
   };

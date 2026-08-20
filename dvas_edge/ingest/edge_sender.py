@@ -39,10 +39,10 @@ import httpx
 
 import os
 
-INGEST_URL  = os.getenv("INGEST_URL",  "http://172.23.46.250/ingest/frame")
-TOKEN_URL   = os.getenv("TOKEN_URL",   "http://172.23.46.250:8080/realms/kerala-police-drone/protocol/openid-connect/token")
+INGEST_URL  = os.getenv("INGEST_URL",  "http://10.123.225.250/ingest/frame")
+TOKEN_URL   = os.getenv("TOKEN_URL",   "http://10.123.225.250:8080/realms/kerala-police-drone/protocol/openid-connect/token")
 CLIENT_ID   = os.getenv("KC_CLIENT_ID",  "drone-ingest-client")
-CLIENT_SEC  = os.getenv("KC_CLIENT_SEC", "j2Icr4lPJHHlvcJBu04nIH7A74k3cl4c")  # rotate after pilot
+CLIENT_SEC  = os.getenv("INGEST__CLIENT_SECRET", os.getenv("KC_CLIENT_SEC", "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn"))
 
 USERNAME    = os.getenv("EDGE_USERNAME", "operator_001")
 PASSWORD    = os.getenv("EDGE_PASSWORD", "Operator@001")  # rotate after pilot
@@ -346,7 +346,7 @@ class IngestClient:
         """Register mission start with the ingest server."""
         mission_start_url = os.getenv(
             "MISSION_START_URL",
-            "http://172.23.46.250/ingest/mission/start"
+            "http://10.123.225.250/ingest/mission/start"
         )
         token = await self.get_token()
         payload = {
@@ -371,7 +371,7 @@ class IngestClient:
         """Register mission end with the ingest server."""
         mission_end_url = os.getenv(
             "MISSION_END_URL",
-            "http://172.23.46.250/ingest/mission/end"
+            "http://10.123.225.250/ingest/mission/end"
         )
         token = await self.get_token()
         client = await self._get_client()

@@ -41,7 +41,7 @@ from models import Base, AuditLog, Mission, Drone, Alert, Evidence, Export, Mode
 from ingest_proxy import ingest_api, _proxy_get
 
 # ---------- Keycloak Setup ----------
-KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "http://172.23.46.250:8080")
+KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "http://10.123.225.250:8080")
 KEYCLOAK_REALM = os.environ.get("KC_REALM", "kerala-police-drone")
 KEYCLOAK_CLIENT_ID = os.environ.get("KC_CLIENT_ID", "dvas-dashboard-client")
 KEYCLOAK_CLIENT_SECRET = os.environ.get("KC_CLIENT_SECRET", "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn")

@@ -62,15 +62,15 @@ export default function Dashboard() {
   const kpis = [
     { label: "Active Mission", value: activeMission ? "1" : "0", status: activeMission ? "green" : "neutral", unit: "" },
     { label: "Drone Link", value: edgeStatus?.connected ? "UP" : "DOWN", status: edgeStatus?.connected ? "green" : "red", unit: "" },
-    { label: "Stream FPS", value: edgeStatus ? Math.round(edgeStatus.fps) : "--", status: "cyan", unit: "fps" },
+    { label: "Stream FPS", value: edgeStatus?.fps !== undefined ? Math.round(edgeStatus.fps) : "--", status: "cyan", unit: "fps" },
     { label: "Bitrate", value: "4.2", status: "blue", unit: "Mbps" },
-    { label: "Buffer Util.", value: edgeStatus ? Math.round(edgeStatus.buffer_fill_pct) : "--", status: edgeStatus?.buffer_fill_pct > 80 ? "red" : edgeStatus?.buffer_fill_pct > 60 ? "amber" : "neutral", unit: "%" },
-    { label: "CPU Usage", value: edgeStatus ? Math.round(edgeStatus.cpu_pct) : "--", status: edgeStatus?.cpu_pct > 80 ? "red" : "neutral", unit: "%" },
-    { label: "GPU Usage", value: edgeStatus ? Math.round(edgeStatus.gpu_pct) : "--", status: edgeStatus?.gpu_pct > 80 ? "red" : "purple", unit: "%" },
+    { label: "Buffer Util.", value: edgeStatus?.buffer_fill_pct !== undefined ? Math.round(edgeStatus.buffer_fill_pct) : "--", status: edgeStatus?.buffer_fill_pct > 80 ? "red" : edgeStatus?.buffer_fill_pct > 60 ? "amber" : "neutral", unit: "%" },
+    { label: "CPU Usage", value: edgeStatus?.cpu_pct !== undefined ? Math.round(edgeStatus.cpu_pct) : "--", status: edgeStatus?.cpu_pct > 80 ? "red" : "neutral", unit: "%" },
+    { label: "GPU Usage", value: edgeStatus?.gpu_pct !== undefined ? Math.round(edgeStatus.gpu_pct) : "--", status: edgeStatus?.gpu_pct > 80 ? "red" : "purple", unit: "%" },
     { label: "Storage", value: "62", status: "amber", unit: "%" },
-    { label: "Upload Queue", value: edgeStatus ? edgeStatus.upload_queue : "--", status: "neutral", unit: "" },
-    { label: "Selected Frames", value: edgeStatus ? edgeStatus.frames_selected.toLocaleString() : "--", status: "green", unit: "" },
-    { label: "Discarded Frames", value: edgeStatus ? (edgeStatus.frames_total - edgeStatus.frames_selected).toLocaleString() : "--", status: "neutral", unit: "" },
+    { label: "Upload Queue", value: edgeStatus?.upload_queue !== undefined ? edgeStatus.upload_queue : "--", status: "neutral", unit: "" },
+    { label: "Selected Frames", value: edgeStatus?.frames_selected !== undefined ? edgeStatus.frames_selected.toLocaleString() : "--", status: "green", unit: "" },
+    { label: "Discarded Frames", value: edgeStatus?.frames_total !== undefined && edgeStatus?.frames_selected !== undefined ? (edgeStatus.frames_total - edgeStatus.frames_selected).toLocaleString() : "--", status: "neutral", unit: "" },
     { label: "Drone Battery", value: telemetry ? Math.round(telemetry.battery_pct) : "--", status: telemetry?.battery_pct > 50 ? "green" : telemetry?.battery_pct > 20 ? "amber" : "red", unit: "%" },
   ];
 
