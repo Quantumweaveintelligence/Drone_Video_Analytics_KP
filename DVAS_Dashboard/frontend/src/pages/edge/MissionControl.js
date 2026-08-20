@@ -14,16 +14,47 @@ export default function MissionControl() {
     const saved = localStorage.getItem('dvas_mission_log');
     if (saved) {
       try {
-        return JSON.parse(saved);
+        const parsed = JSON.parse(saved);
+        if (parsed.length > 2 || (parsed.length > 0 && parsed[0].id !== "MSN-9941-BRAVO")) {
+          return parsed;
+        }
       } catch (e) {
         console.error("Failed to parse saved mission log", e);
       }
     }
-    return [
-      { id: "MSN-9941-BRAVO", designation: "Traffic Monitoring", drone: "DRN-002", operator: "A. Sharma", location: "Junction 12", start: "11:15:00", end: "13:45:00", status: "completed" },
-      { id: "MSN-9940-CHARLIE", designation: "VIP Route Sweep", drone: "DRN-001", operator: "K. Kumar", location: "Airport Road", start: "08:30:00", end: "10:15:00", status: "completed" },
-    ];
+    return [];
   });
+
+  useEffect(() => {
+    const fetchHistoricalMissions = async () => {
+      try {
+        const resp = await authFetch('/api/missions');
+        if (resp.ok) {
+          const data = await resp.json();
+          if (data && data.length > 0) {
+            setMissionLog(data.map(m => ({
+              id: m.mission_id,
+              designation: m.name,
+              drone: m.drone_id,
+              operator: m.operator_name,
+              location: m.zone || m.location || '',
+              start: m.started_at ? new Date(m.started_at).toLocaleTimeString('en-GB') : '',
+              end: m.ended_at ? new Date(m.ended_at).toLocaleTimeString('en-GB') : '',
+              status: m.status
+            })));
+            return;
+          }
+        }
+      } catch (err) {}
+      
+      // Fallback mock data if DB is completely empty and we have no local cache
+      setMissionLog(prev => prev.length > 0 ? prev : [
+        { id: "MSN-9941-BRAVO", designation: "Traffic Monitoring", drone: "DRN-002", operator: "A. Sharma", location: "Junction 12", start: "11:15:00", end: "13:45:00", status: "completed" },
+        { id: "MSN-9940-CHARLIE", designation: "VIP Route Sweep", drone: "DRN-001", operator: "K. Kumar", location: "Airport Road", start: "08:30:00", end: "10:15:00", status: "completed" },
+      ]);
+    };
+    fetchHistoricalMissions();
+  }, []);
 
   useEffect(() => {
     localStorage.setItem('dvas_mission_log', JSON.stringify(missionLog));
