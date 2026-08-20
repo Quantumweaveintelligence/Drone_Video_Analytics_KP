@@ -994,6 +994,27 @@ async def list_users(user: dict = Depends(require_roles("system_administrator"))
     return await list_users_from_keycloak()
 
 
+@api.get("/audit/actors")
+async def list_audit_actors(
+    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+):
+    """
+    Returns a lightweight list of Keycloak users for the Audit Log page's Actor dropdown.
+    Accessible to senior_officer and system_administrator (unlike /users which is sys-admin only).
+    System administrators receive the full list; senior officers receive users scoped to their jurisdiction.
+    """
+    all_users = await list_users_from_keycloak()
+    if user["role"] == "system_administrator":
+        # Sys admin sees all actors (for cross-system audit view)
+        return [{"id": u["id"], "name": u["name"], "email": u["email"],
+                 "role": u["role"], "jurisdiction": u.get("jurisdiction", "")} for u in all_users]
+    else:
+        # Senior Officer — filter to own jurisdiction
+        return [{"id": u["id"], "name": u["name"], "email": u["email"],
+                 "role": u["role"], "jurisdiction": u.get("jurisdiction", "")}
+                for u in all_users if u.get("jurisdiction") == user.get("jurisdiction")]
+
+
 class UserCreateIn(BaseModel):
     email: EmailStr
     name: str
@@ -1751,22 +1772,26 @@ async def crowd_health(user: dict = Depends(get_current_user)):
 
 # ── Person Analytics ──────────────────────────────────────────────────────────
 @api.get("/analytics/person/identities")
-async def person_identities(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 50):
+async def person_identities(user: dict = Depends(get_current_user), drone_id: str = "", mission_id: str = "", limit: int = 50):
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{PERSON_URL}/persons/identities?limit={limit}"
     if drone_id:
         url += f"&drone_id={drone_id}"
+    if mission_id:
+        url += f"&mission_id={mission_id}"
     return await _analytics_get(url)
 
 
 @api.get("/analytics/person/gallery")
-async def person_gallery(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 60):
+async def person_gallery(user: dict = Depends(get_current_user), drone_id: str = "", mission_id: str = "", limit: int = 60):
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     url = f"{PERSON_URL}/faces/gallery?limit={limit}"
     if drone_id:
         url += f"&drone_id={drone_id}"
+    if mission_id:
+        url += f"&mission_id={mission_id}"
     return await _analytics_get(url)
 
 
@@ -1812,6 +1837,41 @@ async def person_reid_trigger(user: dict = Depends(get_current_user)):
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     return await _analytics_post(f"{PERSON_URL}/reid/trigger", {})
+
+
+@api.post("/analytics/person/deduplicate")
+async def person_deduplicate_mission(user: dict = Depends(get_current_user), body: dict = {}):
+    """Trigger mission-scoped face deduplication."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_post(f"{PERSON_URL}/faces/deduplicate/mission", body)
+
+
+@api.get("/analytics/person/dedup/progress")
+async def person_dedup_progress(user: dict = Depends(get_current_user), mission_id: str = ""):
+    """Get current mission deduplication progress."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    url = f"{PERSON_URL}/faces/deduplicate/progress"
+    if mission_id:
+        url += f"?mission_id={mission_id}"
+    return await _analytics_get(url)
+
+
+@api.get("/analytics/person/missions/dedup")
+async def person_missions_dedup(user: dict = Depends(get_current_user)):
+    """List missions with their face embedding counts and dedup status."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{PERSON_URL}/missions/dedup-status")
+
+
+@api.get("/analytics/person/missions/dedup-runs")
+async def person_missions_dedup_runs(user: dict = Depends(get_current_user)):
+    """List all mission deduplication run history records."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{PERSON_URL}/missions/dedup-runs")
 
 
 # ── Analytics Service Health Proxies ─────────────────────────────────────────
@@ -1880,6 +1940,51 @@ async def person_stream_start(user: dict = Depends(get_current_user)):
 async def person_health_proxy(user: dict = Depends(get_current_user)):
     """Proxy person-analyzer health including stream_running status."""
     return await _analytics_get(f"{PERSON_URL}/health")
+
+
+@api.get("/analytics/person/stream/stop")
+async def person_stream_stop(user: dict = Depends(get_current_user)):
+    """Stop the person detection stream loop."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{PERSON_URL}/stream/stop")
+
+
+@api.get("/analytics/person/annotated")
+async def person_annotated_frame(user: dict = Depends(get_current_user), drone_id: str = ""):
+    """
+    Proxy the latest annotated JPEG frame (person + face bounding boxes)
+    from person-analyzer. Used by the Person Tracking live feed.
+    Returns binary JPEG — NOT JSON.
+    """
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    try:
+        params = {"drone_id": drone_id} if drone_id else {}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{PERSON_URL}/annotated/latest", params=params)
+        if r.status_code == 200:
+            return Response(
+                content=r.content,
+                media_type="image/jpeg",
+                headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma":        "no-cache",
+                },
+            )
+        raise HTTPException(r.status_code, "No annotated frame available")
+    except httpx.RequestError:
+        raise HTTPException(503, "Person analyzer unavailable")
+
+@api.get("/analytics/person/live")
+async def person_live_buffer(user: dict = Depends(get_current_user), drone_id: str = ""):
+    """Proxy in-memory live person buffer (crop pairs) from person-analyzer."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    url = f"{PERSON_URL}/persons/live"
+    if drone_id:
+        url += f"?drone_id={drone_id}"
+    return await _analytics_get(url)
 
 
 # ── Vehicle Analytics ─────────────────────────────────────────────────────────

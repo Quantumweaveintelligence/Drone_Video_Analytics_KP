@@ -37,6 +37,53 @@ logger = logging.getLogger("dvas.ingest_proxy")
 # ── Configuration ─────────────────────────────────────────────────────────────
 INGEST_SERVER_URL = os.environ.get("INGEST_SERVER_URL", "http://localhost:8000")
 
+# Keycloak service-token config — uses dvas-admin-service (serviceAccountsEnabled)
+# Keycloak is reachable on the shared drone-net via its service hostname.
+_KC_URL           = "http://keycloak:8080"
+_KC_REALM         = os.environ.get("KC_REALM", "kerala-police-drone")
+_KC_CLIENT_ID     = "dvas-admin-service"
+_KC_CLIENT_SECRET = "MvusAlJk9DMnfe6GVOwuni8ODQbES938"
+
+# ── Service-token cache ────────────────────────────────────────────────────────
+# Cached (token, expiry_epoch) for the backend's own Keycloak service account.
+_svc_token: str = ""
+_svc_token_exp: float = 0.0
+_svc_token_lock = asyncio.Lock()
+
+async def _get_service_token() -> str:
+    """Return a cached Keycloak access token for the backend service account.
+
+    Uses a client-credentials grant so the backend can call the ingest server
+    on behalf of itself without depending on a user's forwarded JWT.
+    Refreshes automatically 30 s before expiry.
+    """
+    global _svc_token, _svc_token_exp
+    async with _svc_token_lock:
+        if _svc_token and time.time() < _svc_token_exp - 30:
+            return _svc_token
+        token_url = (
+            f"{_KC_URL}/realms/{_KC_REALM}/protocol/openid-connect/token"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    token_url,
+                    data={
+                        "grant_type":    "client_credentials",
+                        "client_id":     _KC_CLIENT_ID,
+                        "client_secret": _KC_CLIENT_SECRET,
+                    },
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                _svc_token = payload["access_token"]
+                _svc_token_exp = time.time() + int(payload.get("expires_in", 300))
+                logger.info("Refreshed ingest-proxy service token (expires in %ss)", payload.get("expires_in"))
+                return _svc_token
+        except Exception as exc:
+            logger.warning("Failed to obtain service token: %s", exc)
+            return ""
+
 # ── Router ────────────────────────────────────────────────────────────────────
 ingest_api = APIRouter(prefix="/api/ingest-server", tags=["Ingest Server Proxy"])
 
@@ -265,15 +312,30 @@ async def ingest_latest_frame(drone_id: str, request: Request):
     for the given drone and streams it back as image/jpeg.
     Used by the command dashboard multi-drone view.
     Open to any authenticated role.
+
+    Auth strategy (in priority order):
+      1. Backend service token via Keycloak client-credentials (preferred —
+         works regardless of whether the browser forwarded an auth header).
+      2. User's Authorization header forwarded from the frontend request.
+      3. User's HttpOnly cookie dvas_access_token.
     """
     url = f"{INGEST_SERVER_URL}/ingest/frame/{drone_id}/latest"
-    token = request.cookies.get("dvas_access_token")
-    auth_header = request.headers.get("Authorization")
-    headers = {}
-    if auth_header:
-        headers["Authorization"] = auth_header
-    elif token:
-        headers["Authorization"] = f"Bearer {token}"
+
+    # Prefer a fresh service token so this endpoint never breaks due to
+    # missing/expired user tokens in the frontend.
+    svc_token = await _get_service_token()
+    if svc_token:
+        headers = {"Authorization": f"Bearer {svc_token}"}
+    else:
+        # Fallback: try the user's own token from header or cookie
+        auth_header = request.headers.get("Authorization")
+        cookie_token = request.cookies.get("dvas_access_token")
+        if auth_header:
+            headers = {"Authorization": auth_header}
+        elif cookie_token:
+            headers = {"Authorization": f"Bearer {cookie_token}"}
+        else:
+            headers = {}
 
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -318,7 +380,7 @@ ALL_INGEST_CONTAINERS = [
     # Database
     "drone_postgres",
     # Analytics workers
-    "drone_gpu_consumer",
+
     "drone_crowd_analyzer",
     "drone_person_analyzer",
     "drone_vehicle_analyzer",

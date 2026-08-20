@@ -27,15 +27,7 @@ groups:
       #     summary: "Ingest queue depth exceeding 800"
       #     description: "Queue {{ $labels.stream }} depth is {{ $value }} — GPU consumer may be falling behind."
 
-      # ── GPU consumer container restarting ─────────────────────────────────
-      - alert: GPUConsumerRestarting
-        expr: rate(kube_pod_container_status_restarts_total{container="gpu-consumer"}[5m]) > 0
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "GPU consumer is restarting"
-          description: "The gpu-consumer container has restarted more than once in the last 5 minutes."
+
 
   - name: dvas_vpn
     rules:

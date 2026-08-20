@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { API } from "@/lib/api";
+import { API, api } from "@/lib/api";
 
 /**
  * Live WebSocket connection to /api/ws.
@@ -16,13 +16,9 @@ export function useDvasSocket(onMessage) {
     let heartbeat;
     const connect = async () => {
       if (closed) return;
-      let token = localStorage.getItem("dvas_token") || localStorage.getItem("token") || "";
-      if (!token) {
-        if (!closed) setTimeout(connect, 3000);
-        return;
-      }
+      
       const wsBase = API.replace(/^http/, "ws");
-      const url = `${wsBase}/ws?token=${encodeURIComponent(token)}`;
+      const url = `${wsBase}/ws`;
 
       const ws = new WebSocket(url);
       ref.current = ws;
@@ -38,8 +34,8 @@ export function useDvasSocket(onMessage) {
         clearInterval(heartbeat);
         if (closed) return;
 
-        // If auth expired (code 4401/4403/1008), attempt silent token refresh
-        if (ev.code === 4401 || ev.code === 4403 || ev.code === 1008) {
+        // If auth expired (code 4401/4403/1008) or rejected connection (1006), attempt silent token refresh
+        if (ev.code === 4401 || ev.code === 4403 || ev.code === 1008 || ev.code === 1006) {
           try {
             await api.post("/auth/refresh");
           } catch {}

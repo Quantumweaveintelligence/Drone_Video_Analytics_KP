@@ -255,31 +255,6 @@ services:
   # ANALYTICS LAYER
   # ════════════════════════════════════════════════════════════════════════════
 
-  # ── GPU Batch Consumer ────────────────────────────────────────────────────────
-  # Reads frames from Valkey streams, runs GPU inference, emits confirmed events.
-  # Replace run_gpu_inference() stub with YOLOv8 / DeepSORT when ready.
-  gpu-consumer:
-    build:
-      context:    .
-      dockerfile: Dockerfile.gpu_consumer
-    container_name: drone_gpu_consumer
-    networks: [drone-net]
-    restart: unless-stopped
-    # GPU access requires Docker Engine + nvidia-container-toolkit.
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    environment:
-      REDIS_URL:  redis://valkey:6379/0
-      DRONE_IDS:  "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
-      BATCH_SIZE: "16"
-    depends_on:
-      valkey:
-        condition: service_healthy
     healthcheck:
       test:     ["CMD-SHELL", "kill -0 1 || exit 1"]
       interval: 30s

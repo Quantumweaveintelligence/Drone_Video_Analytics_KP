@@ -207,7 +207,21 @@ export default function AdminDashboard() {
                 </div>
               )}
 
-              {user.role === "system_administrator" && <div className="p-2 border-b border-slate-800 bg-amber-500/5 mono text-[11px] text-amber-300">Sys Admin view limited to own actions.</div>}
+              {user.role === "system_administrator" && (
+                <div className="p-3 border-b border-slate-800 bg-slate-950 flex items-center justify-between flex-wrap gap-2">
+                  <div className="mono text-[11px] text-amber-300 flex items-center gap-2">
+                    <ShieldAlert size={14} className="text-amber-400 shrink-0" />
+                    <span>Sys Admin view limited to own actions. Full styled Audit Log with advanced filters, diff viewer & CSV export available on dedicated page.</span>
+                  </div>
+                  <button
+                    data-testid="open-full-audit-page"
+                    onClick={() => nav("/audit")}
+                    className="px-3 py-1 bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium rounded transition-colors flex items-center gap-1.5"
+                  >
+                    <ClipboardList size={13} /> Open Full Audit Log Page →
+                  </button>
+                </div>
+              )}
 
               {/* Unit Detail view — full log table */}
               {(user.role !== "senior_officer" || auditScope === "detail") && (

@@ -8,6 +8,7 @@ import EdgeRouter from "@/pages/edge/EdgeRouter";
 import IngestDashboard from "@/pages/IngestDashboard";
 import CommandDashboard from "@/pages/CommandDashboard";
 import AdminDashboard from "@/pages/AdminDashboard";
+import AuditLogPage from "@/pages/AuditLogPage";
 
 function Splash() {
   return <div className="min-h-screen" style={{ background: "var(--dvas-root)" }} />;
@@ -40,6 +41,7 @@ export default function App() {
           <Route path="/ingest" element={<Guard allow={["system_administrator"]}><IngestDashboard /></Guard>} />
           <Route path="/command" element={<Guard allow={["control_room_officer","senior_officer"]}><CommandDashboard /></Guard>} />
           <Route path="/admin" element={<Guard allow={["senior_officer","system_administrator"]}><AdminDashboard /></Guard>} />
+          <Route path="/audit" element={<Guard allow={["system_administrator"]}><AuditLogPage /></Guard>} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </BrowserRouter>

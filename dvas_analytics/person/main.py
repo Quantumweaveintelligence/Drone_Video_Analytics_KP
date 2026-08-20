@@ -6,9 +6,11 @@ Person tracking with ByteTrack, face detection, Re-ID, and MinIO crop storage.
 import asyncio
 import base64
 import hashlib
+import json as _json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -26,6 +28,8 @@ from shared.db import (
     write_confirmed_event, get_all_face_embeddings, delete_face_embeddings,
     write_face_embedding, update_face_embedding_cluster,
     write_evidence_frame, get_person_identities, upsert_person_identity,
+    get_face_embeddings_by_mission, get_distinct_missions_face_embeddings,
+    upsert_dedup_run, get_dedup_run, get_dedup_runs,
 )
 from shared.redis_client import (
     close_client, publish_analytics_result, publish_confirmed_event, xread_frames,
@@ -68,6 +72,17 @@ _reid_task:    Optional[asyncio.Task] = None
 _stream_running = False
 _frames_processed = 0
 _reid_frame_counter = 0
+_last_annotated_frames: dict = {}  # {drone_id: jpeg_bytes}
+_active_drone_missions: dict = {}  # {drone_id: mission_id}
+_live_person_buffer: dict = {}     # {(drone_id, tracker_id): {entry dict}}
+_LIVE_BUFFER_MAX = 100
+_LIVE_BUFFER_STALE_SEC = 30
+_CROP_REFRESH_EVERY = 5           # refresh crops every Nth frame per tracker
+_dedup_progress: dict = {          # mission dedup progress tracking
+    "mission_id": None, "status": "idle", "progress_pct": 0,
+    "total_embeddings": 0, "processed": 0, "unique_found": 0,
+    "error": None,
+}
 
 
 @app.on_event("startup")
@@ -104,6 +119,7 @@ async def health():
         "model_loaded":     analyzer.ready if analyzer else False,
         "stream_running":   _stream_running,
         "frames_processed": _frames_processed,
+        "active_missions":  dict(_active_drone_missions),
     }
 
 
@@ -207,9 +223,40 @@ async def _stream_loop():
                     if frame is None:
                         continue
 
+                    # ── Extract mission_id from frame metadata ────────
+                    mission_id = None
+                    raw_meta = f.get("metadata", "")
+                    if raw_meta:
+                        try:
+                            meta = _json.loads(raw_meta)
+                            mission_id = meta.get("mission_id") or None
+                        except (_json.JSONDecodeError, TypeError):
+                            pass
+                    if mission_id:
+                        _active_drone_missions[drone_id] = mission_id
+
                     result = analyzer.analyze_frame(
                         frame, drone_id=drone_id, save_crops=True
                     )
+                    # Tag result with mission_id for downstream consumers
+                    result["mission_id"] = mission_id
+                    # ── Draw annotated overlay for live viewing ──────────
+                    annotated = frame.copy()
+                    for p in result["persons"]:
+                        bb = p["bbox"]
+                        cv2.rectangle(annotated, (bb["x1"], bb["y1"]), (bb["x2"], bb["y2"]), (191, 219, 56), 2)  # teal-ish
+                        label = f'P-{p["tracker_id"]}  {int(p["confidence"]*100)}%'
+                        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                        cv2.rectangle(annotated, (bb["x1"], bb["y1"]-th-8), (bb["x1"]+tw+6, bb["y1"]), (191, 219, 56), -1)
+                        cv2.putText(annotated, label, (bb["x1"]+3, bb["y1"]-4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+                    for fc in result["faces"]:
+                        bb = fc["bbox"]
+                        cv2.rectangle(annotated, (bb["x1"], bb["y1"]), (bb["x2"], bb["y2"]), (0, 191, 255), 2)  # amber
+                        conf_label = f'{int(fc["confidence"]*100)}%'
+                        cv2.putText(annotated, conf_label, (bb["x1"], bb["y2"]+14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 191, 255), 1, cv2.LINE_AA)
+                    _, ann_buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    _last_annotated_frames[drone_id] = bytes(ann_buf)
+
                     ts = datetime.now(timezone.utc)
 
                     for person in result["persons"]:
@@ -217,7 +264,8 @@ async def _stream_loop():
                         if person["confidence"] >= 0.4:
                             track_id = await upsert_track(
                                 drone_id, None, "person", ts, ts,
-                                tracker_id=tracker_id
+                                tracker_id=tracker_id,
+                                mission_id=mission_id,
                             )
                             await write_confirmed_event(
                                 drone_id=drone_id, event_type="person_detected",
@@ -246,6 +294,7 @@ async def _stream_loop():
                                     embedding=emb,
                                     drone_id=drone_id,
                                     object_key=face_obj_key,
+                                    mission_id=mission_id,
                                 )
 
                     # Also clean up person crop_bytes
@@ -255,6 +304,11 @@ async def _stream_loop():
                     await publish_analytics_result("person", result)
                     _frames_processed += 1
                     _reid_frame_counter += 1
+
+                    # ── Populate live person buffer with crop pairs ──────
+                    _update_live_person_buffer(
+                        result, drone_id, mission_id, ts, frame
+                    )
 
                     # Periodic re-ID clustering
                     if _reid_frame_counter >= cfg.REID_CLUSTER_INTERVAL:
@@ -316,6 +370,141 @@ async def stream_stop():
     return {"status": "stopped"}
 
 
+@app.get("/annotated/latest")
+async def annotated_latest(drone_id: str = ""):
+    """Return the latest annotated JPEG frame with person + face bounding boxes."""
+    from fastapi.responses import Response
+    # If no drone_id specified, return any available frame
+    if not drone_id:
+        for did in cfg.DRONE_IDS:
+            if did in _last_annotated_frames:
+                drone_id = did
+                break
+    frame_bytes = _last_annotated_frames.get(drone_id)
+    if not frame_bytes:
+        raise HTTPException(404, "No annotated frame available")
+    return Response(
+        content=frame_bytes,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "X-Drone-ID": drone_id,
+        },
+    )
+
+
+# ── Live person buffer helpers ─────────────────────────────────────────────────
+def _update_live_person_buffer(result, drone_id, mission_id, ts, frame):
+    """Update in-memory live person buffer with crop pairs from latest result."""
+    now = time.time()
+
+    # Build face lookup by proximity to each person bbox
+    faces_by_person = {}
+    for fc in result.get("faces", []):
+        # Link face to nearest person by checking if face center is inside person bbox
+        fbb = fc["bbox"]
+        fcx = (fbb["x1"] + fbb["x2"]) / 2
+        fcy = (fbb["y1"] + fbb["y2"]) / 2
+        for p in result.get("persons", []):
+            pbb = p["bbox"]
+            if pbb["x1"] <= fcx <= pbb["x2"] and pbb["y1"] <= fcy <= pbb["y2"]:
+                tid = p.get("tracker_id")
+                if tid is not None:
+                    faces_by_person[tid] = fc
+                break
+
+    for p in result.get("persons", []):
+        tid = p.get("tracker_id")
+        if tid is None:
+            continue
+        key = (drone_id, tid)
+        conf = p.get("confidence", 0)
+        bb = p["bbox"]
+
+        if key in _live_person_buffer:
+            entry = _live_person_buffer[key]
+            entry["last_seen"] = ts.isoformat()
+            entry["last_seen_epoch"] = now
+            entry["frame_count"] += 1
+            entry["confidence"] = conf
+            entry["bbox"] = bb
+            # Refresh crops every Nth frame
+            if entry["frame_count"] % _CROP_REFRESH_EVERY == 0:
+                pcrop = _safe_crop_b64(frame, bb)
+                if pcrop:
+                    entry["person_crop_b64"] = pcrop
+                face = faces_by_person.get(tid)
+                if face:
+                    fcrop = _safe_crop_b64(frame, face["bbox"])
+                    if fcrop:
+                        entry["face_crop_b64"] = fcrop
+        else:
+            # New person
+            pcrop = _safe_crop_b64(frame, bb)
+            fcrop = None
+            face = faces_by_person.get(tid)
+            if face:
+                fcrop = _safe_crop_b64(frame, face["bbox"])
+            _live_person_buffer[key] = {
+                "tracker_id":      tid,
+                "drone_id":        drone_id,
+                "mission_id":      mission_id,
+                "person_crop_b64": pcrop,
+                "face_crop_b64":   fcrop,
+                "confidence":      conf,
+                "bbox":            bb,
+                "first_seen":      ts.isoformat(),
+                "last_seen":       ts.isoformat(),
+                "last_seen_epoch": now,
+                "frame_count":     1,
+            }
+
+    # Evict stale entries
+    stale_keys = [
+        k for k, v in _live_person_buffer.items()
+        if now - v["last_seen_epoch"] > _LIVE_BUFFER_STALE_SEC
+    ]
+    for k in stale_keys:
+        del _live_person_buffer[k]
+
+    # Cap buffer size
+    if len(_live_person_buffer) > _LIVE_BUFFER_MAX:
+        sorted_entries = sorted(
+            _live_person_buffer.items(), key=lambda x: x[1]["last_seen_epoch"]
+        )
+        for k, _ in sorted_entries[: len(_live_person_buffer) - _LIVE_BUFFER_MAX]:
+            del _live_person_buffer[k]
+
+
+def _safe_crop_b64(frame, bbox) -> "str | None":
+    """Crop a region from frame and return base64 JPEG, or None on failure."""
+    try:
+        h, w = frame.shape[:2]
+        x1 = max(0, int(bbox["x1"]))
+        y1 = max(0, int(bbox["y1"]))
+        x2 = min(w, int(bbox["x2"]))
+        y2 = min(h, int(bbox["y2"]))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        crop = frame[y1:y2, x1:x2]
+        _, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        return base64.b64encode(bytes(buf)).decode()
+    except Exception:
+        return None
+
+
+@app.get("/persons/live")
+async def persons_live(drone_id: str = ""):
+    """Return in-memory live person buffer as JSON array with base64 crop pairs."""
+    entries = list(_live_person_buffer.values())
+    if drone_id:
+        entries = [e for e in entries if e["drone_id"] == drone_id]
+    # Sort by last_seen descending (most recently seen first)
+    entries.sort(key=lambda e: e.get("last_seen_epoch", 0), reverse=True)
+    return {"persons": entries, "count": len(entries)}
+
+
 # ── Face deduplication ─────────────────────────────────────────────────────────
 @app.get("/faces/deduplicate")
 async def deduplicate_faces():
@@ -340,6 +529,167 @@ async def deduplicate_faces():
     }
 
 
+@app.post("/faces/deduplicate/mission")
+async def deduplicate_mission(body: dict):
+    """Run deduplication scoped to a specific mission_id."""
+    global _dedup_progress
+    mission_id = body.get("mission_id")
+    if not mission_id:
+        raise HTTPException(400, "mission_id required")
+    if _dedup_progress["status"] == "running":
+        raise HTTPException(409, f"Dedup already running for {_dedup_progress['mission_id']}")
+    # Start async dedup task
+    asyncio.create_task(_run_mission_dedup(mission_id))
+    return {"status": "started", "mission_id": mission_id}
+
+
+async def _run_mission_dedup(mission_id: str):
+    """Background task: deduplicate face embeddings for a specific mission with DB persistence."""
+    global _dedup_progress
+    _dedup_progress = {
+        "mission_id": mission_id, "status": "running", "progress_pct": 0,
+        "total_embeddings": 0, "processed": 0, "unique_found": 0, "error": None,
+    }
+    await upsert_dedup_run(
+        mission_id=mission_id,
+        status="running",
+        progress_pct=0.0,
+    )
+    try:
+        rows = await get_face_embeddings_by_mission(mission_id)
+        total = len(rows)
+        _dedup_progress["total_embeddings"] = total
+        if total < 2:
+            _dedup_progress.update(status="complete", progress_pct=100, unique_found=total, processed=total)
+            await upsert_dedup_run(
+                mission_id=mission_id,
+                status="complete",
+                total_embeddings=total,
+                unique_found=total,
+                duplicates_removed=0,
+                progress_pct=100.0,
+                completed_at=datetime.now(timezone.utc),
+            )
+            return
+
+        _dedup_progress["progress_pct"] = 10  # fetched embeddings
+        await upsert_dedup_run(
+            mission_id=mission_id, status="running",
+            total_embeddings=total, progress_pct=10.0,
+        )
+
+        ids        = [str(r["id"]) for r in rows]
+        embeddings = [list(r["embedding"]) for r in rows]
+
+        _dedup_progress["progress_pct"] = 20  # starting clustering
+        await upsert_dedup_run(
+            mission_id=mission_id, status="running",
+            total_embeddings=total, progress_pct=20.0,
+        )
+        labels = cluster_embeddings(embeddings, cfg.REID_DISTANCE_THRESHOLD)
+
+        _dedup_progress["progress_pct"] = 50  # clustering complete
+        duplicate_ids, unique_count = find_duplicates_in_clusters(ids, labels)
+        dup_set = set(duplicate_ids)
+
+        _dedup_progress["progress_pct"] = 60  # updating DB
+        await update_cluster_labels_db(ids, labels, dup_set)
+
+        _dedup_progress["progress_pct"] = 70  # upserting identities
+        await upsert_dedup_run(
+            mission_id=mission_id, status="running",
+            total_embeddings=total, unique_found=unique_count,
+            duplicates_removed=len(duplicate_ids), progress_pct=70.0,
+        )
+        reps = get_identity_representatives(ids, labels)
+        processed = 0
+        for cluster_id, rep_id in reps.items():
+            rep_row = next((r for r in rows if str(r["id"]) == rep_id), None)
+            if rep_row:
+                await upsert_person_identity(
+                    cluster_id=cluster_id,
+                    best_image_key=rep_row.get("object_key"),
+                    drone_id=rep_row.get("drone_id"),
+                    embedding_count=sum(1 for l in labels if l == cluster_id),
+                )
+            processed += 1
+            pct = 70 + int(30 * processed / max(len(reps), 1))
+            _dedup_progress["progress_pct"] = min(pct, 99)
+            _dedup_progress["processed"] = processed
+
+        _dedup_progress.update(
+            status="complete", progress_pct=100,
+            unique_found=unique_count, processed=total,
+        )
+        await upsert_dedup_run(
+            mission_id=mission_id,
+            status="complete",
+            total_embeddings=total,
+            unique_found=unique_count,
+            duplicates_removed=len(duplicate_ids),
+            progress_pct=100.0,
+            completed_at=datetime.now(timezone.utc),
+        )
+        log.info("Mission dedup %s: %d embeddings → %d unique", mission_id, total, unique_count)
+    except Exception as exc:
+        log.warning("Mission dedup %s failed: %s", mission_id, exc)
+        _dedup_progress.update(status="error", error=str(exc))
+        await upsert_dedup_run(
+            mission_id=mission_id,
+            status="error",
+            error_message=str(exc),
+        )
+
+
+@app.get("/faces/deduplicate/progress")
+async def dedup_progress(mission_id: str = ""):
+    """Return current mission deduplication progress from memory or DB."""
+    if mission_id and _dedup_progress.get("mission_id") != mission_id:
+        db_run = await get_dedup_run(mission_id)
+        if db_run:
+            return {
+                "mission_id": db_run["mission_id"],
+                "status": db_run["status"],
+                "progress_pct": int(db_run["progress_pct"] or 0),
+                "total_embeddings": db_run["total_embeddings"] or 0,
+                "processed": db_run["total_embeddings"] if db_run["status"] == "complete" else 0,
+                "unique_found": db_run["unique_found"] or 0,
+                "error": db_run["error_message"],
+            }
+    return _dedup_progress
+
+
+@app.get("/missions/dedup-status")
+async def missions_dedup_status():
+    """List missions with their face embedding counts and dedup status."""
+    missions = await get_distinct_missions_face_embeddings()
+    result = []
+    for m in missions:
+        total = m.get("total_faces", 0)
+        clustered = m.get("clustered", 0)
+        dedup_status = m.get("dedup_status")
+        is_deduped = (dedup_status == "complete") or (clustered > 0 and clustered >= total * 0.8)
+        result.append({
+            "mission_id":      m["mission_id"],
+            "total_faces":     total,
+            "duplicates":      m.get("duplicates", 0),
+            "is_deduplicated": is_deduped,
+            "dedup_status":    dedup_status or ("complete" if is_deduped else "pending"),
+            "unique_found":    m.get("unique_found"),
+            "first_seen":      str(m.get("first_seen", "")),
+            "last_seen":       str(m.get("last_seen", "")),
+            "completed_at":    str(m.get("dedup_completed_at", "") or ""),
+        })
+    return {"missions": result, "count": len(result)}
+
+
+@app.get("/missions/dedup-runs")
+async def list_dedup_runs():
+    """List all dedup run records from DB."""
+    runs = await get_dedup_runs()
+    return [{k: str(v) if hasattr(v, 'isoformat') else v for k, v in r.items()} for r in runs]
+
+
 @app.post("/reid/trigger")
 async def reid_trigger():
     """Manually trigger Re-ID clustering."""
@@ -349,10 +699,10 @@ async def reid_trigger():
 
 # ── Person identity endpoints ──────────────────────────────────────────────────
 @app.get("/persons/identities")
-async def list_identities(limit: int = 50):
-    """List unique person identities (Re-ID clusters)."""
-    identities = await get_person_identities(limit=min(limit, 200))
-    # Add presigned URLs for best images
+async def list_identities(limit: int = 50, drone_id: str = "", mission_id: str = ""):
+    """List unique person identities (Re-ID clusters), optionally filtered by mission."""
+    identities = await get_person_identities(limit=min(limit, 200), drone_id=drone_id or None)
+    # Add presigned URLs for best images (face + person body)
     for identity in identities:
         if identity.get("best_image_key"):
             url = await minio.get_presigned_url(
@@ -361,6 +711,13 @@ async def list_identities(limit: int = 50):
                 cfg.MINIO_URL_EXPIRY,
             )
             identity["best_image_url"] = url
+        if identity.get("best_person_image_key"):
+            person_url = await minio.get_presigned_url(
+                cfg.BUCKET_FACES,
+                identity["best_person_image_key"],
+                cfg.MINIO_URL_EXPIRY,
+            )
+            identity["best_person_image_url"] = person_url
     return {"count": len(identities), "identities": identities}
 
 
@@ -379,19 +736,32 @@ async def person_count():
 
 
 @app.get("/faces/gallery")
-async def face_gallery(limit: int = 50):
-    """Face thumbnail gallery — one best face per Re-ID cluster."""
+async def face_gallery(limit: int = 50, drone_id: str = "", mission_id: str = ""):
+    """Face thumbnail gallery — one best face per Re-ID cluster, filterable by mission."""
     pool = await get_pool()
+    conditions = ["is_duplicate = false", "object_key IS NOT NULL"]
+    params = []
+    idx = 1
+    if drone_id:
+        conditions.append(f"drone_id = ${idx}")
+        params.append(drone_id)
+        idx += 1
+    if mission_id:
+        conditions.append(f"mission_id = ${idx}")
+        params.append(mission_id)
+        idx += 1
+    params.append(limit)
+    where = " AND ".join(conditions)
     rows = await pool.fetch(
-        """
+        f"""
         SELECT DISTINCT ON (cluster_id)
-            id::text, cluster_id, object_key, drone_id, created_at
+            id::text, cluster_id, object_key, drone_id, mission_id, created_at
         FROM face_embeddings
-        WHERE is_duplicate = false AND object_key IS NOT NULL
+        WHERE {where}
         ORDER BY cluster_id, created_at DESC
-        LIMIT $1
+        LIMIT ${idx}
         """,
-        limit,
+        *params,
     )
     gallery = []
     for r in rows:

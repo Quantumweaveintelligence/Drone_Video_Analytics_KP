@@ -147,17 +147,17 @@ export function usePersonDedup(intervalMs = 15000) {
   return useAnalyticsFetch('/analytics/person/dedup', intervalMs);
 }
 
-export function usePersonIdentities(droneId = '', intervalMs = 10000) {
-  const path = droneId
-    ? `/analytics/person/identities?drone_id=${droneId}&limit=50`
-    : '/analytics/person/identities?limit=50';
+export function usePersonIdentities(droneId = '', intervalMs = 10000, missionId = '') {
+  let path = '/analytics/person/identities?limit=50';
+  if (droneId) path += `&drone_id=${droneId}`;
+  if (missionId) path += `&mission_id=${missionId}`;
   return useAnalyticsFetch(path, intervalMs);
 }
 
-export function useFacesGallery(droneId = '', intervalMs = 10000) {
-  const path = droneId
-    ? `/analytics/person/gallery?drone_id=${droneId}&limit=60`
-    : '/analytics/person/gallery?limit=60';
+export function useFacesGallery(droneId = '', intervalMs = 10000, missionId = '') {
+  let path = '/analytics/person/gallery?limit=60';
+  if (droneId) path += `&drone_id=${droneId}`;
+  if (missionId) path += `&mission_id=${missionId}`;
   return useAnalyticsFetch(path, intervalMs);
 }
 
@@ -166,6 +166,28 @@ export function usePersonCount(droneId = '', intervalMs = 5000) {
     ? `/analytics/person/count?drone_id=${droneId}`
     : '/analytics/person/count';
   return useAnalyticsFetch(path, intervalMs);
+}
+
+export function usePersonLive(droneId = '', intervalMs = 3000) {
+  const path = droneId
+    ? `/analytics/person/live?drone_id=${droneId}`
+    : '/analytics/person/live';
+  return useAnalyticsFetch(path, intervalMs);
+}
+
+export function usePersonDedupProgress(intervalMs = 2000, missionId = '') {
+  const path = missionId
+    ? `/analytics/person/dedup/progress?mission_id=${missionId}`
+    : '/analytics/person/dedup/progress';
+  return useAnalyticsFetch(path, intervalMs);
+}
+
+export function usePersonMissionDedup(intervalMs = 30000) {
+  return useAnalyticsFetch('/analytics/person/missions/dedup', intervalMs);
+}
+
+export function usePersonDedupRuns(intervalMs = 30000) {
+  return useAnalyticsFetch('/analytics/person/missions/dedup-runs', intervalMs);
 }
 
 // ── Vehicle hooks ──────────────────────────────────────────────────────────

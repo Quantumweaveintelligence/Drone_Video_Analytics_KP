@@ -112,24 +112,7 @@ POST /ingest/mission/end     → {"drone_id": "...", "mission_id": "..."}  (JWT 
 
 ---
 
-## GPU Consumer
 
-The GPU consumer reads frames from Valkey Streams and runs GPU inference in batches.
-
-```bash
-# Runs as a Docker container — see docker-compose.yml (gpu-consumer service)
-docker compose logs -f gpu-consumer
-
-# To run standalone locally (debugging only):
-export REDIS_URL="redis://localhost:6379/0"
-export DRONE_IDS="DRONE_KL_001,DRONE_KL_002"
-export BATCH_SIZE="16"
-python ingest/gpu_consumer.py
-```
-
-Replace the `run_gpu_inference()` stub in `gpu_consumer.py` with your actual YOLOv8 / DeepSORT model when ready.
-
----
 
 ## Scripts
 
@@ -163,9 +146,6 @@ docker compose ps
 
 # Tail ingest API logs
 docker compose logs -f ingest-api
-
-# Tail GPU consumer logs
-docker compose logs -f gpu-consumer
 
 # Watch Keycloak bootstrap
 docker compose logs -f setup

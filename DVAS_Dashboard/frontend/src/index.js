@@ -4,6 +4,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import "@/index.css";
 import App from "@/App";
 
+// Clear legacy tokens on load so all requests use HttpOnly cookies natively
+localStorage.removeItem("dvas_token");
+localStorage.removeItem("token");
+
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {

@@ -517,14 +517,15 @@ async def write_face_embedding(
     embedding: List[float],
     drone_id: Optional[str] = None,
     object_key: Optional[str] = None,
+    mission_id: Optional[str] = None,
 ) -> str:
     pool = await get_pool()
     emb_id = str(uuid.uuid4())
     await pool.execute(
         """
         INSERT INTO face_embeddings
-            (id, track_id, image_path, embedding, drone_id, object_key, created_at)
-        VALUES ($1::uuid, $2::uuid, $3, $4::float4[], $5, $6, now())
+            (id, track_id, image_path, embedding, drone_id, object_key, mission_id, created_at)
+        VALUES ($1::uuid, $2::uuid, $3, $4::float4[], $5, $6, $7, now())
         """,
         emb_id,
         track_id,
@@ -532,6 +533,7 @@ async def write_face_embedding(
         embedding,
         drone_id,
         object_key,
+        mission_id,
     )
     return emb_id
 
@@ -541,9 +543,50 @@ async def get_all_face_embeddings() -> List[Dict]:
     rows = await pool.fetch(
         """
         SELECT id, track_id, image_path, embedding, drone_id, cluster_id,
-               is_duplicate, object_key, created_at
+               is_duplicate, object_key, mission_id, created_at
         FROM face_embeddings
         ORDER BY created_at
+        """
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_face_embeddings_by_mission(mission_id: str) -> List[Dict]:
+    """Get face embeddings scoped to a specific mission."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT id, track_id, image_path, embedding, drone_id, cluster_id,
+               is_duplicate, object_key, mission_id, created_at
+        FROM face_embeddings
+        WHERE mission_id = $1
+        ORDER BY created_at
+        """,
+        mission_id,
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_distinct_missions_face_embeddings() -> List[Dict]:
+    """Get distinct missions with face embedding counts and dedup stats, joined with dedup_runs."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT f.mission_id,
+               COUNT(f.id) AS total_faces,
+               COUNT(f.id) FILTER (WHERE f.is_duplicate = true) AS duplicates,
+               COUNT(f.id) FILTER (WHERE f.cluster_id IS NOT NULL) AS clustered,
+               MIN(f.created_at) AS first_seen,
+               MAX(f.created_at) AS last_seen,
+               r.status AS dedup_status,
+               r.unique_found,
+               r.duplicates_removed,
+               r.completed_at AS dedup_completed_at
+        FROM face_embeddings f
+        LEFT JOIN dedup_runs r ON f.mission_id = r.mission_id
+        WHERE f.mission_id IS NOT NULL
+        GROUP BY f.mission_id, r.status, r.unique_found, r.duplicates_removed, r.completed_at
+        ORDER BY MAX(f.created_at) DESC
         """
     )
     return [dict(r) for r in rows]
@@ -574,6 +617,63 @@ async def update_face_embedding_cluster(
         """,
         cluster_id, is_duplicate, embedding_id,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mission Deduplication Runs
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def upsert_dedup_run(
+    mission_id: str,
+    status: str = "pending",
+    total_embeddings: int = 0,
+    unique_found: int = 0,
+    duplicates_removed: int = 0,
+    progress_pct: float = 0.0,
+    started_at = None,
+    completed_at = None,
+    error_message: Optional[str] = None,
+) -> None:
+    """Insert or update a mission deduplication run record."""
+    pool = await get_pool()
+    await pool.execute(
+        """
+        INSERT INTO dedup_runs (
+            mission_id, status, total_embeddings, unique_found,
+            duplicates_removed, progress_pct, started_at, completed_at, error_message
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9)
+        ON CONFLICT (mission_id) DO UPDATE SET
+            status = EXCLUDED.status,
+            total_embeddings = EXCLUDED.total_embeddings,
+            unique_found = EXCLUDED.unique_found,
+            duplicates_removed = EXCLUDED.duplicates_removed,
+            progress_pct = EXCLUDED.progress_pct,
+            completed_at = COALESCE(EXCLUDED.completed_at, dedup_runs.completed_at),
+            error_message = EXCLUDED.error_message
+        """,
+        mission_id, status, total_embeddings, unique_found,
+        duplicates_removed, float(progress_pct), started_at, completed_at, error_message,
+    )
+
+
+async def get_dedup_run(mission_id: str) -> Optional[Dict]:
+    """Get a single mission deduplication run record."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT * FROM dedup_runs WHERE mission_id = $1",
+        mission_id,
+    )
+    return dict(row) if row else None
+
+
+async def get_dedup_runs() -> List[Dict]:
+    """Get all mission deduplication run records."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT * FROM dedup_runs ORDER BY started_at DESC"
+    )
+    return [dict(r) for r in rows]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -626,11 +726,17 @@ async def upsert_person_identity(
     return await write_person_identity(cluster_id, best_image_key, drone_id, embedding_count)
 
 
-async def get_person_identities(limit: int = 50) -> List[Dict]:
+async def get_person_identities(limit: int = 50, drone_id: Optional[str] = None) -> List[Dict]:
     pool = await get_pool()
-    rows = await pool.fetch(
-        "SELECT * FROM person_identities ORDER BY last_seen DESC LIMIT $1", limit
-    )
+    if drone_id:
+        rows = await pool.fetch(
+            "SELECT * FROM person_identities WHERE drone_id=$1 ORDER BY last_seen DESC LIMIT $2",
+            drone_id, limit,
+        )
+    else:
+        rows = await pool.fetch(
+            "SELECT * FROM person_identities ORDER BY last_seen DESC LIMIT $1", limit
+        )
     return [dict(r) for r in rows]
 
 

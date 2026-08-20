@@ -44,12 +44,7 @@ scrape_configs:
       - targets: ["ingest-api:8000"]   # Direct container access (no NGINX auth needed internally)
     metrics_path: /metrics
 
-  # ── GPU Consumer ──────────────────────────────────────────────────────────
-  # Uncomment when gpu_consumer.py exposes a /metrics endpoint.
-  # - job_name: "gpu-consumer"
-  #   static_configs:
-  #     - targets: ["gpu-consumer:9091"]
-  #   metrics_path: /metrics
+
 
   # ── Valkey (Redis) exporter ────────────────────────────────────────────────
   # Deploy oliver006/redis_exporter alongside valkey to expose queue depth.

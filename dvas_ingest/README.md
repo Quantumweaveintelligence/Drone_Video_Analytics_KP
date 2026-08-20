@@ -39,7 +39,6 @@ CognitiveFrameSelector                         │
 | PostgreSQL | `drone_postgres` | Keycloak database |
 | Ingest API | `drone_ingest_api` | Receives frames, validates JWT, queues to Valkey |
 | Valkey | `drone_valkey` | Frame queue (BSD-3-Clause Redis replacement) |
-| GPU Consumer | `drone_gpu_consumer` | Batch GPU inference on queued frames |
 | SeaweedFS Master | `drone_seaweed_master` | Evidence storage master |
 | SeaweedFS Volume | `drone_seaweed_volume` | Evidence storage volume node |
 | SeaweedFS Filer | `drone_seaweed_filer` | Evidence file access API |
@@ -126,26 +125,6 @@ Key values to change from defaults:
 
 ---
 
-### Step 4 — Enable GPU Access in Docker Compose
-
-**Required before the GPU consumer can use the GPU.**
-
-In `docker-compose.yml`, find the `gpu-consumer` service and uncomment the `deploy:` block:
-
-```yaml
-gpu-consumer:
-  # ...
-  deploy:                      # <- uncomment these 7 lines
-    resources:
-      reservations:
-        devices:
-          - driver: nvidia
-            count: 1
-            capabilities: [gpu]
-```
-
----
-
 ### Step 5 — Start All Services
 
 ```bash
@@ -164,7 +143,6 @@ drone_headscale      running
 drone_step_ca        healthy
 drone_ingest_api     healthy
 drone_nginx          running
-drone_gpu_consumer   running
 drone_seaweed_master running
 drone_seaweed_volume running
 drone_seaweed_filer  running
@@ -332,10 +310,7 @@ python ingest/edge_sender.py --frame test_frame.jpg
 # 4. Frame arrived in Valkey queue (check ON Ubuntu)
 docker compose exec valkey valkey-cli xlen drone:frames:DRONE_KL_001
 
-# 5. GPU consumer picks up frame (check ON Ubuntu)
-docker compose logs gpu-consumer | grep batch_processed
-
-# 6. Grafana dashboard accessible (from any VPN-connected machine)
+# 5. Grafana dashboard accessible (from any VPN-connected machine)
 curl http://10.10.20.1:3000
 
 # 7. Full simulation run (FROM Windows laptop, no real drone needed)
@@ -366,7 +341,6 @@ python main.py
 drone_analytics/                    <- Ubuntu ingest server repo root
 |
 +-- docker-compose.yml              <- All 14 Ubuntu services
-+-- Dockerfile.gpu_consumer         <- GPU consumer container build
 +-- .dockerignore
 +-- .gitignore
 |
@@ -388,7 +362,6 @@ drone_analytics/                    <- Ubuntu ingest server repo root
 |   |   +-- queue_manager.py        <- Valkey stream publish/consume
 |   |   +-- requirements.txt
 |   |   +-- Dockerfile
-|   +-- gpu_consumer.py             <- GPU batch consumer (Valkey -> inference -> events stream)
 |   +-- nginx/
 |   |   +-- default.conf            <- NGINX: TLS, rate limiting, JWT header guard, proxy
 |   +-- certs/                      <- TLS cert files (populated by step-ca — NOT committed)
@@ -443,7 +416,6 @@ docker compose ps                       # Health status of all containers
 
 # Logs
 docker compose logs -f ingest-api       # Live ingest API logs
-docker compose logs -f gpu-consumer     # Live GPU consumer logs
 docker compose logs -f keycloak         # Keycloak startup / auth logs
 docker compose logs setup               # One-time Keycloak bootstrap result
 
@@ -473,11 +445,9 @@ Items from `plan (2).md` **not yet implemented**, to address before district-lev
 
 | Gap | Plan Phase | Action needed |
 |---|---|---|
-| GPU `deploy:` block commented out | Phase 1 | Uncomment in `docker-compose.yml` — see Step 4 above |
 | Grafana dashboard JSON missing | Phase 9 | Create `dvas_dashboard.json` in `monitoring/grafana/provisioning/dashboards/` |
 | WireGuard Prometheus exporter not running | Phase 9 | Deploy `MindFlavor/prometheus_wireguard_exporter` on the Ubuntu host; uncomment scrape target in `prometheus.yml` |
 | Valkey queue depth alert commented out | Phase 9 | Deploy `oliver006/redis_exporter` alongside Valkey; uncomment `IngestQueueOverload` rule in `dvas_alerts.yml` |
-| `GPUConsumerRestarting` alert uses Kubernetes metric | Phase 9 | Replace `kube_pod_container_status_restarts_total` with Docker-native: `changes(engine_daemon_container_states_changes_total{name="drone_gpu_consumer",status="running"}[5m]) > 0` |
 | Ubuntu host metrics (node exporter) not scraped | Phase 9 | `sudo apt install prometheus-node-exporter`; uncomment node scrape in `prometheus.yml` |
 | Ingest API multi-replica scaling | Phase 11 | Add replica count + upstream block to `docker-compose.yml` for 100-laptop fleet |
 | Gateway redundancy (warm standby) | Phase 12 | Provision second Ubuntu VPN gateway before district deployment |
