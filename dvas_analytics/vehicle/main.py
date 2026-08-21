@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 sys.path.insert(0, "/analytics")
-from shared.config import cfg
+from shared.config import cfg, get_drone_aliases
 from shared.db import (
     close_pool, ensure_drone, get_pool, upsert_track,
     write_confirmed_event, write_vehicle_attributes,
@@ -30,6 +30,7 @@ from shared.db import (
 from shared.redis_client import (
     close_client, publish_analytics_result, publish_confirmed_event,
     xread_frames, hset_vehicle_track, hget_vehicle_track,
+    scan_active_stream_drones,
 )
 from shared import minio_client as minio
 from vehicle.analyzer import VehicleAnalyzer
@@ -162,13 +163,19 @@ def _draw_vehicle_annotations(frame: np.ndarray, vehicles: list, drone_id: str) 
 
 @app.on_event("startup")
 async def startup():
-    global analyzer
+    global analyzer, _stream_running, _stream_task
     await get_pool()
     for drone_id in cfg.DRONE_IDS:
         await ensure_drone(drone_id)
     await minio.ensure_all_buckets()
     analyzer = VehicleAnalyzer(VEHICLE_MODEL)
     log.info("Vehicle Analyzer ready. Model: %s", VEHICLE_MODEL)
+
+    # Auto-start stream background consumer loop
+    _stream_running = True
+    _stream_task = asyncio.create_task(_stream_loop())
+    log.info("Vehicle stream loop auto-started for drones: %s", cfg.DRONE_IDS)
+
 
 
 @app.on_event("shutdown")
@@ -280,10 +287,25 @@ async def analyze_frame(
 async def _stream_loop():
     global _stream_running, _frames_processed
     last_ids = {d: "0" for d in cfg.DRONE_IDS}
+    active_drones = list(cfg.DRONE_IDS)
     log.info("Vehicle stream loop started for drones: %s", cfg.DRONE_IDS)
 
+    loop_count = 0
     while _stream_running:
-        for drone_id in cfg.DRONE_IDS:
+        loop_count += 1
+        if loop_count % 10 == 1:
+            try:
+                discovered = await scan_active_stream_drones()
+                for d in discovered:
+                    if d not in active_drones:
+                        active_drones.append(d)
+                        last_ids[d] = "0"
+            except Exception:
+                pass
+
+        for drone_id in active_drones:
+            if drone_id not in last_ids:
+                last_ids[drone_id] = "0"
             try:
                 new_id, frames = await xread_frames(
                     drone_id, last_ids[drone_id], count=4, block_ms=100
@@ -415,13 +437,18 @@ async def stream_stop():
 async def annotated_latest(drone_id: str = ""):
     """
     Returns the most recently annotated JPEG frame (with vehicle bounding boxes).
-    If drone_id is specified and has a cached frame, returns that drone's frame.
+    If drone_id is specified and has a cached frame (or matching alias), returns that frame.
     Falls back to any available cached frame.
     """
     frame_bytes = None
-    if drone_id and drone_id in _last_annotated:
-        frame_bytes = _last_annotated[drone_id]
-    else:
+    if drone_id:
+        aliases = get_drone_aliases(drone_id)
+        for alias in aliases:
+            if alias in _last_annotated:
+                frame_bytes = _last_annotated[alias]
+                break
+
+    if not frame_bytes and _last_annotated:
         # Return the most recently updated frame from any drone
         import time as _time
         best_drone = max(_last_annotated_ts, key=_last_annotated_ts.get, default=None)
@@ -430,6 +457,7 @@ async def annotated_latest(drone_id: str = ""):
 
     if not frame_bytes:
         raise HTTPException(404, "No annotated frame available yet — start detection first")
+
 
     return StreamingResponse(
         io.BytesIO(frame_bytes),

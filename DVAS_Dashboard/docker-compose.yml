@@ -33,8 +33,8 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://dvas:dvas_secret@postgres:5432/dvas
       - JWT_SECRET=super-secret-dvas-key-change-in-prod
-      - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://10.123.225.250:3000,http://10.51.27.155:3000,http://10.51.27.250:3000
-      - INGEST_SERVER_URL=http://10.123.225.250
+      - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://10.123.225.251:3000,http://10.51.27.155:3000,http://10.51.27.250:3000
+      - INGEST_SERVER_URL=http://10.123.225.251
       - EDGE_SERVER_URL=http://edge:8765
       - ANALYTICS_GATEWAY_URL=http://host.docker.internal:8100
       - CROWD_ANALYTICS_URL=http://host.docker.internal:8101
@@ -45,7 +45,7 @@ services:
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin
       - MINIO_SECURE=false
-      - KEYCLOAK_URL=http://10.123.225.250:8080
+      - KEYCLOAK_URL=http://10.123.225.251:8080
       - KC_REALM=kerala-police-drone
       - KC_CLIENT_ID=drone-ingest-client
       - ADMIN_CLIENT_ID=dvas-admin-service
@@ -72,13 +72,13 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       - INGEST__ENABLED=true
-      - KC_CLIENT_SEC=yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn
-      - INGEST__URL=http://10.123.225.250/ingest/frame
-      - INGEST_URL=http://10.123.225.250/ingest/frame
-      - TOKEN_URL=http://10.123.225.250:8080/realms/kerala-police-drone/protocol/openid-connect/token
-      - MISSION_START_URL=http://10.123.225.250/ingest/mission/start
-      - MISSION_END_URL=http://10.123.225.250/ingest/mission/end
-      - TLS_VERIFY=false
+      - INGEST__DRONE_ID=DRN-004
+      - INGEST__CLIENT_SECRET=yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn
+      - INGEST__URL=http://10.123.225.251/ingest/frame
+      - INGEST__TOKEN_URL=http://10.123.225.251:8080/realms/kerala-police-drone/protocol/openid-connect/token
+      - INGEST__MISSION_START_URL=http://10.123.225.251/ingest/mission/start
+      - INGEST__MISSION_END_URL=http://10.123.225.251/ingest/mission/end
+      - INGEST__TLS_VERIFY=false
     networks:
       - default
       - drone-net

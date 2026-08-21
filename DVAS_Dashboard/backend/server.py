@@ -41,7 +41,7 @@ from models import Base, AuditLog, Mission, Drone, Alert, Evidence, Export, Mode
 from ingest_proxy import ingest_api, _proxy_get
 
 # ---------- Keycloak Setup ----------
-KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "http://10.123.225.250:8080")
+KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "http://10.123.225.251:8080")
 KEYCLOAK_REALM = os.environ.get("KC_REALM", "kerala-police-drone")
 KEYCLOAK_CLIENT_ID = os.environ.get("KC_CLIENT_ID", "dvas-dashboard-client")
 KEYCLOAK_CLIENT_SECRET = os.environ.get("KC_CLIENT_SECRET", "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn")
@@ -2366,36 +2366,11 @@ SEED_USERS = [
 
 
 async def seed_data():
-    # ── Migrate existing missions table (rename id → mission_id, add new cols) ──
-    async with engine.begin() as conn:
-        # Check if old 'id' column exists in missions table
-        result = await conn.execute(text(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_name = 'missions' AND column_name = 'id'"
-        ))
-        has_old_id = result.fetchone() is not None
-
-        if has_old_id:
-            logger.info("Migrating missions table: renaming 'id' → 'mission_id', adding new columns...")
-            # Drop and recreate missions table (safe — seed data will re-populate)
-            await conn.execute(text("DROP TABLE IF EXISTS missions CASCADE"))
-            logger.info("Dropped old missions table; it will be recreated with new schema.")
-
     # Create all tables (including the new missions schema)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
     async with async_session_factory() as session:
-        # Check for legacy audit logs without hash chain → clear and re-seed
-        legacy_count = (await session.execute(
-            select(func.count()).select_from(AuditLog).where(AuditLog.hash == None)  # noqa: E711
-        )).scalar() or 0
-        if legacy_count > 0:
-            await session.execute(delete(AuditLog))
-            await session.commit()
-            logger.info(f"Cleared {legacy_count} legacy audit logs (missing hash chain).")
-
-        # users are now seeded in Keycloak via setup script
         user_ids_by_email = {u["email"]: "seed-id" for u in SEED_USERS}
 
         # If missions already seeded, ensure audit chain exists then return

@@ -391,7 +391,7 @@ services:
     environment:
       DATABASE_URL:          postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
       REDIS_URL:             redis://valkey:6379/0
-      DRONE_IDS:             "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
+      DRONE_IDS:             "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005,DRN-001,DRN-002,DRN-003,DRN-004,DRN-005}"
       MODEL_PATH:            /analytics/crowd/models/crowd_counting.pth
       CROWD_ALERT_THRESHOLD: "${CROWD_ALERT_THRESHOLD:-50}"
       LOG_LEVEL:             INFO
@@ -437,7 +437,7 @@ services:
     environment:
       DATABASE_URL: postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
       REDIS_URL:    redis://valkey:6379/0
-      DRONE_IDS:    "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
+      DRONE_IDS:    "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005,DRN-001,DRN-002,DRN-003,DRN-004,DRN-005}"
       PERSON_MODEL: /analytics/person/models/yolov8m.pt
       FACE_MODEL:   /analytics/person/models/yolov8n-face.pt
       LOG_LEVEL:    INFO
@@ -484,7 +484,7 @@ services:
     environment:
       DATABASE_URL:  postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
       REDIS_URL:     redis://valkey:6379/0
-      DRONE_IDS:     "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
+      DRONE_IDS:     "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005,DRN-001,DRN-002,DRN-003,DRN-004,DRN-005}"
       VEHICLE_MODEL: /analytics/vehicle/models/visdrone.pt
       LOG_LEVEL:     INFO
       MINIO_ENDPOINT:   minio:9000
@@ -531,7 +531,7 @@ services:
     environment:
       DATABASE_URL:  postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
       REDIS_URL:     redis://valkey:6379/0
-      DRONE_IDS:     "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
+      DRONE_IDS:     "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005,DRN-001,DRN-002,DRN-003,DRN-004,DRN-005}"
       VEHICLE_MODEL: /analytics/anpr/models/yolov8m.pt
       LP_MODEL:      /analytics/anpr/models/license_plate_detector.pt
       LOG_LEVEL:     INFO
@@ -637,7 +637,7 @@ services:
     environment:
       DATABASE_URL: postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
       REDIS_URL:    redis://valkey:6379/0
-      DRONE_IDS:    "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"
+      DRONE_IDS:    "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005,DRN-001,DRN-002,DRN-003,DRN-004,DRN-005}"
       CROWD_URL:    http://crowd-analyzer:8101
       PERSON_URL:   http://person-analyzer:8102
       VEHICLE_URL:  http://vehicle-analyzer:8103

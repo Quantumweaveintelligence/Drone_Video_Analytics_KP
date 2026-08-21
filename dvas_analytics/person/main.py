@@ -87,7 +87,7 @@ _dedup_progress: dict = {          # mission dedup progress tracking
 
 @app.on_event("startup")
 async def startup():
-    global analyzer, resnet_model, resnet_device
+    global analyzer, resnet_model, resnet_device, _stream_running, _stream_task
     await get_pool()
     for drone_id in cfg.DRONE_IDS:
         await ensure_drone(drone_id)
@@ -96,6 +96,12 @@ async def startup():
     resnet_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     resnet_model = load_resnet_model(resnet_device)
     log.info("Person & Face Analyzer ready")
+
+    # Auto-start stream background consumer loop
+    _stream_running = True
+    _stream_task = asyncio.create_task(_stream_loop())
+    log.info("Person stream loop auto-started for drones: %s", cfg.DRONE_IDS)
+
 
 
 @app.on_event("shutdown")

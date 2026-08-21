@@ -24,7 +24,7 @@ from fastapi import HTTPException, status
 logger = logging.getLogger("dvas.keycloak_service")
 
 # ── Configuration (injected via environment) ─────────────────────────────────
-KEYCLOAK_INTERNAL_URL = os.getenv("KEYCLOAK_URL", "http://10.123.225.250:8080")
+KEYCLOAK_INTERNAL_URL = os.getenv("KEYCLOAK_URL", "http://10.123.225.251:8080")
 REALM = os.getenv("KC_REALM", "kerala-police-drone")
 ADMIN_CLIENT_ID = os.getenv("ADMIN_CLIENT_ID", "dvas-admin-service")
 ADMIN_CLIENT_SECRET = os.getenv("ADMIN_CLIENT_SECRET", "")
