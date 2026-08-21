@@ -8,7 +8,9 @@ export default function MissionControl() {
   const [serverSend, setServerSend] = useState(false);
   const [pipelineEnabled, setPipelineEnabled] = useState(true);
 
-  const [form, setForm] = useState({ name: '', id: '', drone: '', operator: '', location: '', squadron: 'ALPHA' });
+  const [form, setForm] = useState({ name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: 'ALPHA' });
+  const [videoFile, setVideoFile] = useState(null);
+  const [srtFile, setSrtFile] = useState(null);
 
   const [missionLog, setMissionLog] = useState(() => {
     const saved = localStorage.getItem('dvas_mission_log');
@@ -61,6 +63,8 @@ export default function MissionControl() {
   }, [missionLog]);
 
   const [loading, setLoading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState('');
+  const [errorMsg, setErrorMsg] = useState('');
 
   const generateMissionId = (squadron = form.squadron || 'ALPHA') => {
     const now = new Date();
@@ -92,16 +96,45 @@ export default function MissionControl() {
   };
 
   const handleStartMission = async () => {
-    if (!form.name || !form.drone) return;
+    if (!form.name) return;
+    if (form.video_source_type === 'rtmp' && !form.video_source) return;
+    if (form.video_source_type === 'file' && !videoFile) return;
+
     setLoading(true);
+    setErrorMsg('');
     try {
+      let finalVideoSource = form.video_source;
+
+      if (form.video_source_type === 'file') {
+        setUploadProgress('Uploading video...');
+        const formData = new FormData();
+        formData.append('video', videoFile);
+        if (srtFile) {
+          formData.append('srt', srtFile);
+        }
+
+        const uploadResp = await authFetch('/edge-api/api/edge/mission/upload-video', {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!uploadResp.ok) {
+          throw new Error(`Video upload failed: ${uploadResp.status} ${uploadResp.statusText}`);
+        }
+
+        const uploadData = await uploadResp.json();
+        finalVideoSource = uploadData.video_path;
+        setUploadProgress('');
+      }
+
       const resp = await authFetch('/edge-api/api/edge/mission/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           mission_id: form.id || generateMissionId(form.squadron),
           mission_name: form.name,
-          drone_id: form.drone,
+          video_source: finalVideoSource,
+          video_source_type: form.video_source_type,
           operator: form.operator,
           location: form.location,
         }),
@@ -114,6 +147,8 @@ export default function MissionControl() {
           drone: data.drone_id,
           operator: data.operator || form.operator,
           location: data.location || form.location,
+          videoSource: data.video_source,
+          videoSourceType: data.video_source_type,
           startTime: data.start_time,
         });
         setServerSend(false);
@@ -128,7 +163,9 @@ export default function MissionControl() {
           end: '--:--:--',
           status: 'active',
         }, ...prev]);
-        setForm({ name: '', id: '', drone: '', operator: '', location: '', squadron: 'ALPHA' });
+        setForm({ name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: 'ALPHA' });
+        setVideoFile(null);
+        setSrtFile(null);
 
         // Save to backend database
         try {
@@ -152,6 +189,8 @@ export default function MissionControl() {
       }
     } catch (err) {
       console.error('Failed to start mission:', err);
+      setErrorMsg(err.message || 'Failed to start mission');
+      setUploadProgress('');
     } finally {
       setLoading(false);
     }
@@ -359,20 +398,53 @@ export default function MissionControl() {
                     />
                   </div>
                 <div>
-                  <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Drone ID *</label>
+                  <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Source Type *</label>
                   <select 
-                    value={form.drone} 
-                    onChange={e => setForm({...form, drone: e.target.value})}
+                    value={form.video_source_type} 
+                    onChange={e => setForm({...form, video_source_type: e.target.value})}
                     className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm font-mono text-slate-200"
                   >
-                    <option value="">Select Drone</option>
-                    <option value="DRN-001">DRN-001 (Garuda-1)</option>
-                    <option value="DRN-002">DRN-002 (Garuda-2)</option>
-                    <option value="DRN-003">DRN-003 (Garuda-3)</option>
-                    <option value="DRN-004">DRN-004 (Garuda-4)</option>
+                    <option value="rtmp">RTMP Stream</option>
+                    <option value="file">Video File</option>
                   </select>
                 </div>
               </div>
+              {form.video_source_type === 'rtmp' ? (
+                <div>
+                  <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">RTMP URL *</label>
+                  <input 
+                    type="text" 
+                    value={form.video_source} 
+                    onChange={e => setForm({...form, video_source: e.target.value})}
+                    className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm text-slate-200 font-mono"
+                    placeholder="rtmp://your-server/live/stream"
+                  />
+                  <p className="text-[9px] text-slate-600 mt-1">Enter a valid RTMP stream URL</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Video File *</label>
+                    <input 
+                      type="file" 
+                      accept=".mp4,.avi,.mov"
+                      onChange={e => setVideoFile(e.target.files[0])}
+                      className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm text-slate-200"
+                    />
+                    <p className="text-[9px] text-slate-600 mt-1">Supported: .mp4, .avi, .mov</p>
+                  </div>
+                  <div>
+                    <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">SRT Telemetry File (Optional)</label>
+                    <input 
+                      type="file" 
+                      accept=".srt"
+                      onChange={e => setSrtFile(e.target.files[0])}
+                      className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm text-slate-200"
+                    />
+                    <p className="text-[9px] text-slate-600 mt-1">Optional sidecar metadata</p>
+                  </div>
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Operator Name</label>
@@ -402,20 +474,24 @@ export default function MissionControl() {
               </div>
             </div>
 
-            <div className="mt-6 flex gap-3">
-              <button 
-                onClick={handleStartMission} 
-                disabled={loading || !form.name || !form.drone}
-                className="flex-1 bg-sky-600 hover:bg-sky-500 text-white py-2.5 text-sm font-semibold tracking-wide flex items-center justify-center gap-2 rounded transition-colors disabled:opacity-50"
-              >
-                <Play size={16} fill="currentColor" /> {loading ? 'Starting...' : 'Start Mission'}
-              </button>
-              <button 
-                onClick={() => setForm({ name: '', id: '', drone: '', operator: '', location: '', squadron: 'ALPHA' })}
-                className="px-6 border border-slate-700 hover:bg-slate-800 text-slate-300 py-2.5 text-sm font-semibold tracking-wide rounded transition-colors"
-              >
-                Clear
-              </button>
+            <div className="mt-6 flex flex-col gap-2">
+              {errorMsg && <div className="text-xs text-red-400 font-mono text-center mb-2">{errorMsg}</div>}
+              {uploadProgress && <div className="text-xs text-sky-400 font-mono text-center mb-2 animate-pulse">{uploadProgress}</div>}
+              <div className="flex gap-3">
+                <button 
+                  onClick={handleStartMission} 
+                  disabled={loading || !form.name || (form.video_source_type === 'rtmp' && !form.video_source) || (form.video_source_type === 'file' && !videoFile)}
+                  className="flex-1 bg-sky-600 hover:bg-sky-500 text-white py-2.5 text-sm font-semibold tracking-wide flex items-center justify-center gap-2 rounded transition-colors disabled:opacity-50"
+                >
+                  <Play size={16} fill="currentColor" /> {loading ? 'Starting...' : 'Start Mission'}
+                </button>
+                <button 
+                  onClick={() => setForm({ name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: 'ALPHA' })}
+                  className="px-6 border border-slate-700 hover:bg-slate-800 text-slate-300 py-2.5 text-sm font-semibold tracking-wide rounded transition-colors"
+                >
+                  Clear
+                </button>
+              </div>
             </div>
           </div>
         </div>

@@ -66,24 +66,19 @@ services:
     ports:
       - "8765:8765"
     volumes:
-      - ../dvas_edge/DJI_0110.MP4:/data/DJI_0110.MP4:ro
-      - ../dvas_edge/DJI_0111.MP4:/data/DJI_0111.MP4:ro
-      - ../dvas_edge/DJI_0112.MP4:/data/DJI_0112.MP4:ro
-      - ../dvas_edge/DJI_0113.mp4:/data/DJI_0113.mp4:ro
       - edge_buffer:/app/buffer_storage
+      - C:/Users/asus/DVAS_KP/videos:/data:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      - VIDEO_DIR=/data
-      - SIMULATION__ENABLED=true
       - INGEST__ENABLED=true
-      - INGEST__DRONE_ID=DRN-004
-      - INGEST__CLIENT_SECRET=yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn
+      - KC_CLIENT_SEC=yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn
       - INGEST__URL=http://10.123.225.250/ingest/frame
-      - INGEST__TOKEN_URL=http://10.123.225.250:8080/realms/kerala-police-drone/protocol/openid-connect/token
-      - INGEST__MISSION_START_URL=http://10.123.225.250/ingest/mission/start
-      - INGEST__MISSION_END_URL=http://10.123.225.250/ingest/mission/end
-      - INGEST__TLS_VERIFY=false
+      - INGEST_URL=http://10.123.225.250/ingest/frame
+      - TOKEN_URL=http://10.123.225.250:8080/realms/kerala-police-drone/protocol/openid-connect/token
+      - MISSION_START_URL=http://10.123.225.250/ingest/mission/start
+      - MISSION_END_URL=http://10.123.225.250/ingest/mission/end
+      - TLS_VERIFY=false
     networks:
       - default
       - drone-net

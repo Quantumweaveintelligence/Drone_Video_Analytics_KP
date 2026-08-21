@@ -253,6 +253,12 @@ class IngestClient:
         speed_mps:    Optional[float] = None,
         battery_pct:  Optional[float] = None,
         frames_total: Optional[int]   = None,
+        abs_alt:      Optional[float] = None,
+        gb_yaw:       Optional[float] = None,
+        gb_pitch:     Optional[float] = None,
+        gb_roll:      Optional[float] = None,
+        focal_len:    Optional[float] = None,
+        dzoom_ratio:  Optional[float] = None,
         retries:      int = 3,
     ) -> dict:
         """
@@ -265,10 +271,16 @@ class IngestClient:
         Args:
             frame_bytes:  Raw JPEG bytes to send.
             change_score: Edge change-detection score [0.0–1.0].
-            lat/lon/alt:  Optional GPS telemetry.
+            lat/lon/alt:  Optional GPS telemetry. alt = rel_alt (altitude_m).
             speed_mps:    Optional drone speed in meters per second.
             battery_pct:  Optional drone battery percentage.
             frames_total: Optional total frames captured by the edge so far.
+            abs_alt:      Optional absolute altitude from SRT metadata.
+            gb_yaw:       Optional gimbal yaw from SRT metadata.
+            gb_pitch:     Optional gimbal pitch from SRT metadata.
+            gb_roll:      Optional gimbal roll from SRT metadata.
+            focal_len:    Optional focal length from SRT metadata.
+            dzoom_ratio:  Optional digital zoom ratio from SRT metadata.
             retries:      Number of retry attempts on 5xx.
 
         Returns:
@@ -289,6 +301,12 @@ class IngestClient:
             "speed_mps":      speed_mps,
             "battery_pct":    battery_pct,
             "frames_total":   frames_total,
+            "abs_alt":        abs_alt,
+            "gb_yaw":         gb_yaw,
+            "gb_pitch":       gb_pitch,
+            "gb_roll":        gb_roll,
+            "focal_len":      focal_len,
+            "dzoom_ratio":    dzoom_ratio,
         }
 
         last_exc: Optional[Exception] = None

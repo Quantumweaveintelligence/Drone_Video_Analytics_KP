@@ -33,9 +33,11 @@ from typing import Optional, Union
 # ── Third party ──────────────────────────────────────────────────────────────
 import uvicorn
 import psutil
-from fastapi import FastAPI, Depends, HTTPException, Request, Header
+from fastapi import FastAPI, Depends, HTTPException, Request, Header, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+import shutil
+from pathlib import Path
 from pydantic import BaseModel
 import httpx
 
@@ -50,8 +52,7 @@ except Exception:
     _GPU_AVAILABLE = False
 
 # ── Pipeline components ──────────────────────────────────────────────────────
-from src.telemetry.telemetry_simulator import TelemetrySimulator
-from src.video.drone_simulation_source import DroneSimulationSource
+from src.video.real_video_source import RealVideoSource
 from src.buffer.rolling_frame_buffer import RollingFrameBuffer
 from src.change_detection.change_detection_engine import ChangeDetectionEngine
 from src.change_detection.change_event import ChangeEvent
@@ -60,39 +61,6 @@ from src.cognitive_frame_selector.selected_frame import SelectedFrame
 from ingest.edge_sender import IngestClient
 from ingest.offline_buffer import OfflineBuffer
 
-# ---------------------------------------------------------------------------
-# Drone ID → video file mapping
-# ---------------------------------------------------------------------------
-# Maps drone IDs to their assigned MP4 simulation files.
-# Keys are checked case-insensitively. Add DRONE_KL_xxx entries here OR
-# set VIDEO_MAP env var as JSON: '{"DRONE_KL_001": "DJI_0110.MP4", ...}'
-# ---------------------------------------------------------------------------
-import json as _json
-
-_DEFAULT_VIDEO_MAP = {
-    # Legacy test IDs
-    "DRN-001": "DJI_0110.MP4",
-    "DRN-002": "DJI_0111.MP4",
-    "DRN-003": "DJI_0112.MP4",
-    "DRN-004": "DJI_0113.mp4",
-    # Production drone IDs (Kerala Police)
-    "DRONE_KL_001": "DJI_0110.MP4",
-    "DRONE_KL_002": "DJI_0111.MP4",
-    "DRONE_KL_003": "DJI_0112.MP4",
-    "DRONE_KL_004": "DJI_0113.mp4",
-    "DRONE_KL_005": "DJI_0110.MP4",
-}
-
-# Allow runtime override via env var (JSON string)
-try:
-    _env_map = os.environ.get("VIDEO_MAP", "")
-    if _env_map:
-        _DEFAULT_VIDEO_MAP.update(_json.loads(_env_map))
-except Exception:
-    pass
-
-DRONE_VIDEO_MAP = _DEFAULT_VIDEO_MAP
-
 
 # ---------------------------------------------------------------------------
 # Request model
@@ -100,7 +68,8 @@ DRONE_VIDEO_MAP = _DEFAULT_VIDEO_MAP
 class MissionStartRequest(BaseModel):
     mission_id: str
     mission_name: str
-    drone_id: str
+    video_source: str          # RTMP URL or local file path
+    video_source_type: str = "file"   # "rtmp" or "file"
     operator: str = ""
     location: str = ""
 
@@ -183,6 +152,15 @@ class EdgeSenderThread(threading.Thread):
                 try:
                     speed   = tel.get("speed_mps")
                     battery = tel.get("battery_pct")
+                    # Extended telemetry from SRT metadata
+                    ext_tel = {
+                        "abs_alt":     tel.get("abs_alt"),
+                        "gb_yaw":      tel.get("gb_yaw"),
+                        "gb_pitch":    tel.get("gb_pitch"),
+                        "gb_roll":     tel.get("gb_roll"),
+                        "focal_len":   tel.get("focal_len"),
+                        "dzoom_ratio": tel.get("dzoom_ratio"),
+                    }
                     
                     if kind == "selected":
                         await self._client.send_frame_bytes(
@@ -193,6 +171,7 @@ class EdgeSenderThread(threading.Thread):
                             alt          = tel.get("alt"),
                             speed_mps    = speed,
                             battery_pct  = battery,
+                            **ext_tel,
                         )
                     elif kind == "raw":
                         await self._client.send_frame_bytes(
@@ -203,6 +182,7 @@ class EdgeSenderThread(threading.Thread):
                             alt          = tel.get("altitude_m"),
                             speed_mps    = speed,
                             battery_pct  = battery,
+                            **ext_tel,
                         )
                         
                     # Success! Remove from buffer
@@ -258,8 +238,7 @@ class PipelineManager:
         self.lock = threading.Lock()
         self._running = False
         self.active_mission: Optional[dict] = None
-        self.telemetry_simulator: Optional[TelemetrySimulator] = None
-        self.source: Optional[DroneSimulationSource] = None
+        self.source: Optional[RealVideoSource] = None
         self.buffer: Optional[RollingFrameBuffer] = None
         self.change_engine: Optional[ChangeDetectionEngine] = None
         self.cognitive_selector: Optional[CognitiveFrameSelector] = None
@@ -271,31 +250,6 @@ class PipelineManager:
         self._start_wall: float = 0
         self.history_deque = collections.deque(maxlen=60)
         self._history_thread: Optional[threading.Thread] = None
-
-    # ── Helpers ───────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _resolve_video_file(drone_id: str) -> str:
-        """Resolve the video file path for a drone ID."""
-        filename = DRONE_VIDEO_MAP.get(drone_id, "DJI_0110.MP4")
-        video_dir = os.environ.get("VIDEO_DIR", "")
-        if video_dir:
-            path = os.path.join(video_dir, filename)
-            if os.path.exists(path):
-                return path
-        # Fallback: look in the script directory
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.join(script_dir, filename)
-        if os.path.exists(path):
-            return path
-        # Last resort: fallback in order
-        for fallback_name in ["DJI_0110.MP4", "DJI_0111.MP4", "DJI_0112.MP4", "DJI_0113.mp4"]:
-            for d in [video_dir, script_dir]:
-                if d:
-                    path = os.path.join(d, fallback_name)
-                    if os.path.exists(path):
-                        return path
-        return filename  # will fail at open time with a clear error
 
     # ── Mission lifecycle ─────────────────────────────────────────────────
 
@@ -309,12 +263,12 @@ class PipelineManager:
             self._running = True
             self.frames_selected = 0
 
-            # ── Telemetry simulator ───────────────────────────────────────
-            self.telemetry_simulator = TelemetrySimulator()
+            # ── Auto-generate drone_id from mission_id ────────────────────
+            drone_id = f"DRN-{req.mission_id}"
 
             # ── Rolling frame buffer ──────────────────────────────────────
             self.buffer = RollingFrameBuffer(
-                drone_id=req.drone_id,
+                drone_id=drone_id,
                 duration_s=cfg.buffer.duration_s,
                 storage_dir=cfg.buffer.storage_dir,
                 jpeg_quality=cfg.buffer.jpeg_quality,
@@ -331,7 +285,7 @@ class PipelineManager:
                         self.cognitive_selector.evaluate(event)
 
                 self.change_engine = ChangeDetectionEngine(
-                    drone_id=req.drone_id,
+                    drone_id=drone_id,
                     mog2_history=cd_cfg.mog2_history,
                     mog2_var_threshold=cd_cfg.mog2_var_threshold,
                     detect_shadows=cd_cfg.detect_shadows,
@@ -351,12 +305,12 @@ class PipelineManager:
                 def _on_selected_frame(frame: SelectedFrame) -> None:
                     self.frames_selected += 1
                     if self.server_send_enabled and self.sender_thread is not None:
-                        # Attach telemetry data for speed/battery
-                        tel = self.telemetry_simulator.get_current() if self.telemetry_simulator else {}
+                        # Get real telemetry from the video source (SRT data or zeros)
+                        tel = self.source.get_current_telemetry() if self.source else {}
                         self.sender_thread.put_frame(frame, telemetry=tel)
 
                 self.cognitive_selector = CognitiveFrameSelector(
-                    drone_id=req.drone_id,
+                    drone_id=drone_id,
                     mission_id=req.mission_id,
                     transmission_target=cfs_cfg.transmission_target,
                     window_size=cfs_cfg.window_size,
@@ -420,22 +374,29 @@ class PipelineManager:
                     except Exception:
                         pass
 
-            # ── Video source ──────────────────────────────────────────────
-            video_file = self._resolve_video_file(req.drone_id)
-            self.source = DroneSimulationSource(
-                drone_id=req.drone_id,
-                video_files=[video_file],
-                loop=True,
-                playback_speed=1.0,
+            # ── Video source (RealVideoSource) ────────────────────────────
+            clean_video_source = req.video_source.strip().strip("'\"")
+            
+            # Auto-translate Windows file paths or basenames to the /data/ volume
+            if not clean_video_source.startswith("rtmp://") and not clean_video_source.startswith("rtsp://"):
+                import ntpath
+                import os
+                basename = ntpath.basename(clean_video_source)
+                if not basename:
+                    basename = os.path.basename(clean_video_source)
+                clean_video_source = f"/data/{basename}"
+                
+            self.source = RealVideoSource(
+                drone_id=drone_id,
+                video_source=clean_video_source,
                 on_frame=_on_frame,
-                telemetry_simulator=self.telemetry_simulator,
             )
 
             # ── Edge Sender Thread ─────────────────────────────────────────
             client = IngestClient(
                 username=cfg.ingest.username,
                 password=cfg.ingest.password,
-                drone_id=req.drone_id,
+                drone_id=drone_id,
                 mission_id=req.mission_id
             )
             self.sender_thread = EdgeSenderThread(client=client)
@@ -458,13 +419,15 @@ class PipelineManager:
             self.active_mission = {
                 "mission_id": req.mission_id,
                 "mission_name": req.mission_name,
-                "drone_id": req.drone_id,
+                "drone_id": drone_id,
                 "operator": req.operator,
                 "location": req.location,
+                "video_source": req.video_source,
+                "video_source_type": req.video_source_type,
                 "start_time": start_time_str,
             }
 
-            log.info("mission_started", **self.active_mission, video_file=video_file)
+            log.info("mission_started", **self.active_mission)
             return {"status": "started", **self.active_mission}
 
     def end_mission(self) -> dict:
@@ -495,7 +458,6 @@ class PipelineManager:
             self.buffer = None
             self.change_engine = None
             self.cognitive_selector = None
-            self.telemetry_simulator = None
             self.sender_thread = None
             self.server_send_enabled = False
             self.pipeline_bypass = False
@@ -585,13 +547,16 @@ class PipelineManager:
         }
 
     def get_telemetry(self) -> dict:
-        if not self._running or self.telemetry_simulator is None:
+        if not self._running or self.source is None:
             return {
                 "latitude": 0, "longitude": 0, "altitude_m": 0,
+                "rel_alt": 0, "abs_alt": 0,
+                "gb_yaw": 0, "gb_pitch": 0, "gb_roll": 0,
+                "focal_len": 0, "dzoom_ratio": 0,
                 "speed_mps": 0, "heading_deg": 0, "battery_pct": 0,
                 "signal_pct": 0, "gps_lock": False,
             }
-        return self.telemetry_simulator.get_current()
+        return self.source.get_current_telemetry()
 
     def get_latest_jpeg(self) -> Optional[bytes]:
         """Get the latest JPEG frame bytes from the buffer."""
@@ -676,6 +641,29 @@ async def verify_edge_auth(
         return {"auth_type": "loopback_dev", "role": "local_dev"}
 
     raise HTTPException(status_code=401, detail="Unauthorized: Valid Edge API Key or Authentication Token required")
+
+
+@app.post("/api/edge/mission/upload-video")
+async def upload_video(
+    video: UploadFile = File(...),
+    srt: Optional[UploadFile] = File(None),
+    auth: dict = Depends(verify_edge_auth)
+):
+    upload_dir = Path("/data")
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save video
+    video_path = upload_dir / video.filename
+    with open(video_path, "wb") as buffer:
+        shutil.copyfileobj(video.file, buffer)
+        
+    # Save SRT if provided
+    if srt and srt.filename:
+        srt_path = upload_dir / srt.filename
+        with open(srt_path, "wb") as buffer:
+            shutil.copyfileobj(srt.file, buffer)
+            
+    return {"status": "success", "video_path": str(video_path)}
 
 
 @app.post("/api/edge/mission/start")
