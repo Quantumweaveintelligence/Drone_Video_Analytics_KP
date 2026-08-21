@@ -1577,6 +1577,14 @@ export default function TrafficAnalytics() {
   // who has no access to /models), fall back to polling health only.
   useEffect(() => {
     const syncStreams = async () => {
+      // Ensure vehicle and ANPR streams are started when visiting Traffic & ANPR page
+      try {
+        await Promise.allSettled([
+          api.get('/analytics/vehicle/stream/start'),
+          api.get('/analytics/anpr/stream/start'),
+        ]);
+      } catch { /* ignore network/permission errors */ }
+
       try {
         const { data: cfg } = await api.get('/models');
         const active = cfg?.active || [];

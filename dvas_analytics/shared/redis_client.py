@@ -177,3 +177,31 @@ async def hget_vehicle_track(
         except (json.JSONDecodeError, ValueError):
             result[k] = v
     return result
+
+
+async def scan_active_stream_drones() -> List[str]:
+    """
+    Scans Valkey for keys matching `drone:frames:*` and extracts active drone_id strings.
+    Allows microservices to dynamically consume streams published under any drone ID.
+    """
+    try:
+        client = get_client()
+        pattern = "drone:frames:*"
+        cursor = 0
+        found_keys = []
+        for _ in range(200):
+            cursor, keys = await client.scan(cursor=cursor, match=pattern, count=100)
+            found_keys.extend(keys)
+            if cursor == 0:
+                break
+        drone_ids = []
+        for key in found_keys:
+            key_str = key.decode() if isinstance(key, bytes) else key
+            parts = key_str.split(":", 2)
+            if len(parts) >= 3 and parts[2]:
+                drone_ids.append(parts[2])
+        return drone_ids
+    except Exception as exc:
+        log.warning("Failed to scan active stream drones from Valkey: %s", exc)
+        return []
+

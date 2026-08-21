@@ -38,10 +38,11 @@ class Config:
         d.strip()
         for d in os.getenv(
             "DRONE_IDS",
-            "DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005"
+            "DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005,DRN-001,DRN-002,DRN-003,DRN-004,DRN-005"
         ).split(",")
         if d.strip()
     ]
+
 
     # ── Input mode ─────────────────────────────────────────────────────────
     INPUT_SOURCE:    str = os.getenv("INPUT_SOURCE",    "valkey")
@@ -82,3 +83,21 @@ class Config:
 
 
 cfg = Config()
+
+
+def get_drone_aliases(drone_id: str) -> List[str]:
+    """
+    Returns a list of candidate drone_id strings matching variants
+    (e.g., 'DRN-004' <-> 'DRONE_KL_004').
+    """
+    if not drone_id:
+        return []
+    aliases = [drone_id]
+    if drone_id.startswith("DRN-"):
+        num = drone_id.replace("DRN-", "")
+        aliases.append(f"DRONE_KL_{num}")
+    elif drone_id.startswith("DRONE_KL_"):
+        num = drone_id.replace("DRONE_KL_", "")
+        aliases.append(f"DRN-{num}")
+    return aliases
+

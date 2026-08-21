@@ -72,6 +72,7 @@ async def upsert_track(
     mission_id is stored as TEXT in mission_id_str column for string-format mission IDs
     (e.g. MSN-20260813-1530-01-ALPHA).
     """
+    await ensure_drone(drone_id)
     pool = await get_pool()
     track_id = str(uuid.uuid4())
     if tracker_id is not None:

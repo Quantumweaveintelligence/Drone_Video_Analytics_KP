@@ -21,7 +21,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 sys.path.insert(0, "/analytics")
-from shared.config import cfg
+from shared.config import cfg, get_drone_aliases
 from shared.db import (
     close_pool, ensure_drone, get_pool, upsert_track,
     write_confirmed_event, write_plate_read,
@@ -31,6 +31,7 @@ from shared.db import (
 from shared.redis_client import (
     close_client, publish_analytics_result, publish_confirmed_event,
     xread_frames, hget_vehicle_track, hset_vehicle_track,
+    scan_active_stream_drones,
 )
 from shared import minio_client as minio
 from anpr.analyzer import ANPRAnalyzer
@@ -144,7 +145,7 @@ def _draw_anpr_annotations(frame: np.ndarray, plate_reads: list, drone_id: str) 
 
 @app.on_event("startup")
 async def startup():
-    global analyzer
+    global analyzer, _stream_running, _stream_task
     await get_pool()
     for drone_id in cfg.DRONE_IDS:
         await ensure_drone(drone_id)
@@ -159,6 +160,12 @@ async def startup():
         reid_spatial_weight=cfg.ANPR_REID_SPATIAL_WEIGHT,
     )
     log.info("ANPR Analyzer ready. Watchlist: %d entries", len(analyzer.watchlist))
+
+    # Auto-start stream background consumer loop
+    _stream_running = True
+    _stream_task = asyncio.create_task(_stream_loop())
+    log.info("ANPR stream loop auto-started for drones: %s", cfg.DRONE_IDS)
+
 
 
 @app.on_event("shutdown")
@@ -317,14 +324,29 @@ async def _stream_loop():
     global _stream_running, _frames_processed
     try:
         last_ids = {d: "0" for d in cfg.DRONE_IDS}
+        active_drones = list(cfg.DRONE_IDS)
         log.info("ANPR stream loop started for drones: %s", cfg.DRONE_IDS)
     except Exception as exc:
         log.error("ANPR stream loop FAILED to initialize: %s", exc, exc_info=True)
         _stream_running = False
         return
 
+    loop_count = 0
     while _stream_running:
-        for drone_id in cfg.DRONE_IDS:
+        loop_count += 1
+        if loop_count % 10 == 1:
+            try:
+                discovered = await scan_active_stream_drones()
+                for d in discovered:
+                    if d not in active_drones:
+                        active_drones.append(d)
+                        last_ids[d] = "0"
+            except Exception:
+                pass
+
+        for drone_id in active_drones:
+            if drone_id not in last_ids:
+                last_ids[drone_id] = "0"
             try:
                 new_id, frames = await xread_frames(
                     drone_id, last_ids[drone_id], count=2, block_ms=100
@@ -539,11 +561,18 @@ async def stream_stop():
 async def annotated_latest(drone_id: str = ""):
     """
     Returns the most recently annotated JPEG frame with plate bounding boxes + OCR text.
+    If drone_id is specified and has a cached frame (or matching alias), returns that frame.
+    Falls back to any available cached frame.
     """
     frame_bytes = None
-    if drone_id and drone_id in _last_annotated:
-        frame_bytes = _last_annotated[drone_id]
-    else:
+    if drone_id:
+        aliases = get_drone_aliases(drone_id)
+        for alias in aliases:
+            if alias in _last_annotated:
+                frame_bytes = _last_annotated[alias]
+                break
+
+    if not frame_bytes and _last_annotated:
         import time as _time
         best_drone = max(_last_annotated_ts, key=_last_annotated_ts.get, default=None)
         if best_drone:
@@ -551,6 +580,7 @@ async def annotated_latest(drone_id: str = ""):
 
     if not frame_bytes:
         raise HTTPException(404, "No annotated frame available yet — start detection first")
+
 
     return StreamingResponse(
         io.BytesIO(frame_bytes),
