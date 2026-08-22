@@ -608,10 +608,46 @@ async def mission_start(
     )
 
 
+async def _monitor_queue_drain(drone_id: str, mission_id: str, max_wait_sec: float = 30.0) -> None:
+    """
+    Background worker that monitors the per-drone queue after mission_end.
+    Allows consumer analytics services to process remaining buffered frames.
+    Once queue depth reaches 0 (or timeout expires), the stream is purged from Valkey.
+    """
+    t_start = time.monotonic()
+    log.info("queue_drain_started", extra={"drone_id": drone_id, "mission_id": mission_id})
+    while time.monotonic() - t_start < max_wait_sec:
+        await asyncio.sleep(1.0)
+        depth = await _qm.get_queue_depth(drone_id) if _qm else 0
+        if depth == 0:
+            log.info("queue_drain_complete", extra={"drone_id": drone_id, "mission_id": mission_id})
+            break
+
+    # Final cleanup — purge ephemeral stream from Valkey
+    if _qm:
+        await _qm.purge_stream(drone_id)
+        _qm.end_mission(drone_id, mission_id)
+
+    _active_missions.pop(drone_id, None)
+    if drone_id in _latest_metadata:
+        _latest_metadata[drone_id].pop("mission_id", None)
+        _latest_metadata[drone_id].pop("mission_name", None)
+        _latest_metadata[drone_id].pop("operator", None)
+        _latest_metadata[drone_id].pop("location", None)
+
+    ACTIVE_MISSIONS.set(len(_active_missions))
+    await ws_manager.broadcast({
+        "event":       "mission_drained",
+        "drone_id":    drone_id,
+        "mission_id":  mission_id,
+        "timestamp":   time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+    })
+
+
 @app.post(
     "/ingest/mission/end",
     response_model = MissionResponse,
-    summary        = "Mark a drone mission as ended",
+    summary        = "Mark a drone mission as ended and initiate queue drain",
     tags           = ["Mission"],
 )
 async def mission_end(
@@ -619,21 +655,17 @@ async def mission_end(
     claims: dict = Depends(validate_token),
 ) -> MissionResponse:
     """
-    Marks a mission as ended. Removes it from the active missions tracker
-    and publishes a `mission_end` event.
+    Marks a mission as draining/ended. Begins background queue drain monitoring
+    so in-flight frames are processed before stream cleanup.
     """
     ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
 
-    _active_missions.pop(req.drone_id, None)
-    if req.drone_id in _latest_metadata:
-        _latest_metadata[req.drone_id].pop("mission_id", None)
-        _latest_metadata[req.drone_id].pop("mission_name", None)
-        _latest_metadata[req.drone_id].pop("operator", None)
-        _latest_metadata[req.drone_id].pop("location", None)
-
     if _qm:
-        _qm.end_mission(req.drone_id, req.mission_id)
-    ACTIVE_MISSIONS.set(len(_active_missions))
+        _qm.mark_mission_draining(req.drone_id, req.mission_id, req.frames_sent)
+    if req.drone_id in _active_missions:
+        _active_missions[req.drone_id]["status"] = "draining"
+
+    asyncio.create_task(_monitor_queue_drain(req.drone_id, req.mission_id))
 
     await _publish_event("mission_end", req.drone_id, {
         "mission_id":  req.mission_id,
@@ -646,11 +678,11 @@ async def mission_end(
         "drone_id":    req.drone_id,
         "mission_id":  req.mission_id,
         "timestamp":   ts,
-        "data":        {"frames_sent": req.frames_sent},
+        "data":        {"frames_sent": req.frames_sent, "status": "draining"},
     }))
 
     log.info(
-        "mission_ended",
+        "mission_ending_draining",
         extra={
             "drone_id":    req.drone_id,
             "mission_id":  req.mission_id,
@@ -658,7 +690,7 @@ async def mission_end(
         },
     )
     return MissionResponse(
-        status     = "ended",
+        status     = "draining",
         drone_id   = req.drone_id,
         mission_id = req.mission_id,
         timestamp  = ts,
@@ -678,45 +710,24 @@ async def mission_end(
 async def get_active_streams():
     """
     Scans Valkey for ``drone:frames:*`` stream keys and returns the list of
-    drone IDs that have frames stored.  Unlike ``/ingest/telemetry`` this
-    survives server restarts because it reads directly from the persistent
-    Valkey store rather than the in-memory ``_latest_metadata`` dict.
-
-    Returns::
-
-        {
-          "drones": [
-            {
-              "drone_id": "DRN-004",
-              "stream_key": "drone:frames:DRN-004",
-              "frame_count": 1234,
-              "mission_id": "MSN-3705-FOXTROT",   // from in-memory cache or null
-              "last_seen": "2026-08-06T07:40:00.000Z" // from in-memory or null
-            }
-          ],
-          "count": 1
-        }
+    drone IDs that have active frames or are currently draining.
     """
     if not _qm:
         return {"drones": [], "count": 0}
     try:
         client = _qm._client
-        # SCAN for all drone:frames:* keys.
-        # redis-py async returns integer cursor (0 = iteration complete),
-        # NOT bytes b"0". Use integer 0 for init and termination check.
         pattern = "drone:frames:*"
-        cursor = 0          # ← integer, not b"0"
+        cursor = 0
         found_keys = []
-        for _ in range(200):    # safety cap — avoids infinite loop on large keyspaces
+        for _ in range(200):
             cursor, keys = await client.scan(cursor=cursor, match=pattern, count=100)
             found_keys.extend(keys)
-            if cursor == 0:     # ← integer comparison (redis-py returns int)
+            if cursor == 0:
                 break
 
         drones = []
         for key in found_keys:
             key_str = key.decode() if isinstance(key, bytes) else key
-            # key_str = "drone:frames:DRN-003"
             parts = key_str.split(":", 2)
             if len(parts) < 3:
                 continue
@@ -725,22 +736,55 @@ async def get_active_streams():
                 frame_count = await client.xlen(key_str)
             except Exception:
                 frame_count = 0
+
             meta = _latest_metadata.get(drone_id) or {}
+            last_seen_str = meta.get("last_seen")
+            
+            # Determine live vs draining vs offline
+            is_active_mission = drone_id in _active_missions
+            mission_stat = _qm._stats.get(drone_id).mission_status if drone_id in _qm._stats else "idle"
+            
+            # Check if we received a frame recently (within 15s) — strong live signal
+            recently_seen = False
+            if last_seen_str:
+                try:
+                    import datetime
+                    last_seen_dt = datetime.datetime.strptime(last_seen_str, "%Y-%m-%dT%H:%M:%S.%fZ")
+                    age_sec = (datetime.datetime.utcnow() - last_seen_dt).total_seconds()
+                    recently_seen = age_sec < 15.0
+                except Exception:
+                    pass
+            
+            # If 0 frames exist in stream, skip reporting as active
+            if frame_count == 0 and not is_active_mission and not recently_seen:
+                continue
+
+            stream_status = "live"
+            if mission_stat == "draining":
+                stream_status = "draining" if frame_count > 0 else "offline"
+            elif not is_active_mission and not recently_seen:
+                stream_status = "draining" if frame_count > 0 else "offline"
+
             drones.append({
                 "drone_id":        drone_id,
                 "stream_key":      key_str,
                 "frame_count":     frame_count,
-                "frames_received": frame_count,   # alias for frontend compatibility
+                "frames_received": frame_count,
+                "messages_ready":  frame_count,
+                "status":          stream_status,
                 "mission_id":      meta.get("mission_id") or _active_missions.get(drone_id, {}).get("mission_id"),
-                "last_seen":       meta.get("last_seen"),
+                "mission_name":    meta.get("mission_name") or _active_missions.get(drone_id, {}).get("mission_name"),
+                "operator":        meta.get("operator") or _active_missions.get(drone_id, {}).get("operator"),
+                "location":        meta.get("location") or _active_missions.get(drone_id, {}).get("location"),
+                "last_seen":       last_seen_str,
                 "latitude":        meta.get("latitude"),
                 "longitude":       meta.get("longitude"),
                 "battery_pct":     meta.get("battery_pct"),
                 "altitude_m":      meta.get("altitude_m"),
             })
 
-        # Sort: most frames first (i.e. most active drone at top)
-        drones.sort(key=lambda d: d["frame_count"], reverse=True)
+        # Sort: live first, then most frames
+        drones.sort(key=lambda d: (d["status"] == "live", d["frame_count"]), reverse=True)
         return {"drones": drones, "count": len(drones)}
 
     except Exception as exc:
@@ -758,7 +802,6 @@ async def get_telemetry():
     """
     Returns cached latest telemetry (GPS, battery, speed, etc.) for every drone
     that has sent at least one frame since server startup.
-    No auth required — used internally by the dashboard backend telemetry pump.
     """
     return {"drones": list(_latest_metadata.values()), "count": len(_latest_metadata)}
 
@@ -773,9 +816,8 @@ async def get_latest_frame(
     claims: dict = Depends(validate_token_flexible),
 ):
     """
-    Reads the most recent entry from the Valkey stream for the given drone
-    and returns the raw JPEG bytes. Used by the command dashboard multi-drone
-    view to display live frames.
+    Reads the most recent entry from the Valkey stream for the given drone.
+    Returns 404 if no frame exists or if stream has ended/drained.
     """
     if not _qm:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Queue unavailable")
@@ -783,15 +825,36 @@ async def get_latest_frame(
         stream_key = f"drone:frames:{drone_id}"
         entries = await _qm._client.xrevrange(stream_key, max="+", min="-", count=1)
         if not entries:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f"No frames yet for drone {drone_id}")
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"No frames available for drone {drone_id}")
+
+        meta = _latest_metadata.get(drone_id) or {}
+        mission_id = meta.get("mission_id") or ""
+
+        # Determine if stream is truly live based on active mission OR recent frames
+        _is_live = drone_id in _active_missions
+        if not _is_live:
+            try:
+                import datetime
+                ls = meta.get("last_seen", "")
+                if ls:
+                    age = (datetime.datetime.utcnow() - datetime.datetime.strptime(ls, "%Y-%m-%dT%H:%M:%S.%fZ")).total_seconds()
+                    _is_live = age < 15.0
+            except Exception:
+                pass
+
         _entry_id, fields = entries[0]
-        raw_jpeg = fields[b"frame"]
+        raw_jpeg = fields[b"frame"] if b"frame" in fields else fields.get("frame")
+        if isinstance(raw_jpeg, str):
+            raw_jpeg = raw_jpeg.encode("latin-1")
+
         return Response(
             content      = raw_jpeg,
             media_type   = "image/jpeg",
             headers      = {
-                "Cache-Control": "no-store",
-                "X-Drone-ID":   drone_id,
+                "Cache-Control":    "no-store, no-cache, must-revalidate",
+                "X-Drone-ID":       drone_id,
+                "X-Mission-ID":     mission_id,
+                "X-Stream-Status":  "live" if _is_live else "draining",
             },
         )
     except HTTPException:
@@ -799,6 +862,45 @@ async def get_latest_frame(
     except Exception as exc:
         log.error("latest_frame_error", extra={"drone_id": drone_id, "error": str(exc)})
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Frame retrieval failed")
+
+
+@app.post(
+    "/ingest/streams/{drone_id}/purge",
+    summary = "Immediately purge a drone stream queue and take offline",
+    tags    = ["Mission"],
+)
+@app.delete(
+    "/ingest/streams/{drone_id}",
+    summary = "Immediately delete a drone stream queue and take offline",
+    tags    = ["Mission"],
+)
+async def purge_drone_stream(
+    drone_id: str,
+    claims: dict = Depends(validate_token_flexible),
+):
+    """
+    Forcefully purges the Valkey stream queue for the given drone,
+    terminating any ongoing drain process and taking the stream offline immediately.
+    """
+    if not _qm:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Queue unavailable")
+    
+    await _qm.purge_stream(drone_id)
+    _qm.end_mission(drone_id, "")
+    _active_missions.pop(drone_id, None)
+    if drone_id in _latest_metadata:
+        _latest_metadata[drone_id].pop("mission_id", None)
+        _latest_metadata[drone_id].pop("mission_name", None)
+    
+    ACTIVE_MISSIONS.set(len(_active_missions))
+    await ws_manager.broadcast({
+        "event":       "mission_drained",
+        "drone_id":    drone_id,
+        "timestamp":   time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+    })
+    log.info("stream_manually_purged", extra={"drone_id": drone_id})
+    return {"status": "purged", "drone_id": drone_id}
+
 
 
 # ═════════════════════════════════════════════════════════════════════════════

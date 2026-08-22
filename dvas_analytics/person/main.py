@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 sys.path.insert(0, "/analytics")
-from shared.config import cfg
+from shared.config import cfg, get_drone_aliases
 from shared.db import (
     close_pool, ensure_drone, get_pool, upsert_track,
     write_confirmed_event, get_all_face_embeddings, delete_face_embeddings,
@@ -33,6 +33,7 @@ from shared.db import (
 )
 from shared.redis_client import (
     close_client, publish_analytics_result, publish_confirmed_event, xread_frames,
+    scan_active_stream_drones,
 )
 from shared import minio_client as minio
 from person.analyzer import PersonFaceAnalyzer
@@ -73,6 +74,7 @@ _stream_running = False
 _frames_processed = 0
 _reid_frame_counter = 0
 _last_annotated_frames: dict = {}  # {drone_id: jpeg_bytes}
+_last_annotated_ts: dict = {}      # {drone_id: monotonic_timestamp}
 _active_drone_missions: dict = {}  # {drone_id: mission_id}
 _live_person_buffer: dict = {}     # {(drone_id, tracker_id): {entry dict}}
 _LIVE_BUFFER_MAX = 100
@@ -212,11 +214,28 @@ async def analyze_frame(
 async def _stream_loop():
     global _stream_running, _frames_processed, _reid_frame_counter
     last_ids = {d: "0" for d in cfg.DRONE_IDS}
+    active_drones = list(cfg.DRONE_IDS)
+    log.info("Person stream loop started for drones: %s", cfg.DRONE_IDS)
+
+    loop_count = 0
     while _stream_running:
-        for drone_id in cfg.DRONE_IDS:
+        loop_count += 1
+        if loop_count % 10 == 1:
+            try:
+                discovered = await scan_active_stream_drones()
+                for d in discovered:
+                    if d not in active_drones:
+                        active_drones.append(d)
+                        last_ids[d] = "0"
+            except Exception as exc:
+                log.warning("Person stream scanner warning: %s", exc)
+
+        for drone_id in active_drones:
+            if drone_id not in last_ids:
+                last_ids[drone_id] = "0"
             try:
                 new_id, frames = await xread_frames(
-                    drone_id, last_ids[drone_id], count=4, block_ms=100
+                    drone_id, last_ids[drone_id], count=1, block_ms=10
                 )
                 last_ids[drone_id] = new_id
                 for f in frames:
@@ -241,8 +260,9 @@ async def _stream_loop():
                     if mission_id:
                         _active_drone_missions[drone_id] = mission_id
 
-                    result = analyzer.analyze_frame(
-                        frame, drone_id=drone_id, save_crops=True
+                    # Run inference in worker thread pool so FastAPI event loop is never blocked
+                    result = await asyncio.to_thread(
+                        analyzer.analyze_frame, frame, drone_id=drone_id, save_crops=True
                     )
                     # Tag result with mission_id for downstream consumers
                     result["mission_id"] = mission_id
@@ -251,7 +271,8 @@ async def _stream_loop():
                     for p in result["persons"]:
                         bb = p["bbox"]
                         cv2.rectangle(annotated, (bb["x1"], bb["y1"]), (bb["x2"], bb["y2"]), (191, 219, 56), 2)  # teal-ish
-                        label = f'P-{p["tracker_id"]}  {int(p["confidence"]*100)}%'
+                        tid_str = f'P-{p["tracker_id"]}' if p["tracker_id"] > 0 else f'P-{abs(p["tracker_id"])}'
+                        label = f'{tid_str}  {int(p["confidence"]*100)}%'
                         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                         cv2.rectangle(annotated, (bb["x1"], bb["y1"]-th-8), (bb["x1"]+tw+6, bb["y1"]), (191, 219, 56), -1)
                         cv2.putText(annotated, label, (bb["x1"]+3, bb["y1"]-4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
@@ -262,12 +283,13 @@ async def _stream_loop():
                         cv2.putText(annotated, conf_label, (bb["x1"], bb["y2"]+14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 191, 255), 1, cv2.LINE_AA)
                     _, ann_buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
                     _last_annotated_frames[drone_id] = bytes(ann_buf)
+                    _last_annotated_ts[drone_id] = time.monotonic()
 
                     ts = datetime.now(timezone.utc)
 
                     for person in result["persons"]:
                         tracker_id = person.get("tracker_id")
-                        if person["confidence"] >= 0.4:
+                        if person["confidence"] >= 0.15:
                             track_id = await upsert_track(
                                 drone_id, None, "person", ts, ts,
                                 tracker_id=tracker_id,
@@ -380,22 +402,41 @@ async def stream_stop():
 async def annotated_latest(drone_id: str = ""):
     """Return the latest annotated JPEG frame with person + face bounding boxes."""
     from fastapi.responses import Response
-    # If no drone_id specified, return any available frame
-    if not drone_id:
-        for did in cfg.DRONE_IDS:
-            if did in _last_annotated_frames:
-                drone_id = did
+
+    now = time.monotonic()
+    frame_bytes = None
+    matched_drone_id = None
+    frame_age = 0.0
+
+    if drone_id:
+        aliases = get_drone_aliases(drone_id)
+        for alias in aliases:
+            if alias in _last_annotated_frames:
+                frame_bytes = _last_annotated_frames[alias]
+                matched_drone_id = alias
+                frame_age = now - _last_annotated_ts.get(alias, now)
                 break
-    frame_bytes = _last_annotated_frames.get(drone_id)
+
+    if not frame_bytes and _last_annotated_frames:
+        best_drone = max(_last_annotated_ts, key=_last_annotated_ts.get, default=None)
+        if best_drone:
+            frame_bytes = _last_annotated_frames.get(best_drone)
+            matched_drone_id = best_drone
+            frame_age = now - _last_annotated_ts.get(best_drone, now)
+        if not frame_bytes:
+            matched_drone_id, frame_bytes = next(iter(_last_annotated_frames.items()))
+
     if not frame_bytes:
-        raise HTTPException(404, "No annotated frame available")
+        raise HTTPException(404, "No live Person annotated frame available yet")
+
     return Response(
         content=frame_bytes,
         media_type="image/jpeg",
         headers={
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
-            "X-Drone-ID": drone_id,
+            "X-Drone-ID": matched_drone_id or drone_id,
+            "X-Frame-Age": f"{frame_age:.2f}s",
         },
     )
 

@@ -360,6 +360,35 @@ async def ingest_latest_frame(drone_id: str, request: Request):
         raise HTTPException(500, "Frame retrieval failed")
 
 
+@ingest_api.post("/streams/{drone_id}/purge")
+@ingest_api.delete("/streams/{drone_id}")
+async def proxy_purge_stream(
+    drone_id: str,
+    request: Request,
+):
+    """
+    Force-purges a drone stream queue from Valkey and takes it offline immediately.
+    Any authenticated user can perform this action.
+    """
+    from server import get_current_user
+    await get_current_user(request)  # just verify authenticated
+    url = f"{INGEST_SERVER_URL}/ingest/streams/{drone_id}/purge"
+    token = await _get_service_token()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, headers=headers)
+            if resp.status_code == 200:
+                return resp.json()
+            raise HTTPException(resp.status_code, "Failed to purge stream")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Stream purge proxy error for %s: %s", drone_id, exc)
+        raise HTTPException(502, "Ingest server unreachable")
+
+
+
 
 
 # ═════════════════════════════════════════════════════════════════════════════

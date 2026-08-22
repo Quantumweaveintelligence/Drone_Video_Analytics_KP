@@ -39,8 +39,17 @@ SUPER_RES_MIN_WIDTH = 80           # lowered to upscale even small plates
 SUPER_RES_SCALE     = 3            # upscale more aggressively
 MAX_TRAJECTORY_LEN  = 30
 
-VEHICLE_CLASS_MAP = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
-VEHICLE_CLASSES   = list(VEHICLE_CLASS_MAP.keys())
+# Vehicle classes present in VisDrone and COCO models
+ALLOWED_VEHICLE_CLASSES = {
+    "car", "truck", "bus", "motorcycle", "motor", "van",
+    "auto-rickshaw", "tricycle", "awning-tricycle", "bicycle", "vehicle",
+}
+VEHICLE_NAME_STANDARDIZATION = {
+    "motor": "motorcycle",
+    "awning-tricycle": "auto-rickshaw",
+    "tricycle": "auto-rickshaw",
+}
+COCO_VEHICLE_IDS = {2, 3, 5, 6, 7}  # car, motorcycle, bus, train, truck
 
 PLATE_SANITY_RE = re.compile(r"^(?=.*[A-Z])(?=.*[0-9])[A-Z0-9]{5,12}$")
 
@@ -56,6 +65,7 @@ class TrackRecord:
     first_seen_frame: Optional[int] = None
     last_seen_frame:  Optional[int] = None
     last_ocr_frame:   int = -999
+    ocr_attempts:     int = 0
     theft_alerted:    bool = False
     best_crop_b64:    Optional[str] = None
     best_plate_crop_b64: Optional[str] = None  # plate crop image for gallery
@@ -441,9 +451,28 @@ class ANPRAnalyzer:
         self.use_gpu    = torch.cuda.is_available()
         self.device     = 0 if self.use_gpu else "cpu"
 
+        self.vehicle_model: Optional[YOLO] = None
+        self._vehicle_class_ids: Optional[List[int]] = None
+        self._vehicle_class_map: Dict[int, str] = {}
+
         try:
             self.vehicle_model = YOLO(vehicle_model_path)
             log.info("ANPR vehicle model loaded: %s", vehicle_model_path)
+
+            if hasattr(self.vehicle_model, "names") and self.vehicle_model.names:
+                names = self.vehicle_model.names
+                class_ids = []
+                for cid, cname in names.items():
+                    cname_clean = str(cname).lower().strip()
+                    if cname_clean in ALLOWED_VEHICLE_CLASSES or int(cid) in COCO_VEHICLE_IDS:
+                        class_ids.append(int(cid))
+                        self._vehicle_class_map[int(cid)] = VEHICLE_NAME_STANDARDIZATION.get(cname_clean, cname_clean)
+                if class_ids:
+                    self._vehicle_class_ids = class_ids
+                    log.info(
+                        "ANPR vehicle detection active class IDs: %s (mapping: %s)",
+                        self._vehicle_class_ids, self._vehicle_class_map,
+                    )
         except Exception as exc:
             log.error("Failed to load vehicle model: %s", exc)
             self.vehicle_model = None
@@ -509,16 +538,21 @@ class ANPRAnalyzer:
         frame_idx = self._frame_idx
 
         orig_h, orig_w = frame_orig.shape[:2]
-        scale_x = orig_w / TRACK_RESIZE_WIDTH
-        scale_y = orig_h / TRACK_RESIZE_HEIGHT
-
-        frame_track = cv2.resize(frame_orig, (TRACK_RESIZE_WIDTH, TRACK_RESIZE_HEIGHT))
+        if orig_w == TRACK_RESIZE_WIDTH and orig_h == TRACK_RESIZE_HEIGHT:
+            frame_track = frame_orig
+            scale_x = 1.0
+            scale_y = 1.0
+        else:
+            scale_x = orig_w / TRACK_RESIZE_WIDTH
+            scale_y = orig_h / TRACK_RESIZE_HEIGHT
+            frame_track = cv2.resize(frame_orig, (TRACK_RESIZE_WIDTH, TRACK_RESIZE_HEIGHT), interpolation=cv2.INTER_LINEAR)
 
         # ── 1. Vehicle detection + tracking (720p) ──────────────────────────
         try:
             results = self.vehicle_model.track(
                 frame_track, persist=True, imgsz=IMG_SIZE, conf=CONF_VEHICLE,
-                classes=VEHICLE_CLASSES, device=self.device, verbose=False,
+                classes=self._vehicle_class_ids, device=self.device, verbose=False,
+                half=self.use_gpu,
             )
         except Exception as exc:
             log.warning("Vehicle tracking failed: %s", exc)
@@ -538,7 +572,10 @@ class ANPRAnalyzer:
 
                 bt_id      = int(box.id[0])   # raw ByteTrack ID
                 cls_id     = int(box.cls[0])
-                class_name = VEHICLE_CLASS_MAP.get(cls_id, "vehicle")
+                class_name = self._vehicle_class_map.get(
+                    cls_id,
+                    self.vehicle_model.names.get(cls_id, "vehicle") if self.vehicle_model and hasattr(self.vehicle_model, "names") else "vehicle"
+                )
 
                 tx1, ty1, tx2, ty2 = clamp_box(
                     *box.xyxy[0].tolist(), TRACK_RESIZE_WIDTH, TRACK_RESIZE_HEIGHT
@@ -569,16 +606,27 @@ class ANPRAnalyzer:
                 # Always capture vehicle crop if we don't have one yet
                 if vehicle_crop.size > 0 and rec.best_crop_b64 is None:
                     _, buf = cv2.imencode(".jpg", vehicle_crop,
-                                          [cv2.IMWRITE_JPEG_QUALITY, 90])
+                                          [cv2.IMWRITE_JPEG_QUALITY, 85])
                     rec.best_crop_b64 = base64.b64encode(buf).decode()
 
-                # ── 3. Plate OCR on full-res crop ───────────────────────────
-                due_for_ocr = (frame_idx - rec.last_ocr_frame) >= OCR_EVERY_N_FRAMES
+                # ── 3. Adaptive OCR on full-res crop ─────────────────────────
+                best_text, best_conf, read_count = rec.best_plate()
+                if read_count >= 2 and best_conf >= 0.75:
+                    ocr_interval = OCR_EVERY_N_FRAMES * 6  # 30 frames: locked in
+                elif rec.ocr_attempts >= 6 and read_count == 0:
+                    ocr_interval = OCR_EVERY_N_FRAMES * 5  # 25 frames: no plate visible
+                else:
+                    ocr_interval = OCR_EVERY_N_FRAMES
+
+                due_for_ocr = (frame_idx - rec.last_ocr_frame) >= ocr_interval
                 if self.lp_model and self.ocr_engine and due_for_ocr and vehicle_crop.size > 0:
+                    rec.ocr_attempts += 1
+                    rec.last_ocr_frame = frame_idx
                     try:
                         lp_res = self.lp_model.predict(
                             vehicle_crop, imgsz=IMG_SIZE, conf=CONF_LP,
                             device=self.device, verbose=False,
+                            half=self.use_gpu,
                         )
                         lp_found = False
                         if lp_res and lp_res[0].boxes and len(lp_res[0].boxes) > 0:
@@ -594,9 +642,8 @@ class ANPRAnalyzer:
                                 if plate_crop.size > 0:
                                     gray_check = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
                                     sharpness = sharpness_laplacian(gray_check)
-                                    log.info("Track %d: LP model found %d boxes, best conf=%.2f area=%d",
-                                      track_id, len(lp_res[0].boxes),
-                                      max(confs), plate_area)
+                                    log.debug("Track %d: LP model found %d boxes, best conf=%.2f area=%d",
+                                              track_id, len(lp_res[0].boxes), max(confs), plate_area)
                                     if sharpness >= MIN_PLATE_SHARPNESS:
                                         enhanced = enhance_plate_crop(plate_crop)
                                         lines    = run_ocr(self.ocr_engine, enhanced)
@@ -607,10 +654,9 @@ class ANPRAnalyzer:
                                             if avg_conf >= MIN_OCR_CONFIDENCE and is_plausible_plate(clean):
                                                 rec.register_plate_read(frame_idx, clean, avg_conf)
                                                 lp_found = True
-                                        # Always store the plate crop if LP model found it,
-                                        # even if OCR couldn't read the text yet
+                                        # Always store the plate crop if LP model found it
                                         _, pbuf = cv2.imencode(".jpg", plate_crop,
-                                                                [cv2.IMWRITE_JPEG_QUALITY, 90])
+                                                                [cv2.IMWRITE_JPEG_QUALITY, 85])
                                         rec.best_plate_crop_b64 = base64.b64encode(pbuf).decode()
                                         # Store plate bbox in full-frame coords for annotation
                                         pfx1 = round(ox1 + lx1, 2)
@@ -619,19 +665,14 @@ class ANPRAnalyzer:
                                         pfy2 = round(oy1 + ly2, 2)
                                         rec.best_plate_bbox = [pfx1, pfy1, pfx2, pfy2]
                                     else:
-                                        log.info("Track %d: plate sharpness %.1f < %.1f, skipping",
+                                        log.debug("Track %d: plate sharpness %.1f < %.1f, skipping",
                                                   track_id, sharpness, MIN_PLATE_SHARPNESS)
-                                        rec.last_ocr_frame = frame_idx
                             else:
-                                log.info("Track %d: plate area %d < %d, skipping",
+                                log.debug("Track %d: plate area %d < %d, skipping",
                                           track_id, plate_area, MIN_PLATE_AREA_PX)
 
-                        # ── OCR-direct fallback ──────────────────────────
-                        # If the LP model failed, try running PaddleOCR
-                        # directly on the vehicle crop. PaddleOCR has its
-                        # own text detector that may find plate text even
-                        # when the dedicated LP YOLO model misses.
-                        if not lp_found and rec.best_plate_crop_b64 is None:
+                        # ── OCR-direct fallback (only initial attempts) ──
+                        if not lp_found and rec.best_plate_crop_b64 is None and rec.ocr_attempts <= 2:
                             try:
                                 enhanced_vc = enhance_plate_crop(vehicle_crop)
                                 ocr_results = self.ocr_engine.ocr(enhanced_vc, cls=True)
@@ -651,22 +692,21 @@ class ANPRAnalyzer:
                                             if ocr_plate_crop.size > 0:
                                                 rec.register_plate_read(frame_idx, clean, conf)
                                                 _, pbuf = cv2.imencode(".jpg", ocr_plate_crop,
-                                                                        [cv2.IMWRITE_JPEG_QUALITY, 90])
+                                                                        [cv2.IMWRITE_JPEG_QUALITY, 85])
                                                 rec.best_plate_crop_b64 = base64.b64encode(pbuf).decode()
                                                 pfx1 = round(ox1 + bx1o, 2)
                                                 pfy1 = round(oy1 + by1o, 2)
                                                 pfx2 = round(ox1 + bx2o, 2)
                                                 pfy2 = round(oy1 + by2o, 2)
                                                 rec.best_plate_bbox = [pfx1, pfy1, pfx2, pfy2]
-                                                log.info("Track %d: OCR fallback found plate '%s' conf=%.2f",
-                                                         track_id, clean, conf)
+                                                log.debug("Track %d: OCR fallback found plate '%s' conf=%.2f",
+                                                          track_id, clean, conf)
                                                 break  # use first valid plate
                             except Exception as ocr_exc:
                                 log.debug("OCR fallback error: %s", ocr_exc)
 
                     except Exception as exc:
                         log.debug("LP inference error: %s", exc)
-                        rec.last_ocr_frame = frame_idx
 
                 # ── 3. Build result for this track ──────────────────────────
                 plate_text, plate_conf, plate_reads_count = rec.best_plate()

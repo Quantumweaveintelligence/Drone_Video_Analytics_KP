@@ -17,12 +17,31 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { api } from "@/lib/api";
 
 const POLL_INTERVAL = 5000;   // 5 s — ingest status changes infrequently
-const STALE_THRESHOLD = 30000; // 30 s — last_seen older than this → treat as stale
+const STALE_THRESHOLD = 20000; // 20 s — last_seen older than this → treat as stale
 
 /** True if ISO timestamp is recent enough to be considered "live" */
 function isRecentlySeen(lastSeen) {
   if (!lastSeen) return false;
   return Date.now() - new Date(lastSeen).getTime() < STALE_THRESHOLD;
+}
+
+/** Determine stream status: live vs draining vs offline */
+function resolveDroneStatus(stream, fallbackStatus = "offline") {
+  if (!stream) return fallbackStatus;
+  
+  const recent = isRecentlySeen(stream.last_seen);
+  
+  // If frames arrived recently, the stream is live — regardless of backend status field
+  // (backend may have stale _active_missions state after restart)
+  if (recent) return "live";
+  
+  // Backend explicitly says draining and has frames remaining
+  if (stream.status === "draining" && (stream.messages_ready ?? 0) > 0) {
+    return "draining";
+  }
+  
+  // Not recently seen, no draining — offline
+  return "offline";
 }
 
 export function useActiveStreams() {
@@ -66,7 +85,7 @@ export function useActiveStreams() {
   const droneIsLive = useCallback(
     (id) => {
       const s = streamMap.get(id);
-      return !!s && isRecentlySeen(s.last_seen);
+      return !!s && isRecentlySeen(s.last_seen) && s.status !== "offline";
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [streams]
@@ -79,7 +98,7 @@ export function useActiveStreams() {
    *  1. Start with the DB drones array (from /api/drones)
    *  2. For every stream drone NOT in DB, create a minimal record
    *  3. Enrich every record with live ingest metadata (mission_id, battery, GPS)
-   *  4. Sort: live streams first, then degraded, then offline
+   *  4. Sort: live streams first, then draining, then degraded, then offline
    */
   const mergeWithDrones = useCallback(
     (dbDrones = []) => {
@@ -91,7 +110,7 @@ export function useActiveStreams() {
         if (!dbById.has(stream.drone_id)) {
           combined.push({
             id:            stream.drone_id,
-            status:        isRecentlySeen(stream.last_seen) ? "live" : "offline",
+            status:        resolveDroneStatus(stream, "offline"),
             battery_pct:   stream.battery_pct ?? null,
             lat:           stream.latitude  ?? null,
             lng:           stream.longitude ?? null,
@@ -125,15 +144,15 @@ export function useActiveStreams() {
           last_seen:     stream.last_seen,
           messages_ready: stream.messages_ready ?? drone.messages_ready ?? 0,
           frame_count:   stream.frame_count    ?? stream.frames_received ?? 0,
-          status: isRecentlySeen(stream.last_seen) ? "live" : drone.status,
+          status:        resolveDroneStatus(stream, drone.status),
         };
       });
 
-      // Sort: live first → degraded → offline; within same status: by id
-      const statusOrder = { live: 0, degraded: 1, offline: 2 };
+      // Sort: live first → draining → degraded → offline; within same status: by id
+      const statusOrder = { live: 0, draining: 1, degraded: 2, offline: 3 };
       enriched.sort((a, b) => {
-        const ao = statusOrder[a.status] ?? 3;
-        const bo = statusOrder[b.status] ?? 3;
+        const ao = statusOrder[a.status] ?? 4;
+        const bo = statusOrder[b.status] ?? 4;
         if (ao !== bo) return ao - bo;
         return (a.id || "").localeCompare(b.id || "");
       });
@@ -146,3 +165,4 @@ export function useActiveStreams() {
 
   return { streams, streamMap, droneIsLive, mergeWithDrones, loading, error };
 }
+

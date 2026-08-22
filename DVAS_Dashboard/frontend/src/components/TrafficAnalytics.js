@@ -47,8 +47,8 @@ function nvt(raw) {
   const l = raw.toLowerCase();
   if (l === 'car') return 'Car';
   if (l === 'truck') return 'Truck';
-  if (l.includes('3-wheel') || l === '3w') return '3-Wheeler';
-  if (l.includes('two-wheel') || l.includes('2-wheel') || l === 'motorcycle') return '2-Wheeler';
+  if (l.includes('3-wheel') || l === '3w' || l.includes('rickshaw') || l.includes('tricycle')) return '3-Wheeler';
+  if (l.includes('two-wheel') || l.includes('2-wheel') || l === 'motorcycle' || l === 'motor' || l === 'bicycle') return '2-Wheeler';
   if (l === 'bus') return 'Bus';
   if (l === 'van') return 'Van';
   return raw[0].toUpperCase() + raw.slice(1);
@@ -124,6 +124,7 @@ function useJpegPoller(url, intervalMs, enabled) {
   const [ok, setOk] = useState(false);
   const tickRef = useRef(null);
   const errRef = useRef(0);
+  const feedDeadRef = useRef(false);
 
   const doFetch = useCallback(async () => {
     if (!enabled || !url) return;
@@ -131,7 +132,8 @@ function useJpegPoller(url, intervalMs, enabled) {
       const token = localStorage.getItem('dvas_token') || '';
       const sep = url.includes('?') ? '&' : '?';
       const res = await fetch(`${url}${sep}_t=${Date.now()}`, {
-        headers: { Authorization: `Bearer ${token}` },
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        credentials: 'include',
       });
       if (res.ok) {
         const blob = await res.blob();
@@ -139,14 +141,19 @@ function useJpegPoller(url, intervalMs, enabled) {
         setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return next; });
         setOk(true);
         errRef.current = 0;
+        feedDeadRef.current = false;
+      } else if (res.status === 404) {
+        // Feed is offline — immediately invalidate and mark dead
+        setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
+        setOk(false);
+        feedDeadRef.current = true;
       } else {
         errRef.current++;
-        // only drop the "ok" state after 4 consecutive failures
-        if (errRef.current > 4) setOk(false);
+        if (errRef.current > 3) setOk(false);
       }
     } catch {
       errRef.current++;
-      if (errRef.current > 4) setOk(false);
+      if (errRef.current > 3) setOk(false);
     }
   }, [url, enabled]);
 
@@ -155,23 +162,28 @@ function useJpegPoller(url, intervalMs, enabled) {
       setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
       setOk(false);
       errRef.current = 0;
+      feedDeadRef.current = false;
       return;
     }
     errRef.current = 0;
+    feedDeadRef.current = false;
     doFetch();
     tickRef.current = setInterval(() => {
-      // Exponential backoff when getting repeated errors: only retry every 6th tick
-      if (errRef.current > 5 && (errRef.current % 6) !== 0) {
-        errRef.current++;
-        return;
-      }
+      // When feed is confirmed dead (404), poll very slowly (every ~10s)
+      if (feedDeadRef.current) return;
       doFetch();
     }, intervalMs);
+
+    // Slow background retry for dead feeds — check every 10s if feed comes back
+    const slowRetry = setInterval(() => {
+      if (feedDeadRef.current) doFetch();
+    }, 10000);
+
     return () => {
       clearInterval(tickRef.current);
+      clearInterval(slowRetry);
       setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
     };
-  // doFetch is stable (useCallback with stable deps) so this won't loop
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, url, intervalMs]);
 
@@ -179,17 +191,7 @@ function useJpegPoller(url, intervalMs, enabled) {
 }
 
 /* ─── Annotated Frame Viewer ─────────────────────────────────────── */
-/**
- * Dual-layer feed:
- *  Layer 1 — raw ingest JPEG: always polls, works whenever drone is streaming
- *  Layer 2 — annotated JPEG: polled only when streamRunning=true, overlaid
- *             on Layer 1 once the detection pipeline produces its first frame
- *
- * This means the user always sees SOMETHING (raw feed) even before
- * detection starts, and gets a seamless transition to annotated overlays
- * once the analytics service has processed its first frame.
- */
-function AnnotatedFrameViewer({ droneId, mode = 'vehicle', streamRunning }) {
+function AnnotatedFrameViewer({ droneId, mode = 'vehicle', streamRunning, isLive }) {
   const [fps, setFps] = useState(0);
   const fpsRef = useRef({ count: 0, ts: Date.now() });
   const prevAnnotatedRef = useRef(null);
@@ -198,7 +200,7 @@ function AnnotatedFrameViewer({ droneId, mode = 'vehicle', streamRunning }) {
   const hasDrone = !!droneId;
 
   // Build URLs — null-safe (poller ignores empty url)
-  const rawUrl       = hasDrone
+  const rawUrl = hasDrone
     ? `/api/ingest-server/frame/${encodeURIComponent(droneId)}/latest?drone_id=${encodeURIComponent(droneId)}`
     : null;
   const annotatedUrl = hasDrone
@@ -210,11 +212,9 @@ function AnnotatedFrameViewer({ droneId, mode = 'vehicle', streamRunning }) {
   // Layer 1: raw ingest feed — only when a drone is known
   const { blobUrl: rawSrc, ok: rawOk } = useJpegPoller(rawUrl, 1500, hasDrone);
 
-  // Layer 2: annotated overlay — polls whenever a drone is known
-  // (the endpoint returns 404 gracefully when no annotated frame is available yet;
-  // useJpegPoller handles this with exponential backoff)
+  // Layer 2: annotated overlay — polls when stream is running or drone is known
   const { blobUrl: annotatedSrc, ok: annotatedOk } = useJpegPoller(
-    annotatedUrl, FRAME_INTERVAL, hasDrone
+    annotatedUrl, FRAME_INTERVAL, hasDrone && streamRunning
   );
 
   // FPS counter — ticks whenever a new annotated blob URL appears
@@ -229,12 +229,12 @@ function AnnotatedFrameViewer({ droneId, mode = 'vehicle', streamRunning }) {
   }, [annotatedSrc]);
 
   // What to display in the <img>
-  const displaySrc   = annotatedOk ? annotatedSrc : rawSrc;
-  const isAnnotated  = annotatedOk && !!annotatedSrc;
-  const hasAnyFeed   = !!displaySrc;
+  const displaySrc  = annotatedOk ? annotatedSrc : rawSrc;
+  const isAnnotated = annotatedOk && !!annotatedSrc;
+  const hasAnyFeed  = !!displaySrc;
 
   return (
-    <div className="relative w-full h-full bg-black" style={{ minHeight: 340 }}>
+    <div className="relative w-full h-full bg-black flex items-center justify-center" style={{ minHeight: 340 }}>
 
       {/* ── Main image ────────────────────────────────────── */}
       {!hasDrone ? (
@@ -248,15 +248,17 @@ function AnnotatedFrameViewer({ droneId, mode = 'vehicle', streamRunning }) {
           src={displaySrc}
           alt={isAnnotated ? 'Annotated detection feed' : 'Raw drone feed'}
           className="w-full h-full object-contain"
-          style={{ display: 'block' }}
         />
       ) : (
-        <div className="w-full h-full flex flex-col items-center justify-center gap-3">
-          <Camera size={40} className="text-slate-600 opacity-30" />
-          <p className="mono text-sm text-slate-500">No frames from {droneId}</p>
-          <p className="mono text-[10px] text-slate-600">Drone is registered but not streaming to the ingest server</p>
+        <div className="w-full h-full flex flex-col items-center justify-center gap-3 text-center px-4">
+          <Activity size={36} className="text-slate-600 opacity-40" />
+          <p className="mono text-sm text-slate-400 font-bold tracking-wider">FEED OFFLINE — NO ACTIVE STREAM</p>
+          <p className="mono text-[11px] text-slate-500 max-w-sm">
+            Drone <span className="text-teal-400 font-semibold">{droneId}</span> is not transmitting frames to the ingest server.
+          </p>
         </div>
       )}
+
 
 
       {/* ── HUD: top-left labels ───────────────────────── */}
@@ -1615,6 +1617,16 @@ export default function TrafficAnalytics() {
     return () => clearInterval(id);
   }, []);
 
+  const toggleWorker = async (service) => {
+    const isRunning = serviceStatus[service];
+    const endpoint = isRunning ? `/analytics/${service}/stream/stop` : `/analytics/${service}/stream/start`;
+    try {
+      await api.get(endpoint);
+      setServiceStatus(prev => ({ ...prev, [service]: !isRunning }));
+    } catch (e) {
+      console.error(`Failed to toggle ${service} worker`, e);
+    }
+  };
 
   const handleAddWatchlist = async (plate, reason) => {
     setAdding(true);
@@ -1622,6 +1634,7 @@ export default function TrafficAnalytics() {
     catch (e) { console.error(e); }
     finally { setAdding(false); }
   };
+
   const handleRemoveWatchlist = async (plate) => {
     try { await api.delete(`/analytics/watchlist/${plate}`); }
     catch (e) { console.error(e); }
@@ -1680,17 +1693,25 @@ export default function TrafficAnalytics() {
             ))}
           </div>
           <div className="flex items-center gap-2">
-            {[['vehicle','Vehicle'],['anpr','ANPR']].map(([k,l]) => (
-              <span key={k} className="mono text-[9px] px-1.5 py-0.5 rounded-full flex items-center gap-1"
-                style={{
-                  background: serviceStatus[k] ? 'rgba(52,211,153,0.1)':'rgba(148,163,184,0.1)',
-                  color: serviceStatus[k] ? '#34d399':'#64748b',
-                  border: `1px solid ${serviceStatus[k] ? 'rgba(52,211,153,0.3)':'rgba(148,163,184,0.2)'}`,
-                }}>
-                <span className={`w-1.5 h-1.5 rounded-full ${serviceStatus[k] ? 'bg-emerald-400 dvas-live-dot':'bg-slate-500'}`} />
-                {l} {serviceStatus[k] ? 'ON':'OFF'}
-              </span>
-            ))}
+            {[['vehicle','Vehicle'],['anpr','ANPR']].map(([k,l]) => {
+              const isRunning = serviceStatus[k];
+              return (
+                <button
+                  key={k}
+                  onClick={() => toggleWorker(k)}
+                  title={isRunning ? `Click to pause ${l} inference (saves GPU/CPU)` : `Click to start ${l} inference`}
+                  className="mono text-[9px] px-2 py-1 rounded-full flex items-center gap-1.5 transition-all cursor-pointer hover:opacity-90"
+                  style={{
+                    background: isRunning ? 'rgba(52,211,153,0.12)' : 'rgba(148,163,184,0.1)',
+                    color: isRunning ? '#34d399' : '#64748b',
+                    border: `1px solid ${isRunning ? 'rgba(52,211,153,0.35)' : 'rgba(148,163,184,0.2)'}`,
+                  }}
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full ${isRunning ? 'bg-emerald-400 dvas-live-dot' : 'bg-slate-500'}`} />
+                  <span>{l} {isRunning ? 'RUNNING' : 'PAUSED'}</span>
+                </button>
+              );
+            })}
           </div>
         </div>
         <div style={{ height: 400, background:'#0a0a0f' }}>
@@ -1701,6 +1722,7 @@ export default function TrafficAnalytics() {
           />
         </div>
       </div>
+
 
       {/* KPI Strip */}
       <KPIStrip tracks={tracks} plates={plates} alerts={alerts} stats={stats} />

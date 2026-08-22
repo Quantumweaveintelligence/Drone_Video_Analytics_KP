@@ -62,6 +62,8 @@ volumes:
     driver: local     # evidence crops saved by analytics services (../dvas_analytics/)
   minio_data:
     driver: local     # MinIO object storage for crops, heatmaps, plate images
+  paddleocr_models:
+    driver: local     # Cached PaddleOCR detection, recognition, and angle models
 
 services:
 
@@ -532,7 +534,7 @@ services:
       DATABASE_URL:  postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
       REDIS_URL:     redis://valkey:6379/0
       DRONE_IDS:     "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005,DRN-001,DRN-002,DRN-003,DRN-004,DRN-005}"
-      VEHICLE_MODEL: /analytics/anpr/models/yolov8m.pt
+      VEHICLE_MODEL: /analytics/anpr/models/visdrone.pt
       LP_MODEL:      /analytics/anpr/models/license_plate_detector.pt
       LOG_LEVEL:     INFO
       MINIO_ENDPOINT:   minio:9000
@@ -554,6 +556,7 @@ services:
               capabilities: [gpu]
     volumes:
       - analytics_evidence:/data/evidence
+      - paddleocr_models:/root/.paddleocr
     depends_on:
       postgres:
         condition: service_healthy

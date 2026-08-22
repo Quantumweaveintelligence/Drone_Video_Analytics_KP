@@ -433,31 +433,42 @@ async def stream_stop():
 
 
 # ── Annotated frame endpoint ───────────────────────────────────────────────────
+FRAME_CACHE_TTL_SEC = 6.0
+
 @app.get("/annotated/latest")
 async def annotated_latest(drone_id: str = ""):
     """
     Returns the most recently annotated JPEG frame (with vehicle bounding boxes).
-    If drone_id is specified and has a cached frame (or matching alias), returns that frame.
-    Falls back to any available cached frame.
+    Strictly verifies drone ID / alias and enforces a freshness TTL window.
     """
+    import time as _time
+    now = _time.monotonic()
     frame_bytes = None
+    matched_drone_id = None
+    frame_age = 0.0
+
     if drone_id:
         aliases = get_drone_aliases(drone_id)
         for alias in aliases:
             if alias in _last_annotated:
-                frame_bytes = _last_annotated[alias]
-                break
-
-    if not frame_bytes and _last_annotated:
-        # Return the most recently updated frame from any drone
-        import time as _time
+                age = now - _last_annotated_ts.get(alias, 0)
+                if age <= FRAME_CACHE_TTL_SEC:
+                    frame_bytes = _last_annotated[alias]
+                    matched_drone_id = alias
+                    frame_age = age
+                    break
+    elif _last_annotated:
+        # If no specific drone requested, find the freshest frame within TTL
         best_drone = max(_last_annotated_ts, key=_last_annotated_ts.get, default=None)
         if best_drone:
-            frame_bytes = _last_annotated.get(best_drone)
+            age = now - _last_annotated_ts.get(best_drone, 0)
+            if age <= FRAME_CACHE_TTL_SEC:
+                frame_bytes = _last_annotated.get(best_drone)
+                matched_drone_id = best_drone
+                frame_age = age
 
     if not frame_bytes:
-        raise HTTPException(404, "No annotated frame available yet — start detection first")
-
+        raise HTTPException(404, "No live annotated frame available (feed offline or expired)")
 
     return StreamingResponse(
         io.BytesIO(frame_bytes),
@@ -466,6 +477,8 @@ async def annotated_latest(drone_id: str = ""):
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma":        "no-cache",
             "Expires":       "0",
+            "X-Drone-ID":    matched_drone_id or drone_id,
+            "X-Frame-Age":   f"{frame_age:.2f}s",
         },
     )
 

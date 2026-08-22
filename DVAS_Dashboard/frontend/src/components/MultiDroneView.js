@@ -41,7 +41,9 @@ import {
   ShieldCheck,
   User as UserIcon,
   RefreshCw,
+  Trash2,
 } from "lucide-react";
+
 
 import { useActiveStreams } from "@/hooks/useActiveStreams";
 
@@ -206,6 +208,13 @@ function StatusPill({ status }) {
       border: "border-emerald-500/30",
       text: "text-emerald-400",
       label: "LIVE",
+    },
+    draining: {
+      dot: "bg-amber-400 animate-pulse",
+      bg: "bg-amber-500/10",
+      border: "border-amber-500/30",
+      text: "text-amber-400",
+      label: "DRAINING",
     },
     degraded: {
       dot: "bg-amber-400",
@@ -382,10 +391,17 @@ function useDroneFeed(droneId, disabled, intervalMs = 700) {
           clearTimeout(watchRef.current);
           watchRef.current = setTimeout(() => { if (mountedRef.current) setFeedDead(true); }, FEED_WATCHDOG_MS);
           schedule(intervalMs);
+        } else if (res.status === 404) {
+          // Stream is offline or drained — immediately invalidate stale frame
+          setBlobUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return null; });
+          setHasFrame(false);
+          setFeedDead(true);
+          errRef.current = 7;
+          schedule(5000);
         } else { throw new Error(`HTTP ${res.status}`); }
       } catch {
         if (!mountedRef.current) return;
-        errRef.current++; if (errRef.current > 6) setFeedDead(true);
+        errRef.current++; if (errRef.current > 3) setFeedDead(true);
         schedule(FEED_BACKOFF[Math.min(errRef.current - 1, FEED_BACKOFF.length - 1)]);
       }
     };
@@ -396,7 +412,7 @@ function useDroneFeed(droneId, disabled, intervalMs = 700) {
   return { blobUrl, hasFrame, feedDead };
 }
 
-function DroneFeedCard({ drone, isSelected, hasSelection, onSelect }) {
+function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge }) {
   const isDegraded = drone.status === "degraded";
   const isOffline  = drone.status === "offline";
   const isOtherSelected = hasSelection && !isSelected;
@@ -517,13 +533,26 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect }) {
           </div>
         </div>
 
-        {/* Top-right: Status pill + streaming dot */}
+        {/* Top-right: Status pill + streaming dot + Purge button */}
         <div className="absolute top-3 right-3 z-10 flex items-center gap-1.5">
+          {(drone.status === "draining" || (drone.messages_ready && drone.messages_ready > 0)) && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onPurge?.(drone.id);
+              }}
+              title="Delete stream and discard remaining queue immediately"
+              className="mono text-[9px] px-1.5 py-0.5 rounded flex items-center gap-1 transition-all bg-red-500/20 text-red-400 border border-red-500/40 hover:bg-red-500/30"
+            >
+              <Trash2 size={9} /> Purge
+            </button>
+          )}
           {hasFrame && !feedDead && !isOffline && (
             <span className="w-2 h-2 rounded-full bg-teal-400" style={{ animation: "pulse 1.2s infinite" }} />
           )}
           <StatusPill status={isOffline ? "offline" : feedDead ? "offline" : drone.status} />
         </div>
+
 
         {/* Altitude & speed HUD (bottom bar) */}
         <div
@@ -1175,6 +1204,19 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
   const [playingEvent, setPlayingEvent] = useState(null);
   const [galleryType, setGalleryType] = useState(null); // 'persons' | 'faces' | null
 
+  const handlePurgeStream = useCallback(async (droneId) => {
+    try {
+      const token = localStorage.getItem("dvas_token") || "";
+      await fetch(`${API}/ingest-server/streams/${encodeURIComponent(droneId)}/purge`, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        credentials: "include",
+      });
+    } catch (e) {
+      console.error("Failed to purge stream", e);
+    }
+  }, []);
+
   // Clock tick for "X min ago" labels
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -1211,12 +1253,14 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
                   isSelected={isSelected}
                   hasSelection={!!selectedDroneId}
                   onSelect={setSelectedDroneId}
+                  onPurge={handlePurgeStream}
                 />
               </div>
             );
           })}
         </div>
       </div>
+
 
       {/* ── 3. Analytics Row (5 panels horizontal) ── */}
       <AnalyticsRow

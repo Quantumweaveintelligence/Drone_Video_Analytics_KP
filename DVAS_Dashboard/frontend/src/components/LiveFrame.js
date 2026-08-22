@@ -118,16 +118,25 @@ export default function LiveFrame({
           }, WATCHDOG_MS);
 
           scheduleNext(intervalMs);
+        } else if (res.status === 404) {
+          // Stream offline or drained — invalidate immediately
+          revokePrev();
+          setBlobUrl(null);
+          setHasFrame(false);
+          setFeedDead(true);
+          errCountRef.current = 7;
+          scheduleNext(5000);
         } else {
           throw new Error(`HTTP ${res.status}`);
         }
       } catch {
         if (!mountedRef.current) return;
         errCountRef.current += 1;
-        if (errCountRef.current > 6) setFeedDead(true);
+        if (errCountRef.current > 3) setFeedDead(true);
         const stepIdx = Math.min(errCountRef.current - 1, BACKOFF_STEPS.length - 1);
         scheduleNext(BACKOFF_STEPS[stepIdx]);
       }
+
     };
 
     // Kick off immediately

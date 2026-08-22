@@ -17,10 +17,10 @@ from ultralytics import YOLO
 
 log = logging.getLogger(__name__)
 
-FACE_TILE_ROWS   = 2
+FACE_TILE_ROWS   = 1
 FACE_TILE_COLS   = 2
-TILE_IMG_SIZE    = 1280
-CONF_PERSON      = 0.20
+TILE_IMG_SIZE    = 640
+CONF_PERSON      = 0.15
 CONF_FACE        = 0.25
 NMS_IOU          = 0.40
 SAVE_EVERY_N     = 5
@@ -167,6 +167,7 @@ class PersonFaceAnalyzer:
         self._frame_count += 1
         persons: List[dict] = []
         faces:   List[dict] = []
+        _untracked_counter = 0
 
         # ── Person detection + ByteTrack ─────────────────────────────────────
         if self.person_model:
@@ -182,9 +183,11 @@ class PersonFaceAnalyzer:
                 )
                 if results and results[0].boxes:
                     for box in results[0].boxes:
-                        if box.id is None:
-                            continue
-                        tracker_id = int(box.id[0])
+                        if box.id is not None:
+                            tracker_id = int(box.id[0])
+                        else:
+                            _untracked_counter += 1
+                            tracker_id = -_untracked_counter
                         conf = float(box.conf[0])
                         x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
 
@@ -235,6 +238,36 @@ class PersonFaceAnalyzer:
                         "crop_b64":   crop_b64,
                         "crop_bytes": crop_bytes,
                     })
+
+                # ── Anchor person bounding boxes to unlinked faces ─────────────
+                h_frame, w_frame = frame_bgr.shape[:2]
+                for face in faces:
+                    if face["tracker_id"] is None:
+                        fb = face["bbox"]
+                        fw = max(12, fb["x2"] - fb["x1"])
+                        fh = max(12, fb["y2"] - fb["y1"])
+                        fx_center = (fb["x1"] + fb["x2"]) // 2
+
+                        py1 = max(0, fb["y1"] - int(fh * 0.15))
+                        py2 = min(h_frame, fb["y1"] + int(fh * 5.8))
+                        px1 = max(0, fx_center - int(fw * 1.6))
+                        px2 = min(w_frame, fx_center + int(fw * 1.6))
+
+                        _untracked_counter += 1
+                        syn_tid = -_untracked_counter
+                        face["tracker_id"] = syn_tid
+
+                        crop_bytes = _crop_to_bytes(frame_bgr, px1, py1, px2, py2) if (save_crops and self._frame_count % SAVE_EVERY_N == 0) else None
+                        crop_b64 = base64.b64encode(crop_bytes).decode() if crop_bytes else None
+
+                        persons.append({
+                            "tracker_id": syn_tid,
+                            "bbox":       _bbox_dict(px1, py1, px2, py2),
+                            "confidence": round(face["confidence"], 4),
+                            "crop_b64":   crop_b64,
+                            "crop_bytes": crop_bytes,
+                        })
+
             except Exception as exc:
                 log.warning("Face detection error: %s", exc)
 

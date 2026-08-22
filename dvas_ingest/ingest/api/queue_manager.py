@@ -49,6 +49,8 @@ class DroneQueueStats:
     last_frame_ts:   float = 0.0
     mission_id:      Optional[str] = None
     mission_started: Optional[float] = None
+    mission_status:  str   = "idle"  # "active", "draining", "ended", "idle"
+    drain_target_seq: Optional[int] = None
     queue_depth:     int   = 0
     errors:          int   = 0
 
@@ -229,12 +231,33 @@ class QueueManager:
     def start_mission(self, drone_id: str, mission_id: str) -> None:
         if drone_id not in self._stats:
             self._stats[drone_id] = DroneQueueStats(drone_id=drone_id)
-        self._stats[drone_id].mission_id      = mission_id
-        self._stats[drone_id].mission_started = time.time()
+        self._stats[drone_id].mission_id       = mission_id
+        self._stats[drone_id].mission_started  = time.time()
+        self._stats[drone_id].mission_status   = "active"
+        self._stats[drone_id].drain_target_seq = None
+
+    def mark_mission_draining(self, drone_id: str, mission_id: str, last_seq: Optional[int] = None) -> None:
+        if drone_id in self._stats:
+            self._stats[drone_id].mission_status   = "draining"
+            self._stats[drone_id].drain_target_seq = last_seq
 
     def end_mission(self, drone_id: str, mission_id: str) -> None:
         if drone_id in self._stats:
-            self._stats[drone_id].mission_id = None
+            self._stats[drone_id].mission_id     = None
+            self._stats[drone_id].mission_status = "ended"
+
+    async def purge_stream(self, drone_id: str) -> None:
+        """Unlinks/deletes the stream from Valkey when queue is drained."""
+        if not self._connected:
+            await self.connect()
+        key = self._stream_key(drone_id)
+        try:
+            await self._client.unlink(key)
+            if drone_id in self._stats:
+                self._stats[drone_id].queue_depth = 0
+            log.info("stream_purged key=%s", key)
+        except Exception as exc:
+            log.warning("stream_purge_failed key=%s error=%s", key, exc)
 
     # ── Events ────────────────────────────────────────────────────────────────
 

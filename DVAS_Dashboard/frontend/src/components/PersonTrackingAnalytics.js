@@ -120,6 +120,7 @@ function useJpegPoller(url, intervalMs, enabled) {
   const [ok, setOk] = useState(false);
   const tickRef = useRef(null);
   const errRef = useRef(0);
+  const feedDeadRef = useRef(false);
 
   const doFetch = useCallback(async () => {
     if (!enabled || !url) return;
@@ -127,7 +128,8 @@ function useJpegPoller(url, intervalMs, enabled) {
       const token = localStorage.getItem('dvas_token') || '';
       const sep = url.includes('?') ? '&' : '?';
       const res = await fetch(`${url}${sep}_t=${Date.now()}`, {
-        headers: { Authorization: `Bearer ${token}` },
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        credentials: 'include',
       });
       if (res.ok) {
         const blob = await res.blob();
@@ -135,13 +137,19 @@ function useJpegPoller(url, intervalMs, enabled) {
         setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return next; });
         setOk(true);
         errRef.current = 0;
+        feedDeadRef.current = false;
+      } else if (res.status === 404) {
+        // Feed is offline — immediately invalidate and mark dead
+        setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
+        setOk(false);
+        feedDeadRef.current = true;
       } else {
         errRef.current++;
-        if (errRef.current > 4) setOk(false);
+        if (errRef.current > 3) setOk(false);
       }
     } catch {
       errRef.current++;
-      if (errRef.current > 4) setOk(false);
+      if (errRef.current > 3) setOk(false);
     }
   }, [url, enabled]);
 
@@ -150,19 +158,26 @@ function useJpegPoller(url, intervalMs, enabled) {
       setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
       setOk(false);
       errRef.current = 0;
+      feedDeadRef.current = false;
       return;
     }
     errRef.current = 0;
+    feedDeadRef.current = false;
     doFetch();
     tickRef.current = setInterval(() => {
-      if (errRef.current > 5 && (errRef.current % 6) !== 0) {
-        errRef.current++;
-        return;
-      }
+      // When feed is confirmed dead (404), poll very slowly (every ~10s)
+      if (feedDeadRef.current) return;
       doFetch();
     }, intervalMs);
+
+    // Slow background retry for dead feeds — check every 10s if feed comes back
+    const slowRetry = setInterval(() => {
+      if (feedDeadRef.current) doFetch();
+    }, 10000);
+
     return () => {
       clearInterval(tickRef.current);
+      clearInterval(slowRetry);
       setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
     };
   }, [enabled, url, intervalMs]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -264,9 +279,10 @@ function AnnotatedPersonFeedViewer({ activeDrone, setActiveDrone, drones, stream
               Detection Active
             </span>
             <button onClick={onStopStream}
-              className="flex items-center gap-1 px-2 py-1 rounded-lg mono text-[10px] font-bold transition-all hover:bg-red-500/20"
+              className="flex items-center gap-1 px-2.5 py-1 rounded-lg mono text-[10px] font-bold transition-all hover:bg-red-500/20"
+              title="Stop Person Detection worker to save GPU/CPU compute"
               style={{ color: '#f87171', border: '1px solid rgba(248,113,113,0.25)' }}>
-              <Square size={9} /> Stop
+              <Square size={9} /> Stop Worker
             </button>
           </div>
         )}
@@ -285,10 +301,10 @@ function AnnotatedPersonFeedViewer({ activeDrone, setActiveDrone, drones, stream
           <img src={displaySrc} alt={isAnnotated ? 'Annotated person detection feed' : 'Raw drone feed'}
             className="w-full h-full object-contain" />
         ) : hasDrone ? (
-          <div className="text-center text-slate-500 flex flex-col items-center">
-            <RefreshCw size={36} className="mb-3 opacity-40 text-slate-600 animate-spin" />
-            <p className="mono text-sm">Connecting to feed…</p>
-            <p className="mono text-[10px] mt-1 text-slate-600">{activeDrone}</p>
+          <div className="text-center text-slate-500 flex flex-col items-center gap-3 px-4">
+            <VideoOff size={42} className="opacity-40 text-slate-600" />
+            <p className="mono text-sm text-slate-400 font-bold tracking-wider">FEED OFFLINE — NO ACTIVE STREAM</p>
+            <p className="mono text-[10px] text-slate-500">Drone <span className="text-sky-400 font-semibold">{activeDrone}</span> is not transmitting frames</p>
           </div>
         ) : (
           <div className="text-center text-slate-500 flex flex-col items-center">
@@ -297,6 +313,7 @@ function AnnotatedPersonFeedViewer({ activeDrone, setActiveDrone, drones, stream
             <p className="mono text-[10px] mt-1 text-slate-600">Select a drone to view live feed</p>
           </div>
         )}
+
 
         {hasDrone && (
           <>

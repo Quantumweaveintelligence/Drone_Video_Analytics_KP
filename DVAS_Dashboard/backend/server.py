@@ -1961,18 +1961,22 @@ async def person_annotated_frame(user: dict = Depends(get_current_user), drone_i
         raise HTTPException(403, "Not permitted")
     try:
         params = {"drone_id": drone_id} if drone_id else {}
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=8.0) as client:
             r = await client.get(f"{PERSON_URL}/annotated/latest", params=params)
         if r.status_code == 200:
+            headers = {
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma":        "no-cache",
+            }
+            for h in ["X-Drone-ID", "X-Frame-Age", "X-Mission-ID"]:
+                if h in r.headers:
+                    headers[h] = r.headers[h]
             return Response(
                 content=r.content,
                 media_type="image/jpeg",
-                headers={
-                    "Cache-Control": "no-cache, no-store, must-revalidate",
-                    "Pragma":        "no-cache",
-                },
+                headers=headers,
             )
-        raise HTTPException(r.status_code, "No annotated frame available")
+        raise HTTPException(r.status_code, "No live annotated frame available")
     except httpx.RequestError:
         raise HTTPException(503, "Person analyzer unavailable")
 
@@ -2065,15 +2069,19 @@ async def vehicle_annotated_frame(user: dict = Depends(get_current_user), drone_
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.get(f"{VEHICLE_URL}/annotated/latest", params=params)
         if r.status_code == 200:
+            headers = {
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma":        "no-cache",
+            }
+            for h in ["X-Drone-ID", "X-Frame-Age", "X-Mission-ID"]:
+                if h in r.headers:
+                    headers[h] = r.headers[h]
             return Response(
                 content=r.content,
                 media_type="image/jpeg",
-                headers={
-                    "Cache-Control": "no-cache, no-store, must-revalidate",
-                    "Pragma":        "no-cache",
-                },
+                headers=headers,
             )
-        raise HTTPException(r.status_code, "No annotated frame available")
+        raise HTTPException(r.status_code, "No live annotated frame available")
     except httpx.RequestError:
         raise HTTPException(503, "Vehicle analyzer unavailable")
 
@@ -2092,15 +2100,19 @@ async def anpr_annotated_frame(user: dict = Depends(get_current_user), drone_id:
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.get(f"{ANPR_URL}/annotated/latest", params=params)
         if r.status_code == 200:
+            headers = {
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma":        "no-cache",
+            }
+            for h in ["X-Drone-ID", "X-Frame-Age", "X-Mission-ID"]:
+                if h in r.headers:
+                    headers[h] = r.headers[h]
             return Response(
                 content=r.content,
                 media_type="image/jpeg",
-                headers={
-                    "Cache-Control": "no-cache, no-store, must-revalidate",
-                    "Pragma":        "no-cache",
-                },
+                headers=headers,
             )
-        raise HTTPException(r.status_code, "No annotated frame available")
+        raise HTTPException(r.status_code, "No live annotated frame available")
     except httpx.RequestError:
         raise HTTPException(503, "ANPR analyzer unavailable")
 

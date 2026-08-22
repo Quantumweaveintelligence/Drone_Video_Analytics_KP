@@ -55,7 +55,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-VEHICLE_MODEL = os.getenv("VEHICLE_MODEL", "/analytics/anpr/models/yolov8m.pt")
+VEHICLE_MODEL = os.getenv("VEHICLE_MODEL", "/analytics/anpr/models/visdrone.pt")
 LP_MODEL      = os.getenv("LP_MODEL",      "/analytics/anpr/models/license_plate_detector.pt")
 
 analyzer: Optional[ANPRAnalyzer] = None
@@ -353,7 +353,10 @@ async def _stream_loop():
                 )
                 last_ids[drone_id] = new_id
 
-                for f in frames:
+                # If multiple frames arrived, process the newest frame to keep real-time latency minimal
+                frames_to_process = frames[-1:] if len(frames) > 1 else frames
+
+                for f in frames_to_process:
                     raw = f.get("jpeg_b64", "")
                     if not raw:
                         continue
@@ -363,10 +366,12 @@ async def _stream_loop():
                     if frame is None:
                         continue
 
-                    log.info("ANPR: processing frame for %s size=%s", drone_id, frame.shape if frame is not None else None)
+                    _frames_processed += 1
                     result = analyzer.analyze_frame(frame, drone_id=drone_id)
-                    log.info("ANPR: frame done — vehicles=%d plates_read=%d inference_ms=%.0f",
-                             result.get("total_vehicles", 0), result.get("plates_read", 0), result.get("inference_ms", 0))
+                    if _frames_processed % 50 == 1 or result.get("plates_read", 0) > 0:
+                        log.info("ANPR [%s]: frame #%d done — vehicles=%d plates_read=%d inference_ms=%.0f",
+                                 drone_id, _frames_processed, result.get("total_vehicles", 0),
+                                 result.get("plates_read", 0), result.get("inference_ms", 0))
                     ts     = datetime.now(timezone.utc)
 
                     # Extract mission_id from stream frame metadata
@@ -393,14 +398,10 @@ async def _stream_loop():
 
                     # ── Update live in-memory plate cache (for /plates/live) ────
                     import time as _time2
-                    if result.get("plate_reads"):
-                        log.info("Stream loop: caching %d plates/vehicles for %s", len(result["plate_reads"]), drone_id)
                     for plate in result.get("plate_reads", []):
                         cache_key = f"{drone_id}:{plate['tracker_id']}"
                         existing  = _recent_plate_cache.get(cache_key, {})
                         plate_text = plate.get("plate_text") or existing.get("plate_text", "")
-                        
-                        log.info(f"CACHE UPDATE tracker {plate['tracker_id']}: veh_bbox={plate.get('vehicle_bbox')} existing_veh_bbox={existing.get('vehicle_bbox')} plate_bbox={plate.get('plate_bbox')} existing_plate_bbox={existing.get('plate_bbox')}")
                         
                         _recent_plate_cache[cache_key] = {
                             "plate_text":        plate_text,
@@ -557,30 +558,41 @@ async def stream_stop():
 
 
 # ── Annotated frame endpoint ───────────────────────────────────────────────────
+FRAME_CACHE_TTL_SEC = 6.0
+
 @app.get("/annotated/latest")
 async def annotated_latest(drone_id: str = ""):
     """
     Returns the most recently annotated JPEG frame with plate bounding boxes + OCR text.
-    If drone_id is specified and has a cached frame (or matching alias), returns that frame.
-    Falls back to any available cached frame.
+    Strictly verifies drone ID / alias and enforces a freshness TTL window.
     """
+    import time as _time
+    now = _time.monotonic()
     frame_bytes = None
+    matched_drone_id = None
+    frame_age = 0.0
+
     if drone_id:
         aliases = get_drone_aliases(drone_id)
         for alias in aliases:
             if alias in _last_annotated:
-                frame_bytes = _last_annotated[alias]
-                break
-
-    if not frame_bytes and _last_annotated:
-        import time as _time
+                age = now - _last_annotated_ts.get(alias, 0)
+                if age <= FRAME_CACHE_TTL_SEC:
+                    frame_bytes = _last_annotated[alias]
+                    matched_drone_id = alias
+                    frame_age = age
+                    break
+    elif _last_annotated:
         best_drone = max(_last_annotated_ts, key=_last_annotated_ts.get, default=None)
         if best_drone:
-            frame_bytes = _last_annotated.get(best_drone)
+            age = now - _last_annotated_ts.get(best_drone, 0)
+            if age <= FRAME_CACHE_TTL_SEC:
+                frame_bytes = _last_annotated.get(best_drone)
+                matched_drone_id = best_drone
+                frame_age = age
 
     if not frame_bytes:
-        raise HTTPException(404, "No annotated frame available yet — start detection first")
-
+        raise HTTPException(404, "No live ANPR annotated frame available (feed offline or expired)")
 
     return StreamingResponse(
         io.BytesIO(frame_bytes),
@@ -589,6 +601,8 @@ async def annotated_latest(drone_id: str = ""):
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma":        "no-cache",
             "Expires":       "0",
+            "X-Drone-ID":    matched_drone_id or drone_id,
+            "X-Frame-Age":   f"{frame_age:.2f}s",
         },
     )
 
