@@ -39,8 +39,8 @@ import httpx
 
 import os
 
-INGEST_URL  = os.getenv("INGEST_URL",  "http://10.123.225.250/ingest/frame")
-TOKEN_URL   = os.getenv("TOKEN_URL",   "http://10.123.225.250:8080/realms/kerala-police-drone/protocol/openid-connect/token")
+INGEST_URL  = os.getenv("INGEST__URL", os.getenv("INGEST_URL",  "http://10.123.225.251/ingest/frame"))
+TOKEN_URL   = os.getenv("INGEST__TOKEN_URL", os.getenv("TOKEN_URL",   "http://10.123.225.251:8080/realms/kerala-police-drone/protocol/openid-connect/token"))
 CLIENT_ID   = os.getenv("KC_CLIENT_ID",  "drone-ingest-client")
 CLIENT_SEC  = os.getenv("INGEST__CLIENT_SECRET", os.getenv("KC_CLIENT_SEC", "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn"))
 
@@ -363,8 +363,8 @@ class IngestClient:
     ) -> None:
         """Register mission start with the ingest server."""
         mission_start_url = os.getenv(
-            "MISSION_START_URL",
-            "http://10.123.225.250/ingest/mission/start"
+            "INGEST__MISSION_START_URL",
+            os.getenv("MISSION_START_URL", "http://10.123.225.251/ingest/mission/start")
         )
         token = await self.get_token()
         payload = {
@@ -388,8 +388,8 @@ class IngestClient:
     async def end_mission(self) -> None:
         """Register mission end with the ingest server."""
         mission_end_url = os.getenv(
-            "MISSION_END_URL",
-            "http://10.123.225.250/ingest/mission/end"
+            "INGEST__MISSION_END_URL",
+            os.getenv("MISSION_END_URL", "http://10.123.225.251/ingest/mission/end")
         )
         token = await self.get_token()
         client = await self._get_client()

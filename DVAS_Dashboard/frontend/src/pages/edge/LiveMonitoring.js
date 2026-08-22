@@ -21,7 +21,11 @@ export default function LiveMonitoring() {
         const status = await statusResp.json();
         const missionData = await missionResp.json();
         setMetrics(status);
-        if (missionData.active) setMission(missionData);
+        if (missionData.active) {
+          setMission(missionData);
+        } else {
+          setMission(null);
+        }
 
         tick++;
         setFpsHistory(prev => [...prev.slice(1), { time: tick, value: Math.round(status.fps || 0) }]);

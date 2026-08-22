@@ -40,7 +40,7 @@ export default function MissionControl() {
               drone: m.drone_id,
               operator: m.operator_name,
               location: m.zone || m.location || '',
-              start: m.started_at ? new Date(m.started_at).toLocaleTimeString('en-GB') : '',
+              start: m.started_at ? (m.started_at.includes('T') ? new Date(m.started_at).toLocaleTimeString('en-GB') : m.started_at) : '',
               end: m.ended_at ? new Date(m.ended_at).toLocaleTimeString('en-GB') : '',
               status: m.status
             })));
@@ -159,7 +159,7 @@ export default function MissionControl() {
           drone: data.drone_id,
           operator: form.operator,
           location: form.location,
-          start: data.start_time,
+          start: data.start_time.includes('T') ? new Date(data.start_time).toLocaleTimeString('en-GB') : data.start_time,
           end: '--:--:--',
           status: 'active',
         }, ...prev]);
@@ -203,7 +203,7 @@ export default function MissionControl() {
       if (data.status === 'ended') {
         setMissionLog(prev => prev.map(m => 
           m.id === activeMission?.id 
-            ? { ...m, end: data.end_time || new Date().toLocaleTimeString('en-GB'), status: 'completed' }
+            ? { ...m, end: (data.end_time && data.end_time.includes('T')) ? new Date(data.end_time).toLocaleTimeString('en-GB') : (data.end_time || new Date().toLocaleTimeString('en-GB')), status: 'completed' }
             : m
         ));
         
@@ -226,6 +226,11 @@ export default function MissionControl() {
     }
   };
 
+  const activeMissionRef = React.useRef(activeMission);
+  useEffect(() => {
+    activeMissionRef.current = activeMission;
+  }, [activeMission]);
+
   useEffect(() => {
     const poll = async () => {
       try {
@@ -241,14 +246,28 @@ export default function MissionControl() {
             operator: data.operator,
             location: data.location,
             startTime: data.start_time,
+            videoSource: data.video_source,
+            videoSourceType: data.video_source_type,
           });
+        } else {
+          const currentMission = activeMissionRef.current;
+          if (currentMission) {
+            setMissionLog(logs => logs.map(m => 
+              m.id === currentMission.id 
+                ? { ...m, end: new Date().toLocaleTimeString('en-GB'), status: 'completed' }
+                : m
+            ));
+            
+            authFetch(`/api/missions/${currentMission.id}/end`, { method: 'PATCH' }).catch(e => console.error(e));
+            setActiveMission(null);
+          }
         }
       } catch (err) {
         // Edge server not available - keep current state
       }
     };
     poll();
-    const interval = setInterval(poll, 5000);
+    const interval = setInterval(poll, 3000);
     return () => clearInterval(interval);
   }, []);
 
@@ -324,6 +343,14 @@ export default function MissionControl() {
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase font-semibold">Start Time</div>
                     <div className="text-sm text-slate-200 font-mono">{activeMission.startTime}</div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-slate-500 uppercase font-semibold">Stream Type</div>
+                    <div className="text-sm text-slate-200 uppercase">{activeMission.videoSourceType === 'rtmp' ? 'RTMP' : 'Input Video'}</div>
+                  </div>
+                  <div className="col-span-2">
+                    <div className="text-[10px] text-slate-500 uppercase font-semibold">Source</div>
+                    <div className="text-sm text-slate-200 font-mono break-all">{activeMission.videoSourceType === 'file' ? activeMission.videoSource.split('/').pop() : activeMission.videoSource}</div>
                   </div>
                 </div>
 

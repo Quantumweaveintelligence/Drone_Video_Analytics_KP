@@ -68,6 +68,7 @@ class Drone(Base):
     lng = Column(Float)
     altitude_m = Column(Integer)
     battery_pct = Column(Integer)
+    speed_mps = Column(Float)
     signal_pct = Column(Integer)
     last_analytics = Column(JSONB, default=dict)  # crowd_density, vehicles, etc.
 

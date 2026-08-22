@@ -294,11 +294,13 @@ class RealVideoSource:
         video_source: str = "",
         frame_queue_size: int = 8,
         on_frame: Optional[Callable[[VideoFrame], None]] = None,
+        on_complete: Optional[Callable[[], None]] = None,
         heartbeat_interval_frames: int = 60,
     ) -> None:
         self.drone_id = drone_id
         self.video_source = video_source
         self.on_frame = on_frame
+        self.on_complete = on_complete
         self.heartbeat_interval_frames = heartbeat_interval_frames
 
         # Determine source type
@@ -419,7 +421,7 @@ class RealVideoSource:
     def stop(self) -> None:
         """Signal the threads to stop and wait for them."""
         self._stop_event.set()
-        if self._reader_thread is not None:
+        if self._reader_thread is not None and self._reader_thread is not threading.current_thread():
             self._reader_thread.join(timeout=10.0)
         if self._write_thread is not None:
             # Drain the write queue so the sentinel can be enqueued
@@ -432,7 +434,8 @@ class RealVideoSource:
                 self._write_queue.put(None, timeout=2.0)  # sentinel
             except queue.Full:
                 pass
-            self._write_thread.join(timeout=5.0)
+            if self._write_thread is not threading.current_thread():
+                self._write_thread.join(timeout=5.0)
         self.is_connected = False
         DRONE_STREAM_UP.labels(drone_id=self.drone_id).set(0)
         log.info(
@@ -662,6 +665,12 @@ class RealVideoSource:
         self.is_connected = False
         DRONE_STREAM_UP.labels(drone_id=self.drone_id).set(0)
         log.info("real_source_reader_loop_exited", drone_id=self.drone_id)
+        
+        # Signal the writer thread that we are done
+        try:
+            self._write_queue.put(None, timeout=2.0)
+        except queue.Full:
+            pass
 
     # ------------------------------------------------------------------
     # Async buffer writer
@@ -692,3 +701,8 @@ class RealVideoSource:
                         error=str(exc),
                     )
         log.info("real_source_write_worker_stopped", drone_id=self.drone_id)
+        if self.on_complete is not None:
+            try:
+                self.on_complete()
+            except Exception as exc:
+                log.error("real_source_on_complete_error", drone_id=self.drone_id, error=str(exc))

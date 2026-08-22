@@ -24,6 +24,7 @@ log = get_logger(__name__)
 # ── Standard library ─────────────────────────────────────────────────────────
 import os
 import time
+import datetime
 import asyncio
 import threading
 import queue
@@ -258,7 +259,7 @@ class PipelineManager:
             if self._running:
                 return {"error": "Mission already running"}
 
-            start_time_str = time.strftime("%H:%M:%S")
+            start_time_str = datetime.datetime.utcnow().isoformat() + "Z"
             self._start_wall = time.time()
             self._running = True
             self.frames_selected = 0
@@ -390,6 +391,7 @@ class PipelineManager:
                 drone_id=drone_id,
                 video_source=clean_video_source,
                 on_frame=_on_frame,
+                on_complete=self.end_mission,
             )
 
             # ── Edge Sender Thread ─────────────────────────────────────────
@@ -435,7 +437,7 @@ class PipelineManager:
             if not self._running:
                 return {"error": "No active mission"}
 
-            end_time_str = time.strftime("%H:%M:%S")
+            end_time_str = datetime.datetime.utcnow().isoformat() + "Z"
             frames_processed = self.source._frame_index if self.source else 0
             mission_id = self.active_mission.get("mission_id", "") if self.active_mission else ""
 
