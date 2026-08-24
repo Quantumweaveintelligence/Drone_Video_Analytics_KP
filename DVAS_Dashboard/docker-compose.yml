@@ -67,7 +67,7 @@ services:
       - "8765:8765"
     volumes:
       - edge_buffer:/app/buffer_storage
-      - C:/Users/asus/DVAS_KP/videos:/data
+      - ../videos:/data:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
