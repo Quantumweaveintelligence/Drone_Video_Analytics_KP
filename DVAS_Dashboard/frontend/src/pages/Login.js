@@ -3,7 +3,7 @@ import { useNavigate, Navigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import { useI18n } from "@/context/I18nContext";
 import { ROLE_HOME, ROLE_LABELS } from "@/lib/api";
-import { Shield, Lock as LockKey, User, ChevronDown } from "lucide-react";
+import { Shield, Lock as LockKey, User, ChevronDown, Eye, EyeOff } from "lucide-react";
 
 
 function fmt(detail) {
@@ -18,6 +18,7 @@ export default function Login() {
   const { t } = useI18n();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const nav = useNavigate();
@@ -97,12 +98,20 @@ export default function Login() {
                 <LockKey size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
                 <input
                   data-testid="input-password"
-                  type="password"
+                  type={showPassword ? "text" : "password"}
                   required
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-700 focus:border-sky-500 outline-none px-9 py-2.5 text-sm mono"
+                  className="w-full bg-slate-900 border border-slate-700 focus:border-sky-500 outline-none pl-9 pr-10 py-2.5 text-sm mono"
                 />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 transition-colors focus:outline-none"
+                  title={showPassword ? "Hide password" : "Show password"}
+                >
+                  {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
               </div>
             </label>
 
