@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import AppShell from '@/components/layout/AppShell';
 import { Target, Play, Trash, XCircle, CheckCircle, Cpu } from 'lucide-react';
-import { authFetch } from '@/lib/api';
+import { authFetch, getAuthToken } from '@/lib/api';
 
 export default function MissionControl() {
   const [activeMission, setActiveMission] = useState(null);
@@ -107,22 +107,49 @@ export default function MissionControl() {
 
       if (form.video_source_type === 'file') {
         setUploadProgress('Uploading video...');
-        const formData = new FormData();
-        formData.append('video', videoFile);
         if (srtFile) {
-          formData.append('srt', srtFile);
+          const srtFormData = new FormData();
+          srtFormData.append('srt', srtFile);
+          await authFetch('/edge-api/api/edge/mission/upload-srt', {
+            method: 'POST',
+            body: srtFormData,
+          });
         }
 
-        const uploadResp = await authFetch('/edge-api/api/edge/mission/upload-video', {
-          method: 'POST',
-          body: formData,
+        const uploadData = await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open('POST', '/edge-api/api/edge/mission/upload-video-stream', true);
+          
+          const token = getAuthToken();
+          if (token) {
+            xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+          }
+          xhr.setRequestHeader('x-filename', encodeURIComponent(videoFile.name));
+          xhr.setRequestHeader('Content-Type', videoFile.type || 'application/octet-stream');
+
+          xhr.upload.onprogress = (event) => {
+            if (event.lengthComputable) {
+              const percentComplete = Math.round((event.loaded / event.total) * 100);
+              const mbUploaded = (event.loaded / (1024 * 1024)).toFixed(1);
+              const mbTotal = (event.total / (1024 * 1024)).toFixed(1);
+              setUploadProgress(`Streaming to disk... ${percentComplete}% (${mbUploaded} / ${mbTotal} MB)`);
+            }
+          };
+
+          xhr.onload = () => {
+            if (xhr.status >= 200 && xhr.status < 300) {
+              resolve(JSON.parse(xhr.responseText));
+            } else {
+              reject(new Error(`Video upload failed: ${xhr.status} ${xhr.statusText}`));
+            }
+          };
+
+          xhr.onerror = () => {
+            reject(new Error('Video upload failed: Network Error'));
+          };
+
+          xhr.send(videoFile); // Send raw file directly as stream
         });
-
-        if (!uploadResp.ok) {
-          throw new Error(`Video upload failed: ${uploadResp.status} ${uploadResp.statusText}`);
-        }
-
-        const uploadData = await uploadResp.json();
         finalVideoSource = uploadData.video_path;
         setUploadProgress('');
       }

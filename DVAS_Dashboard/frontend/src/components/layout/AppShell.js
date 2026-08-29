@@ -396,7 +396,7 @@ export default function AppShell({ children, title, subtitle }) {
 
   return (
     <div
-      className="min-h-screen flex"
+      className="h-screen overflow-hidden flex"
       style={{ background: "var(--dvas-root)", color: "var(--dvas-text)" }}
     >
       {/* Sidebar */}

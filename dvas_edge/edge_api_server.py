@@ -440,6 +440,8 @@ class PipelineManager:
             end_time_str = datetime.datetime.utcnow().isoformat() + "Z"
             frames_processed = self.source._frame_index if self.source else 0
             mission_id = self.active_mission.get("mission_id", "") if self.active_mission else ""
+            video_source_type = self.active_mission.get("video_source_type", "") if self.active_mission else ""
+            video_source_path = self.active_mission.get("video_source", "") if self.active_mission else ""
 
             # ── Stop components (reverse order) ───────────────────────────
             if self.source is not None:
@@ -453,6 +455,21 @@ class PipelineManager:
                     pass
             if self.sender_thread is not None:
                 self.sender_thread.stop()
+
+            # ── Clean up physical files if this was a local file upload ────────
+            if video_source_type == "file" and video_source_path:
+                try:
+                    if os.path.exists(video_source_path):
+                        os.remove(video_source_path)
+                        log.info("deleted_video_file", file=video_source_path)
+                    
+                    # Also try to clean up potential SRT files matching the name
+                    srt_path = os.path.splitext(video_source_path)[0] + ".srt"
+                    if os.path.exists(srt_path):
+                        os.remove(srt_path)
+                        log.info("deleted_srt_file", file=srt_path)
+                except Exception as e:
+                    log.error("failed_to_delete_video_file", error=str(e))
 
             self._running = False
             self.active_mission = None
@@ -645,6 +662,28 @@ async def verify_edge_auth(
     raise HTTPException(status_code=401, detail="Unauthorized: Valid Edge API Key or Authentication Token required")
 
 
+@app.post("/api/edge/mission/upload-video-stream")
+async def upload_video_stream(
+    request: Request,
+    auth: dict = Depends(verify_edge_auth)
+):
+    """Raw stream upload for large video files directly to disk."""
+    filename_encoded = request.headers.get("x-filename", "uploaded_video.mp4")
+    import urllib.parse
+    filename = urllib.parse.unquote(filename_encoded)
+    
+    upload_dir = Path("/data")
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    video_path = upload_dir / filename
+    
+    # Stream directly from HTTP request to the final volume on disk
+    with open(video_path, "wb") as out_file:
+        async for chunk in request.stream():
+            out_file.write(chunk)
+            
+    return {"status": "success", "video_path": str(video_path)}
+
+
 @app.post("/api/edge/mission/upload-video")
 async def upload_video(
     video: UploadFile = File(...),
@@ -666,6 +705,22 @@ async def upload_video(
             shutil.copyfileobj(srt.file, buffer)
             
     return {"status": "success", "video_path": str(video_path)}
+
+
+@app.post("/api/edge/mission/upload-srt")
+async def upload_srt(
+    srt: UploadFile = File(...),
+    auth: dict = Depends(verify_edge_auth)
+):
+    """Upload SRT file separately."""
+    upload_dir = Path("/data")
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    
+    srt_path = upload_dir / srt.filename
+    with open(srt_path, "wb") as buffer:
+        shutil.copyfileobj(srt.file, buffer)
+        
+    return {"status": "success", "srt_path": str(srt_path)}
 
 
 @app.post("/api/edge/mission/start")

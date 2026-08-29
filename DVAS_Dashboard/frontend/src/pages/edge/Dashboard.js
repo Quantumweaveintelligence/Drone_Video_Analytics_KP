@@ -13,11 +13,7 @@ const generateChartData = (base, variance, count) => {
 };
 
 export default function Dashboard() {
-  const [activeAlerts, setActiveAlerts] = useState([
-    { id: 1, text: "Unidentified object detected in sector 7G", severity: "amber", ack: false, time: "14:32:01" },
-    { id: 2, text: "Wind speed exceeding safe operating limits", severity: "red", ack: false, time: "14:30:44" },
-    { id: 3, text: "Mission waypoint 4 reached", severity: "neutral", ack: true, time: "14:28:12" },
-  ]);
+  const [recentMissions, setRecentMissions] = useState([]);
 
   const [edgeStatus, setEdgeStatus] = useState(null);
   const [telemetry, setTelemetry] = useState(null);
@@ -55,9 +51,20 @@ export default function Dashboard() {
     return () => clearInterval(interval);
   }, []);
 
-  const toggleAck = (id) => {
-    setActiveAlerts(prev => prev.map(a => a.id === id ? { ...a, ack: !a.ack } : a));
-  };
+  useEffect(() => {
+    const fetchRecent = async () => {
+      try {
+        const resp = await authFetch('/api/missions');
+        if (resp.ok) {
+          const data = await resp.json();
+          // Filter to only completed/recovered and take the last 2
+          const completed = data.filter(m => m.status === 'completed' || m.status === 'recovered').slice(0, 2);
+          setRecentMissions(completed);
+        }
+      } catch (e) {}
+    };
+    fetchRecent();
+  }, []);
 
   const kpis = [
     { label: "Active Mission", value: activeMission ? "1" : "0", status: activeMission ? "green" : "neutral", unit: "" },
@@ -136,75 +143,43 @@ export default function Dashboard() {
             </div>
           </div>
 
-          {/* Drone Asset Card */}
-          <div className="bg-slate-900 border border-slate-800 p-5 rounded-lg flex flex-col">
-            <div className="flex justify-between items-start mb-5">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center text-slate-300 border border-slate-700">
-                  <Drone size={24} />
+          {/* Recent Missions */}
+          {recentMissions.map((mission, idx) => (
+            <div key={idx} className="bg-slate-900 border border-slate-800 p-5 rounded-lg flex flex-col relative overflow-hidden opacity-80">
+              <div className="flex justify-between items-start mb-4">
+                <div className="text-xs text-slate-500 font-semibold uppercase tracking-wider">Recent Mission</div>
+                <div className="flex items-center gap-2 text-xs px-2 py-0.5 rounded-full bg-slate-500/10 border border-slate-500/20 text-slate-400">
+                  COMPLETED
+                </div>
+              </div>
+              <div className="text-xl font-bold text-slate-300 font-mono mb-1">{mission.mission_id || 'UNKNOWN'}</div>
+              <div className="text-sm text-slate-400 font-medium mb-4">{mission.name || '--'}</div>
+              <div className="grid grid-cols-2 gap-y-3 mt-auto text-sm">
+                <div>
+                  <div className="text-[10px] text-slate-500 uppercase">Drone Assigned</div>
+                  <div className="text-slate-300">{mission.drone_id || '--'}</div>
                 </div>
                 <div>
-                  <div className="text-sm font-bold text-slate-100">Garuda-1</div>
-                  <div className="text-xs text-slate-500 font-mono">DRN-001</div>
+                  <div className="text-[10px] text-slate-500 uppercase">Operator</div>
+                  <div className="text-slate-300">{mission.operator_name || '--'}</div>
                 </div>
-              </div>
-              <div className="text-[10px] px-2 py-1 rounded-sm bg-sky-500/10 border border-sky-500/20 text-sky-400 font-mono tracking-wider">
-                CONNECTED
+                <div>
+                  <div className="text-[10px] text-slate-500 uppercase">Location</div>
+                  <div className="text-slate-300">{mission.zone || mission.location || '--'}</div>
+                </div>
+                <div>
+                  <div className="text-[10px] text-slate-500 uppercase">Started</div>
+                  <div className="text-slate-300 font-mono text-xs">{mission.started_at ? new Date(mission.started_at).toLocaleString() : '--'}</div>
+                </div>
               </div>
             </div>
-            
-            <div className="space-y-4 mt-auto">
-              <div>
-                <div className="flex justify-between text-xs mb-1">
-                  <span className="text-slate-400">Battery</span>
-                  <span className="text-emerald-400 font-mono">78%</span>
-                </div>
-                <div className="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-                  <div className="bg-emerald-500 h-full rounded-full" style={{ width: '78%' }}></div>
-                </div>
-              </div>
-              
-              <div className="flex justify-between items-center text-xs">
-                <span className="text-slate-400">Signal Strength</span>
-                <span className="text-slate-200 font-mono">92%</span>
-              </div>
-              <div className="flex justify-between items-center text-xs pt-2 border-t border-slate-800">
-                <span className="text-slate-500">Last Seen</span>
-                <span className="text-slate-400 font-mono">Just now</span>
-              </div>
-            </div>
-          </div>
+          ))}
 
-          {/* Active Alerts Card */}
-          <div className="bg-slate-900 border border-slate-800 p-5 rounded-lg flex flex-col">
-            <div className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-4">Active Alerts</div>
-            <div className="space-y-3 overflow-y-auto max-h-[160px] pr-1 scrollbar-thin scrollbar-thumb-slate-700">
-              {activeAlerts.map(alert => (
-                <div key={alert.id} className={`flex gap-3 text-xs p-2 rounded border ${alert.ack ? 'bg-slate-950 border-slate-800 opacity-60' : 'bg-slate-800/50 border-slate-700'}`}>
-                  <div className="mt-0.5 shrink-0">
-                    {alert.severity === 'red' ? <Warning className="text-red-400" size={14} /> :
-                     alert.severity === 'amber' ? <Warning className="text-amber-400" size={14} /> :
-                     <Info className="text-slate-400" size={14} />}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className={`mb-1 ${alert.ack ? 'text-slate-500' : (alert.severity === 'red' ? 'text-red-300' : alert.severity === 'amber' ? 'text-amber-300' : 'text-slate-300')}`}>
-                      {alert.text}
-                    </div>
-                    <div className="text-[10px] text-slate-500 font-mono">{alert.time}</div>
-                  </div>
-                  <button 
-                    onClick={() => toggleAck(alert.id)}
-                    className={`shrink-0 px-2 h-6 text-[9px] uppercase tracking-wider font-bold rounded flex items-center gap-1 ${alert.ack ? 'bg-slate-800 text-slate-500' : 'bg-slate-700 hover:bg-slate-600 text-slate-200'}`}
-                  >
-                    {alert.ack ? 'ACKED' : 'ACK'}
-                  </button>
-                </div>
-              ))}
-              {activeAlerts.length === 0 && (
-                <div className="text-sm text-slate-500 text-center py-4">No active alerts.</div>
-              )}
+          {recentMissions.length < 2 && Array.from({ length: 2 - recentMissions.length }).map((_, idx) => (
+            <div key={`empty-${idx}`} className="bg-slate-900 border border-slate-800 p-5 rounded-lg flex flex-col justify-center items-center opacity-50">
+               <div className="text-slate-500 text-sm">No recent missions</div>
             </div>
-          </div>
+          ))}
 
         </div>
 
