@@ -29,6 +29,7 @@ import asyncio
 import threading
 import queue
 import collections
+import subprocess
 from typing import Optional, Union
 
 # ── Third party ──────────────────────────────────────────────────────────────
@@ -386,7 +387,50 @@ class PipelineManager:
                 if not basename:
                     basename = os.path.basename(clean_video_source)
                 clean_video_source = f"/data/{basename}"
-                
+
+            # ── Auto-extract embedded SRT telemetry from video ────────────
+            if req.video_source_type == "file" and os.path.isfile(clean_video_source):
+                srt_path = os.path.splitext(clean_video_source)[0] + ".srt"
+                if not os.path.exists(srt_path):
+                    # Probe for an embedded subtitle stream
+                    try:
+                        probe_result = subprocess.run(
+                            [
+                                "ffprobe", "-v", "error",
+                                "-select_streams", "s:0",
+                                "-show_entries", "stream=codec_type",
+                                "-of", "csv=p=0",
+                                clean_video_source,
+                            ],
+                            capture_output=True, text=True, timeout=30,
+                        )
+                        has_subtitle = "subtitle" in (probe_result.stdout or "")
+                    except Exception as exc:
+                        log.warning("ffprobe_check_failed", error=str(exc))
+                        has_subtitle = False
+
+                    if has_subtitle:
+                        try:
+                            extract_result = subprocess.run(
+                                [
+                                    "ffmpeg", "-y",
+                                    "-i", clean_video_source,
+                                    "-map", "0:s:0",
+                                    srt_path,
+                                ],
+                                capture_output=True, text=True, timeout=120,
+                            )
+                            if extract_result.returncode == 0 and os.path.isfile(srt_path):
+                                log.info("extracted_embedded_srt", srt_path=srt_path)
+                            else:
+                                log.warning(
+                                    "ffmpeg_srt_extraction_failed",
+                                    returncode=extract_result.returncode,
+                                    stderr=extract_result.stderr[:500] if extract_result.stderr else "",
+                                )
+                        except Exception as exc:
+                            log.warning("ffmpeg_extraction_error", error=str(exc))
+
             self.source = RealVideoSource(
                 drone_id=drone_id,
                 video_source=clean_video_source,

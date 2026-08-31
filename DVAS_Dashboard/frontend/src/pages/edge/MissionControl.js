@@ -119,6 +119,7 @@ export default function MissionControl() {
         const uploadData = await new Promise((resolve, reject) => {
           const xhr = new XMLHttpRequest();
           xhr.open('POST', '/edge-api/api/edge/mission/upload-video-stream', true);
+          xhr.withCredentials = true; // Required to send cookies along with the request!
           
           const token = getAuthToken();
           if (token) {
