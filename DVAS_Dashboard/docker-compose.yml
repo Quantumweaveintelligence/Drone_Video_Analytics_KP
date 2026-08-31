@@ -33,19 +33,19 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://dvas:dvas_secret@postgres:5432/dvas
       - JWT_SECRET=super-secret-dvas-key-change-in-prod
-      - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://10.123.225.251:3000,http://10.51.27.155:3000,http://10.51.27.250:3000
-      - INGEST_SERVER_URL=http://10.123.225.251
+      - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+      - INGEST_SERVER_URL=http://drone_nginx
       - EDGE_SERVER_URL=http://edge:8765
-      - ANALYTICS_GATEWAY_URL=http://host.docker.internal:8100
-      - CROWD_ANALYTICS_URL=http://host.docker.internal:8101
-      - PERSON_ANALYTICS_URL=http://host.docker.internal:8102
-      - VEHICLE_ANALYTICS_URL=http://host.docker.internal:8103
-      - ANPR_ANALYTICS_URL=http://host.docker.internal:8104
-      - MINIO_ENDPOINT=host.docker.internal:9000
+      - ANALYTICS_GATEWAY_URL=http://analytics-gateway:8100
+      - CROWD_ANALYTICS_URL=http://crowd-analyzer:8101
+      - PERSON_ANALYTICS_URL=http://person-analyzer:8102
+      - VEHICLE_ANALYTICS_URL=http://vehicle-analyzer:8103
+      - ANPR_ANALYTICS_URL=http://anpr-analyzer:8104
+      - MINIO_ENDPOINT=minio:9000
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin
       - MINIO_SECURE=false
-      - KEYCLOAK_URL=http://10.123.225.251:8080
+      - KEYCLOAK_URL=http://keycloak:8080
       - KC_REALM=kerala-police-drone
       - KC_CLIENT_ID=drone-ingest-client
       - ADMIN_CLIENT_ID=dvas-admin-service
@@ -74,10 +74,10 @@ services:
       - INGEST__ENABLED=true
       - INGEST__DRONE_ID=DRN-004
       - INGEST__CLIENT_SECRET=yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn
-      - INGEST__URL=http://10.123.225.251/ingest/frame
-      - INGEST__TOKEN_URL=http://10.123.225.251:8080/realms/kerala-police-drone/protocol/openid-connect/token
-      - INGEST__MISSION_START_URL=http://10.123.225.251/ingest/mission/start
-      - INGEST__MISSION_END_URL=http://10.123.225.251/ingest/mission/end
+      - INGEST__URL=http://drone_nginx/ingest/frame
+      - INGEST__TOKEN_URL=http://keycloak:8080/realms/kerala-police-drone/protocol/openid-connect/token
+      - INGEST__MISSION_START_URL=http://drone_nginx/ingest/mission/start
+      - INGEST__MISSION_END_URL=http://drone_nginx/ingest/mission/end
       - INGEST__TLS_VERIFY=false
     networks:
       - default

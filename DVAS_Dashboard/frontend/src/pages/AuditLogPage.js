@@ -1,196 +1,197 @@
 /**
- * AuditLogPage.js  —  System Administrator Audit Log (Own Actions)
+ * AuditLogPage.js  —  Production Audit Log Explorer
  * =================================================================
- * Full-featured Audit Log page, restricted to system_administrator.
+ * Production-ready, tamper-evident Audit Log Explorer for Kerala Police DVAS.
  *
- * What it does:
- *  1. fetchKeycloakUsers()  — calls /api/users (Keycloak Admin API),
- *     falls back to 10 hardcoded Kerala Police DVAS officers.
- *  2. generateAuditLogs()   — 60-85 realistic entries, actors = real users.
- *  3. RBAC: system_administrator sees ONLY their own email as actor.
- *  4. Summary cards: Total Events, Failed Logins, Critical Actions, Warnings.
- *  5. Advanced filters: free-text, date range, actor dropdown, category
- *     multi-select, status toggle buttons.
- *  6. Data table: sortable Timestamp/Actor/Action/Category/Resource/IP/Status.
- *  7. Slide-out drawer: JSON payload, User-Agent, Before/After diff grid.
- *  8. CSV export of currently-filtered rows.
- *  9. Role switcher panel for demo / QA purposes.
+ * Core Capabilities:
+ *  1. Real backend API integration via `/api/audit-logs` (no mock data).
+ *  2. Server-side pagination, multi-column sorting, and comprehensive 10+ dimension filtering.
+ *  3. Summary KPI Cards with real-time aggregate counts from `/api/audit-logs/summary`.
+ *  4. Cryptographic SHA-256 hash-chain verification with live integrity status badge.
+ *  5. Rule-Based Security Anomaly Detection (7 patterns) with real-time alert banner.
+ *  6. Indian Evidence Act Section 65B Certified PDF Evidence Export.
+ *  7. Inline expandable rows with 4 inspection tabs:
+ *     - Overview: Actor grid (name, email, role, IP, session ID, device fingerprint, request ID)
+ *     - Changes: Field-level Before / After diff viewer with change highlight
+ *     - Payload: Formatted raw JSON viewer with one-click copy
+ *     - Related: Correlated session / transaction events timeline
+ *  8. Deep resource links navigating to target entities (Users, Missions, Evidence).
+ *  9. Filter presets management (save, load, and delete custom filter configurations).
+ *  10. Direct server-side streaming CSV & JSON exports.
+ *  11. Keyboard navigation (j/k/arrows for row focus, Enter to toggle, Esc to dismiss).
+ *  12. Print-optimized stylesheet for statutory physical reporting.
  */
-import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
+
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import AppShell from '@/components/layout/AppShell';
 import { useAuth } from '@/context/AuthContext';
 import { api } from '@/lib/api';
 import {
   Search, Filter, Download, X, ChevronLeft, ChevronRight,
-  Shield, AlertTriangle, CheckCircle, Clock, User, Activity,
-  FileText, ChevronDown, ChevronUp, Eye, Terminal, Layers,
-  RefreshCw, Calendar, SlidersHorizontal, UserCheck
+  Shield, AlertTriangle, CheckCircle, Clock, Activity,
+  FileText, ChevronDown, ChevronUp, Eye, Layers,
+  RefreshCw, Calendar, SlidersHorizontal, UserCheck, ShieldCheck,
+  ShieldAlert, ArrowUpRight, RotateCcw, Bookmark, BookmarkPlus,
+  Copy, Check, Printer, FileCheck, Zap, AlertCircle
 } from 'lucide-react';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. Keycloak User Fetching Service
+// Formatters & Styling Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function fetchKeycloakUsers() {
+function formatDateIST(ts) {
+  if (!ts) return '—';
   try {
-    const { data } = await api.get('/users');
-    if (Array.isArray(data) && data.length > 0) return data;
-  } catch (_) { /* fall through */ }
-  // Fallback: realistic Kerala Police DVAS officers
-  return [
-    { id:'u-kp-001', email:'rajesh.kumar@kp.dvas.in',    name:'Rajesh Kumar',    role:'system_administrator', jurisdiction:'State HQ'           },
-    { id:'u-kp-002', email:'priya.nair@kp.dvas.in',      name:'Priya Nair',      role:'senior_officer',       jurisdiction:'Thiruvananthapuram' },
-    { id:'u-kp-003', email:'sanjay.menon@kp.dvas.in',    name:'Sanjay Menon',    role:'drone_operator',       jurisdiction:'Kochi'              },
-    { id:'u-kp-004', email:'deepa.pillai@kp.dvas.in',    name:'Deepa Pillai',    role:'control_room_officer', jurisdiction:'Kozhikode'          },
-    { id:'u-kp-005', email:'arun.krishnan@kp.dvas.in',   name:'Arun Krishnan',   role:'drone_operator',       jurisdiction:'Thrissur'           },
-    { id:'u-kp-006', email:'sindhu.rajan@kp.dvas.in',    name:'Sindhu Rajan',    role:'control_room_officer', jurisdiction:'Thiruvananthapuram' },
-    { id:'u-kp-007', email:'mohan.das@kp.dvas.in',       name:'Mohan Das',       role:'senior_officer',       jurisdiction:'Kannur'             },
-    { id:'u-kp-008', email:'anitha.varghese@kp.dvas.in', name:'Anitha Varghese', role:'drone_operator',       jurisdiction:'Kottayam'           },
-    { id:'u-kp-009', email:'joseph.thomas@kp.dvas.in',   name:'Joseph Thomas',   role:'control_room_officer', jurisdiction:'Ernakulam'          },
-    { id:'u-kp-010', email:'kavitha.suresh@kp.dvas.in',  name:'Kavitha Suresh',  role:'senior_officer',       jurisdiction:'Palakkad'           },
-  ];
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 2. Mock Audit Log Generator
-// ─────────────────────────────────────────────────────────────────────────────
-
-const EVENT_TYPES = [
-  { action:'USER_LOGIN',           category:'Authentication',  risk:'low',      hasPayload:false },
-  { action:'LOGIN_FAILED',         category:'Authentication',  risk:'high',     hasPayload:false },
-  { action:'USER_LOGOUT',          category:'Authentication',  risk:'low',      hasPayload:false },
-  { action:'TOKEN_REFRESHED',      category:'Authentication',  risk:'low',      hasPayload:false },
-  { action:'PASSWORD_CHANGED',     category:'Authentication',  risk:'medium',   hasPayload:true  },
-  { action:'API_KEY_ROTATED',      category:'Authentication',  risk:'high',     hasPayload:true  },
-  { action:'SESSION_TERMINATED',   category:'Authentication',  risk:'medium',   hasPayload:false },
-  { action:'USER_CREATED',         category:'User Management', risk:'critical', hasPayload:true  },
-  { action:'USER_SUSPENDED',       category:'User Management', risk:'critical', hasPayload:true  },
-  { action:'ROLE_ASSIGNED',        category:'User Management', risk:'critical', hasPayload:true  },
-  { action:'USER_PROFILE_UPDATED', category:'User Management', risk:'medium',   hasPayload:true  },
-  { action:'MISSION_STARTED',      category:'Operations',      risk:'medium',   hasPayload:true  },
-  { action:'MISSION_ENDED',        category:'Operations',      risk:'medium',   hasPayload:true  },
-  { action:'DRONE_DEPLOYED',       category:'Operations',      risk:'medium',   hasPayload:true  },
-  { action:'ALERT_ACKNOWLEDGED',   category:'Operations',      risk:'low',      hasPayload:false },
-  { action:'EVIDENCE_EXPORTED',    category:'Evidence',        risk:'high',     hasPayload:true  },
-  { action:'EVIDENCE_DELETED',     category:'Evidence',        risk:'critical', hasPayload:true  },
-  { action:'EXPORT_REQUESTED',     category:'Evidence',        risk:'high',     hasPayload:true  },
-  { action:'LEGAL_HOLD_APPLIED',   category:'Evidence',        risk:'critical', hasPayload:true  },
-  { action:'REPORT_GENERATED',     category:'Evidence',        risk:'low',      hasPayload:false },
-  { action:'RECORD_DELETED',       category:'Data',            risk:'critical', hasPayload:true  },
-  { action:'RETENTION_PURGE',      category:'Data',            risk:'critical', hasPayload:true  },
-  { action:'SETTINGS_UPDATED',     category:'Configuration',   risk:'high',     hasPayload:true  },
-  { action:'POLICY_CHANGED',       category:'Configuration',   risk:'critical', hasPayload:true  },
-  { action:'INGEST_RESTARTED',     category:'Configuration',   risk:'high',     hasPayload:true  },
-];
-
-const IP_RANGES   = ['10.0.1','10.0.2','192.168.1','192.168.10','172.16.0'];
-const USER_AGENTS = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Safari/537.36',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/119.0.0.0',
-  'Mozilla/5.0 (iPad; CPU OS 16_0 like Mac OS X) Mobile/15E148 Safari/604.1',
-  'DVAS-EdgeClient/2.4.1 (Embedded; ARM64)',
-];
-const TARGETS = [
-  'MSN-2026-0441','MSN-2026-0512','DRN-001','DRN-002','DRN-004',
-  'EVI-0028','EVI-0031','EVI-0045','USR-kp-003','USR-kp-007',
-  'SYSTEM','INGEST-SERVER','POLICY-ABAC','RETENTION-JOB','API-GATEWAY',
-  'REPORT-2026-Q3','LEGAL-HOLD-LH24001','SESSION-f9a3c1',
-];
-const BEFORE_AFTER = {
-  USER_CREATED:         { before:null,                                          after:{ role:'drone_operator', jurisdiction:'Kochi', status:'active' } },
-  USER_SUSPENDED:       { before:{ status:'active' },                           after:{ status:'suspended', reason:'Policy violation' } },
-  ROLE_ASSIGNED:        { before:{ role:'control_room_officer' },               after:{ role:'senior_officer' } },
-  SETTINGS_UPDATED:     { before:{ retention_days:90, tls_min:'1.2' },          after:{ retention_days:180, tls_min:'1.3' } },
-  POLICY_CHANGED:       { before:{ rule:'jurisdiction_lock', enabled:false },   after:{ rule:'jurisdiction_lock', enabled:true } },
-  RETENTION_PURGE:      { before:{ records_count:8421 },                        after:{ records_count:6003, purged:2418 } },
-  EVIDENCE_DELETED:     { before:{ file:'EVI-0031.mp4', status:'active' },      after:{ file:'EVI-0031.mp4', status:'deleted' } },
-  INGEST_RESTARTED:     { before:{ status:'stopped', uptime:0 },                after:{ status:'running', uptime:1 } },
-  API_KEY_ROTATED:      { before:{ key_prefix:'sk-old-***' },                   after:{ key_prefix:'sk-new-***' } },
-  LEGAL_HOLD_APPLIED:   { before:{ hold:null },                                 after:{ hold:'LH-24003', reason:'Court order Cr. No. 201/2026' } },
-};
-
-const rand    = (arr) => arr[Math.floor(Math.random() * arr.length)];
-const randInt = (mn, mx) => Math.floor(Math.random() * (mx - mn + 1)) + mn;
-
-function generateAuditLogs(users) {
-  if (!users || !users.length) return [];
-  const now = Date.now();
-  return Array.from({ length: randInt(60, 85) }, (_, i) => {
-    const ev     = rand(EVENT_TYPES);
-    const actor  = rand(users);
-    const target = rand(TARGETS);
-    const ip     = `${rand(IP_RANGES)}.${randInt(10, 254)}`;
-    const ts     = new Date(now - randInt(0, 7 * 24 * 3600 * 1000)).toISOString();
-    let status;
-    if (ev.action === 'LOGIN_FAILED')   status = 'Failed';
-    else if (ev.risk === 'critical')    status = Math.random() > 0.15 ? 'Success' : 'Warning';
-    else if (ev.risk === 'high')        status = Math.random() > 0.1  ? 'Success' : Math.random() > 0.5 ? 'Failed' : 'Warning';
-    else                                status = 'Success';
-    const ba = BEFORE_AFTER[ev.action] || null;
-    return {
-      id: `LOG-${String(i+1).padStart(4,'0')}`,
-      ts, actor_id:actor.id, actor_name:actor.name, actor_email:actor.email,
-      actor_role:actor.role, actor_dept:actor.jurisdiction||'State HQ',
-      action:ev.action, category:ev.category, risk:ev.risk,
-      target, ip, status, user_agent:rand(USER_AGENTS),
-      payload: ev.hasPayload ? {
-        request_id:`req-${Math.random().toString(36).slice(2,10)}`,
-        action:ev.action, actor_id:actor.id, target, ts,
-        metadata:{ ip, session:`ses-${Math.random().toString(36).slice(2,8)}` },
-      } : null,
-      before: ba?.before ?? null,
-      after:  ba?.after  ?? null,
-    };
-  }).sort((a,b) => b.ts.localeCompare(a.ts));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 3. RBAC — System Admin sees ONLY own actions
-// ─────────────────────────────────────────────────────────────────────────────
-
-function applyRbacFilter(logs, currentUser) {
-  if (!currentUser) return logs;
-  if (currentUser.role === 'system_administrator') {
-    return logs.filter(l => l.actor_email === currentUser.email);
+    const d = new Date(ts);
+    return d.toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    });
+  } catch (_) {
+    return ts;
   }
-  return logs; // demo role override: show all
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 4. Constants & helpers
-// ─────────────────────────────────────────────────────────────────────────────
+function formatRelativeTime(ts) {
+  if (!ts) return '';
+  try {
+    const diffMs = Date.now() - new Date(ts).getTime();
+    const diffSec = Math.floor(diffMs / 1000);
+    if (diffSec < 60) return `${diffSec}s ago`;
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return `${diffMin}m ago`;
+    const diffHrs = Math.floor(diffMin / 60);
+    if (diffHrs < 24) return `${diffHrs}h ago`;
+    const diffDays = Math.floor(diffHrs / 24);
+    return `${diffDays}d ago`;
+  } catch (_) {
+    return '';
+  }
+}
 
-const CATEGORIES = ['Authentication','User Management','Operations','Evidence','Data','Configuration'];
-const STATUSES   = ['Success','Failed','Warning'];
-const PAGE_SIZE  = 15;
-
-function statusStyle(s) {
-  const m = {
-    Success:{ bg:'var(--dvas-safe-bg)', color:'var(--dvas-safe)', label:'✓ Success' },
-    Failed: { bg:'var(--dvas-crit-bg)', color:'var(--dvas-crit)', label:'✗ Failed'  },
-    Warning:{ bg:'var(--dvas-warn-bg)', color:'var(--dvas-warn)', label:'⚠ Warning' },
+function statusBadge(status) {
+  const s = (status || 'success').toLowerCase();
+  if (s === 'success') {
+    return {
+      bg: 'var(--dvas-safe-bg)',
+      color: 'var(--dvas-safe)',
+      border: 'color-mix(in srgb, var(--dvas-safe) 30%, transparent)',
+      label: 'Success',
+      icon: CheckCircle,
+    };
+  }
+  if (s === 'failure' || s === 'failed' || s === 'error') {
+    return {
+      bg: 'var(--dvas-crit-bg)',
+      color: 'var(--dvas-crit)',
+      border: 'color-mix(in srgb, var(--dvas-crit) 30%, transparent)',
+      label: 'Failed',
+      icon: X,
+    };
+  }
+  return {
+    bg: 'var(--dvas-warn-bg)',
+    color: 'var(--dvas-warn)',
+    border: 'color-mix(in srgb, var(--dvas-warn) 30%, transparent)',
+    label: status || 'Warning',
+    icon: AlertTriangle,
   };
-  return m[s] || { bg:'var(--dvas-info-bg)', color:'var(--dvas-blue)', label:s };
 }
-function riskColor(r) {
-  return r==='critical'?'var(--dvas-crit)':r==='high'?'var(--dvas-warn)':r==='medium'?'var(--dvas-blue)':'var(--dvas-text-dim)';
+
+function severityBadge(severity) {
+  const sev = (severity || 'info').toLowerCase();
+  if (sev === 'critical') {
+    return {
+      bg: 'rgba(239, 68, 68, 0.15)',
+      color: '#f87171',
+      border: 'rgba(239, 68, 68, 0.3)',
+      label: 'CRITICAL',
+    };
+  }
+  if (sev === 'warning') {
+    return {
+      bg: 'rgba(245, 158, 11, 0.15)',
+      color: '#fbbf24',
+      border: 'rgba(245, 158, 11, 0.3)',
+      label: 'WARNING',
+    };
+  }
+  return {
+    bg: 'rgba(56, 189, 248, 0.12)',
+    color: '#38bdf8',
+    border: 'rgba(56, 189, 248, 0.25)',
+    label: 'INFO',
+  };
+}
+
+function actionTypeBadge(actionType) {
+  const t = (actionType || 'system').toLowerCase();
+  const map = {
+    create: { color: '#34d399', bg: 'rgba(52, 211, 153, 0.12)' },
+    update: { color: '#60a5fa', bg: 'rgba(96, 165, 250, 0.12)' },
+    delete: { color: '#f87171', bg: 'rgba(248, 113, 113, 0.12)' },
+    login:  { color: '#818cf8', bg: 'rgba(129, 140, 248, 0.12)' },
+    logout: { color: '#a78bfa', bg: 'rgba(167, 139, 250, 0.12)' },
+    export: { color: '#fb923c', bg: 'rgba(251, 146, 60, 0.12)' },
+    read:   { color: '#94a3b8', bg: 'rgba(148, 163, 184, 0.12)' },
+    system: { color: '#94a3b8', bg: 'rgba(148, 163, 184, 0.12)' },
+  };
+  return map[t] || map.system;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. Sub-components
+// Subcomponents
 // ─────────────────────────────────────────────────────────────────────────────
 
-function SummaryCard({ icon:Icon, label, value, sub, color, testId }) {
+function SummaryCard({ icon: Icon, label, value, sub, color, testId }) {
   return (
-    <div data-testid={testId} style={{ background:'var(--dvas-surface)', border:'1px solid var(--dvas-border)', borderRadius:'var(--dvas-radius)', boxShadow:'var(--dvas-shadow)', padding:20, display:'flex', alignItems:'center', gap:16 }}>
-      <div style={{ width:48, height:48, borderRadius:12, display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, background:`color-mix(in srgb, ${color} 15%, transparent)` }}>
+    <div
+      data-testid={testId}
+      style={{
+        background: 'var(--dvas-surface)',
+        border: '1px solid var(--dvas-border)',
+        borderRadius: 'var(--dvas-radius-sm)',
+        padding: '16px 20px',
+        boxShadow: 'var(--dvas-shadow)',
+        display: 'flex',
+        alignItems: 'center',
+        gap: 16,
+      }}
+    >
+      <div
+        style={{
+          width: 44,
+          height: 44,
+          borderRadius: 10,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: `color-mix(in srgb, ${color} 15%, transparent)`,
+          border: `1px solid color-mix(in srgb, ${color} 30%, transparent)`,
+          flexShrink: 0,
+        }}
+      >
         <Icon size={22} style={{ color }} />
       </div>
-      <div>
-        <div style={{ fontSize:28, fontWeight:700, fontFamily:'JetBrains Mono,monospace', color }}>{value}</div>
-        <div style={{ fontSize:12, fontWeight:600, marginTop:2, color:'var(--dvas-text)' }}>{label}</div>
-        {sub && <div style={{ fontSize:10, marginTop:2, color:'var(--dvas-text-dim)' }}>{sub}</div>}
+      <div style={{ minWidth: 0, flex: 1 }}>
+        <div style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--dvas-text-dim)' }}>
+          {label}
+        </div>
+        <div style={{ fontSize: 24, fontWeight: 700, fontFamily: 'JetBrains Mono, monospace', color: 'var(--dvas-text)', marginBlock: '2px' }}>
+          {value ?? 0}
+        </div>
+        {sub && (
+          <div style={{ fontSize: 11, color: 'var(--dvas-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {sub}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -199,32 +200,104 @@ function SummaryCard({ icon:Icon, label, value, sub, color, testId }) {
 function MultiSelect({ label, options, selected, onChange, testId }) {
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
+
   useEffect(() => {
     if (!open) return;
-    const h = e => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
-    document.addEventListener('mousedown', h);
-    return () => document.removeEventListener('mousedown', h);
+    const handleClick = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+    };
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
   }, [open]);
-  const toggle = v => onChange(selected.includes(v) ? selected.filter(x=>x!==v) : [...selected,v]);
-  const btnText = selected.length===0 ? label : selected.length===options.length ? 'All Categories' : `${selected.length} selected`;
+
+  const toggle = (v) => {
+    onChange(selected.includes(v) ? selected.filter((x) => x !== v) : [...selected, v]);
+  };
+
+  const btnText = selected.length === 0
+    ? label
+    : selected.length === options.length
+    ? `All ${label}`
+    : `${selected.length} ${label}`;
+
   return (
-    <div ref={ref} style={{ position:'relative' }} data-testid={testId}>
-      <button onClick={() => setOpen(o=>!o)} style={{ display:'flex', alignItems:'center', gap:6, height:36, paddingInline:12, fontSize:12, borderRadius:10, background:'var(--dvas-elev)', border:'1px solid var(--dvas-border)', color:'var(--dvas-text)', minWidth:140, cursor:'pointer' }}>
-        <Filter size={13} style={{ color:'var(--dvas-text-muted)', flexShrink:0 }} />
-        <span style={{ flex:1, textAlign:'left', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{btnText}</span>
-        <ChevronDown size={12} style={{ color:'var(--dvas-text-muted)', flexShrink:0 }} />
+    <div ref={ref} style={{ position: 'relative' }} data-testid={testId}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+          height: 36,
+          paddingInline: 12,
+          fontSize: 12,
+          borderRadius: 8,
+          background: 'var(--dvas-elev)',
+          border: '1px solid var(--dvas-border)',
+          color: 'var(--dvas-text)',
+          minWidth: 140,
+          cursor: 'pointer',
+        }}
+      >
+        <Filter size={13} style={{ color: 'var(--dvas-text-muted)', flexShrink: 0 }} />
+        <span style={{ flex: 1, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {btnText}
+        </span>
+        <ChevronDown size={12} style={{ color: 'var(--dvas-text-muted)', flexShrink: 0 }} />
       </button>
       {open && (
-        <div className="dvas-fade-in" style={{ position:'absolute', top:40, left:0, zIndex:50, width:208, padding:'4px 0', background:'var(--dvas-surface)', border:'1px solid var(--dvas-border)', borderRadius:'var(--dvas-radius-sm)', boxShadow:'var(--dvas-shadow-lg)' }}>
-          {options.map(opt => (
-            <label key={opt} style={{ display:'flex', alignItems:'center', gap:8, padding:'8px 12px', cursor:'pointer', fontSize:12, color:'var(--dvas-text)' }} className="hover:bg-[color:var(--dvas-elev)]">
-              <input type="checkbox" checked={selected.includes(opt)} onChange={() => toggle(opt)} style={{ width:14, height:14 }} />
-              {opt}
+        <div
+          className="dvas-fade-in"
+          style={{
+            position: 'absolute',
+            top: 40,
+            left: 0,
+            zIndex: 50,
+            width: 220,
+            maxHeight: 280,
+            overflowY: 'auto',
+            padding: '4px 0',
+            background: 'var(--dvas-surface)',
+            border: '1px solid var(--dvas-border)',
+            borderRadius: 'var(--dvas-radius-sm)',
+            boxShadow: 'var(--dvas-shadow-lg)',
+          }}
+        >
+          {options.map((opt) => (
+            <label
+              key={opt}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                padding: '8px 12px',
+                cursor: 'pointer',
+                fontSize: 12,
+                color: 'var(--dvas-text)',
+              }}
+              className="hover:bg-[color:var(--dvas-elev)]"
+            >
+              <input
+                type="checkbox"
+                checked={selected.includes(opt)}
+                onChange={() => toggle(opt)}
+                style={{ width: 14, height: 14, cursor: 'pointer' }}
+              />
+              <span style={{ textTransform: 'capitalize' }}>{opt.replace(/_/g, ' ')}</span>
             </label>
           ))}
-          <div style={{ padding:'6px 12px', borderTop:'1px solid var(--dvas-border)' }}>
-            <button onClick={() => onChange(selected.length===options.length ? [] : [...options])} style={{ fontSize:10, fontWeight:600, color:'var(--dvas-blue)', background:'none', border:'none', cursor:'pointer' }}>
-              {selected.length===options.length ? 'Clear all' : 'Select all'}
+          <div style={{ padding: '6px 12px', borderTop: '1px solid var(--dvas-border)', display: 'flex', justifyContent: 'space-between' }}>
+            <button
+              onClick={() => onChange([...options])}
+              style={{ fontSize: 10, fontWeight: 600, color: 'var(--dvas-blue)', background: 'none', border: 'none', cursor: 'pointer' }}
+            >
+              Select all
+            </button>
+            <button
+              onClick={() => onChange([])}
+              style={{ fontSize: 10, fontWeight: 600, color: 'var(--dvas-text-dim)', background: 'none', border: 'none', cursor: 'pointer' }}
+            >
+              Clear
             </button>
           </div>
         </div>
@@ -234,28 +307,115 @@ function MultiSelect({ label, options, selected, onChange, testId }) {
 }
 
 function JsonViewer({ data }) {
+  const [copied, setCopied] = useState(false);
+  const text = JSON.stringify(data || {}, null, 2);
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
   return (
-    <pre style={{ fontSize:11, overflow:'auto', borderRadius:10, padding:16, fontFamily:'JetBrains Mono,monospace', background:'var(--dvas-surface-2)', color:'var(--dvas-text)', border:'1px solid var(--dvas-border)', maxHeight:260, lineHeight:1.6 }}>
-      {JSON.stringify(data || { note:'No payload for this event type.' }, null, 2)}
-    </pre>
+    <div style={{ position: 'relative' }}>
+      <button
+        onClick={handleCopy}
+        style={{
+          position: 'absolute',
+          top: 10,
+          right: 10,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 4,
+          padding: '4px 8px',
+          fontSize: 11,
+          fontWeight: 600,
+          borderRadius: 6,
+          background: 'var(--dvas-elev)',
+          border: '1px solid var(--dvas-border)',
+          color: copied ? 'var(--dvas-safe)' : 'var(--dvas-text-muted)',
+          cursor: 'pointer',
+          zIndex: 10,
+        }}
+      >
+        {copied ? <Check size={12} /> : <Copy size={12} />}
+        {copied ? 'Copied' : 'Copy'}
+      </button>
+      <pre
+        style={{
+          fontSize: 11,
+          overflow: 'auto',
+          borderRadius: 8,
+          padding: 16,
+          fontFamily: 'JetBrains Mono, monospace',
+          background: 'var(--dvas-surface-2)',
+          color: 'var(--dvas-text)',
+          border: '1px solid var(--dvas-border)',
+          maxHeight: 280,
+          lineHeight: 1.6,
+        }}
+      >
+        {text}
+      </pre>
+    </div>
   );
 }
 
 function DiffViewer({ before, after }) {
-  if (!before && !after) return null;
-  const keys = Array.from(new Set([...Object.keys(before||{}), ...Object.keys(after||{})]));
-  return (
-    <div style={{ overflow:'hidden', borderRadius:10, border:'1px solid var(--dvas-border)', fontFamily:'JetBrains Mono,monospace', fontSize:11 }}>
-      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', background:'var(--dvas-surface-2)', borderBottom:'1px solid var(--dvas-border)', color:'var(--dvas-text-muted)', padding:'6px 12px', fontSize:10, fontWeight:600, textTransform:'uppercase', letterSpacing:'0.06em' }}>
-        <span>Field</span><span>Before</span><span>After</span>
+  if (!before && !after) {
+    return (
+      <div style={{ fontSize: 12, textAlign: 'center', padding: '32px 0', color: 'var(--dvas-text-dim)' }}>
+        No before/after state diff captured for this action.
       </div>
-      {keys.map(key => {
-        const bv=before?.[key], av=after?.[key], changed=JSON.stringify(bv)!==JSON.stringify(av);
+    );
+  }
+
+  const keys = Array.from(new Set([...Object.keys(before || {}), ...Object.keys(after || {})]));
+
+  return (
+    <div style={{ overflow: 'hidden', borderRadius: 8, border: '1px solid var(--dvas-border)', fontFamily: 'JetBrains Mono, monospace', fontSize: 11 }}>
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: '1.2fr 1.9fr 1.9fr',
+          background: 'var(--dvas-surface-2)',
+          borderBottom: '1px solid var(--dvas-border)',
+          color: 'var(--dvas-text-muted)',
+          padding: '8px 12px',
+          fontSize: 10,
+          fontWeight: 600,
+          textTransform: 'uppercase',
+          letterSpacing: '0.06em',
+        }}
+      >
+        <span>Field</span>
+        <span>Before Value (Previous)</span>
+        <span>After Value (Applied)</span>
+      </div>
+      {keys.map((key) => {
+        const bv = before?.[key];
+        const av = after?.[key];
+        const changed = JSON.stringify(bv) !== JSON.stringify(av);
         return (
-          <div key={key} style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', borderBottom:'1px solid var(--dvas-border)', background:changed?'color-mix(in srgb, var(--dvas-warn-bg) 60%, transparent)':'transparent', padding:'7px 12px', alignItems:'center' }}>
-            <span style={{ color:'var(--dvas-text-muted)' }}>{key}</span>
-            <span style={{ color:bv==null?'var(--dvas-text-dim)':'var(--dvas-crit)' }}>{bv==null?'—':JSON.stringify(bv)}</span>
-            <span style={{ color:av==null?'var(--dvas-text-dim)':'var(--dvas-safe)' }}>{av==null?'—':JSON.stringify(av)}</span>
+          <div
+            key={key}
+            style={{
+              display: 'grid',
+              gridTemplateColumns: '1.2fr 1.9fr 1.9fr',
+              borderBottom: '1px solid var(--dvas-border)',
+              background: changed ? 'rgba(245, 158, 11, 0.08)' : 'transparent',
+              padding: '8px 12px',
+              alignItems: 'center',
+              gap: 8,
+            }}
+          >
+            <span style={{ color: 'var(--dvas-text)', fontWeight: 600 }}>{key}</span>
+            <span style={{ color: bv == null ? 'var(--dvas-text-dim)' : 'var(--dvas-crit)', wordBreak: 'break-all' }}>
+              {bv == null ? '—' : JSON.stringify(bv)}
+            </span>
+            <span style={{ color: av == null ? 'var(--dvas-text-dim)' : 'var(--dvas-safe)', wordBreak: 'break-all' }}>
+              {av == null ? '—' : JSON.stringify(av)}
+            </span>
           </div>
         );
       })}
@@ -263,369 +423,1605 @@ function DiffViewer({ before, after }) {
   );
 }
 
-function DetailDrawer({ log, onClose }) {
-  const [tab, setTab] = useState('payload');
-  const sty = statusStyle(log.status);
+function RelatedEventsTimeline({ correlationId, sessionId, currentLogId, onSelectLog }) {
+  const [events, setEvents] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let active = true;
+    async function loadRelated() {
+      if (!correlationId && !sessionId) {
+        setEvents([]);
+        setLoading(false);
+        return;
+      }
+      try {
+        setLoading(true);
+        const url = correlationId
+          ? `/audit-logs/related/${encodeURIComponent(correlationId)}`
+          : `/audit-logs?actor_session_id=${encodeURIComponent(sessionId)}&page_size=20`;
+        const { data } = await api.get(url);
+        if (active) {
+          setEvents(Array.isArray(data) ? data : data.items || []);
+        }
+      } catch (err) {
+        if (active) setEvents([]);
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+    loadRelated();
+    return () => { active = false; };
+  }, [correlationId, sessionId]);
+
+  if (loading) {
+    return <div style={{ fontSize: 12, padding: 20, textAlign: 'center', color: 'var(--dvas-text-dim)' }}>Loading correlated timeline events…</div>;
+  }
+
+  if (!events || events.length === 0) {
+    return <div style={{ fontSize: 12, padding: 20, textAlign: 'center', color: 'var(--dvas-text-dim)' }}>No related timeline events found for correlation ID.</div>;
+  }
+
   return (
-    <div onClick={onClose} style={{ position:'fixed', inset:0, zIndex:50, display:'flex', background:'rgba(15,23,42,0.55)' }}>
-      <div onClick={e=>e.stopPropagation()} className="dvas-fade-in" style={{ marginLeft:'auto', height:'100%', display:'flex', flexDirection:'column', width:520, background:'var(--dvas-surface)', borderLeft:'1px solid var(--dvas-border)', boxShadow:'var(--dvas-shadow-lg)', overflow:'hidden' }}>
-        {/* Header */}
-        <div style={{ display:'flex', alignItems:'center', gap:12, padding:'16px 20px', flexShrink:0, borderBottom:'1px solid var(--dvas-border)' }}>
-          <div style={{ width:32, height:32, borderRadius:8, display:'flex', alignItems:'center', justifyContent:'center', background:'var(--dvas-info-bg)', flexShrink:0 }}>
-            <FileText size={16} style={{ color:'var(--dvas-blue)' }} />
-          </div>
-          <div style={{ flex:1, minWidth:0 }}>
-            <div style={{ fontSize:13, fontWeight:700, fontFamily:'JetBrains Mono,monospace', color:'var(--dvas-text)', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{log.action}</div>
-            <div style={{ fontSize:10, marginTop:2, fontFamily:'JetBrains Mono,monospace', color:'var(--dvas-text-dim)' }}>{log.id}</div>
-          </div>
-          <span style={{ fontSize:11, fontWeight:600, padding:'3px 10px', borderRadius:999, background:sty.bg, color:sty.color, flexShrink:0 }}>{sty.label}</span>
-          <button data-testid="drawer-close" onClick={onClose} style={{ width:28, height:28, borderRadius:8, display:'flex', alignItems:'center', justifyContent:'center', background:'none', border:'none', cursor:'pointer', color:'var(--dvas-text-muted)' }}><X size={16}/></button>
-        </div>
-        {/* Meta grid */}
-        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', padding:'12px 20px', gap:12, flexShrink:0, borderBottom:'1px solid var(--dvas-border)', background:'var(--dvas-surface-2)' }}>
-          {[['Actor',log.actor_name||log.actor_email],['Target',log.target],['IP',log.ip],
-            ['Timestamp',new Date(log.ts).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})],
-            ['Role',log.actor_role?.replace(/_/g,' ')],['Dept',log.actor_dept]].map(([l,v]) => (
-            <div key={l}>
-              <div style={{ fontSize:9, fontWeight:600, textTransform:'uppercase', letterSpacing:'0.07em', color:'var(--dvas-text-dim)', marginBottom:2 }}>{l}</div>
-              <div style={{ fontSize:11, fontWeight:500, fontFamily:'JetBrains Mono,monospace', color:'var(--dvas-text)', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{v||'—'}</div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--dvas-text-muted)', marginBottom: 4 }}>
+        Timeline ({events.length} correlated events):
+      </div>
+      {events.map((ev, idx) => {
+        const isCurrent = ev.id === currentLogId;
+        const sty = statusBadge(ev.status);
+        return (
+          <div
+            key={ev.id || idx}
+            onClick={() => onSelectLog && onSelectLog(ev)}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 12,
+              padding: '8px 12px',
+              borderRadius: 8,
+              background: isCurrent ? 'rgba(56, 189, 248, 0.12)' : 'var(--dvas-surface-2)',
+              border: isCurrent ? '1px solid var(--dvas-blue)' : '1px solid var(--dvas-border)',
+              cursor: onSelectLog ? 'pointer' : 'default',
+            }}
+          >
+            <div style={{ width: 8, height: 8, borderRadius: '50%', background: isCurrent ? 'var(--dvas-blue)' : 'var(--dvas-text-dim)' }} />
+            <div style={{ fontSize: 11, fontFamily: 'JetBrains Mono, monospace', color: 'var(--dvas-text-dim)', width: 140 }}>
+              {formatDateIST(ev.ts)}
             </div>
-          ))}
+            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--dvas-text)', flex: 1 }}>
+              {ev.action}
+              {ev.target_name && <span style={{ fontWeight: 400, color: 'var(--dvas-text-muted)', marginLeft: 6 }}>({ev.target_name})</span>}
+            </div>
+            <span style={{ fontSize: 10, padding: '2px 6px', borderRadius: 999, background: sty.bg, color: sty.color }}>
+              {ev.status}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SavePresetModal({ isOpen, onClose, currentFilters, onSaved }) {
+  const [name, setName] = useState('');
+  const [isShared, setIsShared] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  if (!isOpen) return null;
+
+  const handleSave = async (e) => {
+    e.preventDefault();
+    if (!name.trim()) return;
+    try {
+      setSaving(true);
+      await api.post('/audit-presets', {
+        name: name.trim(),
+        filters: currentFilters,
+        is_shared: isShared,
+      });
+      if (onSaved) onSaved();
+      onClose();
+    } catch (err) {
+      console.error('Failed to save preset:', err);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.65)' }}>
+      <div
+        className="dvas-fade-in"
+        style={{
+          width: 400,
+          background: 'var(--dvas-surface)',
+          border: '1px solid var(--dvas-border)',
+          borderRadius: 12,
+          padding: 24,
+          boxShadow: 'var(--dvas-shadow-lg)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--dvas-text)', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <BookmarkPlus size={16} style={{ color: 'var(--dvas-blue)' }} /> Save Filter Preset
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--dvas-text-dim)', cursor: 'pointer' }}>
+            <X size={16} />
+          </button>
         </div>
-        {/* User-Agent */}
-        <div style={{ padding:'10px 20px', flexShrink:0, borderBottom:'1px solid var(--dvas-border)' }}>
-          <div style={{ fontSize:10, fontWeight:600, textTransform:'uppercase', letterSpacing:'0.06em', color:'var(--dvas-text-dim)', marginBottom:4, display:'flex', alignItems:'center', gap:4 }}><Terminal size={11}/>User-Agent</div>
-          <div style={{ fontSize:11, fontFamily:'JetBrains Mono,monospace', wordBreak:'break-all', color:'var(--dvas-text-muted)' }}>{log.user_agent}</div>
-        </div>
-        {/* Tabs */}
-        <div style={{ display:'flex', flexShrink:0, borderBottom:'1px solid var(--dvas-border)' }}>
-          {[{k:'payload',l:'JSON Payload',I:Layers},{k:'diff',l:'Before / After',I:Eye,d:!log.before&&!log.after}].map(({k,l,I:TI,d}) => (
-            <button key={k} onClick={()=>!d&&setTab(k)} disabled={d} style={{ display:'flex', alignItems:'center', gap:6, padding:'12px 16px', fontSize:12, fontWeight:600, background:'none', border:'none', cursor:d?'not-allowed':'pointer', color:tab===k?'var(--dvas-blue)':d?'var(--dvas-text-dim)':'var(--dvas-text-muted)', borderBottom:tab===k?'2px solid var(--dvas-blue)':'2px solid transparent', marginBottom:-1 }}>
-              <TI size={13}/>{l}{d&&<span style={{fontSize:9,opacity:0.6}}>(N/A)</span>}
+        <form onSubmit={handleSave}>
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'var(--dvas-text-dim)', marginBottom: 6 }}>
+              Preset Name
+            </label>
+            <input
+              type="text"
+              placeholder="e.g. Critical Security Actions"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              required
+              style={{
+                width: '100%',
+                padding: '8px 12px',
+                fontSize: 12,
+                background: 'var(--dvas-elev)',
+                border: '1px solid var(--dvas-border)',
+                borderRadius: 8,
+                color: 'var(--dvas-text)',
+                outline: 'none',
+                boxSizing: 'border-box',
+              }}
+            />
+          </div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--dvas-text)', marginBottom: 20, cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={isShared}
+              onChange={(e) => setIsShared(e.target.checked)}
+              style={{ width: 14, height: 14 }}
+            />
+            Share preset with other authorized officers
+          </label>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+            <button
+              type="button"
+              onClick={onClose}
+              style={{
+                padding: '6px 14px',
+                fontSize: 12,
+                fontWeight: 600,
+                borderRadius: 8,
+                background: 'var(--dvas-elev)',
+                border: '1px solid var(--dvas-border)',
+                color: 'var(--dvas-text)',
+                cursor: 'pointer',
+              }}
+            >
+              Cancel
             </button>
-          ))}
-        </div>
-        {/* Tab body */}
-        <div style={{ flex:1, overflow:'auto', padding:20 }}>
-          {tab==='payload' && <div><div style={{ fontSize:10, fontWeight:600, textTransform:'uppercase', letterSpacing:'0.06em', color:'var(--dvas-text-dim)', marginBottom:8 }}>Event Payload</div><JsonViewer data={log.payload}/></div>}
-          {tab==='diff' && <div><div style={{ fontSize:10, fontWeight:600, textTransform:'uppercase', letterSpacing:'0.06em', color:'var(--dvas-text-dim)', marginBottom:8 }}>Data Modification Diff</div>{log.before||log.after?<DiffViewer before={log.before} after={log.after}/>:<div style={{ fontSize:12, textAlign:'center', padding:'32px 0', color:'var(--dvas-text-dim)' }}>No data modification for this event.</div>}</div>}
-        </div>
+            <button
+              type="submit"
+              disabled={saving || !name.trim()}
+              style={{
+                padding: '6px 16px',
+                fontSize: 12,
+                fontWeight: 600,
+                borderRadius: 8,
+                background: 'var(--dvas-blue)',
+                border: 'none',
+                color: '#fff',
+                cursor: 'pointer',
+                opacity: saving || !name.trim() ? 0.6 : 1,
+              }}
+            >
+              {saving ? 'Saving…' : 'Save Preset'}
+            </button>
+          </div>
+        </form>
       </div>
     </div>
   );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6. CSV Export
+// Main Audit Log Explorer Page
 // ─────────────────────────────────────────────────────────────────────────────
-
-function exportToCsv(logs) {
-  const H = ['ID','Timestamp (IST)','Actor','Email','Role','Dept','Action','Category','Resource','IP','Status'];
-  const rows = logs.map(l => [l.id,new Date(l.ts).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}),l.actor_name,l.actor_email,l.actor_role,l.actor_dept,l.action,l.category,l.target,l.ip,l.status].map(v=>`"${String(v??'').replace(/"/g,'""')}"`).join(','));
-  const blob = new Blob([[H.join(','),...rows].join('\n')],{type:'text/csv;charset=utf-8;'});
-  const a = Object.assign(document.createElement('a'),{href:URL.createObjectURL(blob),download:'dvas_audit_own_actions.csv'});
-  a.click();
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 7. Main Page
-// ─────────────────────────────────────────────────────────────────────────────
-
-const COLS = [
-  {key:'ts',       w:'15%', label:'Timestamp'},
-  {key:'actor_name',w:'14%', label:'Actor'},
-  {key:'action',   w:'18%', label:'Action'},
-  {key:'category', w:'12%', label:'Category'},
-  {key:'target',   w:'13%', label:'Resource'},
-  {key:'ip',       w:'10%', label:'IP Address'},
-  {key:'status',   w:'10%', label:'Status'},
-  {key:'_view',    w:'8%',  label:''},
-];
 
 export default function AuditLogPage() {
   const { user: authUser } = useAuth();
+  const navigate = useNavigate();
 
-  // ── data
-  const [users,      setUsers]      = useState([]);
-  const [allLogs,    setAllLogs]    = useState([]);
-  const [loading,    setLoading]    = useState(true);
+  // Data state
+  const [logs, setLogs] = useState([]);
+  const [totalLogs, setTotalLogs] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
+  const [loading, setLoading] = useState(true);
 
-  // ── demo role override (for QA)
-  const [roleMode,   setRoleMode]   = useState(null);
-  const [showPicker, setShowPicker] = useState(false);
+  // KPIs & summary
+  const [summary, setSummary] = useState({ total_events: 0, failed_actions: 0, critical_events: 0, warnings: 0, info_events: 0, anomalies_detected: 0 });
+  const [chainStatus, setChainStatus] = useState(null);
+  const [verifyingChain, setVerifyingChain] = useState(false);
+  const [anomaliesData, setAnomaliesData] = useState([]);
+  const [showAnomaliesBanner, setShowAnomaliesBanner] = useState(true);
 
-  // real current user = authUser unless demo override
-  const currentUser = useMemo(() =>
-    roleMode || authUser || { role:'system_administrator', email:'rajesh.kumar@kp.dvas.in', jurisdiction:'State HQ', name:'Rajesh Kumar' }
-  , [roleMode, authUser]);
+  // Filters state
+  const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+  const [actorFilter, setActorFilter] = useState('');
+  const [selectedCategories, setSelectedCategories] = useState([]);
+  const [selectedSeverities, setSelectedSeverities] = useState([]);
+  const [selectedActionTypes, setSelectedActionTypes] = useState([]);
+  const [selectedStatuses, setSelectedStatuses] = useState([]);
+  const [sortKey, setSortKey] = useState('ts');
+  const [sortDir, setSortDir] = useState('desc');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
 
-  // ── filters
-  const [search,        setSearch]        = useState('');
-  const [dateFrom,      setDateFrom]      = useState('');
-  const [dateTo,        setDateTo]        = useState('');
-  const [actorFilter,   setActorFilter]   = useState('');
-  const [categories,    setCategories]    = useState([...CATEGORIES]);
-  const [statusFilters, setStatusFilters] = useState([...STATUSES]);
-  const [sortKey,       setSortKey]       = useState('ts');
-  const [sortDir,       setSortDir]       = useState('desc');
-  const [page,          setPage]          = useState(1);
+  // Filter options from backend
+  const [actorsList, setActorsList] = useState([]);
+  const [actionTypesList, setActionTypesList] = useState([]);
+  const [categoriesList, setCategoriesList] = useState([]);
+  const [severitiesList, setSeveritiesList] = useState([]);
+  const [presetsList, setPresetsList] = useState([]);
 
-  // ── UI
-  const [selectedLog,  setSelectedLog]  = useState(null);
-  const [exporting,    setExporting]    = useState(false);
+  // UI state
+  const [expandedRows, setExpandedRows] = useState(new Set());
+  const [rowTabMap, setRowTabMap] = useState({});
+  const [selectedDrawerLog, setSelectedDrawerLog] = useState(null);
+  const [isPresetModalOpen, setIsPresetModalOpen] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [selectedRowIndex, setSelectedRowIndex] = useState(0);
 
-  // ── load
-  const loadData = useCallback(async () => {
-    setLoading(true);
-    const fetched = await fetchKeycloakUsers();
-    setUsers(fetched);
-    setAllLogs(generateAuditLogs(fetched));
-    setLoading(false);
+  // Debounce search
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(search), 300);
+    return () => clearTimeout(timer);
+  }, [search]);
+
+  // Load dropdown metadata & presets once on mount
+  useEffect(() => {
+    async function loadMetadata() {
+      try {
+        const [actRes, typRes, catRes, sevRes, preRes, anomRes] = await Promise.allSettled([
+          api.get('/audit/actors'),
+          api.get('/audit-logs/action-types'),
+          api.get('/audit-logs/categories'),
+          api.get('/audit-logs/severities'),
+          api.get('/audit-presets'),
+          api.get('/audit-logs/anomalies?hours=24'),
+        ]);
+        if (actRes.status === 'fulfilled') setActorsList(actRes.value.data || []);
+        if (typRes.status === 'fulfilled') setActionTypesList(typRes.value.data || []);
+        if (catRes.status === 'fulfilled') setCategoriesList(catRes.value.data || []);
+        if (sevRes.status === 'fulfilled') setSeveritiesList(sevRes.value.data || []);
+        if (preRes.status === 'fulfilled') setPresetsList(preRes.value.data || []);
+        if (anomRes.status === 'fulfilled') setAnomaliesData(anomRes.value.data?.anomalies || []);
+      } catch (err) {
+        console.error('Metadata load error:', err);
+      }
+    }
+    loadMetadata();
   }, []);
-  useEffect(() => { loadData(); }, [loadData]);
 
-  // ── RBAC
-  const rbacLogs = useMemo(() => applyRbacFilter(allLogs, currentUser), [allLogs, currentUser]);
+  // Primary Data Query Handler
+  const fetchAuditLogs = useCallback(async () => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      params.set('page', String(page));
+      params.set('page_size', String(pageSize));
+      params.set('sort_by', sortKey);
+      params.set('sort_dir', sortDir);
 
-  // ── filter + sort
-  const filteredLogs = useMemo(() => rbacLogs.filter(l => {
-    const term = search.toLowerCase();
-    const ok = !term || [l.actor_name,l.actor_email,l.action,l.target,l.ip,l.category].some(v=>(v||'').toLowerCase().includes(term));
-    const okActor  = !actorFilter || l.actor_id===actorFilter;
-    const okCat    = !categories.length    || categories.includes(l.category);
-    const okStatus = !statusFilters.length || statusFilters.includes(l.status);
-    const d = new Date(l.ts);
-    const okFrom = !dateFrom || d>=new Date(dateFrom);
-    const okTo   = !dateTo   || d<=new Date(dateTo+'T23:59:59');
-    return ok && okActor && okCat && okStatus && okFrom && okTo;
-  }), [rbacLogs, search, actorFilter, categories, statusFilters, dateFrom, dateTo]);
+      if (debouncedSearch) params.set('q', debouncedSearch);
+      if (dateFrom) params.set('date_from', dateFrom);
+      if (dateTo) params.set('date_to', dateTo + 'T23:59:59');
+      if (actorFilter) params.set('actor_id', actorFilter);
+      if (selectedCategories.length) params.set('category', selectedCategories.join(','));
+      if (selectedSeverities.length) params.set('severity', selectedSeverities.join(','));
+      if (selectedActionTypes.length) params.set('action_type', selectedActionTypes.join(','));
+      if (selectedStatuses.length) params.set('status', selectedStatuses.join(','));
 
-  const sortedLogs = useMemo(() => [...filteredLogs].sort((a,b) => {
-    let av=a[sortKey], bv=b[sortKey];
-    if (typeof av==='string') { av=av.toLowerCase(); bv=bv.toLowerCase(); }
-    return av<bv?(sortDir==='asc'?-1:1):av>bv?(sortDir==='asc'?1:-1):0;
-  }), [filteredLogs, sortKey, sortDir]);
+      const [logsRes, summaryRes] = await Promise.all([
+        api.get(`/audit-logs?${params.toString()}`),
+        api.get(`/audit-logs/summary?${params.toString()}`),
+      ]);
 
-  const totalPages    = Math.max(1, Math.ceil(sortedLogs.length/PAGE_SIZE));
-  const safePage      = Math.min(page, totalPages);
-  const paginatedLogs = sortedLogs.slice((safePage-1)*PAGE_SIZE, safePage*PAGE_SIZE);
+      setLogs(logsRes.data.items || []);
+      setTotalLogs(logsRes.data.total || 0);
+      setTotalPages(logsRes.data.total_pages || 1);
+      setSummary(summaryRes.data || {});
+    } catch (err) {
+      console.error('Audit query error:', err);
+      setLogs([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [
+    page,
+    pageSize,
+    sortKey,
+    sortDir,
+    debouncedSearch,
+    dateFrom,
+    dateTo,
+    actorFilter,
+    selectedCategories,
+    selectedSeverities,
+    selectedActionTypes,
+    selectedStatuses,
+  ]);
 
-  useEffect(() => setPage(1), [search,actorFilter,categories,statusFilters,dateFrom,dateTo,currentUser]);
+  // Execute query on filter change
+  useEffect(() => {
+    fetchAuditLogs();
+  }, [fetchAuditLogs]);
 
-  // ── summary
-  const summary = useMemo(() => ({
-    total:    filteredLogs.length,
-    failed:   filteredLogs.filter(l=>l.status==='Failed').length,
-    critical: filteredLogs.filter(l=>l.risk==='critical').length,
-    warnings: filteredLogs.filter(l=>l.status==='Warning').length,
-  }), [filteredLogs]);
+  // Reset to page 1 on filter modifications
+  useEffect(() => {
+    setPage(1);
+  }, [debouncedSearch, dateFrom, dateTo, actorFilter, selectedCategories, selectedSeverities, selectedActionTypes, selectedStatuses]);
 
-  const handleSort = k => { if (sortKey===k) setSortDir(d=>d==='asc'?'desc':'asc'); else { setSortKey(k); setSortDir('desc'); } };
-  const SortIcon = ({ col }) => sortKey!==col ? <ChevronDown size={11} style={{opacity:0.3}}/> : sortDir==='asc' ? <ChevronUp size={11}/> : <ChevronDown size={11}/>;
+  // Verify chain on mount or on demand
+  const handleVerifyChain = useCallback(async () => {
+    try {
+      setVerifyingChain(true);
+      const { data } = await api.get('/audit-logs/verify');
+      setChainStatus(data);
+    } catch (err) {
+      console.error('Verification error:', err);
+    } finally {
+      setVerifyingChain(false);
+    }
+  }, []);
 
-  const actorOptions = useMemo(() => {
-    const seen = new Set();
-    return rbacLogs.filter(l => { if(seen.has(l.actor_id))return false; seen.add(l.actor_id); return true; })
-      .map(l => ({ value:l.actor_id, label:l.actor_name||l.actor_email }));
-  }, [rbacLogs]);
+  useEffect(() => {
+    handleVerifyChain();
+  }, [handleVerifyChain]);
 
-  const demoOptions = [
-    { label:'System Administrator (own actions only — PRODUCTION)', value:{ role:'system_administrator', email:authUser?.email||'rajesh.kumar@kp.dvas.in', jurisdiction:'State HQ', name:authUser?.name||'Rajesh Kumar' } },
-    { label:'Demo: view all (QA only)',  value:{ role:'_demo_all', email:'qa@kp.dvas.in', jurisdiction:'State HQ', name:'QA User' } },
-  ];
+  // Keyboard navigation
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      // If typing in an input, don't trigger hotkeys
+      if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target?.tagName)) {
+        if (e.key === 'Escape') {
+          e.target.blur();
+        }
+        return;
+      }
 
-  const handleExport = () => { setExporting(true); exportToCsv(sortedLogs); setTimeout(()=>setExporting(false),900); };
+      if (e.key === 'Escape') {
+        setSelectedDrawerLog(null);
+        setIsPresetModalOpen(false);
+      } else if (e.key === 'j' || e.key === 'ArrowDown') {
+        setSelectedRowIndex((prev) => Math.min(logs.length - 1, prev + 1));
+      } else if (e.key === 'k' || e.key === 'ArrowUp') {
+        setSelectedRowIndex((prev) => Math.max(0, prev - 1));
+      } else if (e.key === 'Enter') {
+        const targetLog = logs[selectedRowIndex];
+        if (targetLog) toggleRow(targetLog.id);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [logs, selectedRowIndex]);
+
+  // Sorting Handler
+  const handleSort = (key) => {
+    if (sortKey === key) {
+      setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortKey(key);
+      setSortDir('desc');
+    }
+  };
+
+  const SortIcon = ({ col }) => {
+    if (sortKey !== col) return <ChevronDown size={11} style={{ opacity: 0.3 }} />;
+    return sortDir === 'asc' ? <ChevronUp size={11} /> : <ChevronDown size={11} />;
+  };
+
+  // Row Expansion Toggle
+  const toggleRow = (id) => {
+    setExpandedRows((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const setRowTab = (id, tab) => {
+    setRowTabMap((prev) => ({ ...prev, [id]: tab }));
+  };
+
+  // Target resource navigator
+  const handleNavigateResource = (targetType, targetId) => {
+    if (!targetType) return;
+    const type = targetType.toLowerCase();
+    if (type === 'user') navigate('/admin');
+    else if (type === 'mission' || type === 'drone') navigate('/command');
+    else if (type === 'evidence' || type === 'export') navigate('/admin');
+  };
+
+  // Preset Application
+  const handleApplyPreset = (preset) => {
+    const f = preset.filters || {};
+    setSearch(f.q || '');
+    setDateFrom(f.date_from || '');
+    setDateTo(f.date_to || '');
+    setActorFilter(f.actor_id || '');
+    setSelectedCategories(f.category ? (Array.isArray(f.category) ? f.category : f.category.split(',')) : []);
+    setSelectedSeverities(f.severity ? (Array.isArray(f.severity) ? f.severity : f.severity.split(',')) : []);
+    setSelectedActionTypes(f.action_type ? (Array.isArray(f.action_type) ? f.action_type : f.action_type.split(',')) : []);
+    setSelectedStatuses(f.status ? (Array.isArray(f.status) ? f.status : f.status.split(',')) : []);
+  };
+
+  // Exports
+  const handleExportCSV = async () => {
+    try {
+      setExporting(true);
+      const params = new URLSearchParams();
+      if (debouncedSearch) params.set('q', debouncedSearch);
+      if (dateFrom) params.set('date_from', dateFrom);
+      if (dateTo) params.set('date_to', dateTo + 'T23:59:59');
+      if (actorFilter) params.set('actor_id', actorFilter);
+      if (selectedCategories.length) params.set('category', selectedCategories.join(','));
+      if (selectedSeverities.length) params.set('severity', selectedSeverities.join(','));
+      if (selectedActionTypes.length) params.set('action_type', selectedActionTypes.join(','));
+      if (selectedStatuses.length) params.set('status', selectedStatuses.join(','));
+
+      const response = await api.get(`/audit-logs/export/csv?${params.toString()}`, { responseType: 'blob' });
+      const blob = new Blob([response.data], { type: 'text/csv;charset=utf-8;' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `dvas_audit_log_${new Date().toISOString().slice(0, 10)}.csv`;
+      link.click();
+    } catch (err) {
+      console.error('Export CSV error:', err);
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const handleExportJSON = async () => {
+    try {
+      setExporting(true);
+      const params = new URLSearchParams();
+      if (debouncedSearch) params.set('q', debouncedSearch);
+      if (dateFrom) params.set('date_from', dateFrom);
+      if (dateTo) params.set('date_to', dateTo + 'T23:59:59');
+      if (actorFilter) params.set('actor_id', actorFilter);
+      if (selectedCategories.length) params.set('category', selectedCategories.join(','));
+      if (selectedSeverities.length) params.set('severity', selectedSeverities.join(','));
+      if (selectedActionTypes.length) params.set('action_type', selectedActionTypes.join(','));
+      if (selectedStatuses.length) params.set('status', selectedStatuses.join(','));
+
+      const { data } = await api.get(`/audit-logs/export/json?${params.toString()}`);
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `dvas_audit_log_${new Date().toISOString().slice(0, 10)}.json`;
+      link.click();
+    } catch (err) {
+      console.error('Export JSON error:', err);
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const handleExportSection65BPDF = async () => {
+    try {
+      setExporting(true);
+      const params = new URLSearchParams();
+      if (debouncedSearch) params.set('q', debouncedSearch);
+      if (dateFrom) params.set('date_from', dateFrom);
+      if (dateTo) params.set('date_to', dateTo + 'T23:59:59');
+      if (actorFilter) params.set('actor_id', actorFilter);
+      if (selectedCategories.length) params.set('category', selectedCategories.join(','));
+      if (selectedSeverities.length) params.set('severity', selectedSeverities.join(','));
+      if (selectedActionTypes.length) params.set('action_type', selectedActionTypes.join(','));
+      if (selectedStatuses.length) params.set('status', selectedStatuses.join(','));
+
+      const response = await api.get(`/audit-logs/export/pdf?${params.toString()}`, { responseType: 'blob' });
+      const blob = new Blob([response.data], { type: 'application/pdf' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `dvas_section65b_certificate_${new Date().toISOString().slice(0, 10)}.pdf`;
+      link.click();
+    } catch (err) {
+      console.error('Export Section 65B PDF error:', err);
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const handleClearAllFilters = () => {
+    setSearch('');
+    setDateFrom('');
+    setDateTo('');
+    setActorFilter('');
+    setSelectedCategories([]);
+    setSelectedSeverities([]);
+    setSelectedActionTypes([]);
+    setSelectedStatuses([]);
+  };
+
+  const hasActiveFilters = Boolean(
+    search || dateFrom || dateTo || actorFilter ||
+    selectedCategories.length || selectedSeverities.length ||
+    selectedActionTypes.length || selectedStatuses.length
+  );
 
   return (
-    <AppShell title="Audit Log — Own Actions" subtitle="System Administrator · RBAC-enforced immutable audit trail · Last 7 days">
+    <AppShell
+      title="Audit Log Explorer"
+      subtitle="Kerala Police DVAS · Cryptographically Verified & Immutable Audit Trail"
+    >
+      {/* ── Print Stylesheet ── */}
+      <style>{`
+        @media print {
+          nav, aside, .dvas-no-print, [data-testid="audit-search"], select, button, input {
+            display: none !important;
+          }
+          body {
+            background: #fff !important;
+            color: #000 !important;
+          }
+          table {
+            font-size: 10px !important;
+          }
+        }
+      `}</style>
 
-      {/* ── RBAC context banner ── */}
-      <div style={{ marginBottom:20, padding:'10px 14px', borderRadius:12, display:'flex', alignItems:'center', justifyContent:'space-between', gap:12, flexWrap:'wrap', background:'var(--dvas-info-bg)', border:'1px solid color-mix(in srgb, var(--dvas-blue) 25%, transparent)' }}>
-        <div style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
-          <UserCheck size={15} style={{ color:'var(--dvas-blue)', flexShrink:0 }}/>
-          <span style={{ fontSize:12, fontWeight:600, color:'var(--dvas-text)' }}>Viewing as:&nbsp;
-            <span style={{ fontFamily:'JetBrains Mono,monospace', color:'var(--dvas-blue)' }}>
-              {currentUser.name||currentUser.email} · {currentUser.role?.replace(/_/g,' ')} · {currentUser.jurisdiction||'State HQ'}
+      {/* ── Anomaly Alert Banner (if any anomalies detected) ── */}
+      {anomaliesData.length > 0 && showAnomaliesBanner && (
+        <div
+          data-testid="anomaly-banner"
+          style={{
+            marginBottom: 16,
+            padding: '12px 16px',
+            borderRadius: 10,
+            background: 'rgba(239, 68, 68, 0.12)',
+            border: '1px solid rgba(239, 68, 68, 0.35)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 12,
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <Zap size={18} style={{ color: 'var(--dvas-crit)', flexShrink: 0 }} />
+            <div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--dvas-crit)' }}>
+                {anomaliesData.length} Security Anomaly Pattern(s) Detected in Last 24 Hours
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--dvas-text)' }}>
+                {anomaliesData.map((a) => a.title).join(' · ')}
+              </div>
+            </div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <button
+              onClick={() => setSelectedSeverities(['critical', 'warning'])}
+              style={{
+                fontSize: 11,
+                fontWeight: 600,
+                padding: '4px 10px',
+                borderRadius: 6,
+                background: 'var(--dvas-crit)',
+                color: '#fff',
+                border: 'none',
+                cursor: 'pointer',
+              }}
+            >
+              Filter Anomalous Events
+            </button>
+            <button
+              onClick={() => setShowAnomaliesBanner(false)}
+              style={{ background: 'none', border: 'none', color: 'var(--dvas-text-dim)', cursor: 'pointer' }}
+            >
+              <X size={14} />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Status & Integrity Context Bar ── */}
+      <div
+        style={{
+          marginBottom: 20,
+          padding: '10px 16px',
+          borderRadius: 10,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 12,
+          flexWrap: 'wrap',
+          background: 'var(--dvas-surface)',
+          border: '1px solid var(--dvas-border)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <UserCheck size={16} style={{ color: 'var(--dvas-blue)' }} />
+          <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--dvas-text)' }}>
+            Logged Officer:&nbsp;
+            <span style={{ fontFamily: 'JetBrains Mono, monospace', color: 'var(--dvas-blue)' }}>
+              {authUser?.name || authUser?.email || 'Officer'} · {authUser?.role?.replace(/_/g, ' ')}
             </span>
           </span>
-          {currentUser.role==='system_administrator' && (
-            <span style={{ fontSize:10, fontWeight:600, padding:'2px 8px', borderRadius:999, background:'var(--dvas-warn-bg)', color:'var(--dvas-warn)', marginLeft:4 }}>
-              Own actions only
-            </span>
-          )}
+          <span style={{ fontSize: 10, padding: '2px 8px', borderRadius: 999, background: 'var(--dvas-elev)', color: 'var(--dvas-text-muted)', border: '1px solid var(--dvas-border)' }}>
+            Jurisdiction: {authUser?.jurisdiction || 'State HQ'}
+          </span>
         </div>
-        <div style={{ position:'relative' }}>
-          <button data-testid="role-switcher-btn" onClick={()=>setShowPicker(o=>!o)} style={{ display:'flex', alignItems:'center', gap:6, fontSize:12, fontWeight:600, padding:'6px 12px', borderRadius:8, cursor:'pointer', color:'var(--dvas-blue)', background:'var(--dvas-surface)', border:'1px solid var(--dvas-border)' }}>
-            <Shield size={13}/> View Mode <ChevronDown size={12}/>
-          </button>
-          {showPicker && (
-            <div className="dvas-fade-in" style={{ position:'absolute', right:0, top:40, zIndex:50, width:300, paddingBlock:4, background:'var(--dvas-surface)', border:'1px solid var(--dvas-border)', borderRadius:'var(--dvas-radius-sm)', boxShadow:'var(--dvas-shadow-lg)' }}>
-              <div style={{ padding:'6px 12px', fontSize:10, fontWeight:600, textTransform:'uppercase', letterSpacing:'0.06em', color:'var(--dvas-text-dim)', borderBottom:'1px solid var(--dvas-border)' }}>Select Audit View Mode</div>
-              {demoOptions.map((o,i) => (
-                <button key={i} onClick={()=>{setRoleMode(o.value);setShowPicker(false);}} style={{ width:'100%', textAlign:'left', padding:'10px 12px', fontSize:12, cursor:'pointer', background:'none', border:'none', color:'var(--dvas-text)', borderLeft:`3px solid ${JSON.stringify(currentUser)===JSON.stringify(o.value)?'var(--dvas-blue)':'transparent'}` }} className="hover:bg-[color:var(--dvas-elev)]">
-                  {o.label}
-                </button>
-              ))}
-              {roleMode && <button onClick={()=>{setRoleMode(null);setShowPicker(false);}} style={{ width:'100%', textAlign:'left', padding:'10px 12px', fontSize:12, cursor:'pointer', background:'none', border:'none', color:'var(--dvas-crit)', borderTop:'1px solid var(--dvas-border)' }}>↩ Reset to actual user</button>}
+
+        {/* Chain Integrity Badge */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {chainStatus && (
+            <div
+              data-testid="chain-status-badge"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+                padding: '4px 10px',
+                borderRadius: 999,
+                fontSize: 11,
+                fontWeight: 600,
+                fontFamily: 'JetBrains Mono, monospace',
+                background: chainStatus.is_chain_valid ? 'var(--dvas-safe-bg)' : 'var(--dvas-crit-bg)',
+                color: chainStatus.is_chain_valid ? 'var(--dvas-safe)' : 'var(--dvas-crit)',
+                border: `1px solid ${chainStatus.is_chain_valid ? 'rgba(52,211,153,0.3)' : 'rgba(239,68,68,0.3)'}`,
+              }}
+            >
+              {chainStatus.is_chain_valid ? <ShieldCheck size={13} /> : <ShieldAlert size={13} />}
+              {chainStatus.is_chain_valid ? 'SHA-256 Chain Verified (OK)' : `Tamper Detected (${chainStatus.tampered_count} breaches)`}
+              <span style={{ opacity: 0.6 }}>· {chainStatus.total_checked} rows</span>
             </div>
           )}
+          <button
+            onClick={handleVerifyChain}
+            disabled={verifyingChain}
+            title="Re-verify full cryptographic hash-chain from genesis"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 4,
+              fontSize: 11,
+              fontWeight: 600,
+              padding: '5px 10px',
+              borderRadius: 8,
+              background: 'var(--dvas-elev)',
+              border: '1px solid var(--dvas-border)',
+              color: 'var(--dvas-text)',
+              cursor: verifyingChain ? 'wait' : 'pointer',
+            }}
+          >
+            <RefreshCw size={12} className={verifyingChain ? 'animate-spin' : ''} />
+            {verifyingChain ? 'Verifying…' : 'Verify Chain'}
+          </button>
         </div>
       </div>
 
-      {/* ── Summary Cards ── */}
-      <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(190px,1fr))', gap:16, marginBottom:24 }}>
-        <SummaryCard testId="card-total"    icon={Activity}      label="Total Events"     value={summary.total}    sub="In selected period"      color="var(--dvas-blue)"/>
-        <SummaryCard testId="card-failed"   icon={AlertTriangle} label="Failed Logins"    value={summary.failed}   sub="Authentication failures" color="var(--dvas-crit)"/>
-        <SummaryCard testId="card-critical" icon={Shield}        label="Critical Actions" value={summary.critical} sub="High-risk operations"    color="var(--dvas-warn)"/>
-        <SummaryCard testId="card-warnings" icon={Clock}         label="Warnings"         value={summary.warnings} sub="Flagged for review"      color="var(--dvas-warn)"/>
+      {/* ── Summary KPI Cards ── */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: 14, marginBottom: 20 }}>
+        <SummaryCard testId="card-total" icon={Activity} label="Total Events" value={summary.total_events} sub="Matching active filters" color="var(--dvas-blue)" />
+        <SummaryCard testId="card-failed" icon={AlertTriangle} label="Failed Actions" value={summary.failed_actions} sub="Unauthorized or rejected" color="var(--dvas-crit)" />
+        <SummaryCard testId="card-critical" icon={Shield} label="Critical Actions" value={summary.critical_events} sub="User & security modifications" color="var(--dvas-warn)" />
+        <SummaryCard testId="card-warnings" icon={Clock} label="Warnings" value={summary.warnings} sub="Config & watchlist updates" color="#fbbf24" />
       </div>
 
       {/* ── Main Panel ── */}
-      <div style={{ background:'var(--dvas-surface)', border:'1px solid var(--dvas-border)', borderRadius:'var(--dvas-radius)', boxShadow:'var(--dvas-shadow)', overflow:'hidden' }}>
+      <div
+        style={{
+          background: 'var(--dvas-surface)',
+          border: '1px solid var(--dvas-border)',
+          borderRadius: 12,
+          boxShadow: 'var(--dvas-shadow)',
+          overflow: 'hidden',
+        }}
+      >
+        {/* Filter & Action Toolbar */}
+        <div style={{ padding: 14, display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center', borderBottom: '1px solid var(--dvas-border)' }}>
+          {/* Search Box */}
+          <div style={{ position: 'relative', flex: 1, minWidth: 220 }}>
+            <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--dvas-text-muted)', pointerEvents: 'none' }} />
+            <input
+              data-testid="audit-search"
+              type="text"
+              placeholder="Search actor, email, action, resource, IP, request ID…"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              style={{
+                width: '100%',
+                paddingLeft: 32,
+                paddingRight: search ? 30 : 12,
+                paddingBlock: 8,
+                fontSize: 12,
+                background: 'var(--dvas-elev)',
+                border: '1px solid var(--dvas-border)',
+                borderRadius: 8,
+                color: 'var(--dvas-text)',
+                outline: 'none',
+                boxSizing: 'border-box',
+              }}
+            />
+            {search && (
+              <button
+                onClick={() => setSearch('')}
+                style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', color: 'var(--dvas-text-dim)', cursor: 'pointer' }}
+              >
+                <X size={13} />
+              </button>
+            )}
+          </div>
 
-        {/* Toolbar */}
-        <div style={{ padding:16, display:'flex', flexWrap:'wrap', gap:12, alignItems:'center', borderBottom:'1px solid var(--dvas-border)' }}>
-          {/* Search */}
-          <div style={{ position:'relative', flex:1, minWidth:200 }}>
-            <Search size={14} style={{ position:'absolute', left:10, top:'50%', transform:'translateY(-50%)', color:'var(--dvas-text-muted)', pointerEvents:'none' }}/>
-            <input data-testid="audit-search" type="text" placeholder="Search actor, action, resource, IP…" value={search} onChange={e=>setSearch(e.target.value)}
-              style={{ width:'100%', paddingLeft:34, paddingRight:12, paddingBlock:8, fontSize:12, background:'var(--dvas-elev)', border:'1px solid var(--dvas-border)', borderRadius:10, color:'var(--dvas-text)', outline:'none', boxSizing:'border-box' }}/>
+          {/* Date Range Inputs */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <Calendar size={13} style={{ color: 'var(--dvas-text-muted)' }} />
+            <input
+              data-testid="date-from"
+              type="date"
+              value={dateFrom}
+              onChange={(e) => setDateFrom(e.target.value)}
+              style={{ fontSize: 12, paddingBlock: 6, paddingInline: 8, background: 'var(--dvas-elev)', border: '1px solid var(--dvas-border)', borderRadius: 8, color: 'var(--dvas-text)', outline: 'none' }}
+            />
+            <span style={{ color: 'var(--dvas-text-dim)', fontSize: 12 }}>–</span>
+            <input
+              data-testid="date-to"
+              type="date"
+              value={dateTo}
+              onChange={(e) => setDateTo(e.target.value)}
+              style={{ fontSize: 12, paddingBlock: 6, paddingInline: 8, background: 'var(--dvas-elev)', border: '1px solid var(--dvas-border)', borderRadius: 8, color: 'var(--dvas-text)', outline: 'none' }}
+            />
           </div>
-          {/* Date range */}
-          <div style={{ display:'flex', alignItems:'center', gap:6 }}>
-            <Calendar size={13} style={{ color:'var(--dvas-text-muted)' }}/>
-            <input data-testid="date-from" type="date" value={dateFrom} onChange={e=>setDateFrom(e.target.value)}
-              style={{ fontSize:12, paddingBlock:6, paddingInline:8, background:'var(--dvas-elev)', border:'1px solid var(--dvas-border)', borderRadius:10, color:'var(--dvas-text)', outline:'none' }}/>
-            <span style={{ color:'var(--dvas-text-dim)', fontSize:12 }}>–</span>
-            <input data-testid="date-to" type="date" value={dateTo} onChange={e=>setDateTo(e.target.value)}
-              style={{ fontSize:12, paddingBlock:6, paddingInline:8, background:'var(--dvas-elev)', border:'1px solid var(--dvas-border)', borderRadius:10, color:'var(--dvas-text)', outline:'none' }}/>
-          </div>
-          {/* Actor dropdown */}
-          <div style={{ position:'relative' }}>
-            <User size={13} style={{ position:'absolute', left:10, top:'50%', transform:'translateY(-50%)', color:'var(--dvas-text-muted)', pointerEvents:'none' }}/>
-            <select data-testid="actor-filter" value={actorFilter} onChange={e=>setActorFilter(e.target.value)}
-              style={{ paddingLeft:30, paddingRight:12, paddingBlock:8, fontSize:12, background:'var(--dvas-elev)', border:'1px solid var(--dvas-border)', borderRadius:10, color:'var(--dvas-text)', outline:'none', minWidth:160, cursor:'pointer', appearance:'none' }}>
+
+          {/* Actor Select Dropdown */}
+          <div style={{ position: 'relative' }}>
+            <select
+              data-testid="actor-filter"
+              value={actorFilter}
+              onChange={(e) => setActorFilter(e.target.value)}
+              style={{
+                paddingInline: 12,
+                paddingBlock: 8,
+                fontSize: 12,
+                background: 'var(--dvas-elev)',
+                border: '1px solid var(--dvas-border)',
+                borderRadius: 8,
+                color: 'var(--dvas-text)',
+                outline: 'none',
+                minWidth: 150,
+                cursor: 'pointer',
+              }}
+            >
               <option value="">All Actors</option>
-              {actorOptions.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}
+              {actorsList.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.name || a.email} ({a.role?.replace(/_/g, ' ')})
+                </option>
+              ))}
             </select>
           </div>
-          {/* Category multi-select */}
-          <MultiSelect label="Categories" options={CATEGORIES} selected={categories} onChange={setCategories} testId="category-filter"/>
-          {/* Status toggles */}
-          <div data-testid="status-toggles" style={{ display:'flex', gap:4 }}>
-            {STATUSES.map(s => { const st=statusStyle(s); const active=statusFilters.includes(s); return (
-              <button key={s} onClick={()=>setStatusFilters(f=>active?f.filter(x=>x!==s):[...f,s])}
-                style={{ fontSize:11, fontWeight:600, padding:'6px 10px', borderRadius:8, cursor:'pointer', transition:'all 120ms',
-                         background:active?st.bg:'var(--dvas-elev)', color:active?st.color:'var(--dvas-text-dim)',
-                         border:`1px solid ${active?'color-mix(in srgb, '+st.color+' 30%, transparent)':'var(--dvas-border)'}` }}>{s}</button>
-            ); })}
+
+          {/* Category Filter Dropdown */}
+          <MultiSelect
+            label="Category"
+            options={categoriesList.length ? categoriesList : ['authentication', 'user_mgmt', 'operations', 'evidence', 'configuration', 'security']}
+            selected={selectedCategories}
+            onChange={setSelectedCategories}
+            testId="category-filter"
+          />
+
+          {/* Action Type Filter Dropdown */}
+          <MultiSelect
+            label="Action Type"
+            options={actionTypesList.length ? actionTypesList : ['create', 'update', 'delete', 'login', 'logout', 'export', 'read', 'system']}
+            selected={selectedActionTypes}
+            onChange={setSelectedActionTypes}
+            testId="action-type-filter"
+          />
+
+          {/* Severity Quick Toggles */}
+          <div style={{ display: 'flex', gap: 4 }}>
+            {['critical', 'warning', 'info'].map((sev) => {
+              const active = selectedSeverities.includes(sev);
+              const b = severityBadge(sev);
+              return (
+                <button
+                  key={sev}
+                  onClick={() =>
+                    setSelectedSeverities((prev) =>
+                      active ? prev.filter((s) => s !== sev) : [...prev, sev]
+                    )
+                  }
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 600,
+                    padding: '6px 10px',
+                    borderRadius: 8,
+                    cursor: 'pointer',
+                    background: active ? b.bg : 'var(--dvas-elev)',
+                    color: active ? b.color : 'var(--dvas-text-dim)',
+                    border: `1px solid ${active ? b.border : 'var(--dvas-border)'}`,
+                  }}
+                >
+                  {sev.toUpperCase()}
+                </button>
+              );
+            })}
           </div>
-          {/* Actions */}
-          <div style={{ marginLeft:'auto', display:'flex', gap:8 }}>
-            <button data-testid="refresh-logs" onClick={loadData} title="Regenerate logs"
-              style={{ width:36, height:36, display:'flex', alignItems:'center', justifyContent:'center', borderRadius:8, cursor:'pointer', color:'var(--dvas-text-muted)', background:'var(--dvas-surface)', border:'1px solid var(--dvas-border)' }}>
-              <RefreshCw size={14}/>
+
+          {/* Presets Dropdown */}
+          <div style={{ position: 'relative' }}>
+            <select
+              value=""
+              onChange={(e) => {
+                const found = presetsList.find((p) => p.id === e.target.value);
+                if (found) handleApplyPreset(found);
+              }}
+              style={{
+                paddingInline: 12,
+                paddingBlock: 8,
+                fontSize: 12,
+                background: 'var(--dvas-elev)',
+                border: '1px solid var(--dvas-border)',
+                borderRadius: 8,
+                color: 'var(--dvas-text)',
+                outline: 'none',
+                minWidth: 130,
+                cursor: 'pointer',
+              }}
+            >
+              <option value="" disabled>Presets ({presetsList.length})</option>
+              {presetsList.map((p) => (
+                <option key={p.id} value={p.id}>{p.name} {p.is_shared ? '(Shared)' : ''}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Action Buttons */}
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
+            {hasActiveFilters && (
+              <button
+                onClick={handleClearAllFilters}
+                title="Reset all active filters"
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 4,
+                  fontSize: 11,
+                  fontWeight: 600,
+                  padding: '7px 10px',
+                  borderRadius: 8,
+                  background: 'none',
+                  border: '1px dashed var(--dvas-border)',
+                  color: 'var(--dvas-text-muted)',
+                  cursor: 'pointer',
+                }}
+              >
+                <RotateCcw size={12} /> Clear
+              </button>
+            )}
+
+            <button
+              onClick={() => setIsPresetModalOpen(true)}
+              title="Save current filters as preset"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 5,
+                fontSize: 12,
+                fontWeight: 600,
+                padding: '7px 12px',
+                borderRadius: 8,
+                background: 'var(--dvas-elev)',
+                border: '1px solid var(--dvas-border)',
+                color: 'var(--dvas-text)',
+                cursor: 'pointer',
+              }}
+            >
+              <Bookmark size={13} /> Save Preset
             </button>
-            <button data-testid="export-csv" onClick={handleExport} disabled={exporting||sortedLogs.length===0}
-              style={{ display:'flex', alignItems:'center', gap:8, padding:'0 12px', height:36, fontSize:12, fontWeight:600, borderRadius:8, cursor:exporting?'default':'pointer', transition:'all 120ms',
-                       background:exporting?'var(--dvas-safe-bg)':'var(--dvas-blue)', color:'#fff', border:'none', opacity:sortedLogs.length===0?0.5:1 }}>
-              <Download size={13}/> {exporting?'Exporting…':`Export CSV (${sortedLogs.length})`}
+
+            <button
+              data-testid="refresh-logs"
+              onClick={fetchAuditLogs}
+              title="Refresh logs from server"
+              style={{
+                width: 36,
+                height: 36,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                borderRadius: 8,
+                cursor: 'pointer',
+                color: 'var(--dvas-text-muted)',
+                background: 'var(--dvas-elev)',
+                border: '1px solid var(--dvas-border)',
+              }}
+            >
+              <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
+            </button>
+
+            {/* Section 65B PDF Export Button */}
+            <button
+              data-testid="export-65b-pdf"
+              onClick={handleExportSection65BPDF}
+              disabled={exporting || totalLogs === 0}
+              title="Generate Official Indian Evidence Act Section 65B Compliance Certificate (PDF)"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                padding: '0 12px',
+                height: 36,
+                fontSize: 12,
+                fontWeight: 700,
+                borderRadius: 8,
+                cursor: exporting ? 'wait' : 'pointer',
+                background: 'rgba(56, 189, 248, 0.18)',
+                color: 'var(--dvas-blue)',
+                border: '1px solid var(--dvas-blue)',
+                opacity: totalLogs === 0 ? 0.5 : 1,
+              }}
+            >
+              <FileCheck size={14} /> Section 65B PDF
+            </button>
+
+            {/* CSV & JSON Export */}
+            <button
+              data-testid="export-csv"
+              onClick={handleExportCSV}
+              disabled={exporting || totalLogs === 0}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                padding: '0 12px',
+                height: 36,
+                fontSize: 12,
+                fontWeight: 600,
+                borderRadius: 8,
+                cursor: exporting ? 'wait' : 'pointer',
+                background: 'var(--dvas-blue)',
+                color: '#fff',
+                border: 'none',
+                opacity: totalLogs === 0 ? 0.5 : 1,
+              }}
+            >
+              <Download size={13} /> CSV
+            </button>
+            <button
+              data-testid="export-json"
+              onClick={handleExportJSON}
+              disabled={exporting || totalLogs === 0}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                padding: '0 12px',
+                height: 36,
+                fontSize: 12,
+                fontWeight: 600,
+                borderRadius: 8,
+                cursor: exporting ? 'wait' : 'pointer',
+                background: 'var(--dvas-elev)',
+                color: 'var(--dvas-text)',
+                border: '1px solid var(--dvas-border)',
+                opacity: totalLogs === 0 ? 0.5 : 1,
+              }}
+            >
+              JSON
+            </button>
+
+            {/* Print Button */}
+            <button
+              onClick={() => window.print()}
+              title="Print audit trail report"
+              style={{
+                width: 36,
+                height: 36,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                borderRadius: 8,
+                cursor: 'pointer',
+                color: 'var(--dvas-text-muted)',
+                background: 'var(--dvas-elev)',
+                border: '1px solid var(--dvas-border)',
+              }}
+            >
+              <Printer size={14} />
             </button>
           </div>
         </div>
 
-        {/* Table */}
-        {loading ? (
-          <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', padding:'80px 0', gap:12 }}>
-            <div style={{ width:32, height:32, borderRadius:'50%', border:'2px solid var(--dvas-blue)', borderTopColor:'transparent', animation:'auditSpin 0.8s linear infinite' }}/>
-            <div style={{ fontSize:12, color:'var(--dvas-text-dim)' }}>Fetching users from Keycloak…</div>
-          </div>
-        ) : (
-          <div style={{ overflowX:'auto' }}>
-            <table style={{ width:'100%', fontSize:12, tableLayout:'fixed', borderCollapse:'collapse' }}>
-              <thead>
-                <tr style={{ background:'var(--dvas-surface-2)', borderBottom:'1px solid var(--dvas-border)' }}>
-                  {COLS.map(c => (
-                    <th key={c.key} onClick={()=>c.key!=='_view'&&handleSort(c.key)} style={{ width:c.w, padding:'10px 14px', textAlign:'left', cursor:c.key!=='_view'?'pointer':'default', whiteSpace:'nowrap' }}>
-                      <div style={{ display:'flex', alignItems:'center', gap:4, fontSize:10, fontWeight:600, textTransform:'uppercase', letterSpacing:'0.06em', color:sortKey===c.key?'var(--dvas-blue)':'var(--dvas-text-muted)' }}>
-                        {c.label}{c.key!=='_view'&&<SortIcon col={c.key}/>}
-                      </div>
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {paginatedLogs.length===0 ? (
-                  <tr><td colSpan={8} style={{ padding:'64px 0', textAlign:'center', color:'var(--dvas-text-dim)' }}>
-                    <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:8 }}>
-                      <SlidersHorizontal size={28} style={{ opacity:0.3 }}/>
-                      <span style={{ fontSize:13 }}>No audit records match your current filters.</span>
+        {/* ── Table ── */}
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse', tableLayout: 'fixed' }}>
+            <thead>
+              <tr style={{ background: 'var(--dvas-surface-2)', borderBottom: '1px solid var(--dvas-border)' }}>
+                <th style={{ width: '40px', padding: '10px 12px' }} />
+                <th onClick={() => handleSort('ts')} style={{ width: '16%', padding: '10px 12px', textAlign: 'left', cursor: 'pointer' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', color: sortKey === 'ts' ? 'var(--dvas-blue)' : 'var(--dvas-text-muted)' }}>
+                    Timestamp (IST)<SortIcon col="ts" />
+                  </div>
+                </th>
+                <th onClick={() => handleSort('actor_email')} style={{ width: '17%', padding: '10px 12px', textAlign: 'left', cursor: 'pointer' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', color: sortKey === 'actor_email' ? 'var(--dvas-blue)' : 'var(--dvas-text-muted)' }}>
+                    Actor<SortIcon col="actor_email" />
+                  </div>
+                </th>
+                <th onClick={() => handleSort('action')} style={{ width: '18%', padding: '10px 12px', textAlign: 'left', cursor: 'pointer' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', color: sortKey === 'action' ? 'var(--dvas-blue)' : 'var(--dvas-text-muted)' }}>
+                    Action<SortIcon col="action" />
+                  </div>
+                </th>
+                <th onClick={() => handleSort('category')} style={{ width: '12%', padding: '10px 12px', textAlign: 'left', cursor: 'pointer' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', color: sortKey === 'category' ? 'var(--dvas-blue)' : 'var(--dvas-text-muted)' }}>
+                    Category<SortIcon col="category" />
+                  </div>
+                </th>
+                <th onClick={() => handleSort('target')} style={{ width: '14%', padding: '10px 12px', textAlign: 'left', cursor: 'pointer' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', color: sortKey === 'target' ? 'var(--dvas-blue)' : 'var(--dvas-text-muted)' }}>
+                    Resource<SortIcon col="target" />
+                  </div>
+                </th>
+                <th onClick={() => handleSort('severity')} style={{ width: '10%', padding: '10px 12px', textAlign: 'left', cursor: 'pointer' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', color: sortKey === 'severity' ? 'var(--dvas-blue)' : 'var(--dvas-text-muted)' }}>
+                    Severity<SortIcon col="severity" />
+                  </div>
+                </th>
+                <th onClick={() => handleSort('status')} style={{ width: '9%', padding: '10px 12px', textAlign: 'left', cursor: 'pointer' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', color: sortKey === 'status' ? 'var(--dvas-blue)' : 'var(--dvas-text-muted)' }}>
+                    Status<SortIcon col="status" />
+                  </div>
+                </th>
+                <th style={{ width: '60px', padding: '10px 12px', textAlign: 'right' }} />
+              </tr>
+            </thead>
+            <tbody>
+              {loading ? (
+                <tr>
+                  <td colSpan={9} style={{ padding: '60px 0', textAlign: 'center' }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}>
+                      <RefreshCw size={24} className="animate-spin" style={{ color: 'var(--dvas-blue)' }} />
+                      <span style={{ fontSize: 12, color: 'var(--dvas-text-dim)' }}>Loading audit trail from server…</span>
                     </div>
-                  </td></tr>
-                ) : paginatedLogs.map(log => {
-                  const sty = statusStyle(log.status);
-                  return (
-                    <tr key={log.id} data-testid={`audit-row-${log.id}`} onClick={()=>setSelectedLog(log)} style={{ borderBottom:'1px solid var(--dvas-border)', cursor:'pointer' }} className="hover:bg-[color:var(--dvas-elev)]">
-                      <td style={{ padding:'10px 14px' }}>
-                        <div style={{ fontSize:11, fontFamily:'JetBrains Mono,monospace', color:'var(--dvas-text-muted)' }}>{new Date(log.ts).toLocaleDateString('en-IN')}</div>
-                        <div style={{ fontSize:10, fontFamily:'JetBrains Mono,monospace', color:'var(--dvas-text-dim)' }}>{new Date(log.ts).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata'})}</div>
-                      </td>
-                      <td style={{ padding:'10px 14px' }}>
-                        <div style={{ fontSize:11, fontWeight:600, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', color:'var(--dvas-text)' }}>{log.actor_name}</div>
-                        <div style={{ fontSize:10, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', color:'var(--dvas-text-dim)' }}>{log.actor_dept}</div>
-                      </td>
-                      <td style={{ padding:'10px 14px' }}>
-                        <span style={{ fontFamily:'JetBrains Mono,monospace', display:'inline-block', padding:'2px 8px', borderRadius:999, fontSize:10, fontWeight:600, background:'var(--dvas-info-bg)', color:riskColor(log.risk) }}>{log.action}</span>
-                      </td>
-                      <td style={{ padding:'10px 14px', fontSize:11, color:'var(--dvas-text-muted)' }}>{log.category}</td>
-                      <td style={{ padding:'10px 14px' }}><span style={{ fontFamily:'JetBrains Mono,monospace', fontSize:11, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', display:'block', color:'var(--dvas-text)' }}>{log.target}</span></td>
-                      <td style={{ padding:'10px 14px', fontFamily:'JetBrains Mono,monospace', fontSize:11, color:'var(--dvas-text-dim)' }}>{log.ip}</td>
-                      <td style={{ padding:'10px 14px' }}>
-                        <span style={{ display:'inline-flex', alignItems:'center', gap:4, padding:'3px 8px', borderRadius:999, fontSize:10, fontWeight:600, background:sty.bg, color:sty.color }}>
-                          {log.status==='Success'&&<CheckCircle size={10}/>}{log.status==='Failed'&&<X size={10}/>}{log.status==='Warning'&&<AlertTriangle size={10}/>}{log.status}
-                        </span>
-                      </td>
-                      <td style={{ padding:'10px 14px' }}>
-                        <button data-testid={`view-log-${log.id}`} onClick={e=>{e.stopPropagation();setSelectedLog(log);}} style={{ display:'inline-flex', alignItems:'center', gap:4, fontSize:11, fontWeight:600, padding:'4px 8px', borderRadius:8, cursor:'pointer', color:'var(--dvas-blue)', background:'var(--dvas-info-bg)', border:'none' }}>
-                          <Eye size={11}/>View
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
+                  </td>
+                </tr>
+              ) : logs.length === 0 ? (
+                <tr>
+                  <td colSpan={9} style={{ padding: '60px 0', textAlign: 'center', color: 'var(--dvas-text-dim)' }}>
+                    <SlidersHorizontal size={28} style={{ opacity: 0.3, margin: '0 auto 8px' }} />
+                    <div style={{ fontSize: 13 }}>No audit records found matching your filters.</div>
+                  </td>
+                </tr>
+              ) : (
+                logs.map((log, index) => {
+                  const isExpanded = expandedRows.has(log.id);
+                  const isRowFocused = index === selectedRowIndex;
+                  const activeTab = rowTabMap[log.id] || 'overview';
+                  const sBadge = statusBadge(log.status);
+                  const sevBadge = severityBadge(log.severity);
+                  const actBadge = actionTypeBadge(log.action_type);
+                  const SIcon = sBadge.icon;
 
-        {/* Pagination */}
-        {!loading && (
-          <div style={{ padding:'10px 20px', display:'flex', alignItems:'center', justifyContent:'space-between', borderTop:'1px solid var(--dvas-border)', background:'var(--dvas-surface-2)' }}>
-            <div style={{ fontSize:12, color:'var(--dvas-text-dim)' }}>
+                  return (
+                    <React.Fragment key={log.id}>
+                      <tr
+                        data-testid={`audit-row-${log.id}`}
+                        onClick={() => {
+                          setSelectedRowIndex(index);
+                          toggleRow(log.id);
+                        }}
+                        style={{
+                          borderBottom: '1px solid var(--dvas-border)',
+                          background: isRowFocused ? 'rgba(56, 189, 248, 0.06)' : isExpanded ? 'var(--dvas-elev)' : 'transparent',
+                          cursor: 'pointer',
+                          outline: isRowFocused ? '1px solid rgba(56, 189, 248, 0.3)' : 'none',
+                        }}
+                        className="hover:bg-[color:var(--dvas-elev)]"
+                      >
+                        {/* Expand Toggle Chevron */}
+                        <td style={{ padding: '10px 8px', textAlign: 'center' }}>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedRowIndex(index);
+                              toggleRow(log.id);
+                            }}
+                            style={{ background: 'none', border: 'none', color: 'var(--dvas-text-dim)', cursor: 'pointer', padding: 0 }}
+                          >
+                            {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                          </button>
+                        </td>
+
+                        {/* Timestamp */}
+                        <td style={{ padding: '10px 12px' }}>
+                          <div style={{ fontSize: 11, fontFamily: 'JetBrains Mono, monospace', color: 'var(--dvas-text)', fontWeight: 500 }}>
+                            {formatDateIST(log.ts)}
+                          </div>
+                          <div style={{ fontSize: 10, color: 'var(--dvas-text-dim)', fontFamily: 'JetBrains Mono, monospace' }}>
+                            {formatRelativeTime(log.ts)}
+                          </div>
+                        </td>
+
+                        {/* Actor */}
+                        <td style={{ padding: '10px 12px' }}>
+                          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--dvas-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {log.actor_name || log.actor_email || 'System'}
+                          </div>
+                          <div style={{ fontSize: 10, color: 'var(--dvas-text-dim)', textTransform: 'capitalize' }}>
+                            {log.actor_role?.replace(/_/g, ' ') || 'Internal'}
+                          </div>
+                        </td>
+
+                        {/* Action */}
+                        <td style={{ padding: '10px 12px' }}>
+                          <span
+                            style={{
+                              display: 'inline-block',
+                              padding: '2px 8px',
+                              borderRadius: 6,
+                              fontSize: 11,
+                              fontWeight: 600,
+                              fontFamily: 'JetBrains Mono, monospace',
+                              background: actBadge.bg,
+                              color: actBadge.color,
+                            }}
+                          >
+                            {log.action}
+                          </span>
+                        </td>
+
+                        {/* Category */}
+                        <td style={{ padding: '10px 12px', fontSize: 11, color: 'var(--dvas-text-muted)', textTransform: 'capitalize' }}>
+                          {log.category?.replace(/_/g, ' ') || 'operations'}
+                        </td>
+
+                        {/* Resource Target */}
+                        <td style={{ padding: '10px 12px' }}>
+                          {log.target_name || log.target ? (
+                            <span
+                              onClick={(e) => {
+                                if (log.target_type) {
+                                  e.stopPropagation();
+                                  handleNavigateResource(log.target_type, log.target_id);
+                                }
+                              }}
+                              style={{
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: 4,
+                                fontFamily: 'JetBrains Mono, monospace',
+                                fontSize: 11,
+                                color: log.target_type ? 'var(--dvas-blue)' : 'var(--dvas-text)',
+                                textDecoration: log.target_type ? 'underline' : 'none',
+                                textUnderlineOffset: 3,
+                                cursor: log.target_type ? 'pointer' : 'default',
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                                whiteSpace: 'nowrap',
+                                maxWidth: '100%',
+                              }}
+                            >
+                              {log.target_name || log.target}
+                              {log.target_type && <ArrowUpRight size={11} />}
+                            </span>
+                          ) : (
+                            <span style={{ color: 'var(--dvas-text-dim)', fontSize: 11 }}>—</span>
+                          )}
+                        </td>
+
+                        {/* Severity */}
+                        <td style={{ padding: '10px 12px' }}>
+                          <span
+                            style={{
+                              display: 'inline-block',
+                              padding: '2px 6px',
+                              borderRadius: 4,
+                              fontSize: 10,
+                              fontWeight: 700,
+                              fontFamily: 'JetBrains Mono, monospace',
+                              background: sevBadge.bg,
+                              color: sevBadge.color,
+                              border: `1px solid ${sevBadge.border}`,
+                            }}
+                          >
+                            {sevBadge.label}
+                          </span>
+                        </td>
+
+                        {/* Status */}
+                        <td style={{ padding: '10px 12px' }}>
+                          <span
+                            style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: 4,
+                              padding: '2px 7px',
+                              borderRadius: 999,
+                              fontSize: 10,
+                              fontWeight: 600,
+                              background: sBadge.bg,
+                              color: sBadge.color,
+                              border: `1px solid ${sBadge.border}`,
+                            }}
+                          >
+                            <SIcon size={10} /> {sBadge.label}
+                          </span>
+                        </td>
+
+                        {/* Detail View Icon */}
+                        <td style={{ padding: '10px 12px', textAlign: 'right' }}>
+                          <button
+                            data-testid={`drawer-view-${log.id}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedDrawerLog(log);
+                            }}
+                            title="Open in slide-out inspection drawer"
+                            style={{
+                              background: 'none',
+                              border: 'none',
+                              color: 'var(--dvas-blue)',
+                              cursor: 'pointer',
+                              padding: 4,
+                            }}
+                          >
+                            <Eye size={14} />
+                          </button>
+                        </td>
+                      </tr>
+
+                      {/* ── Inline Expanded Detail Row ── */}
+                      {isExpanded && (
+                        <tr>
+                          <td colSpan={9} style={{ padding: 0, background: 'var(--dvas-surface-2)', borderBottom: '2px solid var(--dvas-border)' }}>
+                            <div style={{ padding: '16px 20px' }}>
+                              {/* Tab Headers */}
+                              <div style={{ display: 'flex', gap: 6, borderBottom: '1px solid var(--dvas-border)', paddingBottom: 8, marginBottom: 14 }}>
+                                {[
+                                  { k: 'overview', l: 'Overview & Metadata', icon: FileText },
+                                  { k: 'diff', l: 'State Diff (Before / After)', icon: Eye, disabled: !log.before_values && !log.after_values },
+                                  { k: 'payload', l: 'Full JSON Payload', icon: Layers },
+                                  { k: 'related', l: 'Related Timeline Events', icon: Clock },
+                                ].map((tb) => {
+                                  const TIcon = tb.icon;
+                                  const active = activeTab === tb.k;
+                                  return (
+                                    <button
+                                      key={tb.k}
+                                      disabled={tb.disabled}
+                                      onClick={() => setRowTab(log.id, tb.k)}
+                                      style={{
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: 6,
+                                        padding: '6px 12px',
+                                        fontSize: 12,
+                                        fontWeight: 600,
+                                        borderRadius: 6,
+                                        cursor: tb.disabled ? 'not-allowed' : 'pointer',
+                                        background: active ? 'var(--dvas-surface)' : 'transparent',
+                                        border: active ? '1px solid var(--dvas-border)' : '1px solid transparent',
+                                        color: active ? 'var(--dvas-blue)' : tb.disabled ? 'var(--dvas-text-dim)' : 'var(--dvas-text-muted)',
+                                        opacity: tb.disabled ? 0.5 : 1,
+                                      }}
+                                    >
+                                      <TIcon size={13} />
+                                      {tb.l}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+
+                              {/* Tab: Overview */}
+                              {activeTab === 'overview' && (
+                                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12, fontSize: 11 }}>
+                                  <div style={{ background: 'var(--dvas-surface)', padding: 12, borderRadius: 8, border: '1px solid var(--dvas-border)' }}>
+                                    <div style={{ fontSize: 10, fontWeight: 600, textTransform: 'uppercase', color: 'var(--dvas-text-dim)', marginBottom: 4 }}>Actor & Identity</div>
+                                    <div style={{ color: 'var(--dvas-text)', fontWeight: 600 }}>{log.actor_name || '—'}</div>
+                                    <div style={{ color: 'var(--dvas-text-muted)', fontFamily: 'JetBrains Mono, monospace' }}>{log.actor_email || '—'}</div>
+                                    <div style={{ color: 'var(--dvas-text-dim)', marginTop: 4 }}>Role: {log.actor_role || '—'}</div>
+                                    <div style={{ color: 'var(--dvas-text-dim)' }}>Session ID: {log.actor_session_id || '—'}</div>
+                                  </div>
+
+                                  <div style={{ background: 'var(--dvas-surface)', padding: 12, borderRadius: 8, border: '1px solid var(--dvas-border)' }}>
+                                    <div style={{ fontSize: 10, fontWeight: 600, textTransform: 'uppercase', color: 'var(--dvas-text-dim)', marginBottom: 4 }}>Target Resource</div>
+                                    <div style={{ color: 'var(--dvas-text)', fontWeight: 600 }}>{log.target_name || log.target || '—'}</div>
+                                    <div style={{ color: 'var(--dvas-text-muted)' }}>Type: {log.target_type || '—'}</div>
+                                    <div style={{ color: 'var(--dvas-text-dim)', fontFamily: 'JetBrains Mono, monospace' }}>ID: {log.target_id || '—'}</div>
+                                    {log.details && <div style={{ color: 'var(--dvas-text-muted)', marginTop: 4 }}>Details: {log.details}</div>}
+                                  </div>
+
+                                  <div style={{ background: 'var(--dvas-surface)', padding: 12, borderRadius: 8, border: '1px solid var(--dvas-border)' }}>
+                                    <div style={{ fontSize: 10, fontWeight: 600, textTransform: 'uppercase', color: 'var(--dvas-text-dim)', marginBottom: 4 }}>Network & Tracing</div>
+                                    <div style={{ color: 'var(--dvas-text)', fontFamily: 'JetBrains Mono, monospace' }}>IP: {log.ip}</div>
+                                    <div style={{ color: 'var(--dvas-text-muted)' }}>Endpoint: {log.source_endpoint || '—'}</div>
+                                    <div style={{ color: 'var(--dvas-text-dim)', fontFamily: 'JetBrains Mono, monospace' }}>Req ID: {log.request_id || '—'}</div>
+                                    <div style={{ color: 'var(--dvas-text-dim)', fontFamily: 'JetBrains Mono, monospace' }}>Corr ID: {log.correlation_id || '—'}</div>
+                                  </div>
+
+                                  <div style={{ background: 'var(--dvas-surface)', padding: 12, borderRadius: 8, border: '1px solid var(--dvas-border)' }}>
+                                    <div style={{ fontSize: 10, fontWeight: 600, textTransform: 'uppercase', color: 'var(--dvas-text-dim)', marginBottom: 4 }}>Cryptographic Hash Chain</div>
+                                    <div style={{ fontSize: 10, color: 'var(--dvas-text-dim)', fontFamily: 'JetBrains Mono, monospace', wordBreak: 'break-all' }}>
+                                      SHA-256: {log.hash || '—'}
+                                    </div>
+                                    <div style={{ fontSize: 10, color: 'var(--dvas-text-dim)', fontFamily: 'JetBrains Mono, monospace', wordBreak: 'break-all', marginTop: 4 }}>
+                                      Prev: {log.prev_hash || '—'}
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* Tab: Diff */}
+                              {activeTab === 'diff' && (
+                                <DiffViewer before={log.before_values} after={log.after_values} />
+                              )}
+
+                              {/* Tab: Payload */}
+                              {activeTab === 'payload' && (
+                                <JsonViewer data={log} />
+                              )}
+
+                              {/* Tab: Related Events */}
+                              {activeTab === 'related' && (
+                                <RelatedEventsTimeline
+                                  correlationId={log.correlation_id}
+                                  sessionId={log.actor_session_id}
+                                  currentLogId={log.id}
+                                  onSelectLog={(selected) => setSelectedDrawerLog(selected)}
+                                />
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {/* ── Server-Side Pagination Bar ── */}
+        <div
+          style={{
+            padding: '12px 18px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            borderTop: '1px solid var(--dvas-border)',
+            background: 'var(--dvas-surface-2)',
+            flexWrap: 'wrap',
+            gap: 12,
+          }}
+        >
+          <div style={{ fontSize: 12, color: 'var(--dvas-text-dim)', display: 'flex', alignItems: 'center', gap: 12 }}>
+            <span>
               Showing&nbsp;
-              <span style={{ fontWeight:600, fontFamily:'JetBrains Mono,monospace', color:'var(--dvas-text)' }}>
-                {sortedLogs.length===0?0:(safePage-1)*PAGE_SIZE+1}–{Math.min(safePage*PAGE_SIZE,sortedLogs.length)}
-              </span>
+              <strong style={{ color: 'var(--dvas-text)', fontFamily: 'JetBrains Mono, monospace' }}>
+                {totalLogs === 0 ? 0 : (page - 1) * pageSize + 1}–{Math.min(page * pageSize, totalLogs)}
+              </strong>
               &nbsp;of&nbsp;
-              <span style={{ fontWeight:600, fontFamily:'JetBrains Mono,monospace', color:'var(--dvas-text)' }}>{sortedLogs.length}</span> entries
-              {sortedLogs.length!==allLogs.length&&<span style={{ color:'var(--dvas-blue)' }}> (filtered from {allLogs.length})</span>}
-            </div>
-            <div style={{ display:'flex', gap:4 }}>
-              <button data-testid="page-prev" disabled={safePage===1} onClick={()=>setPage(p=>p-1)} style={{ width:32, height:32, display:'flex', alignItems:'center', justifyContent:'center', borderRadius:8, cursor:safePage===1?'not-allowed':'pointer', background:'var(--dvas-elev)', border:'none', color:'var(--dvas-text)', opacity:safePage===1?0.4:1 }}><ChevronLeft size={15}/></button>
-              {Array.from({length:Math.min(5,totalPages)},(_,i)=>{
-                let p; if(totalPages<=5)p=i+1; else if(safePage<=3)p=i+1; else if(safePage>=totalPages-2)p=totalPages-4+i; else p=safePage-2+i;
-                return <button key={p} data-testid={`page-btn-${p}`} onClick={()=>setPage(p)} style={{ width:32, height:32, display:'flex', alignItems:'center', justifyContent:'center', borderRadius:8, cursor:'pointer', fontSize:12, fontWeight:600, fontFamily:'JetBrains Mono,monospace', background:safePage===p?'var(--dvas-blue)':'var(--dvas-elev)', color:safePage===p?'#fff':'var(--dvas-text)', border:'none' }}>{p}</button>;
-              })}
-              <button data-testid="page-next" disabled={safePage===totalPages} onClick={()=>setPage(p=>p+1)} style={{ width:32, height:32, display:'flex', alignItems:'center', justifyContent:'center', borderRadius:8, cursor:safePage===totalPages?'not-allowed':'pointer', background:'var(--dvas-elev)', border:'none', color:'var(--dvas-text)', opacity:safePage===totalPages?0.4:1 }}><ChevronRight size={15}/></button>
+              <strong style={{ color: 'var(--dvas-text)', fontFamily: 'JetBrains Mono, monospace' }}>{totalLogs}</strong> entries
+              &nbsp;(Page {page} of {totalPages})
+            </span>
+
+            {/* Page Size Selector */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span style={{ fontSize: 11 }}>Per page:</span>
+              <select
+                value={pageSize}
+                onChange={(e) => {
+                  setPageSize(Number(e.target.value));
+                  setPage(1);
+                }}
+                style={{
+                  fontSize: 11,
+                  padding: '3px 8px',
+                  borderRadius: 6,
+                  background: 'var(--dvas-elev)',
+                  border: '1px solid var(--dvas-border)',
+                  color: 'var(--dvas-text)',
+                  outline: 'none',
+                  cursor: 'pointer',
+                }}
+              >
+                {[15, 25, 50, 100].map((sz) => (
+                  <option key={sz} value={sz}>{sz}</option>
+                ))}
+              </select>
             </div>
           </div>
-        )}
+
+          <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+            <button
+              data-testid="page-prev"
+              disabled={page <= 1}
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              style={{
+                width: 32,
+                height: 32,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                borderRadius: 8,
+                cursor: page <= 1 ? 'not-allowed' : 'pointer',
+                background: 'var(--dvas-elev)',
+                border: '1px solid var(--dvas-border)',
+                color: 'var(--dvas-text)',
+                opacity: page <= 1 ? 0.4 : 1,
+              }}
+            >
+              <ChevronLeft size={15} />
+            </button>
+
+            {/* Page Numbers */}
+            {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
+              let p;
+              if (totalPages <= 5) p = i + 1;
+              else if (page <= 3) p = i + 1;
+              else if (page >= totalPages - 2) p = totalPages - 4 + i;
+              else p = page - 2 + i;
+
+              return (
+                <button
+                  key={p}
+                  data-testid={`page-btn-${p}`}
+                  onClick={() => setPage(p)}
+                  style={{
+                    width: 32,
+                    height: 32,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    borderRadius: 8,
+                    cursor: 'pointer',
+                    fontSize: 12,
+                    fontWeight: 600,
+                    fontFamily: 'JetBrains Mono, monospace',
+                    background: page === p ? 'var(--dvas-blue)' : 'var(--dvas-elev)',
+                    color: page === p ? '#fff' : 'var(--dvas-text)',
+                    border: page === p ? 'none' : '1px solid var(--dvas-border)',
+                  }}
+                >
+                  {p}
+                </button>
+              );
+            })}
+
+            <button
+              data-testid="page-next"
+              disabled={page >= totalPages}
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              style={{
+                width: 32,
+                height: 32,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                borderRadius: 8,
+                cursor: page >= totalPages ? 'not-allowed' : 'pointer',
+                background: 'var(--dvas-elev)',
+                border: '1px solid var(--dvas-border)',
+                color: 'var(--dvas-text)',
+                opacity: page >= totalPages ? 0.4 : 1,
+              }}
+            >
+              <ChevronRight size={15} />
+            </button>
+          </div>
+        </div>
       </div>
 
-      {/* Detail Drawer */}
-      {selectedLog && <DetailDrawer log={selectedLog} onClose={()=>setSelectedLog(null)}/>}
+      {/* ── Slide-Out Detail Drawer ── */}
+      {selectedDrawerLog && (
+        <div
+          onClick={() => setSelectedDrawerLog(null)}
+          style={{ position: 'fixed', inset: 0, zIndex: 60, display: 'flex', background: 'rgba(15,23,42,0.65)' }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="dvas-fade-in"
+            style={{
+              marginLeft: 'auto',
+              height: '100%',
+              display: 'flex',
+              flexDirection: 'column',
+              width: 540,
+              background: 'var(--dvas-surface)',
+              borderLeft: '1px solid var(--dvas-border)',
+              boxShadow: 'var(--dvas-shadow-lg)',
+              overflow: 'hidden',
+            }}
+          >
+            {/* Drawer Header */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '16px 20px', borderBottom: '1px solid var(--dvas-border)', flexShrink: 0 }}>
+              <div style={{ width: 34, height: 34, borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--dvas-info-bg)', flexShrink: 0 }}>
+                <FileText size={18} style={{ color: 'var(--dvas-blue)' }} />
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, fontFamily: 'JetBrains Mono, monospace', color: 'var(--dvas-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {selectedDrawerLog.action}
+                </div>
+                <div style={{ fontSize: 10, marginTop: 2, fontFamily: 'JetBrains Mono, monospace', color: 'var(--dvas-text-dim)' }}>
+                  ID: {selectedDrawerLog.id}
+                </div>
+              </div>
+              <button
+                data-testid="drawer-close"
+                onClick={() => setSelectedDrawerLog(null)}
+                style={{ width: 28, height: 28, borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--dvas-text-muted)' }}
+              >
+                <X size={16} />
+              </button>
+            </div>
 
-      <style>{`@keyframes auditSpin { to { transform: rotate(360deg); } }`}</style>
+            {/* Meta Grid */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', padding: '14px 20px', gap: 12, borderBottom: '1px solid var(--dvas-border)', background: 'var(--dvas-surface-2)', flexShrink: 0 }}>
+              <div>
+                <div style={{ fontSize: 9, fontWeight: 600, textTransform: 'uppercase', color: 'var(--dvas-text-dim)', marginBottom: 2 }}>Timestamp (IST)</div>
+                <div style={{ fontSize: 11, fontFamily: 'JetBrains Mono, monospace', color: 'var(--dvas-text)' }}>{formatDateIST(selectedDrawerLog.ts)}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 9, fontWeight: 600, textTransform: 'uppercase', color: 'var(--dvas-text-dim)', marginBottom: 2 }}>Actor</div>
+                <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--dvas-text)' }}>{selectedDrawerLog.actor_name || selectedDrawerLog.actor_email}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 9, fontWeight: 600, textTransform: 'uppercase', color: 'var(--dvas-text-dim)', marginBottom: 2 }}>IP Address</div>
+                <div style={{ fontSize: 11, fontFamily: 'JetBrains Mono, monospace', color: 'var(--dvas-text)' }}>{selectedDrawerLog.ip}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 9, fontWeight: 600, textTransform: 'uppercase', color: 'var(--dvas-text-dim)', marginBottom: 2 }}>Target Resource</div>
+                <div style={{ fontSize: 11, fontFamily: 'JetBrains Mono, monospace', color: 'var(--dvas-text)' }}>{selectedDrawerLog.target_name || selectedDrawerLog.target || '—'}</div>
+              </div>
+            </div>
+
+            {/* Body */}
+            <div style={{ flex: 1, overflow: 'auto', padding: 20 }}>
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: 10, fontWeight: 600, textTransform: 'uppercase', color: 'var(--dvas-text-dim)', marginBottom: 8 }}>State Modification Diff</div>
+                <DiffViewer before={selectedDrawerLog.before_values} after={selectedDrawerLog.after_values} />
+              </div>
+
+              <div>
+                <div style={{ fontSize: 10, fontWeight: 600, textTransform: 'uppercase', color: 'var(--dvas-text-dim)', marginBottom: 8 }}>Full JSON Event Data</div>
+                <JsonViewer data={selectedDrawerLog} />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Save Filter Preset Modal ── */}
+      <SavePresetModal
+        isOpen={isPresetModalOpen}
+        onClose={() => setIsPresetModalOpen(false)}
+        currentFilters={{
+          q: search,
+          date_from: dateFrom,
+          date_to: dateTo,
+          actor_id: actorFilter,
+          category: selectedCategories,
+          severity: selectedSeverities,
+          action_type: selectedActionTypes,
+          status: selectedStatuses,
+        }}
+        onSaved={async () => {
+          try {
+            const { data } = await api.get('/audit-presets');
+            setPresetsList(data || []);
+          } catch (_) {}
+        }}
+      />
     </AppShell>
   );
 }

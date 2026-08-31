@@ -85,7 +85,12 @@ export default function IngestDashboard() {
     try { const { data } = await api.get("/infra/overview"); setOv(data); } catch (e) {}
   };
   const loadAudit = async () => {
-    try { const { data } = await api.get("/audit-logs"); setAudit(data); } catch (e) {}
+    try {
+      const { data } = await api.get("/audit-logs");
+      setAudit(Array.isArray(data) ? data : (data?.items || []));
+    } catch (e) {
+      setAudit([]);
+    }
   };
   const loadUsers = async () => {
     try { const { data } = await api.get("/users"); setUsers(data); } catch (e) {}
@@ -1290,13 +1295,12 @@ function AlertsPage({ alerts, onAck }) {
 }
 
 function AuditPage({ audit }) {
+  const auditList = Array.isArray(audit) ? audit : (audit?.items || []);
   return (
     <div className="border border-slate-800 bg-slate-900">
-      <div className="p-3 border-b border-slate-800 text-sm flex items-center gap-2">
-        <ClipboardList size={16} className="text-sky-400" /> Audit — Own Actions Only (read-only)
-      </div>
-      <div className="p-2 border-b border-slate-800 bg-amber-500/5 mono text-[11px] text-amber-300">
-        This log is your own configuration-change history. Cross-role review is exclusive to Supervisory / Senior Officers.
+      <div className="p-3 border-b border-slate-800 flex items-center gap-2">
+        <ClipboardList size={16} className="text-sky-400" />
+        <span className="text-sm font-medium text-slate-100">Audit Trail (Last 100 Events)</span>
       </div>
       <table className="w-full text-xs mono">
         <thead className="bg-slate-950/60">
@@ -1305,7 +1309,7 @@ function AuditPage({ audit }) {
           ))}</tr>
         </thead>
         <tbody>
-          {audit.map(l => (
+          {auditList.map(l => (
             <tr key={l.id} className="hover:bg-slate-800/40">
               <td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-400">{new Date(l.ts).toLocaleString()}</td>
               <td className="px-3 py-1.5 border-b border-slate-800/60"><span className="px-1.5 py-0.5 border border-sky-500/40 bg-sky-500/10 text-sky-300 text-[10px]">{l.action}</span></td>

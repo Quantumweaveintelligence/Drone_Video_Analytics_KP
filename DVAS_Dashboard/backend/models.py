@@ -26,15 +26,59 @@ class AuditLog(Base):
 
     id = Column(String, primary_key=True)
     ts = Column(String, nullable=False, index=True)
-    actor_id = Column(String)
+
+    # ── Actor fields ──
+    actor_id = Column(String, index=True)
     actor_email = Column(String)
-    actor_role = Column(String)
-    action = Column(String)
-    target = Column(String, default="")
-    details = Column(Text, default="")
+    actor_role = Column(String, index=True)
+    actor_name = Column(String)                                # display name
+    actor_session_id = Column(String)                          # Keycloak session ID
+    actor_device_id = Column(String)                           # User-Agent fingerprint hash
+
+    # ── Action ──
+    action = Column(String, index=True)                        # raw action key, e.g. "user_create"
+    action_type = Column(String, index=True)                   # normalized: create/update/delete/login/logout/export/system
+    category = Column(String, index=True)                      # authentication/user_mgmt/operations/evidence/data/configuration/security
+    severity = Column(String, index=True, default="info")      # info/warning/critical
+
+    # ── Target resource ──
+    target = Column(String, default="")                        # legacy free-text target
+    target_type = Column(String)                               # entity type: user/mission/drone/evidence/export/policy/watchlist/system
+    target_id = Column(String)                                 # entity primary key
+    target_name = Column(String)                               # human-readable label
+
+    # ── Diff / details ──
+    details = Column(Text, default="")                         # legacy free-text details
+    before_values = Column(JSONB, nullable=True)               # snapshot before change
+    after_values = Column(JSONB, nullable=True)                # snapshot after change
+
+    # ── Result ──
+    status = Column(String, default="success", index=True)     # success/failure/error
+    error_code = Column(String, nullable=True)                 # HTTP status or app error code
+
+    # ── Tracing ──
+    source_module = Column(String)                             # dashboard/ingest/edge/analytics
+    source_endpoint = Column(String)                           # API path, e.g. "POST /api/users"
+    request_id = Column(String, index=True)                    # UUID per HTTP request
+    correlation_id = Column(String, index=True)                # groups related actions (session/transaction)
+
+    # ── Integrity (hash chain) ──
     ip = Column(String, default="-")
     prev_hash = Column(String)
     hash = Column(String)
+
+
+class AuditFilterPreset(Base):
+    """Saved filter presets for the Audit Log Explorer."""
+    __tablename__ = "audit_filter_presets"
+
+    id = Column(String, primary_key=True)
+    name = Column(String, nullable=False)
+    owner_id = Column(String, nullable=False, index=True)      # Keycloak user sub
+    filters = Column(JSONB, nullable=False)                    # serialized filter state
+    is_shared = Column(Boolean, default=False)                 # visible to all authorized users
+    created_at = Column(String)
+    updated_at = Column(String)
 
 
 class Mission(Base):

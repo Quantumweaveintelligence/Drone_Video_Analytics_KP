@@ -64,7 +64,9 @@ export default function AdminDashboard() {
 
   useEffect(() => {
     if (page === "audit") {
-      api.get(`/audit-logs${q ? `?q=${encodeURIComponent(q)}` : ""}`).then(r => setLogs(r.data)).catch(()=>{});
+      api.get(`/audit-logs${q ? `?q=${encodeURIComponent(q)}` : ""}`)
+        .then(r => setLogs(Array.isArray(r.data) ? r.data : (r.data?.items || [])))
+        .catch(() => setLogs([]));
       api.get("/audit-logs/verify").then(r => setChainInfo(r.data)).catch(()=>setChainInfo(null));
     }
     if (page === "users" && user.role === "system_administrator") api.get("/users").then(r => setUsers(r.data)).catch(()=>{});
@@ -207,33 +209,35 @@ export default function AdminDashboard() {
                 </div>
               )}
 
-              {user.role === "system_administrator" && (
-                <div className="p-3 border-b border-slate-800 bg-slate-950 flex items-center justify-between flex-wrap gap-2">
-                  <div className="mono text-[11px] text-amber-300 flex items-center gap-2">
-                    <ShieldAlert size={14} className="text-amber-400 shrink-0" />
-                    <span>Sys Admin view limited to own actions. Full styled Audit Log with advanced filters, diff viewer & CSV export available on dedicated page.</span>
-                  </div>
-                  <button
-                    data-testid="open-full-audit-page"
-                    onClick={() => nav("/audit")}
-                    className="px-3 py-1 bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium rounded transition-colors flex items-center gap-1.5"
-                  >
-                    <ClipboardList size={13} /> Open Full Audit Log Page →
-                  </button>
+              <div className="p-3 border-b border-slate-800 bg-slate-950 flex items-center justify-between flex-wrap gap-2">
+                <div className="mono text-[11px] text-sky-300 flex items-center gap-2">
+                  <ShieldAlert size={14} className="text-sky-400 shrink-0" />
+                  <span>Interactive Audit Log Explorer with server-side filtering, Before/After field diffs, timeline correlation, and compliance export is available on the dedicated explorer page.</span>
                 </div>
-              )}
+                <button
+                  data-testid="open-full-audit-page"
+                  onClick={() => nav("/audit")}
+                  className="px-3 py-1 bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium rounded transition-colors flex items-center gap-1.5 cursor-pointer shadow"
+                >
+                  <ClipboardList size={13} /> Open Full Audit Log Explorer →
+                </button>
+              </div>
 
               {/* Unit Detail view — full log table */}
-              {(user.role !== "senior_officer" || auditScope === "detail") && (
-                <div className="max-h-[560px] overflow-auto"><table className="w-full text-xs mono"><thead className="bg-slate-950/60 sticky top-0"><tr>{[t("table.timestamp"),t("table.actor"),t("table.role"),t("table.action"),t("table.target"),t("table.ip")].map(h=><th key={h} className="text-left px-3 py-2 dvas-label border-b border-slate-800" style={{fontSize:10}}>{h}</th>)}</tr></thead>
-                <tbody>{logs.map(l=>(<tr key={l.id} data-testid={`audit-row-${l.id}`} data-tamper={l.tamper ? "true" : "false"} className={`hover:bg-slate-800/40 ${l.tamper ? "bg-red-500/5" : ""}`}><td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-400"><div className="flex items-center gap-1.5">{l.tamper ? <span data-testid={`tamper-${l.id}`} title="Hash-chain broken — this row may have been tampered with" className="inline-block w-1.5 h-1.5 dvas-live-dot" style={{background:"var(--dvas-crit)"}}/> : <span title="Chain OK" className="inline-block w-1.5 h-1.5" style={{background:"var(--dvas-safe)",opacity:0.8}}/>}<span>{new Date(l.ts).toLocaleString()}</span></div></td><td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-100">{l.actor_email}</td><td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-500">{l.actor_role}</td><td className="px-3 py-1.5 border-b border-slate-800/60"><span className="px-1.5 py-0.5 border border-sky-500/40 bg-sky-500/10 text-sky-300 text-[10px]">{l.action}</span></td><td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-400">{l.target||"-"}</td><td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-500">{l.ip}</td></tr>))}</tbody></table></div>
-              )}
+              {(user.role !== "senior_officer" || auditScope === "detail") && (() => {
+                const logList = Array.isArray(logs) ? logs : (logs?.items || []);
+                return (
+                  <div className="max-h-[560px] overflow-auto"><table className="w-full text-xs mono"><thead className="bg-slate-950/60 sticky top-0"><tr>{[t("table.timestamp"),t("table.actor"),t("table.role"),t("table.action"),t("table.target"),t("table.ip")].map(h=><th key={h} className="text-left px-3 py-2 dvas-label border-b border-slate-800" style={{fontSize:10}}>{h}</th>)}</tr></thead>
+                  <tbody>{logList.map(l=>(<tr key={l.id} data-testid={`audit-row-${l.id}`} data-tamper={l.tamper ? "true" : "false"} className={`hover:bg-slate-800/40 ${l.tamper ? "bg-red-500/5" : ""}`}><td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-400"><div className="flex items-center gap-1.5">{l.tamper ? <span data-testid={`tamper-${l.id}`} title="Hash-chain broken — this row may have been tampered with" className="inline-block w-1.5 h-1.5 dvas-live-dot" style={{background:"var(--dvas-crit)"}}/> : <span title="Chain OK" className="inline-block w-1.5 h-1.5" style={{background:"var(--dvas-safe)",opacity:0.8}}/>}<span>{new Date(l.ts).toLocaleString()}</span></div></td><td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-100">{l.actor_email}</td><td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-500">{l.actor_role}</td><td className="px-3 py-1.5 border-b border-slate-800/60"><span className="px-1.5 py-0.5 border border-sky-500/40 bg-sky-500/10 text-sky-300 text-[10px]">{l.action}</span></td><td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-400">{l.target||"-"}</td><td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-500">{l.ip}</td></tr>))}</tbody></table></div>
+                );
+              })()}
 
               {/* Cross-Jurisdiction Aggregate view — Senior Officer toggle */}
               {user.role === "senior_officer" && auditScope === "aggregate" && (() => {
+                const logList = Array.isArray(logs) ? logs : (logs?.items || []);
                 // Group by role and action for a cross-jurisdiction rollup
-                const byRole = logs.reduce((acc, l) => { acc[l.actor_role] = (acc[l.actor_role] || 0) + 1; return acc; }, {});
-                const byAction = logs.reduce((acc, l) => { acc[l.action] = (acc[l.action] || 0) + 1; return acc; }, {});
+                const byRole = logList.reduce((acc, l) => { acc[l.actor_role] = (acc[l.actor_role] || 0) + 1; return acc; }, {});
+                const byAction = logList.reduce((acc, l) => { acc[l.action] = (acc[l.action] || 0) + 1; return acc; }, {});
                 return (
                   <div className="p-4 grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div className="border border-slate-800 bg-slate-900/60 p-3">
