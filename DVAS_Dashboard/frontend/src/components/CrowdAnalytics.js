@@ -1,42 +1,50 @@
 /**
  * CrowdAnalytics.js
  * ─────────────────────────────────────────────────────────────────────────────
- * Crowd Analytics page — fully connected to live analytics services.
+ * Crowd Analytics page — fully connected to CSRNet live analytics services
+ * and live ingest streams.
  * Kerala Police | Drone Video Analytics System
  *
- * Data sources (live):
- *   - /api/analytics/crowd/readings   → live per-drone person counts (5s poll)
- *   - /api/analytics/crowd/timeline   → 24h density chart (30s poll)
- *   - /api/analytics/crowd/heatmap    → MinIO presigned heatmap URL (15s poll)
- *   - /api/analytics/events/stream    → SSE for real-time count updates
- *
- * Demo video (/DETECTED/Demo_annotated.mp4) kept for the DRN-003 live feed.
+ * Feed architecture (identical to Person Tracking & Traffic):
+ *   - Layer 1: /api/ingest-server/frame/{id}/latest  → raw camera JPEG from edge ingest
+ *   - Layer 2: /api/analytics/crowd/annotated         → CSRNet heatmap overlaid JPEG (800ms)
+ *   - Stream discovery: useActiveStreams hook         → dynamic drone discovery (e.g. DRN-MSN-...)
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
+  ReferenceLine,
 } from 'recharts';
 import {
-  Users, Activity, AlertTriangle, Thermometer, MapPin,
-  TrendingUp, Radio, Play, Pause, VideoOff, RefreshCw, Wifi, WifiOff,
+  Users, Activity, AlertTriangle, Thermometer,
+  TrendingUp, TrendingDown, Minus, Radio, VideoOff, RefreshCw,
+  Wifi, WifiOff, Download, FileText, ChevronDown,
+  BarChart3, Clock, Zap, Play, Square, Cpu,
 } from 'lucide-react';
 import {
-  useCrowdReadings, useCrowdTimeline, useCrowdHeatmap, useAnalyticsSSE,
+  useCrowdReadings, useCrowdTimeline, useCrowdSessionSummary,
+  useCrowdModel, useAnalyticsSSE, switchCrowdModel, useCrowdHealth,
 } from '../lib/useAnalytics';
-import LiveFrame from './LiveFrame';
+import { useActiveStreams } from '../hooks/useActiveStreams';
+import { api } from '../lib/api';
 
 /* ───────────────────────────────────────────────────────────────
    CONSTANTS
    ────────────────────────────────────────────────────────────── */
 const DENSITY_LEVELS = [
-  { label: 'Empty',      color: '#64748b', threshold: 0   },
-  { label: 'Sparse',     color: '#10b981', threshold: 50  },
-  { label: 'Moderate',   color: '#3b82f6', threshold: 150 },
-  { label: 'Dense',      color: '#f59e0b', threshold: 300 },
-  { label: 'Very Dense', color: '#f97316', threshold: 500 },
-  { label: 'Extreme',    color: '#ef4444', threshold: 700 },
+  { label: 'Low',      color: '#10b981', threshold: 0   },
+  { label: 'Medium',   color: '#f59e0b', threshold: 25  },
+  { label: 'High',     color: '#f97316', threshold: 75  },
+  { label: 'Critical', color: '#ef4444', threshold: 150 },
 ];
+
+const MODEL_OPTIONS = [
+  { value: 'csrnet_parta', label: 'CSRNet Part A — Dense Crowds (Drone)',       short: 'Part A · Dense' },
+  { value: 'csrnet_partb', label: 'CSRNet Part B — Static Surveillance (CCTV)', short: 'Part B · Sparse' },
+];
+
+const FRAME_INTERVAL = 800;
 
 function getDensityLevel(count) {
   let level = DENSITY_LEVELS[0];
@@ -44,6 +52,19 @@ function getDensityLevel(count) {
     if (count >= l.threshold) level = l;
   }
   return level;
+}
+
+function computeTrend(counts) {
+  if (!counts || counts.length < 3) return 'stable';
+  const recent = counts.slice(-3);
+  const avg = recent.reduce((s, c) => s + c, 0) / recent.length;
+  const prev = counts.slice(-6, -3);
+  if (prev.length === 0) return 'stable';
+  const prevAvg = prev.reduce((s, c) => s + c, 0) / prev.length;
+  const diff = avg - prevAvg;
+  if (diff > 3) return 'up';
+  if (diff < -3) return 'down';
+  return 'stable';
 }
 
 const CHART_TOOLTIP = {
@@ -63,6 +84,103 @@ function fmtAge(isoTs) {
   if (s < 60)   return `${s}s ago`;
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
   return `${Math.floor(s / 3600)}h ago`;
+}
+
+function fmtDuration(seconds) {
+  if (!seconds || seconds <= 0) return '0:00';
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+/* ───────────────────────────────────────────────────────────────
+   useJpegPoller — EXACT copy from PersonTrackingAnalytics.js
+   with added meta (X-Crowd-Count header extraction)
+   ────────────────────────────────────────────────────────────── */
+function useJpegPoller(url, intervalMs, enabled) {
+  const [blobUrl, setBlobUrl] = useState(null);
+  const [ok, setOk] = useState(false);
+  const [meta, setMeta] = useState({});
+  const tickRef = useRef(null);
+  const errRef = useRef(0);
+  const feedDeadRef = useRef(false);
+
+  const doFetch = useCallback(async () => {
+    if (!enabled || !url) return;
+    try {
+      const token = localStorage.getItem('dvas_token') || '';
+      const sep = url.includes('?') ? '&' : '?';
+      const res = await fetch(`${url}${sep}_t=${Date.now()}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        credentials: 'include',
+      });
+      if (res.ok) {
+        const blob = await res.blob();
+        const next = URL.createObjectURL(blob);
+        setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return next; });
+        setOk(true);
+        errRef.current = 0;
+        feedDeadRef.current = false;
+
+        // Extract crowd-count metadata from response headers
+        const crowdCount = res.headers.get('X-Crowd-Count');
+        const densityLabel = res.headers.get('X-Density-Label');
+        const droneId = res.headers.get('X-Drone-ID');
+        if (crowdCount != null) {
+          const parsed = parseFloat(crowdCount);
+          if (!isNaN(parsed)) {
+            setMeta({
+              crowdCount: parsed,
+              densityLabel: densityLabel || '',
+              droneId: droneId || '',
+              _ts: Date.now(),
+            });
+          }
+        }
+      } else if (res.status === 404) {
+        // Feed is offline — immediately invalidate and mark dead
+        setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
+        setOk(false);
+        feedDeadRef.current = true;
+      } else {
+        errRef.current++;
+        if (errRef.current > 3) setOk(false);
+      }
+    } catch {
+      errRef.current++;
+      if (errRef.current > 3) setOk(false);
+    }
+  }, [url, enabled]);
+
+  useEffect(() => {
+    if (!enabled) {
+      setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
+      setOk(false);
+      setMeta({});
+      errRef.current = 0;
+      feedDeadRef.current = false;
+      return;
+    }
+    errRef.current = 0;
+    feedDeadRef.current = false;
+    doFetch();
+    tickRef.current = setInterval(() => {
+      if (feedDeadRef.current) return;
+      doFetch();
+    }, intervalMs);
+
+    const slowRetry = setInterval(() => {
+      if (feedDeadRef.current) doFetch();
+    }, 10000);
+
+    return () => {
+      clearInterval(tickRef.current);
+      clearInterval(slowRetry);
+      setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
+    };
+  }, [enabled, url, intervalMs]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return { blobUrl, ok, meta };
 }
 
 /* ───────────────────────────────────────────────────────────────
@@ -102,63 +220,246 @@ function ServiceBadge({ online }) {
 }
 
 /* ───────────────────────────────────────────────────────────────
-   SECTION 1 — Live Detection Video Stream
+   MODEL SELECTOR DROPDOWN
    ────────────────────────────────────────────────────────────── */
-function LiveStreamSection({ activeDrone, drones, setActiveDrone, liveCount, liveLevel }) {
+function ModelSelector({ activeModel, onSwitch, switching }) {
+  const [open, setOpen] = useState(false);
+  const current = MODEL_OPTIONS.find(m => m.value === activeModel) || MODEL_OPTIONS[0];
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen(!open)}
+        disabled={switching}
+        className="mono text-[11px] px-3 py-1.5 rounded-lg flex items-center gap-2 transition-all"
+        style={{
+          background: 'var(--dvas-surface-2)',
+          border: '1px solid var(--dvas-border)',
+          color: switching ? 'var(--dvas-text-dim)' : 'var(--dvas-text)',
+        }}
+      >
+        {switching ? (
+          <><RefreshCw size={11} className="animate-spin" /> Switching…</>
+        ) : (
+          <>{current.short} <ChevronDown size={11} /></>
+        )}
+      </button>
+      {open && !switching && (
+        <div className="absolute top-full mt-1 right-0 z-50 rounded-lg overflow-hidden shadow-xl min-w-[300px]"
+          style={{ background: 'var(--dvas-surface)', border: '1px solid var(--dvas-border)' }}>
+          {MODEL_OPTIONS.map(opt => (
+            <button
+              key={opt.value}
+              onClick={() => { setOpen(false); onSwitch(opt.value); }}
+              className={`block w-full text-left px-4 py-2.5 mono text-[11px] transition-colors ${
+                opt.value === activeModel ? 'text-sky-400' : 'text-slate-300 hover:text-white'
+              }`}
+              style={{
+                background: opt.value === activeModel ? 'rgba(14,165,233,0.08)' : 'transparent',
+                borderBottom: '1px solid var(--dvas-border)',
+              }}
+            >
+              <div className="font-semibold">{opt.label}</div>
+              {opt.value === activeModel && (
+                <span className="text-[9px] text-sky-500 mt-0.5 block">● Active</span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ───────────────────────────────────────────────────────────────
+   SECTION 1 — Live Detection Video Stream & Heatmap Viewer
+   ────────────────────────────────────────────────────────────── */
+function LiveFeedSection({
+  activeDrone,
+  droneList,
+  setActiveDrone,
+  liveCount,
+  liveLevel,
+  streamRunning,
+  activeModel,
+  activeMissionId,
+  onStartStream,
+  onStopStream,
+  startingStream,
+  onFrameCount,
+}) {
   const hasDrone = !!activeDrone;
+  const modelLabel = MODEL_OPTIONS.find(m => m.value === activeModel)?.label || 'CSRNet Part A';
+  const [fps, setFps] = useState(0);
+  const fpsRef = useRef({ count: 0, ts: Date.now() });
+  const prevAnnotatedRef = useRef(null);
+
+  // Layer 1: raw ingest feed from edge camera
+  const rawUrl = hasDrone
+    ? `/api/ingest-server/frame/${encodeURIComponent(activeDrone)}/latest?drone_id=${encodeURIComponent(activeDrone)}`
+    : null;
+  const { blobUrl: rawSrc, ok: rawOk } = useJpegPoller(rawUrl, 1500, hasDrone);
+
+  // Layer 2: annotated heatmap overlay
+  const annotatedUrl = hasDrone
+    ? `/api/analytics/crowd/annotated?drone_id=${encodeURIComponent(activeDrone)}`
+    : null;
+  const { blobUrl: annotatedSrc, ok: annotatedOk, meta: annotatedMeta } = useJpegPoller(
+    annotatedUrl, FRAME_INTERVAL, hasDrone
+  );
+
+  // Push frame-level crowd count up to parent whenever annotated meta updates
+  useEffect(() => {
+    if (annotatedOk && annotatedMeta?.crowdCount != null && onFrameCount) {
+      onFrameCount(annotatedMeta.crowdCount, annotatedMeta.densityLabel || '');
+    }
+  }, [annotatedMeta, annotatedOk, onFrameCount]);
+
+  // Measure FPS of live feed
+  useEffect(() => {
+    const currentBlob = annotatedOk ? annotatedSrc : rawSrc;
+    if (!currentBlob || currentBlob === prevAnnotatedRef.current) return;
+    prevAnnotatedRef.current = currentBlob;
+    fpsRef.current.count++;
+    if (Date.now() - fpsRef.current.ts > 3000) {
+      setFps(Math.round(fpsRef.current.count / ((Date.now() - fpsRef.current.ts) / 1000)));
+      fpsRef.current = { count: 0, ts: Date.now() };
+    }
+  }, [annotatedSrc, annotatedOk, rawSrc]);
+
+  const displaySrc  = (annotatedOk && annotatedSrc) ? annotatedSrc : rawSrc;
+  const isAnnotated = annotatedOk && !!annotatedSrc;
+  const hasAnyFeed  = !!displaySrc;
 
   return (
     <div className="rounded-xl overflow-hidden"
       style={{ background: 'var(--dvas-surface)', border: '1px solid var(--dvas-border)' }}>
       {/* Header */}
-      <div className="px-4 py-3 flex items-center gap-3"
+      <div className="px-4 py-3 flex items-center gap-3 flex-wrap"
         style={{ borderBottom: '1px solid var(--dvas-border)' }}>
-        <span className={`w-2 h-2 rounded-full dvas-live-dot ${hasDrone ? 'bg-red-500' : 'bg-slate-500'}`} />
+        <span className={`w-2 h-2 rounded-full dvas-live-dot ${hasDrone && hasAnyFeed ? 'bg-sky-500' : 'bg-slate-500'}`} />
         <span className="dvas-label font-semibold">Crowd Detection Live Feed</span>
-        <div className="flex items-center gap-1 ml-2">
-          {(drones?.length > 0 ? drones : [{ id: 'DRN-001' }, { id: 'DRN-002' }, { id: 'DRN-003' }, { id: 'DRN-004' }]).map(d => (
-            <button
-              key={d.id}
-              onClick={() => setActiveDrone(d.id)}
-              className="mono text-[10px] px-2 py-1 rounded transition-all"
-              style={{
-                background: activeDrone === d.id ? 'rgba(14,165,233,0.15)' : 'var(--dvas-surface-2)',
-                color: activeDrone === d.id ? '#38bdf8' : 'var(--dvas-text-muted)',
-                border: `1px solid ${activeDrone === d.id ? 'rgba(14,165,233,0.35)' : 'var(--dvas-border)'}`,
-              }}
-            >{d.id}</button>
-          ))}
+
+        {/* Dynamic drone selector pills */}
+        <div className="flex items-center gap-1 ml-2 flex-wrap">
+          {droneList.length > 0 ? (
+            droneList.map(d => (
+              <button
+                key={d.id}
+                onClick={() => setActiveDrone(d.id)}
+                className="mono text-[10px] px-2.5 py-1 rounded transition-all font-semibold"
+                style={{
+                  background: activeDrone === d.id ? 'rgba(56,189,248,0.15)' : 'var(--dvas-surface-2)',
+                  color: activeDrone === d.id ? '#38bdf8' : 'var(--dvas-text-muted)',
+                  border: `1px solid ${activeDrone === d.id ? 'rgba(56,189,248,0.35)' : 'var(--dvas-border)'}`,
+                }}
+              >
+                {d.id}
+              </button>
+            ))
+          ) : (
+            <span className="mono text-[10px] text-slate-500 italic">No active drone streams</span>
+          )}
         </div>
+
+        <div className="flex-1" />
+
+        {/* Stream start/stop controls */}
+        {!streamRunning ? (
+          <button
+            onClick={onStartStream}
+            disabled={startingStream}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg mono text-[11px] font-bold transition-all"
+            style={{
+              background: startingStream ? 'rgba(16,185,129,0.08)' : 'rgba(16,185,129,0.15)',
+              color: '#34d399',
+              border: '1px solid rgba(16,185,129,0.35)',
+              cursor: startingStream ? 'wait' : 'pointer',
+            }}
+          >
+            {startingStream ? (
+              <><RefreshCw size={11} className="animate-spin" /> Starting Analytics…</>
+            ) : (
+              <><Play size={11} /> Start Crowd Analysis</>
+            )}
+          </button>
+        ) : (
+          <div className="flex items-center gap-2">
+            <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg mono text-[10px] font-bold"
+              style={{ background: 'rgba(52,211,153,0.12)', color: '#34d399', border: '1px solid rgba(52,211,153,0.3)' }}>
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 dvas-live-dot" />
+              Density Analysis Active
+            </span>
+            <button
+              onClick={onStopStream}
+              className="flex items-center gap-1 px-2.5 py-1 rounded-lg mono text-[10px] font-bold transition-all hover:bg-red-500/20"
+              title="Stop crowd worker"
+              style={{ color: '#f87171', border: '1px solid rgba(248,113,113,0.25)' }}
+            >
+              <Square size={9} /> Stop Worker
+            </button>
+          </div>
+        )}
       </div>
 
-      {/* Video area */}
+      {/* Video viewport */}
       <div className="relative bg-black flex items-center justify-center" style={{ height: 420 }}>
-        {hasDrone ? (
+        {hasAnyFeed ? (
           <div className="relative w-full h-full">
-            <LiveFrame droneId={activeDrone} isOffline={false} isDegraded={false} />
-            <div className="absolute top-3 left-3 flex flex-col gap-1.5 z-10">
-              <div className="mono text-[10px] bg-black/80 px-2 py-1 rounded flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full" style={{ background: liveLevel?.color }} />
-                <span style={{ color: liveLevel?.color }}>{liveLevel?.label}</span>
-                <span className="text-slate-200 ml-1 font-bold">{liveCount} persons</span>
+            <img
+              src={displaySrc}
+              alt={isAnnotated ? 'Crowd density heatmap overlay' : 'Raw drone camera stream'}
+              className="w-full h-full object-contain"
+            />
+            {/* Top Left Overlay */}
+            <div className="absolute top-3 left-3 flex flex-col gap-1.5 z-10 pointer-events-none">
+              {isAnnotated && (
+                <div className="mono text-[10px] bg-black/85 px-2 py-1 rounded flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full" style={{ background: liveLevel?.color }} />
+                  <span style={{ color: liveLevel?.color }} className="font-semibold">{liveLevel?.label}</span>
+                  <span className="text-slate-200 ml-1 font-bold">{Math.round(liveCount)} persons</span>
+                  <span className="text-slate-400 ml-1">({(liveCount / 200).toFixed(2)} p/m²)</span>
+                </div>
+              )}
+              <div className="mono text-[10px] bg-black/85 px-2 py-1 rounded text-teal-300">
+                Drone: {activeDrone}
               </div>
-              <div className="mono text-[10px] bg-black/80 px-2 py-1 rounded text-slate-300">
-                {(liveCount / 200).toFixed(2)} p/m²
-              </div>
+              {activeMissionId && (
+                <div className="mono text-[10px] bg-black/85 px-2 py-1 rounded text-violet-300">
+                  Mission: {activeMissionId}
+                </div>
+              )}
             </div>
-            <div className="absolute top-3 right-3 mono text-[10px] bg-black/80 px-2 py-1 rounded text-emerald-400 flex items-center gap-1 z-10">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 dvas-live-dot" />
-              LIVE
+
+            {/* Top Right Live badge */}
+            <div className="absolute top-3 right-3 z-10 pointer-events-none flex items-center gap-1 mono text-[10px] bg-black/85 px-2 py-1 rounded"
+              style={{ color: isAnnotated ? '#34d399' : '#38bdf8' }}>
+              <span className="w-1.5 h-1.5 rounded-full dvas-live-dot" style={{ background: isAnnotated ? '#34d399' : '#38bdf8' }} />
+              {isAnnotated ? `HEATMAP${fps > 0 ? ` · ${fps}fps` : ''}` : `LIVE · RAW FEED${fps > 0 ? ` · ${fps}fps` : ''}`}
             </div>
-            <div className="absolute bottom-3 left-3 mono text-[10px] bg-black/80 px-2 py-1 rounded text-slate-400 z-10">
-              Crowd Analytics Model · YOLOv8 · Tile-Based Detection
+
+            {/* Bottom Left Model badge */}
+            <div className="absolute bottom-3 left-3 z-10 pointer-events-none mono text-[10px] bg-black/85 px-2 py-1 rounded text-slate-300">
+              {isAnnotated ? `${modelLabel} · Density Estimation` : 'Raw Ingest Stream · Start Analytics for Live Heatmap'}
+            </div>
+
+            {/* Bottom Right Status */}
+            <div className="absolute bottom-3 right-3 z-10 pointer-events-none mono text-[10px] bg-black/85 px-2 py-1 rounded"
+              style={{ color: streamRunning ? '#34d399' : '#fbbf24' }}>
+              {streamRunning ? '● INFERENCE WORKER ACTIVE' : '○ INFERENCE STANDBY'}
             </div>
           </div>
+        ) : hasDrone ? (
+          <div className="text-center text-slate-500 flex flex-col items-center gap-3 px-4">
+            <VideoOff size={42} className="opacity-40 text-slate-600" />
+            <p className="mono text-sm text-slate-400 font-bold tracking-wider">FEED OFFLINE — NO ACTIVE STREAM</p>
+            <p className="mono text-[10px] text-slate-500">Drone <span className="text-sky-400 font-semibold">{activeDrone}</span> is not currently transmitting frames</p>
+          </div>
         ) : (
-          <div className="text-center text-slate-500 flex flex-col items-center">
-            <VideoOff size={48} className="mb-3 opacity-50 text-slate-600" />
-            <p className="mono text-sm">Crowd analytics offline</p>
-            <p className="mono text-[10px] mt-1 text-slate-600">Select a drone to view live feed</p>
+          <div className="text-center text-slate-500 flex flex-col items-center gap-3">
+            <RefreshCw size={32} className="text-slate-600 opacity-40 animate-spin" />
+            <p className="mono text-sm text-slate-400">Discovering active drone streams…</p>
+            <p className="mono text-[10px] text-slate-500">Waiting for edge device telemetry from ingest server</p>
           </div>
         )}
       </div>
@@ -167,37 +468,60 @@ function LiveStreamSection({ activeDrone, drones, setActiveDrone, liveCount, liv
 }
 
 /* ───────────────────────────────────────────────────────────────
-   SECTION 2 — Crowd KPI Strip (LIVE DATA)
+   SECTION 2 — KPI Strip (Current Count, Peak Count, Alerts, Density Status)
    ────────────────────────────────────────────────────────────── */
-function CrowdKPIStrip({ readings, sseConnected }) {
-  // readings is array of {drone_id, people_count, density_label, ts, alert}
-  const items = Array.isArray(readings) ? readings : [];
-  const totalCount    = items.reduce((s, r) => s + (r.people_count || 0), 0);
-  const alertCount    = items.filter(r => r.alert || (r.people_count || 0) > 300).length;
-  const avgDensity    = items.length > 0
-    ? (items.reduce((s, r) => s + (r.people_count || 0), 0) / (items.length * 200)).toFixed(2)
-    : '0.00';
-  const breachedZones = alertCount;
-  const activeDrones  = items.filter(r => (r.people_count || 0) > 0).length;
+function CrowdKPIStrip({ liveCount, peakCount, peakTimestamp, alertCount, avgDensity, densityLevel, trend, sseConnected }) {
+  const TrendIcon = trend === 'up' ? TrendingUp : trend === 'down' ? TrendingDown : Minus;
+  const trendColor = trend === 'up' ? 'text-emerald-400' : trend === 'down' ? 'text-red-400' : 'text-slate-500';
 
   const kpis = [
-    { label: 'Total Persons Detected', value: totalCount.toLocaleString(), tone: 'text-sky-400',    icon: Users,         sub: `${activeDrones} active zone${activeDrones !== 1 ? 's' : ''}` },
-    { label: 'Drone Alerts Active',    value: alertCount,                  tone: 'text-red-400',    icon: AlertTriangle, sub: alertCount > 0 ? 'Density threshold exceeded' : 'All zones nominal' },
-    { label: 'Avg Density (p/m²)',     value: avgDensity,                  tone: 'text-amber-400',  icon: Thermometer,   sub: 'People per square metre' },
-    { label: 'Zones Breached',         value: breachedZones,               tone: breachedZones > 0 ? 'text-red-400' : 'text-emerald-400', icon: MapPin, sub: `${items.length} zones monitored` },
-    { label: 'Live Stream',            value: sseConnected ? 'ON' : 'OFF', tone: sseConnected ? 'text-emerald-400' : 'text-slate-500', icon: TrendingUp, sub: sseConnected ? 'Real-time SSE' : 'Polling only' },
+    {
+      label: 'Current Count',
+      value: (
+        <div className="flex items-center gap-2">
+          <span>{Math.round(liveCount).toLocaleString()}</span>
+          <TrendIcon size={16} className={trendColor} />
+        </div>
+      ),
+      tone: densityLevel.color,
+      icon: Users,
+      sub: `${trend === 'up' ? 'Increasing' : trend === 'down' ? 'Decreasing' : 'Stable'} trend`,
+    },
+    {
+      label: 'Peak Count',
+      value: Math.round(peakCount).toLocaleString(),
+      tone: '#f59e0b',
+      icon: TrendingUp,
+      sub: peakTimestamp ? `at ${new Date(peakTimestamp).toLocaleTimeString()}` : 'No peak recorded',
+    },
+    {
+      label: 'Drone Alerts Active',
+      value: alertCount,
+      tone: alertCount > 0 ? '#ef4444' : '#64748b',
+      icon: AlertTriangle,
+      sub: alertCount > 0 ? 'Density threshold exceeded' : 'All zones nominal',
+    },
+    {
+      label: 'Density Status',
+      value: densityLevel.label,
+      tone: densityLevel.color,
+      icon: Thermometer,
+      sub: `${avgDensity} p/m² avg density`,
+    },
   ];
 
   return (
-    <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
       {kpis.map(({ label, value, tone, icon: Icon, sub }) => (
         <div key={label} className="rounded-xl p-4 flex flex-col gap-1"
           style={{ background: 'var(--dvas-surface)', border: '1px solid var(--dvas-border)' }}>
           <div className="flex items-center gap-2">
-            <Icon size={13} className={`${tone} shrink-0`} />
+            <Icon size={13} style={{ color: tone }} className="shrink-0" />
             <span className="dvas-label" style={{ fontSize: 10 }}>{label}</span>
           </div>
-          <div className={`mono font-bold text-2xl mt-1 ${tone}`}>{value ?? '—'}</div>
+          <div className="mono font-bold text-2xl mt-1" style={{ color: tone }}>
+            {typeof value === 'object' ? value : (value ?? '—')}
+          </div>
           <div className="mono text-[10px]" style={{ color: 'var(--dvas-text-dim)' }}>{sub}</div>
         </div>
       ))}
@@ -209,7 +533,6 @@ function CrowdKPIStrip({ readings, sseConnected }) {
    SECTION 3 — People Count Over Time (LIVE TIMELINE)
    ────────────────────────────────────────────────────────────── */
 function PeopleCountChart({ timelineData, sseWindow, online }) {
-  // Use SSE rolling window if available and non-empty, else timeline from API
   const chartData = sseWindow.length > 0
     ? sseWindow
     : (Array.isArray(timelineData?.timeline) ? timelineData.timeline : []);
@@ -222,7 +545,7 @@ function PeopleCountChart({ timelineData, sseWindow, online }) {
       }))
     : chartData.map(row => ({
         displayTime: row.hour || row.displayTime || row.ts?.slice(11, 16) || '',
-        crowd: Number(row.density ?? row.crowd ?? row.people_count ?? 0),
+        crowd: Number(row.density ?? row.crowd ?? row.estimated_count ?? row.people_count ?? 0),
       }));
 
   return (
@@ -244,6 +567,9 @@ function PeopleCountChart({ timelineData, sseWindow, online }) {
           <XAxis dataKey="displayTime" stroke="var(--dvas-text-muted)" fontSize={9} minTickGap={20} />
           <YAxis stroke="var(--dvas-text-muted)" fontSize={9} />
           <Tooltip {...CHART_TOOLTIP} />
+          <ReferenceLine y={25}  stroke="#10b981" strokeDasharray="4 4" strokeOpacity={0.5} label={{ value: 'Low', position: 'insideTopRight', fill: '#10b981', fontSize: 9 }} />
+          <ReferenceLine y={75}  stroke="#f59e0b" strokeDasharray="4 4" strokeOpacity={0.5} label={{ value: 'Medium', position: 'insideTopRight', fill: '#f59e0b', fontSize: 9 }} />
+          <ReferenceLine y={150} stroke="#ef4444" strokeDasharray="4 4" strokeOpacity={0.5} label={{ value: 'Critical', position: 'insideTopRight', fill: '#ef4444', fontSize: 9 }} />
           <Area type="monotone" dataKey="crowd" stroke="#38bdf8" fill="url(#gCrowd)" strokeWidth={2} name="Persons" dot={false} isAnimationActive={false} />
         </AreaChart>
       </ResponsiveContainer>
@@ -252,30 +578,28 @@ function PeopleCountChart({ timelineData, sseWindow, online }) {
 }
 
 /* ───────────────────────────────────────────────────────────────
-   SECTION 4 — Heatmap Panel
+   SECTION 4 — Session Summary Stats
    ────────────────────────────────────────────────────────────── */
-function HeatmapPanel({ heatmapData }) {
-  const url = heatmapData?.url || heatmapData?.presigned_url;
-  const ts  = heatmapData?.ts;
+function SessionStatsRow({ summary }) {
+  const stats = [
+    { label: 'Mean Count',  value: summary?.mean_count != null ? Math.round(summary.mean_count) : '—', icon: BarChart3, color: 'text-sky-400' },
+    { label: 'Min Count',   value: summary?.min_count  != null ? Math.round(summary.min_count)  : '—', icon: TrendingDown, color: 'text-emerald-400' },
+    { label: 'Max Count',   value: summary?.max_count  != null ? Math.round(summary.max_count)  : '—', icon: TrendingUp, color: 'text-amber-400' },
+    { label: 'Std Dev',     value: summary?.std_dev    != null ? summary.std_dev.toFixed(1)      : '—', icon: Activity, color: 'text-violet-400' },
+    { label: 'Duration',    value: summary?.duration_seconds != null ? fmtDuration(summary.duration_seconds) : '—', icon: Clock, color: 'text-slate-400' },
+    { label: 'Frames',      value: summary?.total_frames ?? '—', icon: Zap, color: 'text-pink-400' },
+  ];
 
   return (
-    <div className="rounded-xl overflow-hidden flex flex-col" style={{ minHeight: 220, background: 'var(--dvas-surface-2)', border: '1px solid var(--dvas-border)' }}>
-      {url ? (
-        <>
-          <img src={url} alt="Crowd Density Heatmap" className="w-full object-contain" style={{ maxHeight: 260 }} />
-          {ts && (
-            <div className="px-3 py-1.5 mono text-[10px]" style={{ color: 'var(--dvas-text-dim)' }}>
-              Heatmap captured: {fmtAge(ts)}
-            </div>
-          )}
-        </>
-      ) : (
-        <div className="flex-1 flex flex-col items-center justify-center gap-2 p-6 opacity-40">
-          <Thermometer size={36} className="text-sky-400" />
-          <span className="mono text-xs text-slate-400">No heatmap available yet</span>
-          <span className="mono text-[10px] text-slate-500">Generated when crowd-analyzer detects activity</span>
+    <div className="grid grid-cols-3 md:grid-cols-6 gap-3">
+      {stats.map(({ label, value, icon: Icon, color }) => (
+        <div key={label} className="rounded-xl p-3 text-center"
+          style={{ background: 'var(--dvas-surface)', border: '1px solid var(--dvas-border)' }}>
+          <Icon size={13} className={`${color} mx-auto mb-1`} />
+          <div className="mono text-xs" style={{ color: 'var(--dvas-text-dim)' }}>{label}</div>
+          <div className={`mono font-bold text-lg mt-0.5 ${color}`}>{value}</div>
         </div>
-      )}
+      ))}
     </div>
   );
 }
@@ -283,8 +607,7 @@ function HeatmapPanel({ heatmapData }) {
 /* ───────────────────────────────────────────────────────────────
    SECTION 5 — Drone Status Grid (LIVE per-drone readings)
    ────────────────────────────────────────────────────────────── */
-function DroneStatusGrid({ readings, drones }) {
-  // Build a map from readings keyed by drone_id
+function DroneStatusGrid({ readings, droneList }) {
   const readingMap = {};
   if (Array.isArray(readings)) {
     for (const r of readings) {
@@ -292,17 +615,23 @@ function DroneStatusGrid({ readings, drones }) {
     }
   }
 
-  const droneList = drones?.length > 0
-    ? drones
-    : [{ id: 'DRN-001' }, { id: 'DRN-002' }, { id: 'DRN-003' }, { id: 'DRN-004' }];
+  if (!droneList || droneList.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center p-6 text-center opacity-40">
+        <Radio size={32} className="text-slate-500 mb-2" />
+        <span className="mono text-xs text-slate-400">No active drones connected</span>
+        <span className="mono text-[10px] text-slate-600">Telemetry will appear when edge streams are active</span>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-2">
       {droneList.map(d => {
         const r = readingMap[d.id] || readingMap[d.drone_id];
-        const count = r ? Number(r.people_count || 0) : 0;
+        const count = r ? Number(r.estimated_count || r.people_count || 0) : 0;
         const level = getDensityLevel(count);
-        const pct   = Math.min(100, Math.round((count / 700) * 100));
+        const pct   = Math.min(100, Math.round((count / 300) * 100));
         const hasData = !!r;
         const label = r?.density_label || level.label;
 
@@ -311,23 +640,23 @@ function DroneStatusGrid({ readings, drones }) {
             style={{
               background: 'var(--dvas-surface-2)',
               border: `1px solid ${hasData ? 'rgba(56,189,248,0.4)' : 'var(--dvas-border)'}`,
-              opacity: hasData ? 1 : 0.5,
+              opacity: hasData || d.status === 'live' ? 1 : 0.6,
             }}>
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <span className="mono text-xs font-bold" style={{ color: 'var(--dvas-text)' }}>{d.id}</span>
                 <span className="mono text-[10px] px-1.5 py-0.5 rounded font-semibold"
                   style={{ background: `${level.color}22`, color: level.color, border: `1px solid ${level.color}44` }}>
-                  {hasData ? label : 'Offline'}
+                  {hasData ? label : d.status === 'live' ? 'Connected' : 'Offline'}
                 </span>
-                {hasData && count > 300 && (
+                {hasData && count > 150 && (
                   <span className="mono text-[10px] text-red-400 flex items-center gap-1">
                     <AlertTriangle size={10} className="dvas-live-dot" /> ALERT
                   </span>
                 )}
               </div>
               <div className="mono text-right">
-                <div className="text-sm font-bold" style={{ color: level.color }}>{count.toLocaleString()}</div>
+                <div className="text-sm font-bold" style={{ color: level.color }}>{Math.round(count).toLocaleString()}</div>
                 <div className="text-[10px]" style={{ color: 'var(--dvas-text-dim)' }}>persons</div>
               </div>
             </div>
@@ -339,7 +668,7 @@ function DroneStatusGrid({ readings, drones }) {
                 {hasData ? (count / 200).toFixed(2) : '0.00'} p/m²
               </span>
               <span className="mono text-[10px]" style={{ color: 'var(--dvas-text-dim)' }}>
-                {hasData ? (r.ts ? fmtAge(r.ts) : 'Live') : 'Disconnected'}
+                {hasData ? (r.ts ? fmtAge(r.ts) : 'Live') : d.last_seen ? fmtAge(d.last_seen) : 'Standby'}
               </span>
             </div>
           </div>
@@ -350,74 +679,341 @@ function DroneStatusGrid({ readings, drones }) {
 }
 
 /* ───────────────────────────────────────────────────────────────
+   SECTION 6 — Mission Report Export
+   ────────────────────────────────────────────────────────────── */
+function MissionExport({ hasData }) {
+  const [meta, setMeta] = useState({ operator: '', location: '', mission_id: '' });
+  const [exporting, setExporting] = useState(null);
+
+  const exportFile = async (type) => {
+    setExporting(type);
+    try {
+      const token = localStorage.getItem('dvas_token') || '';
+      const params = new URLSearchParams();
+      if (meta.operator) params.set('operator', meta.operator);
+      if (meta.location) params.set('location', meta.location);
+      if (meta.mission_id) params.set('mission_id', meta.mission_id);
+
+      const url = type === 'pdf'
+        ? `/api/analytics/crowd/export/pdf?${params.toString()}`
+        : '/api/analytics/crowd/export/csv';
+
+      const res = await fetch(url, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        credentials: 'include',
+      });
+
+      if (res.ok) {
+        const blob = await res.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = type === 'pdf'
+          ? `crowd_mission_report_${meta.mission_id || 'export'}.pdf`
+          : 'crowd_report.csv';
+        a.click();
+        URL.revokeObjectURL(a.href);
+      }
+    } catch (err) {
+      console.error('Export failed:', err);
+    } finally {
+      setExporting(null);
+    }
+  };
+
+  return (
+    <div className="rounded-xl p-4"
+      style={{ background: 'var(--dvas-surface)', border: '1px solid var(--dvas-border)' }}>
+      <div className="flex items-center gap-2 mb-3">
+        <FileText size={14} className="text-sky-400" />
+        <span className="dvas-label font-semibold">Mission Report</span>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
+        <div>
+          <label className="mono text-[10px] text-slate-500 block mb-1">Operator Name</label>
+          <input
+            type="text"
+            value={meta.operator}
+            onChange={e => setMeta(m => ({ ...m, operator: e.target.value }))}
+            className="w-full bg-slate-900 border border-slate-700 focus:border-sky-500 outline-none px-3 py-1.5 rounded text-sm mono text-slate-200"
+            placeholder="Officer name"
+          />
+        </div>
+        <div>
+          <label className="mono text-[10px] text-slate-500 block mb-1">Location</label>
+          <input
+            type="text"
+            value={meta.location}
+            onChange={e => setMeta(m => ({ ...m, location: e.target.value }))}
+            className="w-full bg-slate-900 border border-slate-700 focus:border-sky-500 outline-none px-3 py-1.5 rounded text-sm mono text-slate-200"
+            placeholder="Location / area"
+          />
+        </div>
+        <div>
+          <label className="mono text-[10px] text-slate-500 block mb-1">Mission ID</label>
+          <input
+            type="text"
+            value={meta.mission_id}
+            onChange={e => setMeta(m => ({ ...m, mission_id: e.target.value }))}
+            className="w-full bg-slate-900 border border-slate-700 focus:border-sky-500 outline-none px-3 py-1.5 rounded text-sm mono text-slate-200"
+            placeholder="MSN-001"
+          />
+        </div>
+      </div>
+      <div className="flex items-center gap-3">
+        <button
+          onClick={() => exportFile('pdf')}
+          disabled={!hasData || exporting === 'pdf'}
+          className="flex items-center gap-2 px-4 py-2 rounded-lg mono text-xs font-semibold transition-all disabled:opacity-40"
+          style={{ background: 'rgba(14,165,233,0.15)', color: '#38bdf8', border: '1px solid rgba(14,165,233,0.35)' }}
+        >
+          <Download size={13} />
+          {exporting === 'pdf' ? 'Generating…' : 'Export PDF Report'}
+        </button>
+        <button
+          onClick={() => exportFile('csv')}
+          disabled={!hasData || exporting === 'csv'}
+          className="flex items-center gap-2 px-4 py-2 rounded-lg mono text-xs font-semibold transition-all disabled:opacity-40"
+          style={{ background: 'var(--dvas-surface-2)', color: 'var(--dvas-text-muted)', border: '1px solid var(--dvas-border)' }}
+        >
+          <Download size={13} />
+          {exporting === 'csv' ? 'Exporting…' : 'Export CSV Data'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ───────────────────────────────────────────────────────────────
    MAIN EXPORT
    ────────────────────────────────────────────────────────────── */
 export default function CrowdAnalytics({ crowdSeries, drones }) {
+  const { streams } = useActiveStreams();
   const [activeDrone, setActiveDrone] = useState(null);
+  const [activeMissionId, setActiveMissionId] = useState(null);
+  const [activeModel, setActiveModel] = useState('csrnet_parta');
+  const [modelSwitching, setModelSwitching] = useState(false);
+  const [streamRunning, setStreamRunning] = useState(false);
+  const [startingStream, setStartingStream] = useState(false);
 
-  // Auto-select the first online drone when drones list loads/changes
+  // Dynamic drone list from active streams or fallback to props
+  const droneList = streams?.length > 0
+    ? streams.map(s => ({ id: s.drone_id, ...s }))
+    : (drones?.length > 0 ? drones : []);
+
+  // Auto-select first active drone once discovered
   useEffect(() => {
-    if (!drones || drones.length === 0) return;
-    // Only auto-select if no drone is currently selected, or if the
-    // currently selected drone is no longer in the list
-    const currentStillValid = drones.some(d => d.id === activeDrone);
-    if (!activeDrone || !currentStillValid) {
-      const onlineDrone = drones.find(d => d.status !== 'offline');
-      setActiveDrone(onlineDrone ? onlineDrone.id : drones[0].id);
+    if (droneList.length === 0) return;
+    setActiveDrone(prev => {
+      if (prev && droneList.some(d => d.id === prev)) return prev;
+      const live = droneList.find(d => d.status === 'live' || (d.frame_count || 0) > 0 || (d.messages_ready || 0) > 0);
+      return (live || droneList[0])?.id || null;
+    });
+  }, [droneList]);
+
+  // Track mission ID for selected drone
+  useEffect(() => {
+    if (!activeDrone || !droneList.length) return;
+    const droneObj = droneList.find(d => d.id === activeDrone);
+    const mId = droneObj?.mission_id || null;
+    setActiveMissionId(mId);
+  }, [activeDrone, droneList]);
+
+  // SSE rolling window for real-time chart (last 120 readings)
+  const [sseWindow, setSseWindow]         = useState([]);
+  const [recentCounts, setRecentCounts]   = useState([]);
+  const [realtimeCount, setRealtimeCount] = useState(null);
+  const [peakCount, setPeakCount]         = useState(0);
+  const [peakTimestamp, setPeakTimestamp] = useState(null);
+  const [alertCount, setAlertCount]       = useState(0);
+
+  // Reset realtime count when switching drones
+  useEffect(() => {
+    setRealtimeCount(null);
+  }, [activeDrone]);
+
+  // Data hooks
+  const { data: readingsData, loading: readingsLoading } = useCrowdReadings(activeDrone || '', 4000);
+  const { data: timelineData }    = useCrowdTimeline(activeDrone || '', 24);
+  const { data: sessionSummary }  = useCrowdSessionSummary(10000);
+  const { data: modelInfo }       = useCrowdModel(30000);
+  const { data: healthData }      = useCrowdHealth(10000);
+
+  // Sync stream running state from health check
+  useEffect(() => {
+    if (healthData && typeof healthData.stream_running === 'boolean') {
+      setStreamRunning(healthData.stream_running);
     }
-  }, [drones]); // eslint-disable-line react-hooks/exhaustive-deps
-  // Rolling SSE window for the real-time chart (last 30 readings)
-  const [sseWindow, setSseWindow]     = useState([]);
+  }, [healthData]);
 
-  const { data: readingsData, loading: readingsLoading } = useCrowdReadings('', 5000);
-  const { data: timelineData }    = useCrowdTimeline('', 24);
-  const { data: heatmapData }     = useCrowdHeatmap(activeDrone, 15000);
+  // Sync model info from API
+  useEffect(() => {
+    if (modelInfo?.model_type) {
+      setActiveModel(modelInfo.model_type);
+    }
+  }, [modelInfo]);
 
-  // Handle SSE events — update rolling chart window
+  // Update alert count from session summary
+  useEffect(() => {
+    if (sessionSummary) {
+      setAlertCount(sessionSummary.alert_timestamps?.length || 0);
+      if (peakCount === 0 && sessionSummary.peak_count > 0) {
+        setPeakCount(sessionSummary.peak_count);
+        setPeakTimestamp(sessionSummary.peak_timestamp);
+      }
+    }
+  }, [sessionSummary]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Handle SSE events from Analytics Gateway
   const handleSSEEvent = useCallback((evt) => {
-    if (evt?.service !== 'crowd') return;
-    const count  = evt.data?.people_count ?? evt.data?.count ?? 0;
-    const ts     = evt.data?.ts || new Date().toISOString();
-    const entry  = {
-      displayTime: ts.slice(11, 19), // HH:MM:SS
-      crowd: Number(count),
-    };
-    setSseWindow(w => [...w.slice(-59), entry]); // keep last 60
-  }, []);
+    const isCrowd = evt?.stream === 'crowd' || evt?.service === 'crowd' || evt?.event_type === 'crowd_threshold';
+    if (!isCrowd) return;
+
+    const payload = evt.payload || evt.data || evt;
+    const countVal = payload.estimated_count ?? payload.people_count ?? payload.count ?? payload.density;
+    if (countVal == null) return;
+    const count = Number(countVal);
+    const ts = payload.ts || new Date().toISOString();
+    const eventDroneId = payload.drone_id || evt.drone_id;
+
+    if (!activeDrone || !eventDroneId || eventDroneId === activeDrone || eventDroneId.includes(activeDrone) || activeDrone.includes(eventDroneId)) {
+      setRealtimeCount(count);
+      setRecentCounts(c => [...c.slice(-9), count]);
+
+      const entry = {
+        displayTime: typeof ts === 'string' && ts.length >= 19 ? ts.slice(11, 19) : new Date().toISOString().slice(11, 19),
+        crowd: count,
+      };
+      setSseWindow(w => [...w.slice(-119), entry]);
+
+      if (count > peakCount) {
+        setPeakCount(count);
+        setPeakTimestamp(ts);
+      }
+    }
+  }, [activeDrone, peakCount]);
 
   const { connected: sseConnected } = useAnalyticsSSE(handleSSEEvent);
 
-  // Auto-select active drone
-  useEffect(() => {
-    if (drones?.length > 0) {
-      setActiveDrone(drones.find(d => d.id === 'DRN-003') ? 'DRN-003' : drones[0].id);
-    }
-  }, [drones]);
+  const readings = Array.isArray(readingsData)
+    ? readingsData
+    : Array.isArray(readingsData?.readings)
+      ? readingsData.readings
+      : (readingsData && typeof readingsData === 'object' && (readingsData.estimated_count != null || readingsData.people_count != null))
+        ? [readingsData]
+        : [];
 
-  const readings = Array.isArray(readingsData) ? readingsData
-    : Array.isArray(readingsData?.readings) ? readingsData.readings : [];
+  const activeDroneReading = readings.find(r => r.drone_id === activeDrone || (activeDrone && r.drone_id && (r.drone_id.includes(activeDrone) || activeDrone.includes(r.drone_id))));
+  const polledCount = activeDroneReading?.estimated_count ?? activeDroneReading?.people_count ?? (readings.length > 0 ? readings[0]?.estimated_count : null);
 
-  // Get live count for active drone for video overlay
-  const activeDroneReading = readings.find(r => r.drone_id === activeDrone);
-  const liveCount = activeDroneReading?.people_count ?? 0;
+  // Live count prioritization: frame header count (realtimeCount) > SSE count > recent DB reading
+  const liveCount = realtimeCount !== null
+    ? realtimeCount
+    : (polledCount != null ? Number(polledCount) : 0);
   const liveLevel = getDensityLevel(liveCount);
+  const trend = computeTrend(recentCounts.length > 0 ? recentCounts : (readings.length > 0 ? readings.slice(0, 5).map(r => Number(r.estimated_count || 0)) : []));
+  const avgDensity = (liveCount / 200).toFixed(2);
 
-  const serviceOnline = !readingsLoading && readings.length > 0;
+  const serviceOnline = sseConnected || !readingsLoading || (healthData?.status === 'ok');
+
+  // Model switching handler
+  const handleModelSwitch = async (modelType) => {
+    if (modelType === activeModel) return;
+    setModelSwitching(true);
+    try {
+      await switchCrowdModel(modelType);
+      setActiveModel(modelType);
+    } catch (err) {
+      console.error('Model switch failed:', err);
+    } finally {
+      setModelSwitching(false);
+    }
+  };
+
+  // Start stream handler
+  const handleStartStream = async () => {
+    setStartingStream(true);
+    try {
+      await api.get('/analytics/crowd/stream/start');
+      setStreamRunning(true);
+      setSseWindow([]);
+      setRecentCounts([]);
+      setPeakCount(0);
+      setPeakTimestamp(null);
+    } catch (err) {
+      console.error('Failed to start stream:', err);
+    } finally {
+      setStartingStream(false);
+    }
+  };
+
+  // Stop stream handler
+  const handleStopStream = async () => {
+    try {
+      await api.get('/analytics/crowd/stream/stop');
+      setStreamRunning(false);
+    } catch (err) {
+      console.error('Failed to stop stream:', err);
+    }
+  };
+
+  // Frame-level count from annotated JPEG response headers (most reliable source)
+  const handleFrameCount = useCallback((count, label) => {
+    if (count == null || isNaN(count)) return;
+    const c = Number(count);
+    setRealtimeCount(c);
+    setRecentCounts(prev => [...prev.slice(-9), c]);
+
+    const ts = new Date().toISOString();
+    const entry = {
+      displayTime: ts.slice(11, 19),
+      crowd: c,
+    };
+    setSseWindow(prev => [...prev.slice(-119), entry]);
+
+    if (c > peakCount) {
+      setPeakCount(c);
+      setPeakTimestamp(ts);
+    }
+  }, [peakCount]);
 
   return (
     <div className="flex flex-col gap-5" style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }}>
 
-      {/* LIVE STREAM */}
-      <LiveStreamSection
+      {/* HEADER — Model Selector + Service Badge */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <ModelSelector activeModel={activeModel} onSwitch={handleModelSwitch} switching={modelSwitching} />
+        </div>
+        <ServiceBadge online={sseConnected || serviceOnline} />
+      </div>
+
+      {/* LIVE FEED & HEATMAP STREAM */}
+      <LiveFeedSection
         activeDrone={activeDrone}
-        drones={drones}
+        droneList={droneList}
         setActiveDrone={setActiveDrone}
         liveCount={liveCount}
         liveLevel={liveLevel}
+        streamRunning={streamRunning}
+        activeModel={activeModel}
+        activeMissionId={activeMissionId}
+        onStartStream={handleStartStream}
+        onStopStream={handleStopStream}
+        startingStream={startingStream}
+        onFrameCount={handleFrameCount}
       />
 
       {/* KPI STRIP */}
-      <CrowdKPIStrip readings={readings} sseConnected={sseConnected} />
+      <CrowdKPIStrip
+        liveCount={liveCount}
+        peakCount={peakCount}
+        peakTimestamp={peakTimestamp}
+        alertCount={alertCount}
+        avgDensity={avgDensity}
+        densityLevel={liveLevel}
+        trend={trend}
+        sseConnected={sseConnected}
+      />
 
       {/* PEOPLE COUNT CHART + DRONE STATUS */}
       <div className="grid grid-cols-12 gap-4">
@@ -437,23 +1033,16 @@ export default function CrowdAnalytics({ crowdSeries, drones }) {
         </div>
         <div className="col-span-12 lg:col-span-4">
           <Panel title="Drone Crowd Status" icon={Radio} iconClass="text-violet-400">
-            <DroneStatusGrid readings={readings} drones={drones} />
+            <DroneStatusGrid readings={readings} droneList={droneList} />
           </Panel>
         </div>
       </div>
 
-      {/* HEATMAP */}
-      <Panel
-        title="Crowd Density Heatmap"
-        icon={Thermometer}
-        iconClass="text-amber-400"
-        right={
-          <span className="mono text-[10px]" style={{ color: 'var(--dvas-text-dim)' }}>
-            Generated by crowd-analyzer · MinIO stored
-          </span>
-        }>
-        <HeatmapPanel heatmapData={heatmapData} />
-      </Panel>
+      {/* SESSION STATS */}
+      <SessionStatsRow summary={sessionSummary} />
+
+      {/* MISSION REPORT EXPORT */}
+      <MissionExport hasData={sessionSummary?.total_frames > 0} />
 
     </div>
   );

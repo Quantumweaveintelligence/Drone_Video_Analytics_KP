@@ -135,6 +135,23 @@ export function useCrowdHeatmap(droneId = '') {
   return useAnalyticsFetch(path, 15000);
 }
 
+export function useCrowdSessionSummary(intervalMs = 10000) {
+  return useAnalyticsFetch('/analytics/crowd/session/summary', intervalMs);
+}
+
+export function useCrowdModel(intervalMs = 30000) {
+  return useAnalyticsFetch('/analytics/crowd/model', intervalMs);
+}
+
+export async function switchCrowdModel(modelType) {
+  const res = await api.put('/analytics/crowd/model', { model_type: modelType });
+  return res.data;
+}
+
+export function useCrowdHealth(intervalMs = 15000) {
+  return useAnalyticsFetch('/analytics/crowd/health', intervalMs);
+}
+
 // ── Person hooks ───────────────────────────────────────────────────────────
 export function usePersonTracks(droneId = '', intervalMs = 5000) {
   const path = droneId

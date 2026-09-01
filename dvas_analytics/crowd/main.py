@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 
 sys.path.insert(0, "/analytics")
 from shared.config import cfg
@@ -31,7 +31,7 @@ from shared.redis_client import (
 )
 from shared import minio_client as minio
 from crowd.analyzer import CrowdAnalyzer
-from crowd.schema import CrowdAnalysisResult, StreamStatus, CrowdTimelineItem
+from crowd.schema import CrowdAnalysisResult, StreamStatus, CrowdTimelineItem, ModelSwitchRequest, ModelInfo, SessionSummary
 
 logging.basicConfig(
     level=cfg.LOG_LEVEL,
@@ -51,7 +51,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL_PATH = os.getenv("MODEL_PATH", "/analytics/crowd/models/crowd_counting.pth")
+MODEL_PATH = os.getenv("MODEL_PATH", "/analytics/crowd/models/PartAmodel_best.pth")
+if not os.path.isfile(MODEL_PATH) or "crowd_counting.pth" in MODEL_PATH:
+    MODEL_PATH = "/analytics/crowd/models/PartAmodel_best.pth"
+
+MODEL_PATHS = {
+    "csrnet_parta": "/analytics/crowd/models/PartAmodel_best.pth",
+    "csrnet_partb": "/analytics/crowd/models/partBmodel_best.pth",
+}
+_current_model_type = "csrnet_parta"
+
 analyzer: Optional[CrowdAnalyzer] = None
 _stream_task: Optional[asyncio.Task] = None
 _stream_running = False
@@ -89,6 +98,8 @@ async def health():
         "status":           "ok",
         "service":          "crowd-analyzer",
         "model_loaded":     analyzer.ready if analyzer else False,
+        "model_type":       _current_model_type,
+        "model_path":       analyzer._model_path if analyzer else "",
         "stream_running":   _stream_running,
         "frames_processed": _frames_processed,
     }
@@ -162,11 +173,30 @@ async def analyze_frame(
 # ── Stream control ─────────────────────────────────────────────────────────────
 async def _stream_loop():
     global _stream_running, _frames_processed
-    last_ids = {d: "0" for d in cfg.DRONE_IDS}
-    log.info("Crowd stream loop started for drones: %s", cfg.DRONE_IDS)
+    active_drones = list(cfg.DRONE_IDS)
+    last_ids = {d: "0" for d in active_drones}
+    log.info("Crowd stream loop started for initial drones: %s", active_drones)
 
+    loop_count = 0
     while _stream_running:
-        for drone_id in cfg.DRONE_IDS:
+        loop_count += 1
+        # Dynamically discover active stream drones from Valkey every ~10 iterations
+        if loop_count % 10 == 1:
+            try:
+                from shared.redis_client import scan_active_stream_drones
+                discovered = await scan_active_stream_drones()
+                for d in discovered:
+                    if d not in active_drones:
+                        active_drones.append(d)
+                        last_ids[d] = "0"
+                        await ensure_drone(d)
+                        log.info("Crowd stream loop auto-discovered active drone: %s", d)
+            except Exception as exc:
+                log.warning("Crowd stream scanner warning: %s", exc)
+
+        for drone_id in active_drones:
+            if drone_id not in last_ids:
+                last_ids[drone_id] = "0"
             try:
                 new_id, frames = await xread_frames(
                     drone_id, last_ids[drone_id], count=4, block_ms=100
@@ -182,8 +212,9 @@ async def _stream_loop():
                     if frame is None:
                         continue
 
-                    result = analyzer.analyze_frame(
-                        frame, drone_id=drone_id, include_heatmap=False
+                    # Run inference in worker thread pool so FastAPI event loop is never blocked
+                    result = await asyncio.to_thread(
+                        analyzer.analyze_frame, frame, drone_id=drone_id, include_heatmap=True
                     )
                     ts = datetime.now(timezone.utc)
 
@@ -223,7 +254,10 @@ async def _stream_loop():
                             "count":      result["estimated_count"],
                         })
 
-                    await publish_analytics_result("crowd", result)
+                    # Publish to SSE stream — strip heavy binary fields
+                    sse_result = {k: v for k, v in result.items()
+                                  if k not in ("heatmap_b64", "peak_frame")}
+                    await publish_analytics_result("crowd", sse_result)
                     _frames_processed += 1
 
             except asyncio.CancelledError:
@@ -238,9 +272,12 @@ async def stream_start():
     global _stream_running, _stream_task
     if _stream_running:
         return {"status": "already_running"}
+    # Reset session for new stream
+    if analyzer:
+        analyzer.reset_session()
     _stream_running = True
     _stream_task = asyncio.create_task(_stream_loop())
-    return {"status": "started"}
+    return {"status": "started", "model_type": _current_model_type}
 
 
 @app.get("/stream/stop")
@@ -348,6 +385,109 @@ async def count_live():
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
+    )
+
+# ── New Endpoints ─────────────────────────────────────────────────────────────
+
+@app.get("/annotated/latest")
+async def annotated_latest(drone_id: str = ""):
+    """Return latest heatmap-overlaid frame as binary JPEG."""
+    if not analyzer or not analyzer.ready:
+        raise HTTPException(503, "Model not loaded")
+    frame_bytes, matched_id, age, count, label = analyzer.get_last_annotated_frame(drone_id)
+    if not frame_bytes:
+        raise HTTPException(404, "No annotated frame available")
+    return Response(
+        content=frame_bytes,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "X-Drone-ID": matched_id or drone_id or "unknown",
+            "X-Frame-Age": f"{age:.2f}",
+            "X-Crowd-Count": f"{count:.1f}" if isinstance(count, float) else str(count),
+            "X-Density-Label": label or "Unknown",
+            "Access-Control-Expose-Headers": "X-Crowd-Count, X-Density-Label, X-Drone-ID, X-Frame-Age",
+        }
+    )
+
+@app.put("/model/switch")
+async def switch_model(body: dict):
+    global _current_model_type
+    model_type = body.get("model_type", "csrnet_parta")
+    if model_type not in MODEL_PATHS:
+        raise HTTPException(400, f"Unknown model_type: {model_type}. Options: {list(MODEL_PATHS.keys())}")
+    new_path = MODEL_PATHS[model_type]
+    if not os.path.isfile(new_path):
+        raise HTTPException(404, f"Model file not found: {new_path}")
+    analyzer.switch_model(new_path)
+    _current_model_type = model_type
+    log.info("Switched crowd model to %s (%s)", model_type, new_path)
+    return {"status": "switched", "model_type": model_type, "model_path": new_path}
+
+@app.get("/model/current")
+async def current_model():
+    return {
+        "model_type": _current_model_type,
+        "model_path": analyzer._model_path if analyzer else "",
+        "device": str(analyzer.device) if analyzer else "unknown",
+        "status": "loaded" if (analyzer and analyzer.ready) else "not_loaded",
+    }
+
+@app.get("/session/summary")
+async def session_summary():
+    if not analyzer:
+        raise HTTPException(503, "Analyzer not initialized")
+    return analyzer.get_session_summary()
+
+import csv
+import io as _io
+
+@app.get("/export/csv")
+async def export_csv():
+    if not analyzer:
+        raise HTTPException(503, "No session data")
+    summary = analyzer.get_session_summary()
+    counts = analyzer._session_counts
+    if not counts:
+        raise HTTPException(404, "No data to export")
+    
+    from crowd.analyzer import get_density_label
+    output = _io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["frame_idx", "timestamp_sec", "estimated_count", "density_level"])
+    fps = 25.0  # default, could be made configurable
+    for i, count in enumerate(counts):
+        label, _ = get_density_label(count)
+        writer.writerow([i, round(i / fps, 3), round(count, 2), label])
+    
+    csv_bytes = output.getvalue().encode('utf-8')
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=crowd_report.csv"}
+    )
+
+@app.get("/export/pdf")
+async def export_pdf(operator: str = "", location: str = "", mission_id: str = ""):
+    if not analyzer:
+        raise HTTPException(503, "No session data")
+    summary = analyzer.get_session_summary()
+    if summary["total_frames"] == 0:
+        raise HTTPException(404, "No data to export")
+    
+    from crowd.report import generate_pdf_report
+    pdf_bytes = generate_pdf_report(
+        summary=summary,
+        operator=operator or "Unknown",
+        location=location or "Unknown",
+        mission_id=mission_id or f"MSN-{int(time.time())}",
+        model_type=_current_model_type,
+    )
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=crowd_mission_report_{mission_id or 'export'}.pdf"}
     )
 
 

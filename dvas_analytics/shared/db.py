@@ -205,9 +205,11 @@ async def get_crowd_history(
 ) -> List[Dict]:
     pool = await get_pool()
     if drone_id:
+        from shared.config import get_drone_aliases
+        aliases = get_drone_aliases(drone_id)
         rows = await pool.fetch(
-            "SELECT * FROM crowd_density_readings WHERE drone_id=$1 ORDER BY ts DESC LIMIT $2",
-            drone_id, limit,
+            "SELECT * FROM crowd_density_readings WHERE drone_id = ANY($1::text[]) ORDER BY ts DESC LIMIT $2",
+            aliases, limit,
         )
     else:
         rows = await pool.fetch(

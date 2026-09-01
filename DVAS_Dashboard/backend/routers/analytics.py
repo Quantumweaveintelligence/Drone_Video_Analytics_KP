@@ -105,7 +105,7 @@ async def crowd_analytics(user: dict = Depends(get_current_user)):
 async def crowd_readings(user: dict = Depends(get_current_user), drone_id: str = "", limit: int = 50):
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
-    url = f"{CROWD_URL}/readings/latest?limit={limit}"
+    url = f"{CROWD_URL}/readings/history?limit={limit}"
     if drone_id:
         url += f"&drone_id={drone_id}"
     return await _analytics_get(url)
@@ -134,6 +134,116 @@ async def crowd_heatmap(user: dict = Depends(get_current_user), drone_id: str = 
 @router.get("/analytics/crowd/health")
 async def crowd_health(user: dict = Depends(get_current_user)):
     return await _analytics_get(f"{CROWD_URL}/health")
+
+
+@router.get("/analytics/crowd/annotated")
+async def crowd_annotated_frame(user: dict = Depends(get_current_user), drone_id: str = ""):
+    """
+    Proxy the latest heatmap-overlaid JPEG frame from crowd-analyzer.
+    Used by the Crowd Analytics live feed. Returns binary JPEG — NOT JSON.
+    """
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    try:
+        params = {"drone_id": drone_id} if drone_id else {}
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(f"{CROWD_URL}/annotated/latest", params=params)
+        if r.status_code == 200:
+            headers = {
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma":        "no-cache",
+                "Access-Control-Expose-Headers": "X-Crowd-Count, X-Density-Label, X-Drone-ID, X-Frame-Age",
+            }
+            for h in ["X-Drone-ID", "X-Frame-Age", "X-Crowd-Count", "X-Density-Label"]:
+                if h in r.headers:
+                    headers[h] = r.headers[h]
+            return Response(
+                content=r.content,
+                media_type="image/jpeg",
+                headers=headers,
+            )
+        raise HTTPException(r.status_code, "No live annotated frame available")
+    except httpx.RequestError:
+        raise HTTPException(503, "Crowd analyzer unavailable")
+
+
+@router.put("/analytics/crowd/model")
+async def crowd_switch_model(request: Request, user: dict = Depends(get_current_user)):
+    """Switch crowd model between CSRNet Part A (dense) and Part B (sparse)."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    body = await request.json()
+    result = await _analytics_post(f"{CROWD_URL}/model/switch", body)
+    if "error" not in result:
+        await write_audit_v2(
+            actor=user,
+            action="crowd_model_switch",
+            target=body.get("model_type", "unknown"),
+            target_type="configuration",
+            target_name=f"Crowd Model ({body.get('model_type', 'unknown')})",
+            details=f"Switched crowd model to {body.get('model_type')}",
+            source_endpoint="PUT /api/analytics/crowd/model",
+            request=request,
+        )
+    return result
+
+
+@router.get("/analytics/crowd/model")
+async def crowd_current_model(user: dict = Depends(get_current_user)):
+    """Get current active crowd model info."""
+    return await _analytics_get(f"{CROWD_URL}/model/current")
+
+
+@router.get("/analytics/crowd/session/summary")
+async def crowd_session_summary(user: dict = Depends(get_current_user)):
+    """Get session statistics: mean, min, max, std_dev, peak, density distribution."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{CROWD_URL}/session/summary")
+
+
+@router.get("/analytics/crowd/export/csv")
+async def crowd_export_csv(user: dict = Depends(get_current_user)):
+    """Download crowd analytics session data as CSV."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(f"{CROWD_URL}/export/csv")
+        if r.status_code == 200:
+            return Response(
+                content=r.content,
+                media_type="text/csv",
+                headers={"Content-Disposition": "attachment; filename=crowd_report.csv"},
+            )
+        raise HTTPException(r.status_code, "CSV export failed")
+    except httpx.RequestError:
+        raise HTTPException(503, "Crowd analyzer unavailable")
+
+
+@router.get("/analytics/crowd/export/pdf")
+async def crowd_export_pdf(
+    user: dict = Depends(get_current_user),
+    operator: str = "",
+    location: str = "",
+    mission_id: str = "",
+):
+    """Download crowd analytics mission report as PDF."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    try:
+        params = {k: v for k, v in {"operator": operator, "location": location, "mission_id": mission_id}.items() if v}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(f"{CROWD_URL}/export/pdf", params=params)
+        if r.status_code == 200:
+            return Response(
+                content=r.content,
+                media_type="application/pdf",
+                headers={"Content-Disposition": f"attachment; filename=crowd_mission_report_{mission_id or 'export'}.pdf"},
+            )
+        raise HTTPException(r.status_code, "PDF export failed")
+    except httpx.RequestError:
+        raise HTTPException(503, "Crowd analyzer unavailable")
 
 
 # ── Person Analytics ──────────────────────────────────────────────────────────
@@ -292,6 +402,14 @@ async def crowd_stream_start(user: dict = Depends(get_current_user)):
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     return await _analytics_get(f"{CROWD_URL}/stream/start")
+
+
+@router.get("/analytics/crowd/stream/stop")
+async def crowd_stream_stop(user: dict = Depends(get_current_user)):
+    """Stop the crowd analysis stream loop."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{CROWD_URL}/stream/stop")
 
 
 @router.get("/analytics/person/stream/start")
