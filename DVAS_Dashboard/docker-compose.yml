@@ -67,7 +67,7 @@ services:
       - "8765:8765"
     volumes:
       - edge_buffer:/app/buffer_storage
-      - ../videos:/data:ro
+      - ../videos:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:

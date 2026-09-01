@@ -285,6 +285,23 @@ class PipelineManager:
                 def _on_change_event(event: ChangeEvent) -> None:
                     if self.cognitive_selector is not None:
                         self.cognitive_selector.evaluate(event)
+                    elif self.server_send_enabled and self.sender_thread is not None:
+                        # Fallback: no cognitive selector — send change-detected frames directly
+                        if event.raw_frame is not None:
+                            try:
+                                import cv2 as _cv2
+                                h, w = event.raw_frame.shape[:2]
+                                if w > 1920:
+                                    resized = _cv2.resize(event.raw_frame, (1920, 1080), interpolation=_cv2.INTER_AREA)
+                                else:
+                                    resized = event.raw_frame
+                                ok, buf = _cv2.imencode(".jpg", resized, [_cv2.IMWRITE_JPEG_QUALITY, 80])
+                                if ok:
+                                    tel = self.source.get_current_telemetry() if self.source else {}
+                                    self.sender_thread.put_raw_frame(bytes(buf), telemetry=tel)
+                                    self.frames_selected += 1
+                            except Exception:
+                                pass
 
                 self.change_engine = ChangeDetectionEngine(
                     drone_id=drone_id,

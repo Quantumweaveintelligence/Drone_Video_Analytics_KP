@@ -193,7 +193,7 @@ change_detection:
 
 cognitive_frame_selector:
   # Set to false to disable (ChangeEvents still logged, just not scored further)
-  enabled: false
+  enabled: true
 
   # Mission identifier embedded in every SelectedFrame payload
   mission_id: "MISSION_DEFAULT"
