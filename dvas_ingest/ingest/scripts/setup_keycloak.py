@@ -38,7 +38,7 @@ OPERATORS = [
     {"username": "operator_003", "password": "Operator@003", "firstName": "Operator", "lastName": "Three", "role": "drone-operator"},
     {"username": "operator_004", "password": "Operator@004", "firstName": "Operator", "lastName": "Four", "role": "drone-operator"},
     {"username": "operator_005", "password": "Operator@005", "firstName": "Operator", "lastName": "Five", "role": "drone-operator"},
-    {"username": "admin_dvas", "password": "admin", "firstName": "System", "lastName": "Administrator", "email": "admin@dvas.kp", "role": "sys-admin"},
+    {"username": "admin_dvas", "password": "admin123", "firstName": "System", "lastName": "Administrator", "email": "admin@dvas.kp", "role": "sys-admin"},
     {"username": "control_001", "password": "Control@001", "firstName": "Control", "lastName": "Room", "email": "control@dvas.kp", "role": "control-room"},
     {"username": "senior_001", "password": "Senior@001", "firstName": "Senior", "lastName": "Officer", "email": "senior@dvas.kp", "role": "supervisor"},
 ]
@@ -98,34 +98,37 @@ def create_realm(base_url: str, token: str, realm: str) -> None:
         "realm":                   realm,
         "enabled":                 True,
         "displayName":             "Kerala Police Drone Operations",
-        "accessTokenLifespan":     300,    # 5 minutes
-        "refreshTokenMaxReuse":    0,
-        "bruteForceProtected":     True,
+        "accessTokenLifespan":     3600,   # 1 hour
+        "ssoSessionIdleTimeout":   86400,  # 24 hours
+        "ssoSessionMaxLifespan":   604800, # 7 days
     })
     if r.status_code == 409:
-        log(f"Realm '{realm}' already exists — skipping", "WARN")
+        log(f"Realm '{realm}' already exists — skipping creation", "WARN")
     else:
         r.raise_for_status()
         log(f"Realm '{realm}' created", "OK")
 
 
 def create_client(base_url: str, token: str, realm: str, client_id: str) -> str:
-    """Create the drone-ingest-client and return its UUID."""
+    """Create confidential client and return its client secret."""
     # Check if exists
     r = api("get", f"{base_url}/admin/realms/{realm}/clients?clientId={client_id}", token)
-    existing = r.json()
-    if existing:
-        client_uuid = existing[0]["id"]
-        log(f"Client '{client_id}' already exists (id={client_uuid}) — skipping", "WARN")
-        return client_uuid
+    if r.json():
+        uuid = r.json()[0]["id"]
+        log(f"Client '{client_id}' already exists (id={uuid})", "WARN")
+        return uuid
 
     r = api("post", f"{base_url}/admin/realms/{realm}/clients", token, json={
         "clientId":               client_id,
+        "name":                   "Drone Ingest Client",
+        "description":            "Confidential client for drone edge devices and operators",
         "enabled":                True,
         "clientAuthenticatorType": "client-secret",
-        "standardFlowEnabled":    False,
+        "secret":                 "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn",
         "directAccessGrantsEnabled": True,
-        "serviceAccountsEnabled":    False,
+        "serviceAccountsEnabled":  True,
+        "standardFlowEnabled":     True,
+        "implicitFlowEnabled":     False,
         "publicClient":           False,
         "protocol":               "openid-connect",
     })
@@ -185,7 +188,13 @@ def create_users(
         r = api("get", f"{base_url}/admin/realms/{realm}/users?username={username}", token)
         if r.json():
             user_id = r.json()[0]["id"]
-            log(f"User '{username}' already exists — skipping creation", "WARN")
+            # Ensure password is set/updated
+            api("put", f"{base_url}/admin/realms/{realm}/users/{user_id}/reset-password", token, json={
+                "type": "password",
+                "value": u["password"],
+                "temporary": False
+            })
+            log(f"User '{username}' already exists — password synchronized", "OK")
         else:
             r2 = api("post", f"{base_url}/admin/realms/{realm}/users", token, json={
                 "username":    username,
