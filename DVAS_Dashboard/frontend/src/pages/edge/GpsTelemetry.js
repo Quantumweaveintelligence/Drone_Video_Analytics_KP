@@ -22,21 +22,22 @@ export default function GpsTelemetry() {
   const [telemetry, setTelemetry] = useState({
     lat: KERALA_LAT,
     lng: KERALA_LNG,
-    alt: 120,
-    heading: 45,
-    speed: 12.5,
-    battery: 78,
-    signal: 92,
-    lastUpdate: new Date().toLocaleTimeString()
+    alt: 0,
+    heading: 0,
+    speed: 0,
+    battery: 0,
+    signal: 0,
+    gpsLock: false,
+    lastUpdate: '--:--:--'
   });
 
   const [path, setPath] = useState([{ lat: KERALA_LAT, lng: KERALA_LNG }]);
   const [history, setHistory] = useState(
     Array.from({ length: 30 }).map((_, i) => ({
       time: i,
-      alt: 120 + (Math.random() - 0.5) * 10,
-      speed: 12.5 + (Math.random() - 0.5) * 2,
-      battery: 100 - (30 - i) * 0.1
+      alt: 0,
+      speed: 0,
+      battery: 0
     }))
   );
 
@@ -75,44 +76,8 @@ export default function GpsTelemetry() {
           return;
         }
       } catch (err) {
-        // Fall through to existing mock simulation
+        // Edge API unavailable — keep current state, no simulated data
       }
-
-      setTelemetry(prev => {
-        const newLat = prev.lat + 0.0001 + (Math.random() - 0.5) * 0.00005;
-        const newLng = prev.lng + 0.0001 + (Math.random() - 0.5) * 0.00005;
-        const newAlt = prev.alt + (Math.random() - 0.5) * 2;
-        const newSpeed = prev.speed + (Math.random() - 0.5) * 1;
-        const newBattery = Math.max(0, prev.battery - 0.01);
-        
-        setPath(p => {
-          const newPath = [...p, { lat: newLat, lng: newLng }];
-          if (newPath.length > 30) newPath.shift();
-          return newPath;
-        });
-
-        setHistory(h => {
-          const newHist = [...h, {
-            time: h.length,
-            alt: newAlt,
-            speed: newSpeed,
-            battery: newBattery
-          }];
-          if (newHist.length > 30) newHist.shift();
-          return newHist;
-        });
-
-        return {
-          ...prev,
-          lat: newLat,
-          lng: newLng,
-          alt: newAlt,
-          speed: newSpeed,
-          battery: newBattery,
-          heading: (prev.heading + (Math.random() - 0.5) * 10) % 360,
-          lastUpdate: new Date().toLocaleTimeString()
-        };
-      });
     }, 1000);
     return () => clearInterval(timer);
   }, []);
@@ -181,8 +146,8 @@ export default function GpsTelemetry() {
               zoomControl={false}
             >
               <TileLayer
-                attribution='&copy; <a href="https://carto.com/">CartoDB</a>'
-                url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
+                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
               />
               
               {/* Flight path trail */}

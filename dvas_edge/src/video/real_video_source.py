@@ -70,24 +70,39 @@ def _parse_srt_telemetry(srt_content: str) -> Dict[int, dict]:
     """
     Parse DJI-style SRT subtitle content into a dict keyed by FrameCnt.
 
-    Each SRT block looks like:
+    Supports two DJI SRT formats:
+
+    **Format A — Multi-line (one key per line):**
         1
         00:00:00,000 --> 00:00:01,000
         FrameCnt: 0
         Timestamp: 2026-08-18 09:55:09.187
         latitude:   9.411869
         longitude: 77.073732
-        rel_alt: 760.146
-        abs_alt: 852.991
-        gb_yaw:   -61.1
-        gb_pitch: -61.1
-        gb_roll:    0.0
-        focal_len:   24.00
-        dzoom_ratio: 1.00
+
+    **Format B — Bracket-delimited (embedded subtitle track):**
+        1
+        00:00:00,000 --> 00:00:00,033
+        FrameCnt: 0 2026-08-18 09:55:09.187
+        [iso: 170] [shutter: 1/3200.0] [focal_len: 24.00] [dzoom_ratio: 1.00],
+        [latitude: 9.411869] [longitude: 77.073732]
+        [rel_alt: 760.146 abs_alt: 852.991]
+        [gb_yaw: -61.1 gb_pitch: -61.1 gb_roll: 0.0]
 
     Returns a dict: {frame_cnt_int: {telemetry_dict}}
     """
     result: Dict[int, dict] = {}
+
+    # Fields we want to extract (all numeric)
+    _NUMERIC_KEYS = {
+        'latitude', 'longitude', 'rel_alt', 'abs_alt',
+        'gb_yaw', 'gb_pitch', 'gb_roll', 'focal_len', 'dzoom_ratio',
+    }
+
+    # Regex for bracket-delimited key-value pairs: [key: value ...]
+    _BRACKET_RE = re.compile(r'\[([^\]]+)\]')
+    # Regex for individual "key: value" tokens inside a bracket group
+    _KV_TOKEN_RE = re.compile(r'(\w[\w_]*):\s*([-+]?\d*\.?\d+(?:/\d*\.?\d+)?)')
 
     # Split into SRT blocks (separated by blank lines)
     blocks = re.split(r'\n\s*\n', srt_content.strip())
@@ -99,6 +114,7 @@ def _parse_srt_telemetry(srt_content: str) -> Dict[int, dict]:
 
         telemetry: dict = {}
         frame_cnt: Optional[int] = None
+        has_brackets = '[' in block
 
         for line in lines:
             line = line.strip()
@@ -108,23 +124,42 @@ def _parse_srt_telemetry(srt_content: str) -> Dict[int, dict]:
             if '-->' in line:
                 continue
 
-            # Parse key: value pairs
+            # ── Try FrameCnt line (both formats) ──────────────────────
+            # Format A: "FrameCnt: 0"
+            # Format B: "FrameCnt: 0 2026-08-18 09:55:09.187"
+            fc_match = re.match(r'^[Ff]rame[Cc]nt:\s*(\d+)', line)
+            if fc_match:
+                frame_cnt = int(fc_match.group(1))
+                telemetry['frame_cnt'] = frame_cnt
+                # Extract timestamp if present on same line
+                ts_match = re.search(r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+)', line)
+                if ts_match:
+                    telemetry['srt_timestamp'] = ts_match.group(1)
+                continue
+
+            # ── Format B: bracket-delimited fields ────────────────────
+            if has_brackets:
+                for bracket_match in _BRACKET_RE.finditer(line):
+                    bracket_content = bracket_match.group(1)
+                    for kv_match in _KV_TOKEN_RE.finditer(bracket_content):
+                        key = kv_match.group(1).lower()
+                        val_str = kv_match.group(2)
+                        if key in _NUMERIC_KEYS:
+                            try:
+                                telemetry[key] = float(val_str)
+                            except ValueError:
+                                telemetry[key] = 0.0
+                continue
+
+            # ── Format A: plain "key: value" lines ────────────────────
             match = re.match(r'^(\w[\w_]*):\s*(.+)$', line)
             if match:
                 key = match.group(1).strip().lower()
                 value_str = match.group(2).strip()
 
-                if key == 'framecnt':
-                    try:
-                        frame_cnt = int(value_str)
-                        telemetry['frame_cnt'] = frame_cnt
-                    except ValueError:
-                        pass
-                elif key == 'timestamp':
+                if key == 'timestamp':
                     telemetry['srt_timestamp'] = value_str
-                elif key in ('latitude', 'longitude', 'rel_alt', 'abs_alt',
-                             'gb_yaw', 'gb_pitch', 'gb_roll', 'focal_len',
-                             'dzoom_ratio'):
+                elif key in _NUMERIC_KEYS:
                     try:
                         telemetry[key] = float(value_str)
                     except ValueError:
