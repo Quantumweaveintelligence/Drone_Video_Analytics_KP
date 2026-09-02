@@ -104,9 +104,16 @@ _health_lock = asyncio.Lock()
 async def _proxy_get(path: str, timeout: float = 5.0) -> dict:
     """Fire a GET to the ingest server and return the JSON response."""
     url = f"{INGEST_SERVER_URL}{path}"
+    headers = {}
+    svc_token = await _get_service_token()
+    if svc_token:
+        headers["Authorization"] = f"Bearer {svc_token}"
+    print(f"PROXY GET {url} - Token starts with: {svc_token[:10] if svc_token else 'NONE'}")
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(url)
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                print(f"PROXY GET FAILED: {resp.status_code} - {resp.text}")
             resp.raise_for_status()
             return resp.json()
     except httpx.ConnectError:
@@ -120,9 +127,13 @@ async def _proxy_get(path: str, timeout: float = 5.0) -> dict:
 async def _proxy_get_text(path: str, timeout: float = 5.0) -> str:
     """Fire a GET to the ingest server and return raw text."""
     url = f"{INGEST_SERVER_URL}{path}"
+    headers = {}
+    svc_token = await _get_service_token()
+    if svc_token:
+        headers["Authorization"] = f"Bearer {svc_token}"
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(url)
+            resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             return resp.text
     except httpx.ConnectError:

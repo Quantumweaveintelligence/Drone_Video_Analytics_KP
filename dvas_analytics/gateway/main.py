@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import AsyncGenerator, Dict, Any, Optional
 
 import httpx
-from fastapi import FastAPI, Query
+from fastapi import Depends, FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, PlainTextResponse
 
@@ -28,6 +28,7 @@ from shared.db import (
     get_recent_confirmed_events, get_recent_plates,
 )
 from shared.redis_client import close_client, get_client
+from shared.auth import verify_service_key
 
 logging.basicConfig(
     level=cfg.LOG_LEVEL,
@@ -107,7 +108,7 @@ async def health_all():
 
 # ── Unified Summary ──────────────────────────────────────────────────────────
 
-@app.get("/summary")
+@app.get("/summary", dependencies=[Depends(verify_service_key)])
 async def summary():
     """
     Unified real-time stats snapshot for the dashboard header cards.
@@ -159,7 +160,7 @@ async def summary():
 
 # ── Dashboard Live Data ───────────────────────────────────────────────────────
 
-@app.get("/dashboard/live")
+@app.get("/dashboard/live", dependencies=[Depends(verify_service_key)])
 async def dashboard_live():
     """
     Combined live data snapshot for dashboard initial load.
@@ -198,7 +199,7 @@ async def dashboard_live():
 
 # ── SSE Event Stream ─────────────────────────────────────────────────────────
 
-@app.get("/events/stream")
+@app.get("/events/stream", dependencies=[Depends(verify_service_key)])
 async def events_stream(drone_id: Optional[str] = Query(default=None)):
     """
     SSE endpoint multiplexing all analytics Redis streams.

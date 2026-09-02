@@ -389,7 +389,7 @@ services:
     networks: [drone-net]
     restart: unless-stopped
     ports:
-      - "0.0.0.0:8101:8101"   # REST API — crowd analysis
+      - "127.0.0.1:8101:8101"   # REST API — crowd analysis (localhost only, Issue #6)
     environment:
       DATABASE_URL:          postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
       REDIS_URL:             redis://valkey:6379/0
@@ -397,6 +397,7 @@ services:
       MODEL_PATH:            /analytics/crowd/models/PartAmodel_best.pth
       CROWD_ALERT_THRESHOLD: "${CROWD_ALERT_THRESHOLD:-50}"
       LOG_LEVEL:             INFO
+      ANALYTICS_SERVICE_KEY: "${ANALYTICS_SERVICE_KEY}"
       MINIO_ENDPOINT:        minio:9000
       MINIO_ACCESS_KEY:      "${MINIO_ACCESS_KEY:-minioadmin}"
       MINIO_SECRET_KEY:      "${MINIO_SECRET_KEY:-minioadmin}"
@@ -435,7 +436,7 @@ services:
     networks: [drone-net]
     restart: unless-stopped
     ports:
-      - "0.0.0.0:8102:8102"   # REST API — person/face analysis
+      - "127.0.0.1:8102:8102"   # REST API — person/face analysis (localhost only, Issue #6)
     environment:
       DATABASE_URL: postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
       REDIS_URL:    redis://valkey:6379/0
@@ -443,6 +444,7 @@ services:
       PERSON_MODEL: /analytics/person/models/yolov8m.pt
       FACE_MODEL:   /analytics/person/models/yolov8n-face.pt
       LOG_LEVEL:    INFO
+      ANALYTICS_SERVICE_KEY: "${ANALYTICS_SERVICE_KEY}"
       MINIO_ENDPOINT:   minio:9000
       MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-minioadmin}"
       MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-minioadmin}"
@@ -450,6 +452,7 @@ services:
       BUCKET_FACES:     dvas-faces
       BUCKET_EVIDENCE:  dvas-evidence
       REID_CLUSTER_INTERVAL: "${REID_CLUSTER_INTERVAL:-50}"
+      FACE_VECTOR_ENCRYPTION_KEY: "${FACE_VECTOR_ENCRYPTION_KEY}"
     deploy:
       resources:
         reservations:
@@ -482,13 +485,14 @@ services:
     networks: [drone-net]
     restart: unless-stopped
     ports:
-      - "0.0.0.0:8103:8103"   # REST API — vehicle detection
+      - "127.0.0.1:8103:8103"   # REST API — vehicle detection (localhost only, Issue #6)
     environment:
       DATABASE_URL:  postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
       REDIS_URL:     redis://valkey:6379/0
       DRONE_IDS:     "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005,DRN-001,DRN-002,DRN-003,DRN-004,DRN-005}"
       VEHICLE_MODEL: /analytics/vehicle/models/visdrone.pt
       LOG_LEVEL:     INFO
+      ANALYTICS_SERVICE_KEY: "${ANALYTICS_SERVICE_KEY}"
       MINIO_ENDPOINT:   minio:9000
       MINIO_PUBLIC_URL: "http://localhost:9000"
       MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-minioadmin}"
@@ -529,7 +533,7 @@ services:
     networks: [drone-net]
     restart: unless-stopped
     ports:
-      - "0.0.0.0:8104:8104"   # REST API — ANPR + watchlist management
+      - "127.0.0.1:8104:8104"   # REST API — ANPR + watchlist management (localhost only, Issue #6)
     environment:
       DATABASE_URL:  postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
       REDIS_URL:     redis://valkey:6379/0
@@ -537,6 +541,7 @@ services:
       VEHICLE_MODEL: /analytics/anpr/models/visdrone.pt
       LP_MODEL:      /analytics/anpr/models/license_plate_detector.pt
       LOG_LEVEL:     INFO
+      ANALYTICS_SERVICE_KEY: "${ANALYTICS_SERVICE_KEY}"
       MINIO_ENDPOINT:   minio:9000
       MINIO_PUBLIC_URL: "http://localhost:9000"
       MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-minioadmin}"
@@ -636,7 +641,7 @@ services:
     networks: [drone-net]
     restart: unless-stopped
     ports:
-      - "0.0.0.0:8100:8100"   # Unified analytics API for dashboard
+      - "127.0.0.1:8100:8100"   # Unified analytics API for dashboard (localhost only, Issue #6)
     environment:
       DATABASE_URL: postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
       REDIS_URL:    redis://valkey:6379/0
@@ -649,6 +654,8 @@ services:
       MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-minioadmin}"
       MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-minioadmin}"
       LOG_LEVEL:    INFO
+      ANALYTICS_SERVICE_KEY: "${ANALYTICS_SERVICE_KEY}"
+      FACE_VECTOR_ENCRYPTION_KEY: "${FACE_VECTOR_ENCRYPTION_KEY}"
     depends_on:
       postgres:
         condition: service_healthy

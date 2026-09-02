@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import engine
 from models import Mission
 from core.security import get_current_user, _row_to_dict
-from core.analytics_client import _analytics_get, _analytics_post, _analytics_delete
+from core.analytics_client import _analytics_get, _analytics_post, _analytics_delete, _service_headers
 from core.config import (
     ANALYTICS_BASE, CROWD_URL, PERSON_URL, VEHICLE_URL, ANPR_URL,
 )
@@ -67,7 +67,7 @@ async def analytics_events_stream(request: Request, drone_id: str = ""):
     async def event_generator():
         try:
             async with httpx.AsyncClient() as client:
-                async with client.stream("GET", upstream_url, timeout=None) as resp:
+                async with client.stream("GET", upstream_url, timeout=None, headers=_service_headers()) as resp:
                     async for line in resp.aiter_lines():
                         if await request.is_disconnected():
                             break

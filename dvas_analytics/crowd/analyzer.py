@@ -116,17 +116,35 @@ class CrowdAnalyzer:
             return 'csrnet_partb'
         return 'csrnet'
 
+    # SHA-256 hashes of trusted model files that use legacy pickle format
+    # and cannot load with weights_only=True. Any model NOT on this list
+    # must load with weights_only=True (Issue #15).
+    _TRUSTED_MODEL_HASHES = frozenset({
+        "68383c1053be371ad54b0061ab99fed08c2bfff39de73937f2a4388041ab0128",  # PartAmodel_best.pth
+    })
+
     def _load_model(self, path):
         try:
             logger.info(f"Loading CSRNet model from {path} to {self.device}")
+
+            # Security: compute model file hash for integrity auditing
+            import hashlib
+            with open(path, "rb") as f:
+                file_hash = hashlib.sha256(f.read()).hexdigest()
+            logger.info(f"Model file SHA-256: {file_hash}")
+
             model = CSRNet(load_weights=True).to(self.device)
-            
-            try:
+
+            # Security (Issue #15): Only trusted, hash-verified models may use
+            # weights_only=False. Unknown models must use weights_only=True to
+            # prevent arbitrary code execution via malicious pickle payloads.
+            if file_hash in self._TRUSTED_MODEL_HASHES:
+                logger.info("Model hash matches trusted allowlist — loading with legacy pickle")
                 checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-            except Exception:
-                # Fallback for older environments
-                checkpoint = torch.load(path, map_location=self.device)
-                
+            else:
+                logger.info("Model hash NOT in trusted allowlist — loading with weights_only=True")
+                checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+
             if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
                 model.load_state_dict(checkpoint['state_dict'])
             else:

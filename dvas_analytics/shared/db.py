@@ -522,18 +522,20 @@ async def write_face_embedding(
     object_key: Optional[str] = None,
     mission_id: Optional[str] = None,
 ) -> str:
+    from shared.crypto import encrypt_vector
     pool = await get_pool()
     emb_id = str(uuid.uuid4())
+    encrypted_emb = encrypt_vector(embedding)
     await pool.execute(
         """
         INSERT INTO face_embeddings
-            (id, track_id, image_path, embedding, drone_id, object_key, mission_id, created_at)
-        VALUES ($1::uuid, $2::uuid, $3, $4::float4[], $5, $6, $7, now())
+            (id, track_id, image_path, encrypted_embedding, drone_id, object_key, mission_id, created_at)
+        VALUES ($1::uuid, $2::uuid, $3, $4::bytea, $5, $6, $7, now())
         """,
         emb_id,
         track_id,
         image_path,
-        embedding,
+        encrypted_emb,
         drone_id,
         object_key,
         mission_id,
@@ -542,24 +544,35 @@ async def write_face_embedding(
 
 
 async def get_all_face_embeddings() -> List[Dict]:
+    from shared.crypto import decrypt_vector
     pool = await get_pool()
     rows = await pool.fetch(
         """
-        SELECT id, track_id, image_path, embedding, drone_id, cluster_id,
+        SELECT id, track_id, image_path, encrypted_embedding, drone_id, cluster_id,
                is_duplicate, object_key, mission_id, created_at
         FROM face_embeddings
         ORDER BY created_at
         """
     )
-    return [dict(r) for r in rows]
+    results = []
+    for r in rows:
+        d = dict(r)
+        raw = d.pop("encrypted_embedding", None)
+        if raw:
+            d["embedding"] = decrypt_vector(raw)
+        else:
+            d["embedding"] = []
+        results.append(d)
+    return results
 
 
 async def get_face_embeddings_by_mission(mission_id: str) -> List[Dict]:
     """Get face embeddings scoped to a specific mission."""
+    from shared.crypto import decrypt_vector
     pool = await get_pool()
     rows = await pool.fetch(
         """
-        SELECT id, track_id, image_path, embedding, drone_id, cluster_id,
+        SELECT id, track_id, image_path, encrypted_embedding, drone_id, cluster_id,
                is_duplicate, object_key, mission_id, created_at
         FROM face_embeddings
         WHERE mission_id = $1
@@ -567,7 +580,16 @@ async def get_face_embeddings_by_mission(mission_id: str) -> List[Dict]:
         """,
         mission_id,
     )
-    return [dict(r) for r in rows]
+    results = []
+    for r in rows:
+        d = dict(r)
+        raw = d.pop("encrypted_embedding", None)
+        if raw:
+            d["embedding"] = decrypt_vector(raw)
+        else:
+            d["embedding"] = []
+        results.append(d)
+    return results
 
 
 async def get_distinct_missions_face_embeddings() -> List[Dict]:

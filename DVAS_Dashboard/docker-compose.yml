@@ -50,6 +50,7 @@ services:
       - KC_CLIENT_ID=drone-ingest-client
       - ADMIN_CLIENT_ID=dvas-admin-service
       - ADMIN_CLIENT_SECRET=MvusAlJk9DMnfe6GVOwuni8ODQbES938
+      - ANALYTICS_SERVICE_KEY=${ANALYTICS_SERVICE_KEY}
     depends_on:
       postgres:
         condition: service_healthy

@@ -29,21 +29,6 @@ from config import (
     JWKS_URL,
 )
 
-import os
-
-def is_skip_auth_allowed() -> bool:
-    """Check if SKIP_AUTH is allowed. Strictly disallowed in any production environment."""
-    env = os.getenv("ENV", os.getenv("ENVIRONMENT", "development")).strip().lower()
-    if env.startswith("prod") or env in ("production", "prod", "live"):
-        if os.getenv("SKIP_AUTH", "false").lower() == "true":
-            logging.getLogger(__name__).critical(
-                "SECURITY ALERT: SKIP_AUTH was set to true in production environment ('%s')! Forcing SKIP_AUTH=False.",
-                env
-            )
-        return False
-    return os.getenv("SKIP_AUTH", "false").lower() == "true"
-
-SKIP_AUTH: bool = is_skip_auth_allowed()
 log = logging.getLogger(__name__)
 
 # ── JWKS cache ────────────────────────────────────────────────────────────────
@@ -97,14 +82,6 @@ _bearer = HTTPBearer(
 
 async def validate_token_string(token: str) -> dict:
     """Validate a raw JWT token string against Keycloak JWKS and verify role."""
-    if is_skip_auth_allowed():
-        log.info("skip_auth_enabled — bypassing JWT validation (demo mode)")
-        return {
-            "sub": "demo-operator",
-            "preferred_username": "demo_operator",
-            "realm_access": {"roles": ["drone-operator", "sys-admin"]},
-        }
-
     try:
         jwks = await get_jwks()
         payload = jwt.decode(

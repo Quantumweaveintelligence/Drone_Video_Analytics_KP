@@ -39,8 +39,14 @@ async def _telemetry_pump():
             # ── 1. Fetch real telemetry from the ingest server ─────────────────
             real_drones: dict[str, dict] = {}  # drone_id → telemetry dict
             try:
+                from ingest_proxy import _get_service_token
+                headers = {}
+                svc_token = await _get_service_token()
+                if svc_token:
+                    headers["Authorization"] = f"Bearer {svc_token}"
+
                 async with _httpx.AsyncClient(timeout=2.0) as client:
-                    resp = await client.get(f"{INGEST_URL_local}/ingest/telemetry")
+                    resp = await client.get(f"{INGEST_URL_local}/ingest/telemetry", headers=headers)
                     if resp.status_code == 200:
                         data = resp.json()
                         for d in data.get("drones", []):

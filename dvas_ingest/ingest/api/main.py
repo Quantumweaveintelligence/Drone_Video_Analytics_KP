@@ -359,6 +359,19 @@ async def ingest_frame(
             f"Frame {len(data)//1024} KB exceeds limit {MAX_FRAME_BYTES//1024//1024} MB",
         )
 
+    # ── Binary magic-byte verification (Issue #9) ────────────────────────────
+    # Validates actual file content regardless of Content-Type header to prevent
+    # malformed payloads from crashing downstream OpenCV analytics workers.
+    _JPEG_MAGIC = b"\xFF\xD8\xFF"
+    _PNG_MAGIC  = b"\x89PNG\r\n\x1a\n"
+    if not (data.startswith(_JPEG_MAGIC) or data.startswith(_PNG_MAGIC)):
+        _record_rejection(drone_id)
+        FRAMES_RECEIVED.labels(drone_id=drone_id, status="rejected_magic").inc()
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Invalid image: binary header does not match JPEG or PNG magic bytes",
+        )
+
     # ── Publish to Redis Stream ───────────────────────────────────────────────
     try:
         msg_id = await _publish_frame(drone_id, meta.model_dump(), data)
@@ -798,10 +811,11 @@ async def get_active_streams():
     summary = "Latest telemetry for all active drones",
     tags    = ["Telemetry"],
 )
-async def get_telemetry():
+async def get_telemetry(claims: dict = Depends(validate_token_flexible)):
     """
     Returns cached latest telemetry (GPS, battery, speed, etc.) for every drone
     that has sent at least one frame since server startup.
+    Requires valid JWT with an authorized role (drone-operator or sys-admin).
     """
     return {"drones": list(_latest_metadata.values()), "count": len(_latest_metadata)}
 

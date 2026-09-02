@@ -15,13 +15,14 @@ from typing import Optional, Dict
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 sys.path.insert(0, "/analytics")
 from shared.config import cfg, get_drone_aliases
+from shared.auth import verify_service_key
 from shared.db import (
     close_pool, ensure_drone, get_pool, upsert_track,
     write_confirmed_event, write_plate_read,
@@ -932,7 +933,7 @@ class WatchlistAddRequest(BaseModel):
     case_ref: Optional[str] = None
 
 
-@app.post("/watchlist/add")
+@app.post("/watchlist/add", dependencies=[Depends(verify_service_key)])
 async def watchlist_add(req: WatchlistAddRequest):
     await add_to_watchlist(req.plate_text, req.reason)
     if analyzer:
@@ -940,7 +941,7 @@ async def watchlist_add(req: WatchlistAddRequest):
     return {"status": "added", "plate": req.plate_text.upper().strip()}
 
 
-@app.delete("/watchlist/{plate}")
+@app.delete("/watchlist/{plate}", dependencies=[Depends(verify_service_key)])
 async def watchlist_remove(plate: str):
     await remove_from_watchlist(plate)
     if analyzer:
