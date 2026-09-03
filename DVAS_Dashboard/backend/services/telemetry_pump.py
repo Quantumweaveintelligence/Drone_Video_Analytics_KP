@@ -22,7 +22,7 @@ async def _telemetry_pump():
     3. Falls back to small simulated drift for DB drones not seen in the ingest server.
     """
     import httpx as _httpx
-    INGEST_URL_local = os.environ.get("INGEST_SERVER_URL", "http://10.51.27.250:8000")
+    INGEST_URL_local = INGEST_URL
 
     alert_types = [
         "crowd_surge",

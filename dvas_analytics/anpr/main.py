@@ -326,6 +326,7 @@ async def _stream_loop():
     try:
         last_ids = {d: "0" for d in cfg.DRONE_IDS}
         active_drones = list(cfg.DRONE_IDS)
+        active_drone_missions: dict = {}
         log.info("ANPR stream loop started for drones: %s", cfg.DRONE_IDS)
     except Exception as exc:
         log.error("ANPR stream loop FAILED to initialize: %s", exc, exc_info=True)
@@ -367,15 +368,7 @@ async def _stream_loop():
                     if frame is None:
                         continue
 
-                    _frames_processed += 1
-                    result = analyzer.analyze_frame(frame, drone_id=drone_id)
-                    if _frames_processed % 50 == 1 or result.get("plates_read", 0) > 0:
-                        log.info("ANPR [%s]: frame #%d done — vehicles=%d plates_read=%d inference_ms=%.0f",
-                                 drone_id, _frames_processed, result.get("total_vehicles", 0),
-                                 result.get("plates_read", 0), result.get("inference_ms", 0))
-                    ts     = datetime.now(timezone.utc)
-
-                    # Extract mission_id from stream frame metadata
+                    # Extract mission_id from stream frame metadata first
                     import json as _json
                     frame_mission_id = None
                     raw_meta = f.get("metadata", "")
@@ -387,6 +380,28 @@ async def _stream_loop():
                             frame_mission_id = meta_dict.get("mission_id")
                         except Exception:
                             pass
+
+                    # Detect mission transition per drone to evict stale cache & tracks
+                    if frame_mission_id:
+                        old_m = active_drone_missions.get(drone_id)
+                        if old_m and old_m != frame_mission_id:
+                            log.info("ANPR stream loop: mission change on %s (%s -> %s), flushing old cache",
+                                     drone_id, old_m, frame_mission_id)
+                            stale_keys = [k for k, v in _recent_plate_cache.items()
+                                          if v.get("drone_id") == drone_id and v.get("mission_id") == old_m]
+                            for k in stale_keys:
+                                _recent_plate_cache.pop(k, None)
+                            if analyzer:
+                                analyzer.reset_drone(drone_id, frame_mission_id)
+                        active_drone_missions[drone_id] = frame_mission_id
+
+                    _frames_processed += 1
+                    result = analyzer.analyze_frame(frame, drone_id=drone_id, mission_id=frame_mission_id)
+                    if _frames_processed % 50 == 1 or result.get("plates_read", 0) > 0:
+                        log.info("ANPR [%s]: frame #%d done — vehicles=%d plates_read=%d inference_ms=%.0f",
+                                 drone_id, _frames_processed, result.get("total_vehicles", 0),
+                                 result.get("plates_read", 0), result.get("inference_ms", 0))
+                    ts     = datetime.now(timezone.utc)
 
                     # ── Annotate frame and cache for dashboard ─────────────────
                     import time as _time
@@ -400,10 +415,15 @@ async def _stream_loop():
                     # ── Update live in-memory plate cache (for /plates/live) ────
                     import time as _time2
                     for plate in result.get("plate_reads", []):
-                        cache_key = f"{drone_id}:{plate['tracker_id']}"
+                        m_key = frame_mission_id or "default"
+                        cache_key = f"{drone_id}:{m_key}:{plate['tracker_id']}"
                         existing  = _recent_plate_cache.get(cache_key, {})
                         plate_text = plate.get("plate_text") or existing.get("plate_text", "")
-                        
+
+                        # Synchronized fresh crops from current detection take precedence
+                        veh_img = plate.get("vehicle_image_b64") or existing.get("vehicle_image_b64")
+                        plate_img = plate.get("plate_crop_b64") or existing.get("plate_crop_b64")
+
                         _recent_plate_cache[cache_key] = {
                             "plate_text":        plate_text,
                             "ocr_confidence":    plate.get("ocr_confidence") or existing.get("ocr_confidence", 0.0),
@@ -412,8 +432,8 @@ async def _stream_loop():
                             "mission_id":        frame_mission_id or existing.get("mission_id"),
                             "tracker_id":        plate.get("tracker_id"),
                             "vehicle_type":      plate.get("vehicle_type", "vehicle"),
-                            "vehicle_image_b64": plate.get("vehicle_image_b64") or existing.get("vehicle_image_b64"),
-                            "plate_crop_b64":    plate.get("plate_crop_b64") or existing.get("plate_crop_b64"),
+                            "vehicle_image_b64": veh_img,
+                            "plate_crop_b64":    plate_img,
                             "vehicle_bbox":      plate.get("vehicle_bbox") or existing.get("vehicle_bbox"),
                             "plate_bbox":        plate.get("plate_bbox") or existing.get("plate_bbox"),
                             "is_watchlisted":    plate.get("is_watchlisted", False),
@@ -431,7 +451,7 @@ async def _stream_loop():
                             tracker_id=tracker_id, mission_id=frame_mission_id
                         )
                         plate_image_key = None
-                        plate_crop_b64  = plate.pop("plate_crop_b64", None)
+                        plate_crop_b64  = plate.get("plate_crop_b64")
                         if plate_crop_b64:
                             plate_bytes_data = base64.b64decode(plate_crop_b64)
                             key = minio.make_key(
@@ -445,7 +465,7 @@ async def _stream_loop():
 
                         # Upload vehicle image if available
                         vehicle_image_key = None
-                        veh_img_b64 = plate.pop("vehicle_image_b64", None)
+                        veh_img_b64 = plate.get("vehicle_image_b64")
                         if veh_img_b64:
                             veh_bytes_data = base64.b64decode(veh_img_b64)
                             key = minio.make_key(
@@ -456,6 +476,7 @@ async def _stream_loop():
                             vehicle_image_key = await minio.upload_bytes(
                                 cfg.BUCKET_VEHICLES, key, veh_bytes_data, "image/jpeg"
                             )
+
 
                         await write_plate_read(
                             track_id=track_id, event_id=None,
@@ -556,6 +577,30 @@ async def stream_stop():
         _stream_task = None
     log.info("ANPR stream loop STOPPED")
     return {"status": "stopped", "frames_processed": _frames_processed}
+
+
+@app.post("/stream/reset")
+@app.get("/stream/reset")
+async def stream_reset(drone_id: str = "", mission_id: str = ""):
+    """Reset in-memory cache and tracking state for a given drone or all drones."""
+    global _recent_plate_cache, _last_annotated, _last_annotated_ts
+    if drone_id:
+        stale = [k for k, v in _recent_plate_cache.items() if v.get("drone_id") == drone_id]
+        for k in stale:
+            _recent_plate_cache.pop(k, None)
+        _last_annotated.pop(drone_id, None)
+        _last_annotated_ts.pop(drone_id, None)
+        if analyzer:
+            analyzer.reset_drone(drone_id, mission_id or None)
+    else:
+        _recent_plate_cache.clear()
+        _last_annotated.clear()
+        _last_annotated_ts.clear()
+        if analyzer:
+            for d in list(analyzer._drone_tracks.keys()):
+                analyzer.reset_drone(d, mission_id or None)
+    log.info("ANPR stream reset completed for drone='%s' mission='%s'", drone_id, mission_id)
+    return {"status": "reset", "drone_id": drone_id, "mission_id": mission_id}
 
 
 # ── Annotated frame endpoint ───────────────────────────────────────────────────
@@ -679,16 +724,16 @@ async def live_plates(drone_id: str = "", mission_id: str = "", limit: int = 50)
     """
     import time as _t
     now = _t.monotonic()
-    MAX_AGE = 30.0  # drop entries older than 30 seconds
+    MAX_AGE = 20.0  # drop entries older than 20 seconds
 
     results = []
     for entry in _recent_plate_cache.values():
         age = now - entry.get("_cache_ts", 0)
         if age > MAX_AGE:
             continue
-        if mission_id and entry.get("mission_id") != mission_id:
+        if mission_id and entry.get("mission_id") and entry.get("mission_id") != mission_id:
             continue
-        if not mission_id and drone_id and entry.get("drone_id") != drone_id:
+        if drone_id and entry.get("drone_id") != drone_id:
             continue
         results.append(entry)
 

@@ -9,6 +9,8 @@ KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "http://keycloak:8080")
 KEYCLOAK_REALM = os.environ.get("KC_REALM", "kerala-police-drone")
 KEYCLOAK_CLIENT_ID = os.environ.get("KC_CLIENT_ID", "drone-ingest-client")
 KEYCLOAK_CLIENT_SECRET = os.environ.get("KC_CLIENT_SECRET", "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn")
+ADMIN_CLIENT_ID = os.environ.get("ADMIN_CLIENT_ID", "dvas-admin-service")
+ADMIN_CLIENT_SECRET = os.environ.get("ADMIN_CLIENT_SECRET", "MvusAlJk9DMnfe6GVOwuni8ODQbES938")
 KEYCLOAK_ADMIN = os.environ.get("KEYCLOAK_ADMIN", "admin")
 
 # ---------- Analytics microservices ----------

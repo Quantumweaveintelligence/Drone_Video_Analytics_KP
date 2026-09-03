@@ -34,14 +34,22 @@ from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSo
 
 logger = logging.getLogger("dvas.ingest_proxy")
 
+from core.config import (
+    KEYCLOAK_URL,
+    KEYCLOAK_REALM,
+    ADMIN_CLIENT_ID,
+    ADMIN_CLIENT_SECRET,
+    INGEST_URL,
+)
+
 # ── Configuration ─────────────────────────────────────────────────────────────
-INGEST_SERVER_URL = os.environ.get("INGEST_SERVER_URL", "http://localhost:8000")
+INGEST_SERVER_URL = INGEST_URL
 
 # Keycloak service-token config — uses dvas-admin-service (serviceAccountsEnabled)
-_KC_URL           = os.environ.get("KEYCLOAK_URL", "http://keycloak:8080")
-_KC_REALM         = os.environ.get("KC_REALM", "kerala-police-drone")
-_KC_CLIENT_ID     = os.environ.get("ADMIN_CLIENT_ID", "dvas-admin-service")
-_KC_CLIENT_SECRET = os.environ.get("ADMIN_CLIENT_SECRET", "MvusAlJk9DMnfe6GVOwuni8ODQbES938")
+_KC_URL           = KEYCLOAK_URL
+_KC_REALM         = KEYCLOAK_REALM
+_KC_CLIENT_ID     = ADMIN_CLIENT_ID
+_KC_CLIENT_SECRET = ADMIN_CLIENT_SECRET
 
 # ── Service-token cache ────────────────────────────────────────────────────────
 # Cached (token, expiry_epoch) for the backend's own Keycloak service account.

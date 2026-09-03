@@ -129,7 +129,7 @@ function useJpegPoller(url, intervalMs, enabled) {
   const doFetch = useCallback(async () => {
     if (!enabled || !url) return;
     try {
-      const token = localStorage.getItem('dvas_token') || '';
+      const token = localStorage.getItem('dvas_token') || localStorage.getItem('token') || '';
       const sep = url.includes('?') ? '&' : '?';
       const res = await fetch(`${url}${sep}_t=${Date.now()}`, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -542,29 +542,52 @@ function ANPRWindow({ plates, activeDrone, activeMissionId, anprStreamRunning })
   const { data: livePlates } = usePoll(liveUrl, 3000);
 
   // Merge DB plates (from /plates/recent) with live in-memory plates.
-  // Live cache has b64 images; DB has presigned URLs.
-  // When merging, never let null/empty DB fields overwrite existing live data.
-  const dbArr   = plates?.plates  || [];
-  const liveArr = livePlates?.plates || [];
+  // Scoped strictly by mission_id and drone_id to prevent cross-mission bleed.
+  const rawDbArr   = plates?.plates  || [];
+  const rawLiveArr = livePlates?.plates || [];
+
+  // Filter out any plates from other missions if activeMissionId is set
+  const dbArr = activeMissionId
+    ? rawDbArr.filter(p => !p.mission_id_str || p.mission_id_str === activeMissionId)
+    : rawDbArr;
+
+  const liveArr = activeMissionId
+    ? rawLiveArr.filter(p => !p.mission_id || p.mission_id === activeMissionId)
+    : rawLiveArr;
 
   const mergedMap = new Map();
+  // Insert live plates first (they hold fresh synchronized b64 crops)
   for (const p of liveArr) {
-    const key = `${p.drone_id}:${p.tracker_id ?? p.plate_text}`;
-    mergedMap.set(key, p);
+    const mId = p.mission_id || activeMissionId || 'live';
+    const key = `${p.drone_id || activeDrone || ''}:${mId}:${p.tracker_id != null ? p.tracker_id : (p.plate_text || '')}`;
+    mergedMap.set(key, { ...p });
   }
+
+  // Merge DB records into existing live items or add them
   for (const p of dbArr) {
-    const key = `${p.drone_id}:${p.tracker_id ?? p.plate_text}`;
-    const existing = mergedMap.get(key) || {};
-    // Only spread non-null, non-empty values from DB record
-    const cleaned = {};
-    for (const [k, v] of Object.entries(p)) {
-      if (v !== null && v !== undefined && v !== '') cleaned[k] = v;
+    const mId = p.mission_id_str || p.mission_id || activeMissionId || 'db';
+    const key = `${p.drone_id || activeDrone || ''}:${mId}:${p.tracker_id != null ? p.tracker_id : (p.plate_text || '')}`;
+    const existing = mergedMap.get(key);
+    if (!existing) {
+      mergedMap.set(key, { ...p });
+    } else {
+      // Enrich with presigned URLs or metadata only if missing in live item
+      const merged = { ...existing };
+      if (p.plate_image_url && !merged.plate_crop_b64) merged.plate_image_url = p.plate_image_url;
+      if (p.vehicle_image_url && !merged.vehicle_image_b64) merged.vehicle_image_url = p.vehicle_image_url;
+      if (p.plate_image_key && !merged.plate_crop_b64) merged.plate_image_key = p.plate_image_key;
+      if (p.vehicle_image_key && !merged.vehicle_image_b64) merged.vehicle_image_key = p.vehicle_image_key;
+      if (p.plate_text && !merged.plate_text) merged.plate_text = p.plate_text;
+      if (p.ocr_confidence && !merged.ocr_confidence) merged.ocr_confidence = p.ocr_confidence;
+      if (p.vehicle_type && (!merged.vehicle_type || merged.vehicle_type === 'vehicle')) merged.vehicle_type = p.vehicle_type;
+      if (p.id) merged.id = p.id;
+      mergedMap.set(key, merged);
     }
-    mergedMap.set(key, { ...existing, ...cleaned });
   }
   let arr = Array.from(mergedMap.values())
     .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
     .slice(0, 50);
+
 
   // Apply filters
   if (search) {

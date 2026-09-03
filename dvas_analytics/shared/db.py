@@ -91,15 +91,28 @@ async def upsert_track(
         if row:
             return str(row["track_id"])
         # Already exists — fetch it and update mission_id_str if now available
-        existing = await pool.fetchrow(
-            """
-            SELECT track_id::text FROM tracks
-            WHERE drone_id=$1 AND track_type=$2
-              AND metadata->>'tracker_id' = $3
-            ORDER BY first_seen DESC LIMIT 1
-            """,
-            drone_id, track_type, str(tracker_id),
-        )
+        if mission_id:
+            existing = await pool.fetchrow(
+                """
+                SELECT track_id::text FROM tracks
+                WHERE drone_id=$1 AND track_type=$2
+                  AND metadata->>'tracker_id' = $3
+                  AND mission_id_str = $4
+                ORDER BY first_seen DESC LIMIT 1
+                """,
+                drone_id, track_type, str(tracker_id), mission_id,
+            )
+        else:
+            existing = await pool.fetchrow(
+                """
+                SELECT track_id::text FROM tracks
+                WHERE drone_id=$1 AND track_type=$2
+                  AND metadata->>'tracker_id' = $3
+                ORDER BY first_seen DESC LIMIT 1
+                """,
+                drone_id, track_type, str(tracker_id),
+            )
+
         if existing:
             # Update last_seen and mission_id_str
             await pool.execute(
@@ -284,7 +297,7 @@ async def write_vehicle_plate_link(
             colour            = COALESCE(EXCLUDED.colour, vehicle_plate_links.colour),
             plate_image_key   = COALESCE(EXCLUDED.plate_image_key, vehicle_plate_links.plate_image_key),
             vehicle_image_key = COALESCE(EXCLUDED.vehicle_image_key, vehicle_plate_links.vehicle_image_key),
-            mission_id_str    = COALESCE(vehicle_plate_links.mission_id_str, EXCLUDED.mission_id_str),
+            mission_id_str    = COALESCE(EXCLUDED.mission_id_str, vehicle_plate_links.mission_id_str),
             linked_at         = now()
         """,
         link_id, tracker_id, drone_id, plate_text, plate_conf,
@@ -296,17 +309,29 @@ async def write_vehicle_plate_link(
 async def get_vehicle_plate_link(
     tracker_id: int,
     drone_id: str,
+    mission_id: Optional[str] = None,
 ) -> Optional[Dict]:
     pool = await get_pool()
-    row = await pool.fetchrow(
-        """
-        SELECT * FROM vehicle_plate_links
-        WHERE tracker_id=$1 AND drone_id=$2
-        ORDER BY plate_conf DESC LIMIT 1
-        """,
-        tracker_id, drone_id,
-    )
+    if mission_id:
+        row = await pool.fetchrow(
+            """
+            SELECT * FROM vehicle_plate_links
+            WHERE tracker_id=$1 AND drone_id=$2 AND mission_id_str=$3
+            ORDER BY plate_conf DESC LIMIT 1
+            """,
+            tracker_id, drone_id, mission_id,
+        )
+    else:
+        row = await pool.fetchrow(
+            """
+            SELECT * FROM vehicle_plate_links
+            WHERE tracker_id=$1 AND drone_id=$2
+            ORDER BY plate_conf DESC LIMIT 1
+            """,
+            tracker_id, drone_id,
+        )
     return dict(row) if row else None
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -339,7 +364,7 @@ async def write_plate_read(
             vehicle_image_b64 = COALESCE(EXCLUDED.vehicle_image_b64, plate_reads.vehicle_image_b64),
             plate_image_key   = COALESCE(EXCLUDED.plate_image_key,   plate_reads.plate_image_key),
             vehicle_image_key = COALESCE(EXCLUDED.vehicle_image_key, plate_reads.vehicle_image_key),
-            mission_id_str    = COALESCE(plate_reads.mission_id_str, EXCLUDED.mission_id_str),
+            mission_id_str    = COALESCE(EXCLUDED.mission_id_str, plate_reads.mission_id_str),
             updated_at        = now()
         """,
         plate_id, track_id, event_id, plate_text, ocr_confidence, is_reliable,
@@ -521,6 +546,7 @@ async def write_face_embedding(
     drone_id: Optional[str] = None,
     object_key: Optional[str] = None,
     mission_id: Optional[str] = None,
+    person_object_key: Optional[str] = None,
 ) -> str:
     from shared.crypto import encrypt_vector
     pool = await get_pool()
@@ -529,8 +555,8 @@ async def write_face_embedding(
     await pool.execute(
         """
         INSERT INTO face_embeddings
-            (id, track_id, image_path, encrypted_embedding, drone_id, object_key, mission_id, created_at)
-        VALUES ($1::uuid, $2::uuid, $3, $4::bytea, $5, $6, $7, now())
+            (id, track_id, image_path, encrypted_embedding, drone_id, object_key, mission_id, person_object_key, created_at)
+        VALUES ($1::uuid, $2::uuid, $3, $4::bytea, $5, $6, $7, $8, now())
         """,
         emb_id,
         track_id,
@@ -539,6 +565,7 @@ async def write_face_embedding(
         drone_id,
         object_key,
         mission_id,
+        person_object_key,
     )
     return emb_id
 
@@ -549,7 +576,7 @@ async def get_all_face_embeddings() -> List[Dict]:
     rows = await pool.fetch(
         """
         SELECT id, track_id, image_path, encrypted_embedding, drone_id, cluster_id,
-               is_duplicate, object_key, mission_id, created_at
+               is_duplicate, object_key, person_object_key, mission_id, created_at
         FROM face_embeddings
         ORDER BY created_at
         """
@@ -573,7 +600,7 @@ async def get_face_embeddings_by_mission(mission_id: str) -> List[Dict]:
     rows = await pool.fetch(
         """
         SELECT id, track_id, image_path, encrypted_embedding, drone_id, cluster_id,
-               is_duplicate, object_key, mission_id, created_at
+               is_duplicate, object_key, person_object_key, mission_id, created_at
         FROM face_embeddings
         WHERE mission_id = $1
         ORDER BY created_at
@@ -710,17 +737,19 @@ async def write_person_identity(
     best_image_key: Optional[str],
     drone_id: Optional[str],
     embedding_count: int = 1,
+    best_person_image_key: Optional[str] = None,
+    mission_id: Optional[str] = None,
 ) -> str:
     pool = await get_pool()
     identity_id = str(uuid.uuid4())
     await pool.execute(
         """
         INSERT INTO person_identities
-            (identity_id, cluster_id, best_image_key, drone_id, embedding_count)
-        VALUES ($1::uuid, $2, $3, $4, $5)
+            (identity_id, cluster_id, best_image_key, best_person_image_key, drone_id, embedding_count, mission_id)
+        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)
         ON CONFLICT DO NOTHING
         """,
-        identity_id, cluster_id, best_image_key, drone_id, embedding_count,
+        identity_id, cluster_id, best_image_key, best_person_image_key, drone_id, embedding_count, mission_id,
     )
     return identity_id
 
@@ -730,6 +759,8 @@ async def upsert_person_identity(
     best_image_key: Optional[str],
     drone_id: Optional[str],
     embedding_count: int = 1,
+    best_person_image_key: Optional[str] = None,
+    mission_id: Optional[str] = None,
 ) -> str:
     pool = await get_pool()
     row = await pool.fetchrow(
@@ -741,14 +772,19 @@ async def upsert_person_identity(
             """
             UPDATE person_identities
             SET best_image_key=COALESCE($1, best_image_key),
-                embedding_count=$2,
+                best_person_image_key=COALESCE($2, best_person_image_key),
+                embedding_count=$3,
+                mission_id=COALESCE($4, mission_id),
                 last_seen=now()
-            WHERE cluster_id=$3
+            WHERE cluster_id=$5
             """,
-            best_image_key, embedding_count, cluster_id,
+            best_image_key, best_person_image_key, embedding_count, mission_id, cluster_id,
         )
         return row["identity_id"]
-    return await write_person_identity(cluster_id, best_image_key, drone_id, embedding_count)
+    return await write_person_identity(
+        cluster_id, best_image_key, drone_id, embedding_count,
+        best_person_image_key=best_person_image_key, mission_id=mission_id,
+    )
 
 
 async def get_person_identities(limit: int = 50, drone_id: Optional[str] = None) -> List[Dict]:

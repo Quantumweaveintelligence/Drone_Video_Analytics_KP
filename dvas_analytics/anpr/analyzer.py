@@ -8,9 +8,10 @@ to prevent duplicate tracker IDs when ByteTrack loses/re-acquires vehicles.
 """
 import base64
 import logging
+import os
 import re
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
@@ -70,6 +71,8 @@ class TrackRecord:
     best_crop_b64:    Optional[str] = None
     best_plate_crop_b64: Optional[str] = None  # plate crop image for gallery
     best_plate_bbox: Optional[list] = None      # plate bbox in full-frame coords [x1,y1,x2,y2]
+    best_plate_rel_bbox: Optional[list] = None  # [rx1, ry1, rx2, ry2] relative to vehicle crop (0..1)
+
 
     def register_detection(self, frame_idx, class_name, center):
         if self.first_seen_frame is None:
@@ -159,6 +162,16 @@ class VehicleReIDTracker:
         # Statistics
         self.total_remaps: int = 0
         self.total_new_ids: int = 0
+
+    def reset(self):
+        """Reset all tracking and Re-ID state between missions/streams."""
+        self._bt_to_stable.clear()
+        self._active.clear()
+        self._lost.clear()
+        self._frame_bt_ids.clear()
+        self._next_stable_id = 1
+        self.total_remaps = 0
+        self.total_new_ids = 0
 
     # ── Feature extraction ─────────────────────────────────────────────────
 
@@ -494,8 +507,12 @@ class ANPRAnalyzer:
             self.ocr_engine = None
 
         self.watchlist: Set[str] = watchlist or set()
-        self.tracks: Dict[int, TrackRecord] = {}
+        self._drone_tracks: Dict[str, Dict[int, TrackRecord]] = defaultdict(dict)
+        self._drone_missions: Dict[str, str] = {}
         self._frame_idx = 0
+
+        # Enable/disable appearance Re-ID (defaults to False for clean ByteTrack stability)
+        self.enable_reid: bool = os.getenv("ANPR_ENABLE_REID", "false").lower() == "true"
 
         # Vehicle Re-ID tracker for deduplication
         self.reid_tracker = VehicleReIDTracker(
@@ -506,13 +523,38 @@ class ANPRAnalyzer:
             spatial_weight=reid_spatial_weight,
         )
         log.info(
-            "Vehicle Re-ID tracker initialised (threshold=%.2f, max_lost=%d)",
-            reid_match_threshold, reid_max_lost_frames,
+            "Vehicle Re-ID tracker initialised (enabled=%s, threshold=%.2f, max_lost=%d)",
+            self.enable_reid, reid_match_threshold, reid_max_lost_frames,
         )
 
     @property
     def ready(self) -> bool:
         return self.vehicle_model is not None
+
+    @property
+    def tracks(self) -> Dict[int, TrackRecord]:
+        """Backward-compatible view of all active tracks across drones."""
+        merged: Dict[int, TrackRecord] = {}
+        for d_tracks in self._drone_tracks.values():
+            merged.update(d_tracks)
+        return merged
+
+    def reset_drone(self, drone_id: str, new_mission_id: Optional[str] = None):
+        """Cleanly flush tracking and Re-ID state for a drone on mission transition or stream reset."""
+        log.info("ANPRAnalyzer: resetting tracks for drone %s (new_mission=%s)", drone_id, new_mission_id)
+        if drone_id in self._drone_tracks:
+            self._drone_tracks[drone_id].clear()
+        if new_mission_id is not None:
+            self._drone_missions[drone_id] = new_mission_id
+        self.reid_tracker.reset()
+        if self.vehicle_model and hasattr(self.vehicle_model, "predictor") and self.vehicle_model.predictor:
+            for t in getattr(self.vehicle_model.predictor, "trackers", []):
+                if hasattr(t, "reset"):
+                    try:
+                        t.reset()
+                    except Exception:
+                        pass
+
 
     def update_watchlist(self, watchlist: Set[str]):
         self.watchlist = watchlist
@@ -521,6 +563,7 @@ class ANPRAnalyzer:
         self,
         frame_orig: np.ndarray,
         drone_id: str = "DRONE_KL_001",
+        mission_id: Optional[str] = None,
     ) -> dict:
         """
         Process a single full-resolution frame.
@@ -532,6 +575,16 @@ class ANPRAnalyzer:
                 "plate_reads": [], "total_vehicles": 0, "plates_read": 0,
                 "theft_alerts": 0, "inference_ms": 0.0,
             }
+
+        # Check mission transition per drone
+        if mission_id and self._drone_missions.get(drone_id) and self._drone_missions.get(drone_id) != mission_id:
+            log.info("ANPRAnalyzer: mission transition for %s (%s -> %s), resetting tracks",
+                     drone_id, self._drone_missions.get(drone_id), mission_id)
+            self.reset_drone(drone_id, mission_id)
+        elif mission_id:
+            self._drone_missions[drone_id] = mission_id
+
+        drone_tracks = self._drone_tracks[drone_id]
 
         t0 = time.perf_counter()
         self._frame_idx += 1
@@ -586,12 +639,15 @@ class ANPRAnalyzer:
                 # ── Re-ID: extract crop at tracking resolution for matching ──
                 reid_crop = frame_track[ty1:ty2, tx1:tx2]
 
-                # Resolve ByteTrack ID → stable Re-ID
-                track_id = self.reid_tracker.resolve_id(
-                    bt_id, reid_crop, cx, cy, bw, bh, frame_idx
-                )
+                # Resolve ByteTrack ID → stable Re-ID (if enabled)
+                if self.enable_reid:
+                    track_id = self.reid_tracker.resolve_id(
+                        bt_id, reid_crop, cx, cy, bw, bh, frame_idx
+                    )
+                else:
+                    track_id = bt_id
 
-                rec = self.tracks.setdefault(track_id, TrackRecord(track_id=track_id))
+                rec = drone_tracks.setdefault(track_id, TrackRecord(track_id=track_id))
                 rec.register_detection(frame_idx, class_name, (cx, cy))
 
                 # ── 2. Always capture vehicle crop on first sight ────────────
@@ -658,12 +714,22 @@ class ANPRAnalyzer:
                                         _, pbuf = cv2.imencode(".jpg", plate_crop,
                                                                 [cv2.IMWRITE_JPEG_QUALITY, 85])
                                         rec.best_plate_crop_b64 = base64.b64encode(pbuf).decode()
+                                        # Store relative coordinates inside vehicle crop (0.0 to 1.0)
+                                        rec.best_plate_rel_bbox = [
+                                            round(lx1 / max(cw, 1), 4),
+                                            round(ly1 / max(ch, 1), 4),
+                                            round(lx2 / max(cw, 1), 4),
+                                            round(ly2 / max(ch, 1), 4),
+                                        ]
                                         # Store plate bbox in full-frame coords for annotation
                                         pfx1 = round(ox1 + lx1, 2)
                                         pfy1 = round(oy1 + ly1, 2)
                                         pfx2 = round(ox1 + lx2, 2)
                                         pfy2 = round(oy1 + ly2, 2)
                                         rec.best_plate_bbox = [pfx1, pfy1, pfx2, pfy2]
+                                        # Synchronize vehicle crop with plate detection
+                                        _, vbuf = cv2.imencode(".jpg", vehicle_crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                                        rec.best_crop_b64 = base64.b64encode(vbuf).decode()
                                     else:
                                         log.debug("Track %d: plate sharpness %.1f < %.1f, skipping",
                                                   track_id, sharpness, MIN_PLATE_SHARPNESS)
@@ -694,11 +760,20 @@ class ANPRAnalyzer:
                                                 _, pbuf = cv2.imencode(".jpg", ocr_plate_crop,
                                                                         [cv2.IMWRITE_JPEG_QUALITY, 85])
                                                 rec.best_plate_crop_b64 = base64.b64encode(pbuf).decode()
+                                                rec.best_plate_rel_bbox = [
+                                                    round(bx1o / max(cw, 1), 4),
+                                                    round(by1o / max(ch, 1), 4),
+                                                    round(bx2o / max(cw, 1), 4),
+                                                    round(by2o / max(ch, 1), 4),
+                                                ]
                                                 pfx1 = round(ox1 + bx1o, 2)
                                                 pfy1 = round(oy1 + by1o, 2)
                                                 pfx2 = round(ox1 + bx2o, 2)
                                                 pfy2 = round(oy1 + by2o, 2)
                                                 rec.best_plate_bbox = [pfx1, pfy1, pfx2, pfy2]
+                                                if vehicle_crop.size > 0:
+                                                    _, vbuf = cv2.imencode(".jpg", vehicle_crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                                                    rec.best_crop_b64 = base64.b64encode(vbuf).decode()
                                                 log.debug("Track %d: OCR fallback found plate '%s' conf=%.2f",
                                                           track_id, clean, conf)
                                                 break  # use first valid plate
@@ -724,6 +799,21 @@ class ANPRAnalyzer:
                     round(tx2 * scale_x, 2), round(ty2 * scale_y, 2),
                 ]
 
+                # Dynamic projection of plate bounding box onto current vehicle position
+                current_plate_bbox = None
+                if rec.best_plate_rel_bbox and len(rec.best_plate_rel_bbox) == 4:
+                    rx1, ry1, rx2, ry2 = rec.best_plate_rel_bbox
+                    vw = max(0, ox2 - ox1)
+                    vh = max(0, oy2 - oy1)
+                    current_plate_bbox = [
+                        round(ox1 + rx1 * vw, 2),
+                        round(oy1 + ry1 * vh, 2),
+                        round(ox1 + rx2 * vw, 2),
+                        round(oy1 + ry2 * vh, 2),
+                    ]
+                elif rec.best_plate_bbox:
+                    current_plate_bbox = rec.best_plate_bbox
+
                 plate_reads.append({
                     "tracker_id":        track_id,
                     "vehicle_type":      class_name,
@@ -736,13 +826,14 @@ class ANPRAnalyzer:
                     "vehicle_image_b64": rec.best_crop_b64,
                     "plate_crop_b64":    rec.best_plate_crop_b64,
                     "vehicle_bbox":      veh_bbox_orig,
-                    "plate_bbox":        rec.best_plate_bbox,
+                    "plate_bbox":        current_plate_bbox,
                     "first_seen_frame":  rec.first_seen_frame,
                     "last_seen_frame":   rec.last_seen_frame,
                 })
 
         # ── End-of-frame Re-ID housekeeping ──────────────────────────────
-        self.reid_tracker.end_frame(frame_idx)
+        if self.enable_reid:
+            self.reid_tracker.end_frame(frame_idx)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
         return {
@@ -756,10 +847,11 @@ class ANPRAnalyzer:
             "reid_stats":     self.reid_tracker.get_stats(),
         }
 
-    def get_all_tracks(self) -> List[dict]:
+    def get_all_tracks(self, drone_id: Optional[str] = None) -> List[dict]:
         """Return final per-track plate summary (for batch video processing)."""
         result = []
-        for rec in self.tracks.values():
+        track_source = self._drone_tracks[drone_id].values() if (drone_id and drone_id in self._drone_tracks) else self.tracks.values()
+        for rec in track_source:
             plate_text, plate_conf, reads = rec.best_plate()
             is_theft = bool(plate_text) and plate_text in self.watchlist
             result.append({

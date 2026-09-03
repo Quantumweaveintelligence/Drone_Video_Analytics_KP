@@ -33,7 +33,7 @@ ALLOWED_ORIGINS: list[str] = [
     "http://10.51.27.250:3000",      # Ingest server dashboard (LAN demo)
 ]
 
-ALLOWED_ROLES: set[str] = {"drone-operator", "sys-admin"}
+ALLOWED_ROLES: set[str] = {"drone-operator", "sys-admin", "control-room", "supervisor"}
 
 # ── Valkey Queue (BSD-3-Clause drop-in Redis replacement) ────────────────────
 # REDIS_URL still uses the redis:// scheme — Valkey is wire-protocol compatible.

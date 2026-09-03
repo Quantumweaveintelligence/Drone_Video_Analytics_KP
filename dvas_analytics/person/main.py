@@ -78,7 +78,7 @@ _last_annotated_ts: dict = {}      # {drone_id: monotonic_timestamp}
 _active_drone_missions: dict = {}  # {drone_id: mission_id}
 _live_person_buffer: dict = {}     # {(drone_id, tracker_id): {entry dict}}
 _LIVE_BUFFER_MAX = 100
-_LIVE_BUFFER_STALE_SEC = 30
+_LIVE_BUFFER_STALE_SEC = 60
 _CROP_REFRESH_EVERY = 5           # refresh crops every Nth frame per tracker
 _dedup_progress: dict = {          # mission dedup progress tracking
     "mission_id": None, "status": "idle", "progress_pct": 0,
@@ -287,56 +287,103 @@ async def _stream_loop():
 
                     ts = datetime.now(timezone.utc)
 
-                    for person in result["persons"]:
-                        tracker_id = person.get("tracker_id")
-                        if person["confidence"] >= 0.15:
-                            track_id = await upsert_track(
-                                drone_id, None, "person", ts, ts,
-                                tracker_id=tracker_id,
-                                mission_id=mission_id,
-                            )
-                            await write_confirmed_event(
-                                drone_id=drone_id, event_type="person_detected",
-                                confidence=person["confidence"], ts=ts,
-                                track_id=track_id,
-                            )
+                    # ── Populate live person buffer with crop pairs IMMEDIATELY ──
+                    # Must happen before any DB / network I/O so live UI is decoupled
+                    _update_live_person_buffer(
+                        result, drone_id, mission_id, ts, frame
+                    )
 
-                    # Process face crops + embeddings
-                    for face in result["faces"]:
-                        face_crop_bytes = face.pop("crop_bytes", None)
-                        if face_crop_bytes and resnet_model:
-                            emb = extract_embedding_from_bytes(
-                                resnet_model, face_crop_bytes, resnet_device
-                            )
-                            if emb:
-                                key = minio.make_key(
-                                    "faces", drone_id,
-                                    f"face_{int(ts.timestamp()*1000)}.jpg"
-                                )
-                                face_obj_key = await minio.upload_bytes(
-                                    cfg.BUCKET_FACES, key, face_crop_bytes, "image/jpeg"
-                                )
-                                await write_face_embedding(
-                                    track_id=None,
-                                    image_path=face_obj_key or "",
-                                    embedding=emb,
-                                    drone_id=drone_id,
-                                    object_key=face_obj_key,
+                    # ── Database updates (isolated so DB errors don't crash stream) ──
+                    try:
+                        for person in result["persons"]:
+                            tracker_id = person.get("tracker_id")
+                            if person["confidence"] >= 0.15:
+                                track_id = await upsert_track(
+                                    drone_id, None, "person", ts, ts,
+                                    tracker_id=tracker_id,
                                     mission_id=mission_id,
                                 )
+                                await write_confirmed_event(
+                                    drone_id=drone_id, event_type="person_detected",
+                                    confidence=person["confidence"], ts=ts,
+                                    track_id=track_id,
+                                )
+                    except Exception as db_exc:
+                        log.warning("Person track/event write error: %s", db_exc)
+
+                    # Process face crops + embeddings
+                    try:
+                        # Build lookup of person crop_bytes by tracker_id
+                        person_crops_by_tid = {
+                            p.get("tracker_id"): p.get("crop_bytes")
+                            for p in result.get("persons", [])
+                            if p.get("tracker_id") is not None
+                        }
+
+                        for face in result["faces"]:
+                            face_crop_bytes = face.pop("crop_bytes", None)
+                            if face_crop_bytes and resnet_model:
+                                emb = extract_embedding_from_bytes(
+                                    resnet_model, face_crop_bytes, resnet_device
+                                )
+                                if emb:
+                                    face_ts_ms = int(ts.timestamp() * 1000)
+                                    key = minio.make_key(
+                                        "faces", drone_id,
+                                        f"face_{face_ts_ms}.jpg"
+                                    )
+                                    face_obj_key = await minio.upload_bytes(
+                                        cfg.BUCKET_FACES, key, face_crop_bytes, "image/jpeg"
+                                    )
+
+                                    # Upload whole body crop if available
+                                    person_obj_key = None
+                                    tid = face.get("tracker_id")
+                                    p_crop_bytes = person_crops_by_tid.get(tid)
+                                    if not p_crop_bytes and tid is not None:
+                                        # Fallback: crop from frame using person bbox
+                                        matched_p = next((p for p in result.get("persons", []) if p.get("tracker_id") == tid), None)
+                                        if matched_p:
+                                            pbb = matched_p["bbox"]
+                                            h, w = frame.shape[:2]
+                                            x1, y1 = max(0, int(pbb["x1"])), max(0, int(pbb["y1"]))
+                                            x2, y2 = min(w, int(pbb["x2"])), min(h, int(pbb["y2"]))
+                                            if x2 > x1 and y2 > y1:
+                                                _, p_buf = cv2.imencode(".jpg", frame[y1:y2, x1:x2], [cv2.IMWRITE_JPEG_QUALITY, 85])
+                                                p_crop_bytes = bytes(p_buf)
+
+                                    if p_crop_bytes:
+                                        person_key = minio.make_key(
+                                            "persons", drone_id,
+                                            f"person_{face_ts_ms}_{tid}.jpg"
+                                        )
+                                        person_obj_key = await minio.upload_bytes(
+                                            cfg.BUCKET_FACES, person_key, p_crop_bytes, "image/jpeg"
+                                        )
+
+                                    await write_face_embedding(
+                                        track_id=None,
+                                        image_path=face_obj_key or "",
+                                        embedding=emb,
+                                        drone_id=drone_id,
+                                        object_key=face_obj_key,
+                                        mission_id=mission_id,
+                                        person_object_key=person_obj_key,
+                                    )
+                    except Exception as face_exc:
+                        log.warning("Face embedding write error: %s", face_exc)
 
                     # Also clean up person crop_bytes
                     for person in result["persons"]:
                         person.pop("crop_bytes", None)
 
-                    await publish_analytics_result("person", result)
+                    try:
+                        await publish_analytics_result("person", result)
+                    except Exception as pub_exc:
+                        log.warning("Failed to publish analytics result: %s", pub_exc)
+
                     _frames_processed += 1
                     _reid_frame_counter += 1
-
-                    # ── Populate live person buffer with crop pairs ──────
-                    _update_live_person_buffer(
-                        result, drone_id, mission_id, ts, frame
-                    )
 
                     # Periodic re-ID clustering
                     if _reid_frame_counter >= cfg.REID_CLUSTER_INTERVAL:
@@ -367,11 +414,20 @@ async def _run_reid_clustering():
         for cluster_id, rep_id in reps.items():
             rep_row = next((r for r in rows if str(r["id"]) == rep_id), None)
             if rep_row:
+                person_key = rep_row.get("person_object_key")
+                if not person_key:
+                    cluster_member_ids = {ids[i] for i, l in enumerate(labels) if l == cluster_id}
+                    for r in rows:
+                        if str(r["id"]) in cluster_member_ids and r.get("person_object_key"):
+                            person_key = r.get("person_object_key")
+                            break
                 await upsert_person_identity(
                     cluster_id=cluster_id,
                     best_image_key=rep_row.get("object_key"),
                     drone_id=rep_row.get("drone_id"),
                     embedding_count=sum(1 for l in labels if l == cluster_id),
+                    best_person_image_key=person_key,
+                    mission_id=rep_row.get("mission_id"),
                 )
         log.info("Re-ID clustering: %d embeddings → %d identities", len(rows), unique_count)
     except Exception as exc:
@@ -446,9 +502,13 @@ def _update_live_person_buffer(result, drone_id, mission_id, ts, frame):
     """Update in-memory live person buffer with crop pairs from latest result."""
     now = time.time()
 
-    # Build face lookup by proximity to each person bbox
+    # Build face lookup by tracker_id OR spatial proximity to each person bbox
     faces_by_person = {}
     for fc in result.get("faces", []):
+        tid = fc.get("tracker_id")
+        if tid is not None:
+            faces_by_person[tid] = fc
+            continue
         # Link face to nearest person by checking if face center is inside person bbox
         fbb = fc["bbox"]
         fcx = (fbb["x1"] + fbb["x2"]) / 2
@@ -456,9 +516,9 @@ def _update_live_person_buffer(result, drone_id, mission_id, ts, frame):
         for p in result.get("persons", []):
             pbb = p["bbox"]
             if pbb["x1"] <= fcx <= pbb["x2"] and pbb["y1"] <= fcy <= pbb["y2"]:
-                tid = p.get("tracker_id")
-                if tid is not None:
-                    faces_by_person[tid] = fc
+                ptid = p.get("tracker_id")
+                if ptid is not None:
+                    faces_by_person[ptid] = fc
                 break
 
     for p in result.get("persons", []):
@@ -653,11 +713,20 @@ async def _run_mission_dedup(mission_id: str):
         for cluster_id, rep_id in reps.items():
             rep_row = next((r for r in rows if str(r["id"]) == rep_id), None)
             if rep_row:
+                person_key = rep_row.get("person_object_key")
+                if not person_key:
+                    cluster_member_ids = {ids[i] for i, l in enumerate(labels) if l == cluster_id}
+                    for r in rows:
+                        if str(r["id"]) in cluster_member_ids and r.get("person_object_key"):
+                            person_key = r.get("person_object_key")
+                            break
                 await upsert_person_identity(
                     cluster_id=cluster_id,
                     best_image_key=rep_row.get("object_key"),
                     drone_id=rep_row.get("drone_id"),
                     embedding_count=sum(1 for l in labels if l == cluster_id),
+                    best_person_image_key=person_key,
+                    mission_id=rep_row.get("mission_id") or mission_id,
                 )
             processed += 1
             pct = 70 + int(30 * processed / max(len(reps), 1))

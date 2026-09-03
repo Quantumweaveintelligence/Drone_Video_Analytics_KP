@@ -143,40 +143,66 @@ async def hset_vehicle_track(
     drone_id: str,
     data: Dict[str, Any],
     ttl: int = 300,
+    mission_id: Optional[str] = None,
 ) -> None:
     """
     Store vehicle track info (type, colour, plate) in Redis hash.
-    Key: vehicle:track:{drone_id}:{tracker_id}
+    Scopes by mission_id when available to prevent cross-mission state bleed.
     TTL: 5 minutes by default.
     """
     client = get_client()
-    key = f"{cfg.VEHICLE_TRACK_KEY_PREFIX}:{drone_id}:{tracker_id}"
+    m_id = mission_id or data.get("mission_id") or ""
     serialized = {k: json.dumps(v) if isinstance(v, (dict, list)) else str(v)
                   for k, v in data.items()}
-    await client.hset(key, mapping=serialized)
-    await client.expire(key, ttl)
+    # Write legacy key for compatibility
+    legacy_key = f"{cfg.VEHICLE_TRACK_KEY_PREFIX}:{drone_id}:{tracker_id}"
+    await client.hset(legacy_key, mapping=serialized)
+    await client.expire(legacy_key, ttl)
+
+    if m_id:
+        mission_key = f"{cfg.VEHICLE_TRACK_KEY_PREFIX}:{drone_id}:{m_id}:{tracker_id}"
+        await client.hset(mission_key, mapping=serialized)
+        await client.expire(mission_key, ttl)
 
 
 async def hget_vehicle_track(
     tracker_id: int,
     drone_id: str,
+    mission_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Retrieve vehicle track info from Redis.
+    Checks mission-scoped key first if mission_id is provided.
     Returns {} if not found.
     """
     client = get_client()
-    key = f"{cfg.VEHICLE_TRACK_KEY_PREFIX}:{drone_id}:{tracker_id}"
-    raw = await client.hgetall(key)
+    raw = None
+    if mission_id:
+        mission_key = f"{cfg.VEHICLE_TRACK_KEY_PREFIX}:{drone_id}:{mission_id}:{tracker_id}"
+        raw = await client.hgetall(mission_key)
+
+    if not raw:
+        key = f"{cfg.VEHICLE_TRACK_KEY_PREFIX}:{drone_id}:{tracker_id}"
+        raw = await client.hgetall(key)
+        # If legacy entry belongs to a different mission, do not use it!
+        if raw and mission_id:
+            raw_mid = raw.get("mission_id") or raw.get(b"mission_id")
+            if raw_mid:
+                raw_mid_str = raw_mid.decode() if isinstance(raw_mid, bytes) else str(raw_mid)
+                if raw_mid_str and raw_mid_str != mission_id:
+                    return {}
+
     if not raw:
         return {}
     result = {}
     for k, v in raw.items():
+        k_str = k.decode() if isinstance(k, bytes) else k
         try:
-            result[k] = json.loads(v)
+            result[k_str] = json.loads(v)
         except (json.JSONDecodeError, ValueError):
-            result[k] = v
+            result[k_str] = v.decode() if isinstance(v, bytes) else v
     return result
+
 
 
 async def scan_active_stream_drones() -> List[str]:

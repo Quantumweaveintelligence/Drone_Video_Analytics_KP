@@ -682,13 +682,15 @@ function GalleryCard({ item, i, isSelected, isAnySelected, onSelect, isPersonGal
   const personRawUrl = item.best_person_image_url;
 
   let imgUrl;
-  if (isPersonGallery && (personObjKey || personRawUrl)) {
-    // Use person body crop from dvas-faces bucket (persons/ prefix)
+  if (isPersonGallery) {
+    // Strictly use person body crop from dvas-faces bucket (persons/ prefix)
     imgUrl = personObjKey
       ? toProxiedUrl(personObjKey, 'dvas-faces')
-      : toProxiedUrl(personRawUrl, 'dvas-faces');
+      : personRawUrl
+      ? toProxiedUrl(personRawUrl, 'dvas-faces')
+      : null;
   } else {
-    // Fall back to face crop from dvas-faces bucket
+    // Face gallery uses face crop from dvas-faces bucket
     imgUrl = faceObjKey
       ? toProxiedUrl(faceObjKey, bucket)
       : toProxiedUrl(faceRawUrl, bucket);
@@ -1143,7 +1145,13 @@ export default function PersonTrackingAnalytics({ drones }) {
     : Array.isArray(facesData?.faces)                     ? facesData.faces : [];
 
   // Live persons from in-memory buffer (has crop_b64 pairs)
-  const livePersons = Array.isArray(liveData?.persons) ? liveData.persons : [];
+  const livePersons = Array.isArray(liveData?.persons)
+    ? liveData.persons
+    : Array.isArray(liveData?.entries)
+    ? liveData.entries
+    : Array.isArray(liveData)
+    ? liveData
+    : [];
 
   return (
     <div className="flex flex-col gap-5" style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }}>

@@ -32,10 +32,19 @@ export const authFetch = async (url, options = {}) => {
 
   if (response.status === 401 && !url.includes("/auth/")) {
     try {
-      await api.post("/auth/refresh");
+      const refreshRes = await api.post("/auth/refresh");
+      const newToken = refreshRes?.data?.access_token;
+      if (newToken) {
+        localStorage.setItem("dvas_token", newToken);
+      }
+      const retryToken = newToken || getAuthToken();
+      const retryHeaders = {
+        ...(options.headers || {}),
+        ...(retryToken ? { Authorization: `Bearer ${retryToken}` } : {}),
+      };
       response = await fetch(url, {
         ...options,
-        headers,
+        headers: retryHeaders,
         credentials: "include",
       });
     } catch (e) {
@@ -47,6 +56,15 @@ export const authFetch = async (url, options = {}) => {
 
   return response;
 };
+
+// Automatically attach Bearer token to all outgoing API requests
+api.interceptors.request.use((config) => {
+  const token = getAuthToken();
+  if (token && !config.headers.Authorization) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
 
 // Auto-refresh token on 401 response and replay original request transparently
 api.interceptors.response.use(
@@ -61,7 +79,11 @@ api.interceptors.response.use(
     ) {
       originalRequest._retry = true;
       try {
-        await api.post("/auth/refresh");
+        const refreshRes = await api.post("/auth/refresh");
+        if (refreshRes?.data?.access_token) {
+          localStorage.setItem("dvas_token", refreshRes.data.access_token);
+          originalRequest.headers.Authorization = `Bearer ${refreshRes.data.access_token}`;
+        }
         return api(originalRequest);
       } catch (refreshError) {
         if (window.location.pathname !== "/login") {
