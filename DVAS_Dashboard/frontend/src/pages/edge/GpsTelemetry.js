@@ -30,6 +30,7 @@ function RecenterMap({ lat, lng }) {
 }
 
 export default function GpsTelemetry() {
+  const [mission, setMission] = useState(null);
   const [telemetry, setTelemetry] = useState({
     lat: KERALA_LAT,
     lng: KERALA_LNG,
@@ -55,37 +56,56 @@ export default function GpsTelemetry() {
   useEffect(() => {
     const timer = setInterval(async () => {
       try {
-        const resp = await authFetch('/edge-api/api/edge/telemetry');
-        const tel = await resp.json();
-        if (tel.latitude && tel.longitude) {
-          setTelemetry(prev => ({
-            ...prev,
-            lat: tel.latitude,
-            lng: tel.longitude,
-            alt: tel.altitude_m || prev.alt,
-            heading: tel.heading_deg || prev.heading,
-            speed: tel.speed_mps || prev.speed,
-            battery: tel.battery_pct || prev.battery,
-            signal: tel.signal_pct || prev.signal,
-            lastUpdate: new Date().toLocaleTimeString()
-          }));
+        const [telResp, missionResp] = await Promise.all([
+          authFetch('/edge-api/api/edge/telemetry'),
+          authFetch('/edge-api/api/edge/mission/active')
+        ]);
+        const tel = await telResp.json();
+        const missionData = await missionResp.json();
+
+        if (missionData.active) {
+          setMission(missionData);
+        } else {
+          setMission(null);
+        }
+
+        const altVal = (tel && tel.altitude_m !== undefined && tel.altitude_m !== null && !isNaN(tel.altitude_m)) ? Number(tel.altitude_m) : 0;
+        const spdVal = (tel && tel.speed_mps !== undefined && tel.speed_mps !== null && !isNaN(tel.speed_mps)) ? Number(tel.speed_mps) : 0;
+        const batVal = (tel && tel.battery_pct !== undefined && tel.battery_pct !== null && !isNaN(tel.battery_pct)) ? Number(tel.battery_pct) : 0;
+        const headVal = (tel && tel.heading_deg !== undefined && tel.heading_deg !== null && !isNaN(tel.heading_deg)) ? Number(tel.heading_deg) : 0;
+        const sigVal = (tel && tel.signal_pct !== undefined && tel.signal_pct !== null && !isNaN(tel.signal_pct)) ? Number(tel.signal_pct) : 0;
+        const hasGps = Boolean(tel && tel.latitude && tel.longitude && tel.gps_lock);
+
+        setTelemetry({
+          lat: tel?.latitude ? Number(tel.latitude) : KERALA_LAT,
+          lng: tel?.longitude ? Number(tel.longitude) : KERALA_LNG,
+          alt: altVal,
+          heading: headVal,
+          speed: spdVal,
+          battery: batVal,
+          signal: sigVal,
+          gpsLock: hasGps,
+          lastUpdate: new Date().toLocaleTimeString()
+        });
+
+        if (tel?.latitude && tel?.longitude) {
           setPath(prev => {
-            const newPath = [...prev, { lat: tel.latitude, lng: tel.longitude }];
+            const newPath = [...prev, { lat: Number(tel.latitude), lng: Number(tel.longitude) }];
             if (newPath.length > 30) newPath.shift();
             return newPath;
           });
-          setHistory(h => {
-            const newHist = [...h, {
-              time: h.length,
-              alt: tel.altitude_m || 120,
-              speed: tel.speed_mps || 12.5,
-              battery: tel.battery_pct || 100
-            }];
-            if (newHist.length > 30) newHist.shift();
-            return newHist;
-          });
-          return;
         }
+
+        setHistory(h => {
+          const newHist = [...h, {
+            time: h.length,
+            alt: Math.round(altVal * 10) / 10,
+            speed: Math.round(spdVal * 10) / 10,
+            battery: Math.round(batVal * 10) / 10
+          }];
+          if (newHist.length > 30) newHist.shift();
+          return newHist;
+        });
       } catch (err) {
         // Edge API unavailable — keep current state, no simulated data
       }
@@ -108,11 +128,15 @@ export default function GpsTelemetry() {
             <div className="space-y-4 flex-1">
               <div className="flex justify-between items-center pb-2 border-b border-slate-800">
                 <span className="text-[10px] text-slate-500 uppercase tracking-wider">Latitude</span>
-                <span className="text-sm font-mono text-slate-200">{telemetry.lat.toFixed(6)}°</span>
+                <span className="text-sm font-mono text-slate-200">
+                  {telemetry.gpsLock ? `${telemetry.lat.toFixed(6)}°` : 'N/A (No Lock)'}
+                </span>
               </div>
               <div className="flex justify-between items-center pb-2 border-b border-slate-800">
                 <span className="text-[10px] text-slate-500 uppercase tracking-wider">Longitude</span>
-                <span className="text-sm font-mono text-slate-200">{telemetry.lng.toFixed(6)}°</span>
+                <span className="text-sm font-mono text-slate-200">
+                  {telemetry.gpsLock ? `${telemetry.lng.toFixed(6)}°` : 'N/A (No Lock)'}
+                </span>
               </div>
               <div className="flex justify-between items-center pb-2 border-b border-slate-800">
                 <span className="text-[10px] text-slate-500 uppercase tracking-wider">Altitude</span>
@@ -148,7 +172,6 @@ export default function GpsTelemetry() {
 
           {/* Map (9 columns) */}
           <div className="lg:col-span-9 bg-slate-900 border border-slate-800 rounded-lg p-2 h-[420px] relative z-0">
-            {/* The tile layer below is CartoDB Positron (Light), providing a clean, subtle background */}
             <MapContainer 
               center={[KERALA_LAT, KERALA_LNG]} 
               zoom={15} 
@@ -168,7 +191,7 @@ export default function GpsTelemetry() {
               <Polyline 
                 positions={path.map(p => [p.lat, p.lng])}
                 pathOptions={{ 
-                  color: '#0f172a', // Navy blue
+                  color: '#0f172a',
                   weight: 3, 
                   opacity: 0.55, 
                   dashArray: '6, 5' 
@@ -186,20 +209,23 @@ export default function GpsTelemetry() {
               <Marker position={[telemetry.lat, telemetry.lng]}>
                 <Popup className="dvas-map-popup">
                   <div className="font-sans">
-                    <div className="font-bold text-slate-800">DRN-001 (Garuda-1)</div>
+                    <div className="font-bold text-slate-800">
+                      {mission?.mission_name || mission?.drone_id || 'Active Asset (Standby)'}
+                    </div>
                     <div className="text-xs mt-1 text-slate-600">
                       Alt: <span className="font-mono text-cyan-600">{telemetry.alt.toFixed(1)}m</span><br/>
-                      Spd: <span className="font-mono text-amber-600">{telemetry.speed.toFixed(1)}m/s</span>
+                      Spd: <span className="font-mono text-amber-600">{telemetry.speed.toFixed(1)}m/s</span><br/>
+                      Bat: <span className="font-mono text-emerald-600">{telemetry.battery.toFixed(1)}%</span>
                     </div>
                   </div>
                 </Popup>
               </Marker>
             </MapContainer>
 
-            {/* Floating map controls/labels over the map */}
+            {/* Floating map labels over the map */}
             <div className="absolute top-4 left-4 z-[400] flex gap-2 pointer-events-none">
               <div className="px-3 py-1.5 bg-white/90 backdrop-blur shadow-sm border border-slate-200 text-slate-800 text-xs font-semibold rounded flex items-center gap-1.5">
-                <MapPin size={14} className="text-sky-500" /> Thiruvananthapuram Sector
+                <MapPin size={14} className="text-sky-500" /> {mission?.location || 'Tactical Sector (Standby)'}
               </div>
             </div>
           </div>
@@ -210,7 +236,10 @@ export default function GpsTelemetry() {
           
           {/* Altitude Chart */}
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 h-[140px] flex flex-col">
-            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-2 font-semibold">Altitude (m)</div>
+            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-2 font-semibold flex items-center justify-between">
+              <span>Altitude (m)</span>
+              <span className="text-cyan-400 font-mono text-xs">{telemetry.alt.toFixed(1)} m</span>
+            </div>
             <div className="flex-1 min-h-0 w-full">
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={history} margin={{ top: 5, right: 0, left: -25, bottom: 0 }}>
@@ -221,7 +250,7 @@ export default function GpsTelemetry() {
                     </linearGradient>
                   </defs>
                   <XAxis dataKey="time" hide />
-                  <YAxis stroke="#475569" fontSize={9} tickFormatter={(v) => `${v}`} domain={['dataMin - 10', 'dataMax + 10']} />
+                  <YAxis stroke="#475569" fontSize={9} tickFormatter={(v) => `${v}`} domain={[0, 'auto']} />
                   <Tooltip 
                     contentStyle={{ backgroundColor: '#0f172a', borderColor: '#1e293b', fontSize: '10px', color: '#cbd5e1' }}
                     itemStyle={{ color: '#22d3ee' }}
@@ -234,7 +263,10 @@ export default function GpsTelemetry() {
 
           {/* Speed Chart */}
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 h-[140px] flex flex-col">
-            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-2 font-semibold">Speed (m/s)</div>
+            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-2 font-semibold flex items-center justify-between">
+              <span>Speed (m/s)</span>
+              <span className="text-amber-400 font-mono text-xs">{telemetry.speed.toFixed(1)} m/s</span>
+            </div>
             <div className="flex-1 min-h-0 w-full">
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={history} margin={{ top: 5, right: 0, left: -25, bottom: 0 }}>
@@ -245,7 +277,7 @@ export default function GpsTelemetry() {
                     </linearGradient>
                   </defs>
                   <XAxis dataKey="time" hide />
-                  <YAxis stroke="#475569" fontSize={9} tickFormatter={(v) => `${v}`} domain={['dataMin - 2', 'dataMax + 2']} />
+                  <YAxis stroke="#475569" fontSize={9} tickFormatter={(v) => `${v}`} domain={[0, 'auto']} />
                   <Tooltip 
                     contentStyle={{ backgroundColor: '#0f172a', borderColor: '#1e293b', fontSize: '10px', color: '#cbd5e1' }}
                     itemStyle={{ color: '#fbbf24' }}
@@ -258,7 +290,10 @@ export default function GpsTelemetry() {
 
           {/* Battery Chart */}
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 h-[140px] flex flex-col">
-            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-2 font-semibold">Battery (%)</div>
+            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-2 font-semibold flex items-center justify-between">
+              <span>Battery (%)</span>
+              <span className="text-emerald-400 font-mono text-xs">{telemetry.battery.toFixed(1)}%</span>
+            </div>
             <div className="flex-1 min-h-0 w-full">
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={history} margin={{ top: 5, right: 0, left: -25, bottom: 0 }}>

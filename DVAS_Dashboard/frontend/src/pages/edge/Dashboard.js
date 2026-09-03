@@ -1,16 +1,7 @@
 import React, { useState, useEffect } from "react";
 import AppShell from "@/components/layout/AppShell";
 import { AreaChart, Area, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
-import { Send as Drone, AlertTriangle as Warning, Info } from "lucide-react";
 import { authFetch } from "@/lib/api";
-
-// Mock data generation for charts
-const generateChartData = (base, variance, count) => {
-  return Array.from({ length: count }).map((_, i) => ({
-    time: i,
-    value: Math.max(0, Math.round(base + (Math.random() - 0.5) * variance))
-  }));
-};
 
 export default function Dashboard() {
   const [recentMissions, setRecentMissions] = useState([]);
@@ -18,8 +9,35 @@ export default function Dashboard() {
   const [edgeStatus, setEdgeStatus] = useState(null);
   const [telemetry, setTelemetry] = useState(null);
   const [activeMission, setActiveMission] = useState(null);
-  const [altData, setAltData] = useState(() => generateChartData(120, 20, 30));
-  const [spdData, setSpdData] = useState(() => generateChartData(45, 10, 30));
+  const [elapsedTime, setElapsedTime] = useState("--");
+
+  // Initialize altitude and speed charts cleanly with 0
+  const [altData, setAltData] = useState(() => Array.from({ length: 30 }, (_, i) => ({ time: i, value: 0 })));
+  const [spdData, setSpdData] = useState(() => Array.from({ length: 30 }, (_, i) => ({ time: i, value: 0 })));
+
+  // Live calculation of active mission duration
+  useEffect(() => {
+    if (!activeMission?.start_time) {
+      setElapsedTime("--");
+      return;
+    }
+    const updateDuration = () => {
+      const start = new Date(activeMission.start_time).getTime();
+      const now = Date.now();
+      const diffSeconds = Math.max(0, Math.floor((now - start) / 1000));
+      const hrs = Math.floor(diffSeconds / 3600);
+      const mins = Math.floor((diffSeconds % 3600) / 60);
+      const secs = diffSeconds % 60;
+      if (hrs > 0) {
+        setElapsedTime(`${hrs}h ${mins.toString().padStart(2, '0')}m ${secs.toString().padStart(2, '0')}s`);
+      } else {
+        setElapsedTime(`${mins.toString().padStart(2, '0')}m ${secs.toString().padStart(2, '0')}s`);
+      }
+    };
+    updateDuration();
+    const timer = setInterval(updateDuration, 1000);
+    return () => clearInterval(timer);
+  }, [activeMission?.start_time]);
 
   useEffect(() => {
     let tick = 0;
@@ -40,14 +58,17 @@ export default function Dashboard() {
         else setActiveMission(null);
         
         tick++;
-        setAltData(prev => [...prev.slice(1), { time: tick, value: Math.round(tel.altitude_m || 120) }]);
-        setSpdData(prev => [...prev.slice(1), { time: tick, value: Math.round((tel.speed_mps || 12) * 3.6) }]);
+        const currentAlt = (tel && tel.altitude_m !== undefined && tel.altitude_m !== null && !isNaN(tel.altitude_m)) ? Math.round(tel.altitude_m) : 0;
+        const currentSpd = (tel && tel.speed_mps !== undefined && tel.speed_mps !== null && !isNaN(tel.speed_mps)) ? Math.round(tel.speed_mps * 3.6) : 0;
+
+        setAltData(prev => [...prev.slice(1), { time: tick, value: currentAlt }]);
+        setSpdData(prev => [...prev.slice(1), { time: tick, value: currentSpd }]);
       } catch (err) {
         // Edge not available
       }
     };
     poll();
-    const interval = setInterval(poll, 3000);
+    const interval = setInterval(poll, 2000);
     return () => clearInterval(interval);
   }, []);
 
@@ -70,15 +91,15 @@ export default function Dashboard() {
     { label: "Active Mission", value: activeMission ? "1" : "0", status: activeMission ? "green" : "neutral", unit: "" },
     { label: "Drone Link", value: edgeStatus?.connected ? "UP" : "DOWN", status: edgeStatus?.connected ? "green" : "red", unit: "" },
     { label: "Stream FPS", value: edgeStatus?.fps !== undefined ? Math.round(edgeStatus.fps) : "--", status: "cyan", unit: "fps" },
-    { label: "Bitrate", value: "4.2", status: "blue", unit: "Mbps" },
+    { label: "Bitrate", value: edgeStatus?.bitrate_mbps !== undefined ? edgeStatus.bitrate_mbps.toFixed(1) : (edgeStatus?.connected ? "0.0" : "--"), status: "blue", unit: "Mbps" },
     { label: "Buffer Util.", value: edgeStatus?.buffer_fill_pct !== undefined ? Math.round(edgeStatus.buffer_fill_pct) : "--", status: edgeStatus?.buffer_fill_pct > 80 ? "red" : edgeStatus?.buffer_fill_pct > 60 ? "amber" : "neutral", unit: "%" },
     { label: "CPU Usage", value: edgeStatus?.cpu_pct !== undefined ? Math.round(edgeStatus.cpu_pct) : "--", status: edgeStatus?.cpu_pct > 80 ? "red" : "neutral", unit: "%" },
     { label: "GPU Usage", value: edgeStatus?.gpu_pct !== undefined ? Math.round(edgeStatus.gpu_pct) : "--", status: edgeStatus?.gpu_pct > 80 ? "red" : "purple", unit: "%" },
-    { label: "Storage", value: "62", status: "amber", unit: "%" },
+    { label: "Storage", value: edgeStatus?.storage_pct !== undefined ? Math.round(edgeStatus.storage_pct) : "--", status: edgeStatus?.storage_pct > 85 ? "red" : edgeStatus?.storage_pct > 70 ? "amber" : "green", unit: "%" },
     { label: "Upload Queue", value: edgeStatus?.upload_queue !== undefined ? edgeStatus.upload_queue : "--", status: "neutral", unit: "" },
     { label: "Selected Frames", value: edgeStatus?.frames_selected !== undefined ? edgeStatus.frames_selected.toLocaleString() : "--", status: "green", unit: "" },
-    { label: "Discarded Frames", value: edgeStatus?.frames_total !== undefined && edgeStatus?.frames_selected !== undefined ? (edgeStatus.frames_total - edgeStatus.frames_selected).toLocaleString() : "--", status: "neutral", unit: "" },
-    { label: "Drone Battery", value: telemetry ? Math.round(telemetry.battery_pct) : "--", status: telemetry?.battery_pct > 50 ? "green" : telemetry?.battery_pct > 20 ? "amber" : "red", unit: "%" },
+    { label: "Discarded Frames", value: edgeStatus?.frames_total !== undefined && edgeStatus?.frames_selected !== undefined ? Math.max(0, edgeStatus.frames_total - edgeStatus.frames_selected).toLocaleString() : "--", status: "neutral", unit: "" },
+    { label: "Drone Battery", value: telemetry && telemetry.battery_pct > 0 ? Math.round(telemetry.battery_pct) : "--", status: telemetry?.battery_pct > 50 ? "green" : telemetry?.battery_pct > 20 ? "amber" : "red", unit: "%" },
   ];
 
   const getColorClass = (status) => {
@@ -93,6 +114,9 @@ export default function Dashboard() {
     };
     return map[status] || map.neutral;
   };
+
+  const currentLiveAlt = (telemetry && telemetry.altitude_m !== undefined && telemetry.altitude_m !== null && !isNaN(telemetry.altitude_m)) ? Math.round(telemetry.altitude_m) : 0;
+  const currentLiveSpd = (telemetry && telemetry.speed_mps !== undefined && telemetry.speed_mps !== null && !isNaN(telemetry.speed_mps)) ? Math.round(telemetry.speed_mps * 3.6) : 0;
 
   return (
     <AppShell title="Dashboard" subtitle="Central Operational Overview">
@@ -138,7 +162,7 @@ export default function Dashboard() {
               </div>
               <div>
                 <div className="text-[10px] text-slate-500 uppercase">Duration</div>
-                <div className="text-slate-200">--</div>
+                <div className="text-slate-200 font-mono text-emerald-400 font-semibold">{elapsedTime}</div>
               </div>
             </div>
           </div>
@@ -186,7 +210,10 @@ export default function Dashboard() {
         {/* Bottom Section (2 Trend Charts) */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 h-64">
           <div className="bg-slate-900 border border-slate-800 p-4 rounded-lg flex flex-col">
-            <div className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-4">Altitude Trend</div>
+            <div className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-4 flex items-center justify-between">
+              <span>Altitude Trend</span>
+              <span className="text-cyan-400 font-mono text-xs font-normal">Live: {currentLiveAlt}m</span>
+            </div>
             <div className="flex-1 min-h-0 w-full">
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={altData} margin={{ top: 5, right: 0, left: -20, bottom: 0 }}>
@@ -197,19 +224,22 @@ export default function Dashboard() {
                     </linearGradient>
                   </defs>
                   <XAxis dataKey="time" hide />
-                  <YAxis stroke="#475569" fontSize={10} tickFormatter={(v) => `${v}m`} />
+                  <YAxis stroke="#475569" fontSize={10} domain={[0, 'auto']} tickFormatter={(v) => `${v}m`} />
                   <Tooltip 
                     contentStyle={{ backgroundColor: '#0f172a', borderColor: '#1e293b', fontSize: '12px', color: '#cbd5e1' }}
                     itemStyle={{ color: '#22d3ee' }}
                   />
-                  <Area type="monotone" dataKey="value" stroke="#22d3ee" strokeWidth={2} fillOpacity={1} fill="url(#colorAlt)" />
+                  <Area type="monotone" dataKey="value" stroke="#22d3ee" strokeWidth={2} fillOpacity={1} fill="url(#colorAlt)" isAnimationActive={false} />
                 </AreaChart>
               </ResponsiveContainer>
             </div>
           </div>
           
           <div className="bg-slate-900 border border-slate-800 p-4 rounded-lg flex flex-col">
-            <div className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-4">Speed Trend</div>
+            <div className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-4 flex items-center justify-between">
+              <span>Speed Trend</span>
+              <span className="text-amber-400 font-mono text-xs font-normal">Live: {currentLiveSpd} km/h</span>
+            </div>
             <div className="flex-1 min-h-0 w-full">
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={spdData} margin={{ top: 5, right: 0, left: -20, bottom: 0 }}>
@@ -220,12 +250,12 @@ export default function Dashboard() {
                     </linearGradient>
                   </defs>
                   <XAxis dataKey="time" hide />
-                  <YAxis stroke="#475569" fontSize={10} tickFormatter={(v) => `${v}kph`} />
+                  <YAxis stroke="#475569" fontSize={10} domain={[0, 'auto']} tickFormatter={(v) => `${v}kph`} />
                   <Tooltip 
                     contentStyle={{ backgroundColor: '#0f172a', borderColor: '#1e293b', fontSize: '12px', color: '#cbd5e1' }}
                     itemStyle={{ color: '#fbbf24' }}
                   />
-                  <Area type="monotone" dataKey="value" stroke="#fbbf24" strokeWidth={2} fillOpacity={1} fill="url(#colorSpd)" />
+                  <Area type="monotone" dataKey="value" stroke="#fbbf24" strokeWidth={2} fillOpacity={1} fill="url(#colorSpd)" isAnimationActive={false} />
                 </AreaChart>
               </ResponsiveContainer>
             </div>

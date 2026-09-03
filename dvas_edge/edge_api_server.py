@@ -579,10 +579,23 @@ class PipelineManager:
     # ── Status / Telemetry ────────────────────────────────────────────────
 
     def get_status(self) -> dict:
+        # Storage usage
+        storage_pct = 0.0
+        try:
+            disk = psutil.disk_usage("/data") if os.path.exists("/data") else psutil.disk_usage("/")
+            storage_pct = round(disk.percent, 1)
+        except Exception:
+            try:
+                disk = psutil.disk_usage("/")
+                storage_pct = round(disk.percent, 1)
+            except Exception:
+                storage_pct = 0.0
+
         if not self._running:
             return {"active": False, "connected": False, "fps": 0, "decode_latency_ms": 0,
                     "buffer_fill_pct": 0, "buffer_frames": 0, "buffer_max_frames": 0,
-                    "cpu_pct": 0, "gpu_pct": 0, "gpu_mem_used_mb": 0, "gpu_mem_total_mb": 0,
+                    "cpu_pct": round(psutil.cpu_percent(), 1), "gpu_pct": 0, "gpu_mem_used_mb": 0, "gpu_mem_total_mb": 0,
+                    "storage_pct": storage_pct, "bitrate_mbps": 0.0,
                     "upload_queue": 0, "frames_selected": 0, "frames_total": 0,
                     "change_events_total": 0}
 
@@ -611,10 +624,14 @@ class PipelineManager:
             except Exception:
                 pass
 
+        fps = round(self.source.source_fps, 1) if self.source else 0.0
+        bitrate_mbps = round(fps * 0.14, 1) if fps > 0 else 0.0
+
         return {
             "active": True,
             "connected": self.source.is_connected if self.source else False,
-            "fps": round(self.source.source_fps, 1) if self.source else 0.0,
+            "fps": fps,
+            "bitrate_mbps": bitrate_mbps,
             "decode_latency_ms": 0.0,
             "buffer_fill_pct": round(buf_frames / max(max_frames, 1) * 100, 1),
             "buffer_frames": buf_frames,
@@ -623,6 +640,7 @@ class PipelineManager:
             "gpu_pct": gpu_pct,
             "gpu_mem_used_mb": gpu_mem_used,
             "gpu_mem_total_mb": gpu_mem_total,
+            "storage_pct": storage_pct,
             "upload_queue": 0,
             "frames_selected": self.frames_selected,
             "frames_total": self.source._frame_index if self.source else 0,
