@@ -65,3 +65,4 @@ psutil>=5.9.0
 python-jose[cryptography]>=3.3.0
 httpx>=0.24.0
 python-multipart==0.0.18
+slowapi>=0.1.9

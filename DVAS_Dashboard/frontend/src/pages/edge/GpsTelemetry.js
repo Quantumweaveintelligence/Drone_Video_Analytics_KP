@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import AppShell from '@/components/layout/AppShell';
-import { MapContainer, TileLayer, Marker, Popup, Polyline, CircleMarker } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Polyline, CircleMarker, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { AreaChart, Area, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
@@ -17,6 +17,17 @@ L.Icon.Default.mergeOptions({
 
 const KERALA_LAT = 8.5241;
 const KERALA_LNG = 76.9366;
+
+// Auto-recenter map when drone position changes
+function RecenterMap({ lat, lng }) {
+  const map = useMap();
+  useEffect(() => {
+    if (lat && lng && (lat !== KERALA_LAT || lng !== KERALA_LNG)) {
+      map.setView([lat, lng], map.getZoom(), { animate: true });
+    }
+  }, [lat, lng, map]);
+  return null;
+}
 
 export default function GpsTelemetry() {
   const [telemetry, setTelemetry] = useState({
@@ -149,6 +160,9 @@ export default function GpsTelemetry() {
                 attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
                 url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
               />
+              
+              {/* Auto-recenter map on drone position */}
+              <RecenterMap lat={telemetry.lat} lng={telemetry.lng} />
               
               {/* Flight path trail */}
               <Polyline 

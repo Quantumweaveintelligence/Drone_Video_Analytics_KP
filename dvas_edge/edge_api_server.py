@@ -520,15 +520,18 @@ class PipelineManager:
             # ── Clean up physical files if this was a local file upload ────────
             if video_source_type == "file" and video_source_path:
                 try:
-                    if os.path.exists(video_source_path):
-                        os.remove(video_source_path)
-                        log.info("deleted_video_file", file=video_source_path)
+                    resolved_video_path = Path(video_source_path).resolve()
+                    if str(resolved_video_path).startswith(str(Path("/data").resolve())):
+                        if resolved_video_path.exists():
+                            os.remove(resolved_video_path)
+                            log.info("deleted_video_file", file=str(resolved_video_path))
                     
                     # Also try to clean up potential SRT files matching the name
-                    srt_path = os.path.splitext(video_source_path)[0] + ".srt"
-                    if os.path.exists(srt_path):
-                        os.remove(srt_path)
-                        log.info("deleted_srt_file", file=srt_path)
+                    srt_path = Path(os.path.splitext(video_source_path)[0] + ".srt").resolve()
+                    if str(srt_path).startswith(str(Path("/data").resolve())):
+                        if srt_path.exists():
+                            os.remove(srt_path)
+                            log.info("deleted_srt_file", file=str(srt_path))
                 except Exception as e:
                     log.error("failed_to_delete_video_file", error=str(e))
 
@@ -654,9 +657,42 @@ class PipelineManager:
 # ---------------------------------------------------------------------------
 # FastAPI Application
 # ---------------------------------------------------------------------------
+JWKS_CACHE = {}
+
+def get_jwks():
+    global JWKS_CACHE
+    if JWKS_CACHE:
+        return JWKS_CACHE
+    token_url = os.getenv("INGEST__TOKEN_URL", "http://keycloak:8080/realms/kerala-police-drone/protocol/openid-connect/token")
+    certs_url = token_url.replace("/token", "/certs")
+    try:
+        import httpx
+        r = httpx.get(certs_url, timeout=5.0)
+        if r.status_code == 200:
+            JWKS_CACHE = r.json()
+    except Exception as e:
+        log.error(f"Failed to fetch JWKS: {e}")
+    return JWKS_CACHE
+
 pipeline = PipelineManager()
 
 app = FastAPI(title="DVAS Edge Control API")
+
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.errors import RateLimitExceeded
+from fastapi.responses import JSONResponse
+
+# 300 req/min for management/upload routes by default
+limiter = Limiter(key_func=get_remote_address, default_limits=["300/minute"])
+app.state.limiter = limiter
+
+async def ratelimit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(status_code=429, content={"error": f"Rate limit exceeded: {exc.detail}"})
+
+app.add_exception_handler(RateLimitExceeded, ratelimit_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 # ── CORS Hardening ────────────────────────────────────────────────────────────
 _RAW_CORS = os.getenv(
@@ -708,11 +744,18 @@ async def verify_edge_auth(
             return {"auth_type": "token_match", "role": "edge_m2m"}
         try:
             from jose import jwt as jose_jwt
-            payload = jose_jwt.decode(bearer_token, "", options={"verify_signature": False, "verify_aud": False})
+            public_key_env = os.getenv("KEYCLOAK_PUB_KEY")
+            key_source = public_key_env if (public_key_env and "..." not in public_key_env) else get_jwks()
+            payload = jose_jwt.decode(
+                bearer_token, 
+                key_source, 
+                algorithms=["RS256"], 
+                options={"verify_signature": True, "verify_aud": False}
+            )
             if payload and payload.get("exp", float("inf")) >= time.time():
                 return {"auth_type": "jwt", "user": payload.get("preferred_username") or payload.get("sub")}
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"JWT verification failed: {e}")
 
     # 3. Development Loopback Exception (strictly disabled in production)
     is_prod = os.getenv("ENV", "").lower().startswith("prod") or os.getenv("ENVIRONMENT", "").lower().startswith("prod")
@@ -731,11 +774,19 @@ async def upload_video_stream(
     """Raw stream upload for large video files directly to disk."""
     filename_encoded = request.headers.get("x-filename", "uploaded_video.mp4")
     import urllib.parse
-    filename = urllib.parse.unquote(filename_encoded)
-    
+    raw_name = urllib.parse.unquote(filename_encoded)
+    safe_name = os.path.basename(raw_name).strip()
+    ALLOWED_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".ts", ".webm", ".srt", ".vtt"}
+    ext = os.path.splitext(safe_name)[1].lower()
+    if ext not in ALLOWED_EXTS:
+        raise HTTPException(400, f"Unsupported file extension: {ext}")
+        
     upload_dir = Path("/data")
     upload_dir.mkdir(parents=True, exist_ok=True)
-    video_path = upload_dir / filename
+    
+    video_path = (upload_dir / safe_name).resolve()
+    if not str(video_path).startswith(str(upload_dir.resolve())):
+        raise HTTPException(400, "Invalid file path traversal detected")
     
     # Stream directly from HTTP request to the final volume on disk
     with open(video_path, "wb") as out_file:
@@ -754,14 +805,33 @@ async def upload_video(
     upload_dir = Path("/data")
     upload_dir.mkdir(parents=True, exist_ok=True)
     
-    # Save video
-    video_path = upload_dir / video.filename
+    import urllib.parse
+    raw_video_name = urllib.parse.unquote(video.filename or "video.mp4")
+    safe_video_name = os.path.basename(raw_video_name).strip()
+    ALLOWED_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".ts", ".webm", ".srt", ".vtt"}
+    video_ext = os.path.splitext(safe_video_name)[1].lower()
+    if video_ext not in ALLOWED_EXTS:
+        raise HTTPException(400, f"Unsupported file extension: {video_ext}")
+
+    video_path = (upload_dir / safe_video_name).resolve()
+    if not str(video_path).startswith(str(upload_dir.resolve())):
+        raise HTTPException(400, "Invalid file path traversal detected")
+        
     with open(video_path, "wb") as buffer:
         shutil.copyfileobj(video.file, buffer)
         
     # Save SRT if provided
     if srt and srt.filename:
-        srt_path = upload_dir / srt.filename
+        raw_srt_name = urllib.parse.unquote(srt.filename)
+        safe_srt_name = os.path.basename(raw_srt_name).strip()
+        srt_ext = os.path.splitext(safe_srt_name)[1].lower()
+        if srt_ext not in ALLOWED_EXTS:
+            raise HTTPException(400, f"Unsupported file extension: {srt_ext}")
+            
+        srt_path = (upload_dir / safe_srt_name).resolve()
+        if not str(srt_path).startswith(str(upload_dir.resolve())):
+            raise HTTPException(400, "Invalid file path traversal detected")
+            
         with open(srt_path, "wb") as buffer:
             shutil.copyfileobj(srt.file, buffer)
             
@@ -777,7 +847,18 @@ async def upload_srt(
     upload_dir = Path("/data")
     upload_dir.mkdir(parents=True, exist_ok=True)
     
-    srt_path = upload_dir / srt.filename
+    import urllib.parse
+    raw_srt_name = urllib.parse.unquote(srt.filename or "video.srt")
+    safe_srt_name = os.path.basename(raw_srt_name).strip()
+    ALLOWED_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".ts", ".webm", ".srt", ".vtt"}
+    srt_ext = os.path.splitext(safe_srt_name)[1].lower()
+    if srt_ext not in ALLOWED_EXTS:
+        raise HTTPException(400, f"Unsupported file extension: {srt_ext}")
+        
+    srt_path = (upload_dir / safe_srt_name).resolve()
+    if not str(srt_path).startswith(str(upload_dir.resolve())):
+        raise HTTPException(400, "Invalid file path traversal detected")
+        
     with open(srt_path, "wb") as buffer:
         shutil.copyfileobj(srt.file, buffer)
         
@@ -831,7 +912,8 @@ def get_status(auth: dict = Depends(verify_edge_auth)):
 
 
 @app.get("/api/edge/telemetry")
-def get_telemetry(auth: dict = Depends(verify_edge_auth)):
+@limiter.limit("3000/minute")
+def get_telemetry(request: Request, auth: dict = Depends(verify_edge_auth)):
     return pipeline.get_telemetry()
 
 
@@ -872,7 +954,8 @@ async def mjpeg_generator():
 
 
 @app.get("/stream/live")
-async def stream_live(auth: dict = Depends(verify_edge_auth)):
+@limiter.limit("3000/minute")
+async def stream_live(request: Request, auth: dict = Depends(verify_edge_auth)):
     return StreamingResponse(
         mjpeg_generator(),
         media_type="multipart/x-mixed-replace; boundary=frame",

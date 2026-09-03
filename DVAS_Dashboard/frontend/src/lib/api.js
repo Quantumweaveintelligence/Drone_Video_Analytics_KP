@@ -24,11 +24,28 @@ export const authFetch = async (url, options = {}) => {
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
   };
 
-  return fetch(url, {
+  let response = await fetch(url, {
     ...options,
     headers,
     credentials: "include",
   });
+
+  if (response.status === 401 && !url.includes("/auth/")) {
+    try {
+      await api.post("/auth/refresh");
+      response = await fetch(url, {
+        ...options,
+        headers,
+        credentials: "include",
+      });
+    } catch (e) {
+      if (window.location.pathname !== "/login") {
+        window.location.href = "/login";
+      }
+    }
+  }
+
+  return response;
 };
 
 // Auto-refresh token on 401 response and replay original request transparently

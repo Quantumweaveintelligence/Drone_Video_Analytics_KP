@@ -38,11 +38,10 @@ logger = logging.getLogger("dvas.ingest_proxy")
 INGEST_SERVER_URL = os.environ.get("INGEST_SERVER_URL", "http://localhost:8000")
 
 # Keycloak service-token config — uses dvas-admin-service (serviceAccountsEnabled)
-# Keycloak is reachable on the shared drone-net via its service hostname.
-_KC_URL           = "http://keycloak:8080"
+_KC_URL           = os.environ.get("KEYCLOAK_URL", "http://keycloak:8080")
 _KC_REALM         = os.environ.get("KC_REALM", "kerala-police-drone")
-_KC_CLIENT_ID     = "dvas-admin-service"
-_KC_CLIENT_SECRET = "MvusAlJk9DMnfe6GVOwuni8ODQbES938"
+_KC_CLIENT_ID     = os.environ.get("ADMIN_CLIENT_ID", "dvas-admin-service")
+_KC_CLIENT_SECRET = os.environ.get("ADMIN_CLIENT_SECRET", "MvusAlJk9DMnfe6GVOwuni8ODQbES938")
 
 # ── Service-token cache ────────────────────────────────────────────────────────
 # Cached (token, expiry_epoch) for the backend's own Keycloak service account.

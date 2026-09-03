@@ -278,17 +278,17 @@ export default function MissionControl() {
             videoSourceType: data.video_source_type,
           });
         } else {
-          const currentMission = activeMissionRef.current;
-          if (currentMission) {
-            setMissionLog(logs => logs.map(m => 
-              m.id === currentMission.id 
-                ? { ...m, end: new Date().toLocaleTimeString('en-GB'), status: 'completed' }
-                : m
-            ));
-            
-            authFetch(`/api/missions/${currentMission.id}/end`, { method: 'PATCH' }).catch(e => console.error(e));
-            setActiveMission(null);
-          }
+          setActiveMission(null);
+          setMissionLog(logs => {
+            const staleMissions = logs.filter(m => m.status === 'active');
+            if (staleMissions.length > 0) {
+              staleMissions.forEach(m => {
+                authFetch(`/api/missions/${m.id}/end`, { method: 'PATCH' }).catch(e => console.error(e));
+              });
+              return logs.map(m => m.status === 'active' ? { ...m, end: new Date().toLocaleTimeString('en-GB'), status: 'completed' } : m);
+            }
+            return logs;
+          });
         }
       } catch (err) {
         // Edge server not available - keep current state
