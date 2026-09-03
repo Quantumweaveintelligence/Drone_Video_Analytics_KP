@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import engine
 from models import Mission
 from core.security import get_current_user, _row_to_dict
-from core.analytics_client import _analytics_get, _analytics_post, _analytics_delete, _service_headers
+from core.analytics_client import _analytics_get, _analytics_post, _analytics_put, _analytics_delete, _service_headers
 from core.config import (
     ANALYTICS_BASE, CROWD_URL, PERSON_URL, VEHICLE_URL, ANPR_URL,
 )
@@ -173,18 +173,23 @@ async def crowd_switch_model(request: Request, user: dict = Depends(get_current_
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     body = await request.json()
-    result = await _analytics_post(f"{CROWD_URL}/model/switch", body)
-    if "error" not in result:
-        await write_audit_v2(
-            actor=user,
-            action="crowd_model_switch",
-            target=body.get("model_type", "unknown"),
-            target_type="configuration",
-            target_name=f"Crowd Model ({body.get('model_type', 'unknown')})",
-            details=f"Switched crowd model to {body.get('model_type')}",
-            source_endpoint="PUT /api/analytics/crowd/model",
-            request=request,
-        )
+    result = await _analytics_put(f"{CROWD_URL}/model/switch", body)
+    if "error" in result:
+        # Fallback to post if put had an issue
+        result = await _analytics_post(f"{CROWD_URL}/model/switch", body)
+    if "error" in result:
+        raise HTTPException(502, detail=result.get("detail", "Failed to switch crowd model upstream"))
+
+    await write_audit_v2(
+        actor=user,
+        action="crowd_model_switch",
+        target=body.get("model_type", "unknown"),
+        target_type="configuration",
+        target_name=f"Crowd Model ({body.get('model_type', 'unknown')})",
+        details=f"Switched crowd model to {body.get('model_type')}",
+        source_endpoint="PUT /api/analytics/crowd/model",
+        request=request,
+    )
     return result
 
 
@@ -295,7 +300,7 @@ async def person_tracks(user: dict = Depends(get_current_user), drone_id: str = 
 async def person_dedup(user: dict = Depends(get_current_user)):
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
-    return await _analytics_get(f"{PERSON_URL}/faces/deduplicate")
+    return await _analytics_get(f"{PERSON_URL}/persons/deduplicate")
 
 
 @router.get("/analytics/person/detections")
@@ -317,10 +322,10 @@ async def person_reid_trigger(user: dict = Depends(get_current_user)):
 
 @router.post("/analytics/person/deduplicate")
 async def person_deduplicate_mission(user: dict = Depends(get_current_user), body: dict = {}):
-    """Trigger mission-scoped face deduplication."""
+    """Trigger mission-scoped person deduplication."""
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
-    return await _analytics_post(f"{PERSON_URL}/faces/deduplicate/mission", body)
+    return await _analytics_post(f"{PERSON_URL}/persons/deduplicate/mission", body)
 
 
 @router.get("/analytics/person/dedup/progress")
@@ -328,7 +333,7 @@ async def person_dedup_progress(user: dict = Depends(get_current_user), mission_
     """Get current mission deduplication progress."""
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
-    url = f"{PERSON_URL}/faces/deduplicate/progress"
+    url = f"{PERSON_URL}/persons/deduplicate/progress"
     if mission_id:
         url += f"?mission_id={mission_id}"
     return await _analytics_get(url)

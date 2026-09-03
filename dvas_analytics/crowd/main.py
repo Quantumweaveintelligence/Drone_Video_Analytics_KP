@@ -412,6 +412,7 @@ async def annotated_latest(drone_id: str = ""):
     )
 
 @app.put("/model/switch")
+@app.post("/model/switch")
 async def switch_model(body: dict):
     global _current_model_type
     model_type = body.get("model_type", "csrnet_parta")
@@ -420,7 +421,11 @@ async def switch_model(body: dict):
     new_path = MODEL_PATHS[model_type]
     if not os.path.isfile(new_path):
         raise HTTPException(404, f"Model file not found: {new_path}")
-    analyzer.switch_model(new_path)
+    try:
+        analyzer.switch_model(new_path)
+    except Exception as exc:
+        log.error("Failed to switch model to %s: %s", model_type, exc)
+        raise HTTPException(500, f"Failed to switch model to {model_type}: {exc}")
     _current_model_type = model_type
     log.info("Switched crowd model to %s (%s)", model_type, new_path)
     return {"status": "switched", "model_type": model_type, "model_path": new_path}

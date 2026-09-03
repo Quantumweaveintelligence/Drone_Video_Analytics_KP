@@ -27,6 +27,8 @@ from shared.db import (
     close_pool, ensure_drone, get_pool, upsert_track,
     write_confirmed_event, get_all_face_embeddings, delete_face_embeddings,
     write_face_embedding, update_face_embedding_cluster,
+    write_person_embedding, get_all_person_embeddings, get_person_embeddings_by_mission,
+    update_person_embedding_cluster, get_distinct_missions_person_embeddings,
     write_evidence_frame, get_person_identities, upsert_person_identity,
     get_face_embeddings_by_mission, get_distinct_missions_face_embeddings,
     upsert_dedup_run, get_dedup_run, get_dedup_runs,
@@ -40,7 +42,7 @@ from person.analyzer import PersonFaceAnalyzer
 from person.deduplicator import (
     cluster_embeddings, find_duplicates_in_clusters, load_resnet_model,
     extract_embedding_from_bytes, get_identity_representatives,
-    update_cluster_labels_db,
+    update_cluster_labels_db, update_person_cluster_labels_db, get_sharpness_score,
 )
 from person.schema import FrameAnalysisResult, DeduplicationResult
 
@@ -311,16 +313,58 @@ async def _stream_loop():
                     except Exception as db_exc:
                         log.warning("Person track/event write error: %s", db_exc)
 
-                    # Process face crops + embeddings
+                    # 1. Process whole-body person crops + person appearance embeddings
                     try:
-                        # Build lookup of person crop_bytes by tracker_id
-                        person_crops_by_tid = {
-                            p.get("tracker_id"): p.get("crop_bytes")
-                            for p in result.get("persons", [])
-                            if p.get("tracker_id") is not None
-                        }
+                        for person in result.get("persons", []):
+                            p_crop_bytes = person.pop("crop_bytes", None)
+                            tid = person.get("tracker_id", 0)
+                            if not p_crop_bytes and tid is not None:
+                                # Fallback: crop from frame using person bbox
+                                pbb = person.get("bbox")
+                                if pbb:
+                                    h, w = frame.shape[:2]
+                                    x1, y1 = max(0, int(pbb["x1"])), max(0, int(pbb["y1"]))
+                                    x2, y2 = min(w, int(pbb["x2"])), min(h, int(pbb["y2"]))
+                                    if x2 > x1 and y2 > y1:
+                                        _, p_buf = cv2.imencode(".jpg", frame[y1:y2, x1:x2], [cv2.IMWRITE_JPEG_QUALITY, 85])
+                                        p_crop_bytes = bytes(p_buf)
 
-                        for face in result["faces"]:
+                            if p_crop_bytes and resnet_model:
+                                ts_ms = int(ts.timestamp() * 1000)
+                                try:
+                                    nparr = np.frombuffer(p_crop_bytes, np.uint8)
+                                    img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                                    sharpness = get_sharpness_score(img_bgr) if img_bgr is not None else 0.0
+                                except Exception:
+                                    sharpness = 0.0
+
+                                person_key = minio.make_key(
+                                    "persons", drone_id,
+                                    f"person_{ts_ms}_{tid}.jpg"
+                                )
+                                person_obj_key = await minio.upload_bytes(
+                                    cfg.BUCKET_FACES, person_key, p_crop_bytes, "image/jpeg"
+                                )
+                                p_emb = extract_embedding_from_bytes(
+                                    resnet_model, p_crop_bytes, resnet_device
+                                )
+                                if p_emb and person_obj_key:
+                                    await write_person_embedding(
+                                        track_id=None,
+                                        image_path=person_obj_key,
+                                        embedding=p_emb,
+                                        drone_id=drone_id,
+                                        object_key=person_obj_key,
+                                        mission_id=mission_id,
+                                        tracker_id=tid,
+                                        sharpness_score=sharpness,
+                                    )
+                    except Exception as person_exc:
+                        log.warning("Person appearance embedding write error: %s", person_exc)
+
+                    # 2. Process face crops + face embeddings (for Detected Faces gallery)
+                    try:
+                        for face in result.get("faces", []):
                             face_crop_bytes = face.pop("crop_bytes", None)
                             if face_crop_bytes and resnet_model:
                                 emb = extract_embedding_from_bytes(
@@ -335,32 +379,6 @@ async def _stream_loop():
                                     face_obj_key = await minio.upload_bytes(
                                         cfg.BUCKET_FACES, key, face_crop_bytes, "image/jpeg"
                                     )
-
-                                    # Upload whole body crop if available
-                                    person_obj_key = None
-                                    tid = face.get("tracker_id")
-                                    p_crop_bytes = person_crops_by_tid.get(tid)
-                                    if not p_crop_bytes and tid is not None:
-                                        # Fallback: crop from frame using person bbox
-                                        matched_p = next((p for p in result.get("persons", []) if p.get("tracker_id") == tid), None)
-                                        if matched_p:
-                                            pbb = matched_p["bbox"]
-                                            h, w = frame.shape[:2]
-                                            x1, y1 = max(0, int(pbb["x1"])), max(0, int(pbb["y1"]))
-                                            x2, y2 = min(w, int(pbb["x2"])), min(h, int(pbb["y2"]))
-                                            if x2 > x1 and y2 > y1:
-                                                _, p_buf = cv2.imencode(".jpg", frame[y1:y2, x1:x2], [cv2.IMWRITE_JPEG_QUALITY, 85])
-                                                p_crop_bytes = bytes(p_buf)
-
-                                    if p_crop_bytes:
-                                        person_key = minio.make_key(
-                                            "persons", drone_id,
-                                            f"person_{face_ts_ms}_{tid}.jpg"
-                                        )
-                                        person_obj_key = await minio.upload_bytes(
-                                            cfg.BUCKET_FACES, person_key, p_crop_bytes, "image/jpeg"
-                                        )
-
                                     await write_face_embedding(
                                         track_id=None,
                                         image_path=face_obj_key or "",
@@ -368,14 +386,9 @@ async def _stream_loop():
                                         drone_id=drone_id,
                                         object_key=face_obj_key,
                                         mission_id=mission_id,
-                                        person_object_key=person_obj_key,
                                     )
                     except Exception as face_exc:
                         log.warning("Face embedding write error: %s", face_exc)
-
-                    # Also clean up person crop_bytes
-                    for person in result["persons"]:
-                        person.pop("crop_bytes", None)
 
                     try:
                         await publish_analytics_result("person", result)
@@ -385,9 +398,10 @@ async def _stream_loop():
                     _frames_processed += 1
                     _reid_frame_counter += 1
 
-                    # Periodic re-ID clustering
+                    # Periodic re-ID clustering for both Persons and Faces
                     if _reid_frame_counter >= cfg.REID_CLUSTER_INTERVAL:
                         _reid_frame_counter = 0
+                        asyncio.create_task(_run_person_reid_clustering())
                         asyncio.create_task(_run_reid_clustering())
 
             except asyncio.CancelledError:
@@ -397,8 +411,52 @@ async def _stream_loop():
                 await asyncio.sleep(1)
 
 
+async def _run_person_reid_clustering():
+    """Background Person Re-ID clustering on whole-body person embeddings."""
+    try:
+        rows = await get_all_person_embeddings()
+        if len(rows) < 2:
+            if len(rows) == 1:
+                r = rows[0]
+                await upsert_person_identity(
+                    cluster_id=0,
+                    best_image_key=None,
+                    drone_id=r.get("drone_id"),
+                    embedding_count=1,
+                    best_person_image_key=r.get("object_key"),
+                    mission_id=r.get("mission_id"),
+                )
+            return
+
+        ids = [str(r["id"]) for r in rows]
+        embeddings = [list(r["embedding"]) for r in rows]
+        sharpness_scores = [float(r.get("sharpness_score") or 0.0) for r in rows]
+
+        labels = cluster_embeddings(embeddings, cfg.REID_DISTANCE_THRESHOLD)
+        duplicate_ids, unique_count = find_duplicates_in_clusters(ids, labels, sharpness_scores)
+        dup_set = set(duplicate_ids)
+        await update_person_cluster_labels_db(ids, labels, dup_set)
+
+        # Upsert person identities from best representative whole-body crops
+        reps = get_identity_representatives(ids, labels, sharpness_scores)
+        for cluster_id, rep_id in reps.items():
+            rep_row = next((r for r in rows if str(r["id"]) == rep_id), None)
+            if rep_row and rep_row.get("object_key"):
+                await upsert_person_identity(
+                    cluster_id=cluster_id,
+                    best_image_key=None,
+                    drone_id=rep_row.get("drone_id"),
+                    embedding_count=sum(1 for l in labels if l == cluster_id),
+                    best_person_image_key=rep_row.get("object_key"),
+                    mission_id=rep_row.get("mission_id"),
+                )
+        log.info("Person Re-ID clustering: %d person embeddings → %d unique person identities", len(rows), unique_count)
+    except Exception as exc:
+        log.warning("Person Re-ID clustering failed: %s", exc)
+
+
 async def _run_reid_clustering():
-    """Background Re-ID clustering — runs asynchronously."""
+    """Background Face Re-ID clustering — runs asynchronously."""
     try:
         rows = await get_all_face_embeddings()
         if len(rows) < 2:
@@ -409,29 +467,9 @@ async def _run_reid_clustering():
         duplicate_ids, unique_count = find_duplicates_in_clusters(ids, labels)
         dup_set = set(duplicate_ids)
         await update_cluster_labels_db(ids, labels, dup_set)
-        # Upsert person identities
-        reps = get_identity_representatives(ids, labels)
-        for cluster_id, rep_id in reps.items():
-            rep_row = next((r for r in rows if str(r["id"]) == rep_id), None)
-            if rep_row:
-                person_key = rep_row.get("person_object_key")
-                if not person_key:
-                    cluster_member_ids = {ids[i] for i, l in enumerate(labels) if l == cluster_id}
-                    for r in rows:
-                        if str(r["id"]) in cluster_member_ids and r.get("person_object_key"):
-                            person_key = r.get("person_object_key")
-                            break
-                await upsert_person_identity(
-                    cluster_id=cluster_id,
-                    best_image_key=rep_row.get("object_key"),
-                    drone_id=rep_row.get("drone_id"),
-                    embedding_count=sum(1 for l in labels if l == cluster_id),
-                    best_person_image_key=person_key,
-                    mission_id=rep_row.get("mission_id"),
-                )
-        log.info("Re-ID clustering: %d embeddings → %d identities", len(rows), unique_count)
+        log.info("Face Re-ID clustering: %d embeddings → %d clusters", len(rows), unique_count)
     except Exception as exc:
-        log.warning("Re-ID clustering failed: %s", exc)
+        log.warning("Face Re-ID clustering failed: %s", exc)
 
 
 @app.get("/stream/start")
@@ -636,7 +674,7 @@ async def deduplicate_faces():
     }
 
 
-@app.post("/faces/deduplicate/mission")
+@app.post("/persons/deduplicate/mission")
 async def deduplicate_mission(body: dict):
     """Run deduplication scoped to a specific mission_id."""
     global _dedup_progress
@@ -651,7 +689,7 @@ async def deduplicate_mission(body: dict):
 
 
 async def _run_mission_dedup(mission_id: str):
-    """Background task: deduplicate face embeddings for a specific mission with DB persistence."""
+    """Background task: deduplicate person and face embeddings for a specific mission with DB persistence."""
     global _dedup_progress
     _dedup_progress = {
         "mission_id": mission_id, "status": "running", "progress_pct": 0,
@@ -663,7 +701,14 @@ async def _run_mission_dedup(mission_id: str):
         progress_pct=0.0,
     )
     try:
-        rows = await get_face_embeddings_by_mission(mission_id)
+        # Prioritize whole-body person embeddings for this mission
+        rows = await get_person_embeddings_by_mission(mission_id)
+        is_person_pipeline = True
+        if len(rows) < 2:
+            # Fallback to face embeddings if no person embeddings exist
+            rows = await get_face_embeddings_by_mission(mission_id)
+            is_person_pipeline = False
+
         total = len(rows)
         _dedup_progress["total_embeddings"] = total
         if total < 2:
@@ -687,6 +732,7 @@ async def _run_mission_dedup(mission_id: str):
 
         ids        = [str(r["id"]) for r in rows]
         embeddings = [list(r["embedding"]) for r in rows]
+        sharpness_scores = [float(r.get("sharpness_score") or 0.0) for r in rows]
 
         _dedup_progress["progress_pct"] = 20  # starting clustering
         await upsert_dedup_run(
@@ -696,11 +742,14 @@ async def _run_mission_dedup(mission_id: str):
         labels = cluster_embeddings(embeddings, cfg.REID_DISTANCE_THRESHOLD)
 
         _dedup_progress["progress_pct"] = 50  # clustering complete
-        duplicate_ids, unique_count = find_duplicates_in_clusters(ids, labels)
+        duplicate_ids, unique_count = find_duplicates_in_clusters(ids, labels, sharpness_scores)
         dup_set = set(duplicate_ids)
 
         _dedup_progress["progress_pct"] = 60  # updating DB
-        await update_cluster_labels_db(ids, labels, dup_set)
+        if is_person_pipeline:
+            await update_person_cluster_labels_db(ids, labels, dup_set)
+        else:
+            await update_cluster_labels_db(ids, labels, dup_set)
 
         _dedup_progress["progress_pct"] = 70  # upserting identities
         await upsert_dedup_run(
@@ -708,26 +757,30 @@ async def _run_mission_dedup(mission_id: str):
             total_embeddings=total, unique_found=unique_count,
             duplicates_removed=len(duplicate_ids), progress_pct=70.0,
         )
-        reps = get_identity_representatives(ids, labels)
+        reps = get_identity_representatives(ids, labels, sharpness_scores)
         processed = 0
         for cluster_id, rep_id in reps.items():
             rep_row = next((r for r in rows if str(r["id"]) == rep_id), None)
             if rep_row:
-                person_key = rep_row.get("person_object_key")
-                if not person_key:
-                    cluster_member_ids = {ids[i] for i, l in enumerate(labels) if l == cluster_id}
-                    for r in rows:
-                        if str(r["id"]) in cluster_member_ids and r.get("person_object_key"):
-                            person_key = r.get("person_object_key")
-                            break
-                await upsert_person_identity(
-                    cluster_id=cluster_id,
-                    best_image_key=rep_row.get("object_key"),
-                    drone_id=rep_row.get("drone_id"),
-                    embedding_count=sum(1 for l in labels if l == cluster_id),
-                    best_person_image_key=person_key,
-                    mission_id=rep_row.get("mission_id") or mission_id,
-                )
+                if is_person_pipeline:
+                    await upsert_person_identity(
+                        cluster_id=cluster_id,
+                        best_image_key=None,
+                        drone_id=rep_row.get("drone_id"),
+                        embedding_count=sum(1 for l in labels if l == cluster_id),
+                        best_person_image_key=rep_row.get("object_key"),
+                        mission_id=rep_row.get("mission_id") or mission_id,
+                    )
+                else:
+                    person_key = rep_row.get("person_object_key")
+                    await upsert_person_identity(
+                        cluster_id=cluster_id,
+                        best_image_key=rep_row.get("object_key"),
+                        drone_id=rep_row.get("drone_id"),
+                        embedding_count=sum(1 for l in labels if l == cluster_id),
+                        best_person_image_key=person_key,
+                        mission_id=rep_row.get("mission_id") or mission_id,
+                    )
             processed += 1
             pct = 70 + int(30 * processed / max(len(reps), 1))
             _dedup_progress["progress_pct"] = min(pct, 99)
@@ -736,6 +789,7 @@ async def _run_mission_dedup(mission_id: str):
         _dedup_progress.update(
             status="complete", progress_pct=100,
             unique_found=unique_count, processed=total,
+            duplicates_removed=len(duplicate_ids),
         )
         await upsert_dedup_run(
             mission_id=mission_id,
@@ -757,18 +811,18 @@ async def _run_mission_dedup(mission_id: str):
         )
 
 
-@app.get("/faces/deduplicate/progress")
+@app.get("/persons/deduplicate/progress")
 async def dedup_progress(mission_id: str = ""):
     """Return current mission deduplication progress from memory or DB."""
     if mission_id and _dedup_progress.get("mission_id") != mission_id:
         db_run = await get_dedup_run(mission_id)
         if db_run:
             return {
-                "mission_id": db_run["mission_id"],
+                "mission_id": mission_id,
                 "status": db_run["status"],
                 "progress_pct": int(db_run["progress_pct"] or 0),
                 "total_embeddings": db_run["total_embeddings"] or 0,
-                "processed": db_run["total_embeddings"] if db_run["status"] == "complete" else 0,
+                "processed": db_run["total_embeddings"] or 0,
                 "unique_found": db_run["unique_found"] or 0,
                 "error": db_run["error_message"],
             }
@@ -777,25 +831,49 @@ async def dedup_progress(mission_id: str = ""):
 
 @app.get("/missions/dedup-status")
 async def missions_dedup_status():
-    """List missions with their face embedding counts and dedup status."""
-    missions = await get_distinct_missions_face_embeddings()
-    result = []
-    for m in missions:
-        total = m.get("total_faces", 0)
+    """List missions with their person and face embedding counts and dedup status."""
+    person_missions = await get_distinct_missions_person_embeddings()
+    face_missions = await get_distinct_missions_face_embeddings()
+    # Combine or prioritize person missions
+    missions_map = {}
+    for m in person_missions:
+        mid = m["mission_id"]
+        total = m.get("total_persons", 0)
         clustered = m.get("clustered", 0)
         dedup_status = m.get("dedup_status")
         is_deduped = (dedup_status == "complete") or (clustered > 0 and clustered >= total * 0.8)
-        result.append({
-            "mission_id":      m["mission_id"],
-            "total_faces":     total,
-            "duplicates":      m.get("duplicates", 0),
+        missions_map[mid] = {
+            "mission_id": mid,
+            "total_faces": total, # For UI compatibility
+            "total_persons": total,
+            "duplicates": m.get("duplicates", 0),
             "is_deduplicated": is_deduped,
-            "dedup_status":    dedup_status or ("complete" if is_deduped else "pending"),
-            "unique_found":    m.get("unique_found"),
-            "first_seen":      str(m.get("first_seen", "")),
-            "last_seen":       str(m.get("last_seen", "")),
-            "completed_at":    str(m.get("dedup_completed_at", "") or ""),
-        })
+            "dedup_status": dedup_status or ("complete" if is_deduped else "pending"),
+            "unique_found": m.get("unique_found"),
+            "first_seen": str(m.get("first_seen", "")),
+            "last_seen": str(m.get("last_seen", "")),
+            "completed_at": str(m.get("dedup_completed_at", "") or ""),
+        }
+    for m in face_missions:
+        mid = m["mission_id"]
+        if mid not in missions_map:
+            total = m.get("total_faces", 0)
+            clustered = m.get("clustered", 0)
+            dedup_status = m.get("dedup_status")
+            is_deduped = (dedup_status == "complete") or (clustered > 0 and clustered >= total * 0.8)
+            missions_map[mid] = {
+                "mission_id": mid,
+                "total_faces": total,
+                "total_persons": 0,
+                "duplicates": m.get("duplicates", 0),
+                "is_deduplicated": is_deduped,
+                "dedup_status": dedup_status or ("complete" if is_deduped else "pending"),
+                "unique_found": m.get("unique_found"),
+                "first_seen": str(m.get("first_seen", "")),
+                "last_seen": str(m.get("last_seen", "")),
+                "completed_at": str(m.get("dedup_completed_at", "") or ""),
+            }
+    result = list(missions_map.values())
     return {"missions": result, "count": len(result)}
 
 
@@ -808,7 +886,8 @@ async def list_dedup_runs():
 
 @app.post("/reid/trigger")
 async def reid_trigger():
-    """Manually trigger Re-ID clustering."""
+    """Manually trigger Person & Face Re-ID clustering."""
+    asyncio.create_task(_run_person_reid_clustering())
     asyncio.create_task(_run_reid_clustering())
     return {"status": "clustering_started"}
 
@@ -817,16 +896,13 @@ async def reid_trigger():
 @app.get("/persons/identities")
 async def list_identities(limit: int = 50, drone_id: str = "", mission_id: str = ""):
     """List unique person identities (Re-ID clusters), optionally filtered by mission."""
-    identities = await get_person_identities(limit=min(limit, 200), drone_id=drone_id or None)
-    # Add presigned URLs for best images (face + person body)
+    identities = await get_person_identities(
+        limit=min(limit, 200),
+        drone_id=drone_id or None,
+        mission_id=mission_id or None,
+    )
+    # Add presigned URLs for best images (person body + face)
     for identity in identities:
-        if identity.get("best_image_key"):
-            url = await minio.get_presigned_url(
-                cfg.BUCKET_FACES,
-                identity["best_image_key"],
-                cfg.MINIO_URL_EXPIRY,
-            )
-            identity["best_image_url"] = url
         if identity.get("best_person_image_key"):
             person_url = await minio.get_presigned_url(
                 cfg.BUCKET_FACES,
@@ -834,7 +910,52 @@ async def list_identities(limit: int = 50, drone_id: str = "", mission_id: str =
                 cfg.MINIO_URL_EXPIRY,
             )
             identity["best_person_image_url"] = person_url
+        if identity.get("best_image_key"):
+            url = await minio.get_presigned_url(
+                cfg.BUCKET_FACES,
+                identity["best_image_key"],
+                cfg.MINIO_URL_EXPIRY,
+            )
+            identity["best_image_url"] = url
     return {"count": len(identities), "identities": identities}
+
+
+@app.get("/persons/deduplicate")
+async def person_deduplicate_stats():
+    """Return summary statistics of deduplicated person tracks."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """
+        SELECT COUNT(*) AS total_persons,
+               COUNT(*) FILTER (WHERE is_duplicate = true) AS duplicates,
+               COUNT(DISTINCT cluster_id) FILTER (WHERE cluster_id IS NOT NULL) AS unique_identities
+        FROM person_embeddings
+        """
+    )
+    total = row["total_persons"] if row else 0
+    dups = row["duplicates"] if row else 0
+    uniq = row["unique_identities"] if row else 0
+    # Fallback to face_embeddings if person_embeddings has no rows yet
+    if total == 0:
+        row_f = await pool.fetchrow(
+            """
+            SELECT COUNT(*) AS total_faces,
+                   COUNT(*) FILTER (WHERE is_duplicate = true) AS duplicates,
+                   COUNT(DISTINCT cluster_id) FILTER (WHERE cluster_id IS NOT NULL) AS unique_identities
+            FROM face_embeddings
+            """
+        )
+        total = row_f["total_faces"] if row_f else 0
+        dups = row_f["duplicates"] if row_f else 0
+        uniq = row_f["unique_identities"] if row_f else 0
+
+    return {
+        "total_persons": total,
+        "total_faces": total,
+        "unique_identities": uniq,
+        "duplicates_found": dups,
+        "dedup_rate": round((dups / total) * 100, 1) if total > 0 else 0,
+    }
 
 
 @app.get("/persons/count")

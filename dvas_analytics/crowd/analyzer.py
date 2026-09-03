@@ -120,7 +120,8 @@ class CrowdAnalyzer:
     # and cannot load with weights_only=True. Any model NOT on this list
     # must load with weights_only=True (Issue #15).
     _TRUSTED_MODEL_HASHES = frozenset({
-        "68383c1053be371ad54b0061ab99fed08c2bfff39de73937f2a4388041ab0128",  # PartAmodel_best.pth
+        "68383c1053be371ad54b0061ab99fed08c2bfff39de73937f2a4388041ab0128",  # PartAmodel_best.pth (dense crowds / drone)
+        "eb4329b111da5d752db0502f2d1bb450728e63490753607bb31e361fc25c9b97",  # partBmodel_best.pth (static surveillance / CCTV)
     })
 
     def _load_model(self, path):
@@ -157,14 +158,27 @@ class CrowdAnalyzer:
             raise e
 
     def switch_model(self, new_model_path):
-        """Thread-safe method to switch the active model weights."""
+        """Thread-safe method to switch the active model weights with rollback on failure."""
         with self._lock:
-            self.ready = False
-            self.model = self._load_model(new_model_path)
-            self._model_path = new_model_path
-            self._model_type = self._determine_model_type(new_model_path)
-            self.ready = True
-            logger.info(f"Switched model to {self._model_type} ({new_model_path})")
+            old_ready = self.ready
+            old_model = self.model
+            old_path = self._model_path
+            old_type = self._model_type
+            try:
+                self.ready = False
+                loaded = self._load_model(new_model_path)
+                self.model = loaded
+                self._model_path = new_model_path
+                self._model_type = self._determine_model_type(new_model_path)
+                self.ready = True
+                logger.info(f"Switched model to {self._model_type} ({new_model_path})")
+            except Exception as e:
+                self.model = old_model
+                self._model_path = old_path
+                self._model_type = old_type
+                self.ready = old_ready
+                logger.error(f"Failed to switch to {new_model_path}: {e}. Restored {old_type} (ready={old_ready})")
+                raise e
 
     def reset_session(self):
         """Clears session data."""
@@ -337,7 +351,7 @@ class CrowdAnalyzer:
         with self._lock:
             density_map = self._infer(frame_bgr)
             
-        count = float(np.sum(density_map))
+        count = max(0.0, float(np.sum(density_map)))
         
         # Determine labels and alerts
         label, color = get_density_label(count)

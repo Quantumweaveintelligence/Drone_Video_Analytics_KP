@@ -672,6 +672,133 @@ async def update_face_embedding_cluster(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Person embeddings (Whole-body Person Re-ID)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def write_person_embedding(
+    track_id: Optional[str],
+    image_path: str,
+    embedding: List[float],
+    drone_id: Optional[str] = None,
+    object_key: Optional[str] = None,
+    mission_id: Optional[str] = None,
+    tracker_id: Optional[int] = None,
+    sharpness_score: float = 0.0,
+) -> str:
+    from shared.crypto import encrypt_vector
+    pool = await get_pool()
+    emb_id = str(uuid.uuid4())
+    encrypted_emb = encrypt_vector(embedding)
+    await pool.execute(
+        """
+        INSERT INTO person_embeddings
+            (id, track_id, image_path, encrypted_embedding, drone_id, object_key, mission_id, tracker_id, sharpness_score, created_at)
+        VALUES ($1::uuid, $2::uuid, $3, $4::bytea, $5, $6, $7, $8, $9, now())
+        """,
+        emb_id,
+        track_id,
+        image_path,
+        encrypted_emb,
+        drone_id,
+        object_key,
+        mission_id,
+        tracker_id,
+        sharpness_score,
+    )
+    return emb_id
+
+
+async def get_all_person_embeddings() -> List[Dict]:
+    from shared.crypto import decrypt_vector
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT id, track_id, tracker_id, image_path, encrypted_embedding, drone_id, cluster_id,
+               is_duplicate, object_key, mission_id, sharpness_score, created_at
+        FROM person_embeddings
+        ORDER BY created_at
+        """
+    )
+    results = []
+    for r in rows:
+        d = dict(r)
+        raw = d.pop("encrypted_embedding", None)
+        if raw:
+            d["embedding"] = decrypt_vector(raw)
+        else:
+            d["embedding"] = []
+        results.append(d)
+    return results
+
+
+async def get_person_embeddings_by_mission(mission_id: str) -> List[Dict]:
+    """Get person embeddings scoped to a specific mission."""
+    from shared.crypto import decrypt_vector
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT id, track_id, tracker_id, image_path, encrypted_embedding, drone_id, cluster_id,
+               is_duplicate, object_key, mission_id, sharpness_score, created_at
+        FROM person_embeddings
+        WHERE mission_id = $1
+        ORDER BY created_at
+        """,
+        mission_id,
+    )
+    results = []
+    for r in rows:
+        d = dict(r)
+        raw = d.pop("encrypted_embedding", None)
+        if raw:
+            d["embedding"] = decrypt_vector(raw)
+        else:
+            d["embedding"] = []
+        results.append(d)
+    return results
+
+
+async def update_person_embedding_cluster(
+    embedding_id: str,
+    cluster_id: int,
+    is_duplicate: bool,
+) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        """
+        UPDATE person_embeddings
+        SET cluster_id=$1, is_duplicate=$2
+        WHERE id=$3::uuid
+        """,
+        cluster_id, is_duplicate, embedding_id,
+    )
+
+
+async def get_distinct_missions_person_embeddings() -> List[Dict]:
+    """Get distinct missions with person embedding counts and dedup stats, joined with dedup_runs."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT p.mission_id,
+               COUNT(p.id) AS total_persons,
+               COUNT(p.id) FILTER (WHERE p.is_duplicate = true) AS duplicates,
+               COUNT(p.id) FILTER (WHERE p.cluster_id IS NOT NULL) AS clustered,
+               MIN(p.created_at) AS first_seen,
+               MAX(p.created_at) AS last_seen,
+               r.status AS dedup_status,
+               r.unique_found,
+               r.duplicates_removed,
+               r.completed_at AS dedup_completed_at
+        FROM person_embeddings p
+        LEFT JOIN dedup_runs r ON p.mission_id = r.mission_id
+        WHERE p.mission_id IS NOT NULL
+        GROUP BY p.mission_id, r.status, r.unique_found, r.duplicates_removed, r.completed_at
+        ORDER BY MAX(p.created_at) DESC
+        """
+    )
+    return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Mission Deduplication Runs
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -787,17 +914,29 @@ async def upsert_person_identity(
     )
 
 
-async def get_person_identities(limit: int = 50, drone_id: Optional[str] = None) -> List[Dict]:
+async def get_person_identities(
+    limit: int = 50,
+    drone_id: Optional[str] = None,
+    mission_id: Optional[str] = None,
+) -> List[Dict]:
     pool = await get_pool()
+    conditions = []
+    params = []
+    idx = 1
     if drone_id:
-        rows = await pool.fetch(
-            "SELECT * FROM person_identities WHERE drone_id=$1 ORDER BY last_seen DESC LIMIT $2",
-            drone_id, limit,
-        )
-    else:
-        rows = await pool.fetch(
-            "SELECT * FROM person_identities ORDER BY last_seen DESC LIMIT $1", limit
-        )
+        conditions.append(f"drone_id = ${idx}")
+        params.append(drone_id)
+        idx += 1
+    if mission_id:
+        conditions.append(f"mission_id = ${idx}")
+        params.append(mission_id)
+        idx += 1
+    params.append(limit)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    rows = await pool.fetch(
+        f"SELECT * FROM person_identities {where} ORDER BY last_seen DESC LIMIT ${idx}",
+        *params,
+    )
     return [dict(r) for r in rows]
 
 

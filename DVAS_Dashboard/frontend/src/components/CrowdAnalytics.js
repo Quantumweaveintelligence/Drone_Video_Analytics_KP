@@ -681,7 +681,7 @@ function DroneStatusGrid({ readings, droneList }) {
 /* ───────────────────────────────────────────────────────────────
    SECTION 6 — Mission Report Export
    ────────────────────────────────────────────────────────────── */
-function MissionExport({ hasData }) {
+function MissionExport({ hasData, activeModel }) {
   const [meta, setMeta] = useState({ operator: '', location: '', mission_id: '' });
   const [exporting, setExporting] = useState(null);
 
@@ -693,10 +693,11 @@ function MissionExport({ hasData }) {
       if (meta.operator) params.set('operator', meta.operator);
       if (meta.location) params.set('location', meta.location);
       if (meta.mission_id) params.set('mission_id', meta.mission_id);
+      if (activeModel) params.set('model_type', activeModel);
 
       const url = type === 'pdf'
         ? `/api/analytics/crowd/export/pdf?${params.toString()}`
-        : '/api/analytics/crowd/export/csv';
+        : `/api/analytics/crowd/export/csv?${params.toString()}`;
 
       const res = await fetch(url, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -1042,7 +1043,7 @@ export default function CrowdAnalytics({ crowdSeries, drones }) {
       <SessionStatsRow summary={sessionSummary} />
 
       {/* MISSION REPORT EXPORT */}
-      <MissionExport hasData={sessionSummary?.total_frames > 0} />
+      <MissionExport hasData={sessionSummary?.total_frames > 0} activeModel={activeModel} />
 
     </div>
   );

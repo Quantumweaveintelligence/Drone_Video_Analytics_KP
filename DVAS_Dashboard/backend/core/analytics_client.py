@@ -63,6 +63,19 @@ async def _analytics_post(url: str, payload: dict, timeout: float = 8.0) -> dict
     except Exception as exc:
         return {"error": "proxy_error", "detail": str(exc)}
 
+async def _analytics_put(url: str, payload: dict, timeout: float = 8.0) -> dict:
+    """Forward PUT to analytics service."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.put(url, json=payload, timeout=timeout, headers=_service_headers())
+            if r.status_code in (200, 201):
+                return r.json()
+            return {"error": f"upstream {r.status_code}", "detail": r.text[:200]}
+    except httpx.ConnectError:
+        return {"error": "service_unavailable", "detail": f"Cannot reach {url}"}
+    except Exception as exc:
+        return {"error": "proxy_error", "detail": str(exc)}
+
 async def _analytics_delete(url: str, timeout: float = 8.0) -> dict:
     """Forward DELETE to analytics service."""
     try:

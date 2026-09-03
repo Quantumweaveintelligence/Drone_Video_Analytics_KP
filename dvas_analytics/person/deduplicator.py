@@ -170,3 +170,24 @@ async def update_cluster_labels_db(
         for row_id, label in zip(ids, labels)
     ]
     await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def update_person_cluster_labels_db(
+    ids: List[str],
+    labels: List[int],
+    duplicate_ids_set: set,
+) -> None:
+    """
+    Write cluster_id and is_duplicate back to person_embeddings rows.
+    """
+    from shared.db import update_person_embedding_cluster
+    tasks = [
+        update_person_embedding_cluster(
+            embedding_id=row_id,
+            cluster_id=label,
+            is_duplicate=(row_id in duplicate_ids_set),
+        )
+        for row_id, label in zip(ids, labels)
+    ]
+    await asyncio.gather(*tasks, return_exceptions=True)
+

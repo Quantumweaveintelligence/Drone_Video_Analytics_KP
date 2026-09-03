@@ -861,10 +861,10 @@ function DeduplicationSection({ missions, dedupProgress, onDeduplicate, dedupDat
   const isComplete = progress.status === 'complete';
   const isError    = progress.status === 'error';
 
-  const totalFaces = dedupData?.total_faces    || 0;
-  const uniqueIds  = dedupData?.unique_identities || dedupData?.total_unique || 0;
-  const duplicates = dedupData?.duplicates_found  || 0;
-  const dedupRate  = totalFaces > 0 ? Math.round((duplicates / totalFaces) * 100) : 0;
+  const totalPersons = dedupData?.total_persons || dedupData?.total_faces || 0;
+  const uniqueIds    = dedupData?.unique_identities || dedupData?.total_unique || 0;
+  const duplicates   = dedupData?.duplicates_found  || 0;
+  const dedupRate    = totalPersons > 0 ? Math.round((duplicates / totalPersons) * 100) : 0;
 
   return (
     <div className="flex flex-col gap-4">
@@ -872,10 +872,10 @@ function DeduplicationSection({ missions, dedupProgress, onDeduplicate, dedupDat
       {/* Stats row */}
       <div className="grid grid-cols-4 gap-3">
         {[
-          { label: 'Total Faces',   value: totalFaces, tone: '#fbbf24' },
-          { label: 'Unique IDs',    value: uniqueIds,  tone: '#38bdf8' },
-          { label: 'Duplicates',    value: duplicates, tone: '#34d399' },
-          { label: 'Dedup Rate',    value: `${dedupRate}%`, tone: '#a78bfa' },
+          { label: 'Total Sightings', value: totalPersons, tone: '#fbbf24' },
+          { label: 'Unique Persons',  value: uniqueIds,    tone: '#38bdf8' },
+          { label: 'Duplicates',      value: duplicates,   tone: '#34d399' },
+          { label: 'Dedup Rate',      value: `${dedupRate}%`, tone: '#a78bfa' },
         ].map(({ label, value, tone }) => (
           <div key={label} className="rounded-lg p-3 text-center"
             style={{ background: 'var(--dvas-surface-2)', border: '1px solid var(--dvas-border)' }}>
@@ -916,12 +916,12 @@ function DeduplicationSection({ missions, dedupProgress, onDeduplicate, dedupDat
 
       {/* Mission list */}
       <div>
-        <div className="dvas-label mb-2" style={{ fontSize: 9 }}>MISSIONS WITH FACE DATA</div>
+        <div className="dvas-label mb-2" style={{ fontSize: 9 }}>MISSIONS WITH PERSON TRACK DATA</div>
         {missionList.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-8 gap-2">
             <Database size={28} className="text-slate-600 opacity-40" />
-            <span className="mono text-xs text-slate-500">No missions with face embeddings</span>
-            <span className="mono text-[10px] text-slate-600">Faces will appear after person detection runs on drone feeds</span>
+            <span className="mono text-xs text-slate-500">No missions with person track data</span>
+            <span className="mono text-[10px] text-slate-600">Person tracks will appear after person detection runs on drone feeds</span>
           </div>
         ) : (
           <div className="flex flex-col gap-2" style={{ maxHeight: 320, overflowY: 'auto' }}>
