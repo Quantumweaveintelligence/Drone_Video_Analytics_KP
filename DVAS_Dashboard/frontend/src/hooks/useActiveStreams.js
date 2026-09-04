@@ -130,13 +130,26 @@ export function useActiveStreams() {
       // Enrich DB records with the freshest ingest data
       const enriched = combined.map((drone) => {
         const stream = streamMap.get(drone.id);
-        if (!stream) return drone;
+        if (!stream) {
+          return {
+            ...drone,
+            messages_ready: drone.messages_ready ?? 0,
+            status: drone.status === "live" && !drone.mission_id ? "offline" : (drone.status || "offline"),
+          };
+        }
         return {
           ...drone,
           battery_pct:   stream.battery_pct   ?? drone.battery_pct,
           lat:           stream.latitude       ?? drone.lat,
           lng:           stream.longitude      ?? drone.lng,
           altitude_m:    stream.altitude_m     ?? drone.altitude_m,
+          abs_alt:       stream.abs_alt        ?? drone.abs_alt,
+          gb_yaw:        stream.gb_yaw         ?? drone.gb_yaw,
+          gb_pitch:      stream.gb_pitch       ?? drone.gb_pitch,
+          gb_roll:       stream.gb_roll        ?? drone.gb_roll,
+          focal_len:     stream.focal_len      ?? drone.focal_len,
+          dzoom_ratio:   stream.dzoom_ratio    ?? drone.dzoom_ratio,
+          gps_lock:      stream.gps_lock       ?? drone.gps_lock ?? true,
           mission_id:    stream.mission_id     ?? drone.mission_id,
           mission_name:  stream.mission_name   ?? drone.mission_name,
           operator_name: stream.operator       ?? drone.operator_name,
@@ -148,9 +161,14 @@ export function useActiveStreams() {
         };
       });
 
-      // Sort: live first → draining → degraded → offline; within same status: by id
+      // Sort: active live streams ALWAYS first → draining → degraded → offline; within tier: by id
       const statusOrder = { live: 0, draining: 1, degraded: 2, offline: 3 };
       enriched.sort((a, b) => {
+        const aLiveStream = streamMap.has(a.id) && isRecentlySeen(streamMap.get(a.id)?.last_seen);
+        const bLiveStream = streamMap.has(b.id) && isRecentlySeen(streamMap.get(b.id)?.last_seen);
+        if (aLiveStream && !bLiveStream) return -1;
+        if (!aLiveStream && bLiveStream) return 1;
+
         const ao = statusOrder[a.status] ?? 4;
         const bo = statusOrder[b.status] ?? 4;
         if (ao !== bo) return ao - bo;

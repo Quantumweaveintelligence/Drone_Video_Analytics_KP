@@ -273,10 +273,12 @@ function MiniStreamCell({ drone }) {
 /* ─────────────────────────────────────────────────────────────────
    MULTI DRONE GRID — Tactical Map right panel
    ───────────────────────────────────────────────────────────────── */
-function MultiDroneGrid({ dbDrones }) {
+function MultiDroneGrid({ dbDrones, selectedDroneId, onSelectDrone }) {
   const { mergeWithDrones, loading, streams } = useActiveStreams();
   const merged = mergeWithDrones(dbDrones);
-  const slots  = merged.slice(0, 4);
+  // Only assign slots to active streaming or draining drones
+  const activeDrones = merged.filter((d) => d.status === "live" || d.status === "draining" || (d.messages_ready ?? 0) > 0);
+  const slots  = activeDrones.slice(0, 4);
 
   return (
     <div className="p-2 flex flex-col gap-2 h-full">
@@ -294,7 +296,15 @@ function MultiDroneGrid({ dbDrones }) {
       {/* 2×2 grid */}
       <div className="grid grid-cols-2 gap-2 flex-1">
         {slots.map((d) => (
-          <MiniStreamCell key={d.id} drone={d} />
+          <div
+            key={d.id}
+            onClick={() => onSelectDrone && onSelectDrone(d.id === selectedDroneId ? null : d.id)}
+            className={`cursor-pointer transition-all rounded-lg overflow-hidden ${
+              d.id === selectedDroneId ? "ring-2 ring-cyan-400 ring-offset-1 ring-offset-slate-900" : "hover:ring-1 hover:ring-slate-600"
+            }`}
+          >
+            <MiniStreamCell drone={d} />
+          </div>
         ))}
         {/* Fill empty slots */}
         {Array.from({ length: Math.max(0, 4 - slots.length) }).map((_, i) => (
@@ -380,6 +390,10 @@ export default function CommandDashboard() {
   const [justification, setJustification] = useState("");
   const [selectedDrone, setSelectedDrone] = useState(null);
 
+  const { mergeWithDrones } = useActiveStreams();
+  const mergedDrones = mergeWithDrones(drones);
+  const liveMissionsCount = mergedDrones.filter((d) => d.status === "live" && Boolean(d.mission_id)).length;
+
   const load = async () => {
     try {
       const [k, dR, aR, eR, mR, xR, cR] = await Promise.all([
@@ -402,10 +416,15 @@ export default function CommandDashboard() {
   // WebSocket live updates
   const { connected } = useDvasSocket((msg) => {
     if (msg.type === "telemetry" && Array.isArray(msg.drones)) {
-      setDrones((prev) => prev.map((d) => {
-        const u = msg.drones.find((x) => x.id === d.id);
-        return u ? { ...d, ...u } : d;
-      }));
+      setDrones((prev) => {
+        const existingIds = new Set(prev.map((d) => d.id));
+        const updated = prev.map((d) => {
+          const u = msg.drones.find((x) => x.id === d.id);
+          return u ? { ...d, ...u } : d;
+        });
+        const brandNew = msg.drones.filter((x) => !existingIds.has(x.id));
+        return brandNew.length > 0 ? [...updated, ...brandNew] : updated;
+      });
     } else if (msg.type === "alert" && msg.alert) {
       // Only include alerts in scope
       const a = msg.alert;
@@ -499,9 +518,15 @@ export default function CommandDashboard() {
                   {connected ? t("cmd.wsLive") : t("cmd.connecting")}
                 </span>
               </div>
-              <div className="mono text-[10px] text-slate-500">{drones.length} {t("cmd.dronesInScope")}</div>
+              <div className="flex items-center gap-3">
+                <div className="mono text-[10px] text-emerald-400 font-semibold flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                  {liveMissionsCount} {liveMissionsCount === 1 ? "Live Mission" : "Live Missions"} on Map
+                </div>
+                <div className="mono text-[10px] text-slate-500">{drones.length} {t("cmd.dronesInScope")}</div>
+              </div>
             </div>
-            <LiveMap drones={drones} height={480} />
+            <LiveMap drones={mergedDrones} height={480} selectedDroneId={selectedDrone} />
           </div>
 
           <div className="col-span-12 lg:col-span-4 rounded-xl overflow-hidden flex flex-col" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
@@ -509,7 +534,7 @@ export default function CommandDashboard() {
               <Broadcast size={14} className="text-emerald-500 dvas-live-dot" /> {t("cmd.multiDroneGrid")}
             </div>
             <div className="flex-1 min-h-0">
-              <MultiDroneGrid dbDrones={drones} />
+              <MultiDroneGrid dbDrones={drones} selectedDroneId={selectedDrone} onSelectDrone={setSelectedDrone} />
             </div>
           </div>
         </div>

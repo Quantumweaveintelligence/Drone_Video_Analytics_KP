@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 from typing import Optional
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 import re
 
 
@@ -19,6 +19,8 @@ class FrameMetadata(BaseModel):
     Metadata attached alongside every frame upload.
     Sent as a JSON string in the multipart `metadata_json` field.
     """
+    model_config = ConfigDict(extra="allow")
+
     drone_id:       str   = Field(..., description="Drone identifier e.g. DRONE_KL_001")
     mission_id:     str   = Field(..., description="Mission identifier e.g. MISSION_20250527_BEACH")
     timestamp:      str   = Field(..., description="ISO 8601 UTC timestamp of frame capture")
@@ -37,6 +39,15 @@ class FrameMetadata(BaseModel):
     speed_mps:    Optional[float] = Field(None, ge=0.0)          # m/s from edge device
     battery_pct:  Optional[float] = Field(None, ge=0.0, le=100.0)  # 0–100% from edge device
     frames_total: Optional[int]   = Field(None, ge=0)            # Total frames processed by edge
+
+    # Extended DJI SRT Telemetry from Edge
+    abs_alt:      Optional[float] = None
+    gb_yaw:       Optional[float] = None
+    gb_pitch:     Optional[float] = None
+    gb_roll:      Optional[float] = None
+    focal_len:    Optional[float] = None
+    dzoom_ratio:  Optional[float] = None
+    gps_lock:     Optional[bool]  = None
 
     @field_validator("drone_id")
     @classmethod

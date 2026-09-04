@@ -75,6 +75,22 @@ async def login(body: LoginIn, response: Response, request: Request):
             if isinstance(mission_scope_val, str):
                 mission_scope_val = [mission_scope_val]
 
+            if (not jurisdiction_val or not mission_scope_val) and email:
+                try:
+                    from database import async_session_factory
+                    from models import User
+                    from sqlalchemy import select
+                    async with async_session_factory() as session:
+                        res = await session.execute(select(User.jurisdiction, User.mission_scope).where(User.email == email))
+                        row = res.first()
+                        if row:
+                            if not jurisdiction_val and row[0]:
+                                jurisdiction_val = row[0]
+                            if not mission_scope_val and row[1]:
+                                mission_scope_val = row[1]
+                except Exception as e:
+                    logger.debug(f"Could not hydrate user attributes from DB: {e}")
+
             user_dict = {
                 "id": payload.get("sub"),
                 "email": payload.get("email", email),

@@ -118,71 +118,7 @@ const MOCK_EVENTS = [
   },
 ];
 
-const MOCK_DRONES = [
-  {
-    id: "DRN-001",
-    mission_id: "M-102",
-    status: "live",
-    battery_pct: 78,
-    altitude_m: 120,
-    speed_kmh: 18,
-    lat: 8.5241,
-    lng: 76.9366,
-    jurisdiction: "Thiruvananthapuram Central",
-    last_analytics: {
-      crowd_density: "High",
-      crowd_count: 342,
-      vehicles: 210,
-      cars: 150,
-      two_wheelers: 60,
-      traffic_state: "Congested",
-    },
-    signal_strength: 92,
-    uptime_min: 47,
-  },
-  {
-    id: "DRN-002",
-    mission_id: "M-104",
-    status: "live",
-    battery_pct: 51,
-    altitude_m: 95,
-    speed_kmh: 12,
-    lat: 8.5281,
-    lng: 76.9432,
-    jurisdiction: "Thiruvananthapuram East",
-    last_analytics: {
-      crowd_density: "Medium",
-      crowd_count: 187,
-      vehicles: 134,
-      cars: 98,
-      two_wheelers: 36,
-      traffic_state: "Moderate",
-    },
-    signal_strength: 85,
-    uptime_min: 31,
-  },
-  {
-    id: "DRN-003",
-    mission_id: "M-106",
-    status: "degraded",
-    battery_pct: 23,
-    altitude_m: 60,
-    speed_kmh: 5,
-    lat: 8.5193,
-    lng: 76.9319,
-    jurisdiction: "Thiruvananthapuram South",
-    last_analytics: {
-      crowd_density: "Low",
-      crowd_count: 54,
-      vehicles: 38,
-      cars: 27,
-      two_wheelers: 11,
-      traffic_state: "Clear",
-    },
-    signal_strength: 41,
-    uptime_min: 72,
-  },
-];
+const MOCK_DRONES = [];
 
 /* ─────────────────────────────────────────────
    HELPERS
@@ -1174,18 +1110,15 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
   const baseList = liveDrones && liveDrones.length > 0 ? liveDrones : [];
   let merged   = mergeWithDrones(baseList);
 
-  // Filter out offline drones whose stream queue is exhausted
-  merged = merged.filter(d => !(d.status === "offline" && d.messages_ready === 0));
+  // Filter to active streaming or draining drones
+  merged = merged.filter(d => d.status === "live" || d.status === "degraded" || d.status === "draining" || (d.messages_ready ?? 0) > 0);
 
-  // If neither DB nor ingest has any drones, fall back to MOCK_DRONES for UI demo
-  const drones = merged.length > 0
-    ? merged.sort((a, b) => {
-        const ord = { live: 0, degraded: 1, offline: 2 };
-        const ao = ord[a.status] ?? 3; const bo = ord[b.status] ?? 3;
-        if (ao !== bo) return ao - bo;
-        return (a.id || "").localeCompare(b.id || "");
-      })
-    : MOCK_DRONES;
+  const drones = merged.sort((a, b) => {
+    const ord = { live: 0, degraded: 1, draining: 2, offline: 3 };
+    const ao = ord[a.status] ?? 4; const bo = ord[b.status] ?? 4;
+    if (ao !== bo) return ao - bo;
+    return (a.id || "").localeCompare(b.id || "");
+  });
 
   const events = liveAlerts && liveAlerts.length > 0
     ? liveAlerts.map((a) => ({
@@ -1235,7 +1168,14 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
 
       {/* ── 2. Drone Cards Grid (tiled CSS grid format) ── */}
       <div className="flex-1 overflow-y-auto dvas-scrollbar min-h-[60vh] xl:min-h-[500px]">
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 transition-all duration-500 ease-in-out h-full content-start pb-4">
+        {drones.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-64 border border-dashed rounded-xl border-slate-700/60 p-8 text-center text-slate-500">
+            <Radio size={36} className="text-slate-600 mb-2 animate-pulse" />
+            <div className="text-sm font-semibold text-slate-400">No Active Mission Feeds</div>
+            <div className="text-xs text-slate-500 mt-1">Awaiting live telemetry or video stream from edge units...</div>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 transition-all duration-500 ease-in-out h-full content-start pb-4">
           {drones.map((d) => {
             const isSelected = selectedDroneId === d.id;
             
@@ -1259,6 +1199,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
             );
           })}
         </div>
+        )}
       </div>
 
 

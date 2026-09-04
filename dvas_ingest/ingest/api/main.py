@@ -407,6 +407,13 @@ async def ingest_frame(
         "frame_sequence": meta.frame_sequence,
         "timestamp":   meta.timestamp,
         "last_seen":   time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+        "abs_alt":     getattr(meta, "abs_alt", None),
+        "gb_yaw":      getattr(meta, "gb_yaw", None),
+        "gb_pitch":    getattr(meta, "gb_pitch", None),
+        "gb_roll":     getattr(meta, "gb_roll", None),
+        "focal_len":   getattr(meta, "focal_len", None),
+        "dzoom_ratio": getattr(meta, "dzoom_ratio", None),
+        "gps_lock":    getattr(meta, "gps_lock", None) if getattr(meta, "gps_lock", None) is not None else (meta.latitude is not None and meta.longitude is not None and (meta.latitude != 0.0 or meta.longitude != 0.0)),
     }
 
     queue_name = f"drone:frames:{drone_id}"
@@ -794,6 +801,13 @@ async def get_active_streams():
                 "longitude":       meta.get("longitude"),
                 "battery_pct":     meta.get("battery_pct"),
                 "altitude_m":      meta.get("altitude_m"),
+                "abs_alt":         meta.get("abs_alt"),
+                "gb_yaw":          meta.get("gb_yaw"),
+                "gb_pitch":        meta.get("gb_pitch"),
+                "gb_roll":         meta.get("gb_roll"),
+                "focal_len":       meta.get("focal_len"),
+                "dzoom_ratio":     meta.get("dzoom_ratio"),
+                "gps_lock":        meta.get("gps_lock", True),
             })
 
         # Sort: live first, then most frames

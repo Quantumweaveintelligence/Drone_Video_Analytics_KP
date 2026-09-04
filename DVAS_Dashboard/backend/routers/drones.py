@@ -32,6 +32,16 @@ async def list_drones(user: dict = Depends(get_current_user)):
             stmt = _apply_scope_to_query(stmt, Drone, f)
             if stmt is None:
                 raise HTTPException(403, "Not permitted")
+            # Exclude dead ephemeral test drones (offline with no active mission)
+            if user["role"] in ["senior_officer", "control_room_officer"]:
+                active_missions_subq = select(Mission.mission_id).where(Mission.status == "active")
+                stmt = stmt.where(
+                    or_(
+                        Drone.status.in_(["live", "degraded"]),
+                        Drone.mission_id.in_(active_missions_subq),
+                        ~Drone.id.like("DRN-MSN-%")
+                    )
+                )
         stmt = stmt.limit(200)
         result = await session.execute(stmt)
         rows = result.scalars().all()

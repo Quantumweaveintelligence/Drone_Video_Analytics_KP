@@ -96,7 +96,7 @@ ingest_api = APIRouter(prefix="/api/ingest-server", tags=["Ingest Server Proxy"]
 
 
 async def _admin_user(request: Request):
-    from server import get_current_user
+    from core.security import get_current_user
     user = await get_current_user(request)
     if user.get("role") != "system_administrator":
         raise HTTPException(403, "Role not permitted")
@@ -296,17 +296,24 @@ async def ingest_streams_active():
         # reflects Valkey stream existence rather than per-worker in-memory stats.
         active = [
             d for d in all_drones
-            if d.get("online") is True or (d.get("frames_received") or 0) > 0
+            if d.get("online") is True or (d.get("ingest_stats", {}).get("frames_received") or d.get("frames_received") or 0) > 0
         ]
         if active:
             return {
                 "drones": [
                     {
                         "drone_id":       d["drone_id"],
-                        "frames_received": d.get("frames_received", 0),
-                        "frame_count":     d.get("frames_received", 0),
+                        "frames_received": d.get("ingest_stats", {}).get("frames_received", d.get("frames_received", 0)),
+                        "frame_count":     d.get("ingest_stats", {}).get("frames_received", d.get("frame_count", 0)),
                         "mission_id":      d.get("mission_id"),
-                        "last_seen":       d.get("last_frame_at"),
+                        "last_seen":       d.get("ingest_stats", {}).get("last_frame_at", d.get("last_frame_at")),
+                        "messages_ready":  d.get("queue", {}).get("messages_ready", 0),
+                        "online":          d.get("online", False),
+                        "latitude":        d.get("latitude"),
+                        "longitude":       d.get("longitude"),
+                        "altitude_m":      d.get("altitude_m"),
+                        "gb_yaw":          d.get("gb_yaw"),
+                        "gps_lock":        d.get("gps_lock", True),
                     }
                     for d in active
                 ],
@@ -388,7 +395,7 @@ async def proxy_purge_stream(
     Force-purges a drone stream queue from Valkey and takes it offline immediately.
     Any authenticated user can perform this action.
     """
-    from server import get_current_user
+    from core.security import get_current_user
     await get_current_user(request)  # just verify authenticated
     url = f"{INGEST_SERVER_URL}/ingest/streams/{drone_id}/purge"
     token = await _get_service_token()

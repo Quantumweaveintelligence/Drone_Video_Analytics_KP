@@ -111,10 +111,18 @@ class EdgeSenderThread(threading.Thread):
         """Queue a SelectedFrame (from cognitive pipeline) with optional telemetry."""
         jpeg_bytes = frame.encode_jpeg()
         
-        tel = telemetry or {}
-        tel["lat"] = frame.location.lat if frame.location.lat != 0.0 else None
-        tel["lon"] = frame.location.lon if frame.location.lon != 0.0 else None
-        tel["alt"] = frame.location.altitude_m if frame.location.altitude_m != 0.0 else None
+        tel = telemetry.copy() if telemetry else {}
+        # Prioritize live GPS from telemetry (parsed SRT or live hardware), fallback to frame.location
+        tel_lat = tel.get("latitude") if tel.get("latitude") not in (None, 0.0) else (frame.location.lat if frame.location.lat != 0.0 else None)
+        tel_lon = tel.get("longitude") if tel.get("longitude") not in (None, 0.0) else (frame.location.lon if frame.location.lon != 0.0 else None)
+        tel_alt = tel.get("altitude_m") if tel.get("altitude_m") not in (None, 0.0) else (frame.location.altitude_m if frame.location.altitude_m != 0.0 else None)
+
+        tel["lat"] = tel_lat
+        tel["lon"] = tel_lon
+        tel["alt"] = tel_alt
+        tel["latitude"] = tel_lat
+        tel["longitude"] = tel_lon
+        tel["altitude_m"] = tel_alt
         tel["change_score"] = frame.change_score
         
         self._buffer.put("selected", jpeg_bytes, tel)
@@ -163,14 +171,17 @@ class EdgeSenderThread(threading.Thread):
                         "focal_len":   tel.get("focal_len"),
                         "dzoom_ratio": tel.get("dzoom_ratio"),
                     }
+                    lat = tel.get("latitude") if tel.get("latitude") is not None else tel.get("lat")
+                    lon = tel.get("longitude") if tel.get("longitude") is not None else tel.get("lon")
+                    alt = tel.get("altitude_m") if tel.get("altitude_m") is not None else tel.get("alt")
                     
                     if kind == "selected":
                         await self._client.send_frame_bytes(
                             frame_bytes  = jpeg_bytes,
                             change_score = tel.get("change_score", 0.0),
-                            lat          = tel.get("lat"),
-                            lon          = tel.get("lon"),
-                            alt          = tel.get("alt"),
+                            lat          = lat,
+                            lon          = lon,
+                            alt          = alt,
                             speed_mps    = speed,
                             battery_pct  = battery,
                             **ext_tel,
@@ -179,9 +190,9 @@ class EdgeSenderThread(threading.Thread):
                         await self._client.send_frame_bytes(
                             frame_bytes  = jpeg_bytes,
                             change_score = 0.0,
-                            lat          = tel.get("latitude"),
-                            lon          = tel.get("longitude"),
-                            alt          = tel.get("altitude_m"),
+                            lat          = lat,
+                            lon          = lon,
+                            alt          = alt,
                             speed_mps    = speed,
                             battery_pct  = battery,
                             **ext_tel,

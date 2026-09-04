@@ -57,10 +57,13 @@ async def _telemetry_pump():
             # ── 2. Upsert real drones into the DB ──────────────────────────────
             async with async_session_factory() as session:
                 for drone_id, telem in real_drones.items():
-                    lat = telem.get("latitude") or 8.5241
-                    lng = telem.get("longitude") or 76.9366
-                    battery = telem.get("battery_pct") or 85.0
-                    altitude = telem.get("altitude_m") or 120.0
+                    lat = telem.get("latitude")
+                    lng = telem.get("longitude")
+                    if lat is None or lng is None:
+                        lat = lat or 8.5241
+                        lng = lng or 76.9366
+                    battery = telem.get("battery_pct") if telem.get("battery_pct") is not None else 85.0
+                    altitude = telem.get("altitude_m") if telem.get("altitude_m") is not None else 120.0
                     speed_mps = telem.get("speed_mps") or 0.0
                     # If mission_id is absent, the drone is not actively on a mission
                     # and should be considered offline for the dashboard.
@@ -111,65 +114,58 @@ async def _telemetry_pump():
                         ))
                 await session.commit()
 
-            # ── 3. Simulate drift for DB-only drones + build broadcast ─────────
+            # ── 3. Transition drones no longer in real_drones to offline ──────────
             async with async_session_factory() as session:
-                result = await session.execute(
-                    select(Drone).where(Drone.status.in_(["live", "degraded"]))
-                )
-                drone_objs = result.scalars().all()
-                updates = []
-                for d in drone_objs:
-                    if d.id in real_drones:
-                        # Use real values — already updated above
-                        telem = real_drones[d.id]
-                        updates.append({
-                            "id": d.id,
-                            "lat": round(telem.get("latitude") or d.lat, 6),
-                            "lng": round(telem.get("longitude") or d.lng, 6),
-                            "battery_pct": round(telem.get("battery_pct") or d.battery_pct, 1),
-                            "altitude_m": round(telem.get("altitude_m") or d.altitude_m or 0, 1),
-                            "speed_mps": round(telem.get("speed_mps") or 0, 2),
-                            "status": "live",
-                            "mission_id": telem.get("mission_id") or d.mission_id,
-                            "mission_name": telem.get("mission_name") or d.mission_name,
-                            "operator_name": telem.get("operator") or d.operator_name,
-                            "jurisdiction": telem.get("location") or d.jurisdiction,
-                            "is_real": True,
-                        })
-                    else:
-                        # Simulate small drift for demo drones not in ingest
-                        new_lat = round(d.lat + random.uniform(-0.0015, 0.0015), 6)
-                        new_lng = round(d.lng + random.uniform(-0.0015, 0.0015), 6)
-                        new_battery = max(0, d.battery_pct - random.choice([0, 0, 0, 1]))
-                        await session.execute(
-                            update(Drone)
-                            .where(Drone.id == d.id)
-                            .values(lat=new_lat, lng=new_lng, battery_pct=new_battery)
-                        )
-                        updates.append({
-                            "id": d.id,
-                            "lat": new_lat,
-                            "lng": new_lng,
-                            "battery_pct": new_battery,
-                            "altitude_m": d.altitude_m or 0,
-                            "speed_mps": 0,
-                            "status": d.status,
-                            "mission_id": d.mission_id,
-                            "jurisdiction": d.jurisdiction,
-                            "is_real": False,
-                        })
-                await session.commit()
+                stale_stmt = select(Drone).where(Drone.status.in_(["live", "degraded"]))
+                if real_drones:
+                    stale_stmt = stale_stmt.where(Drone.id.not_in(list(real_drones.keys())))
+                stale_result = await session.execute(stale_stmt)
+                stale_drones = stale_result.scalars().all()
+                for sd in stale_drones:
+                    sd.status = "offline"
+                if stale_drones:
+                    await session.commit()
 
-            await hub.broadcast(
-                {
-                    "type": "telemetry",
-                    "drones": updates,
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-            # occasionally inject a new alert
-            if random.random() < 0.28 and drone_objs:
-                d = random.choice(drone_objs)
+            # ── 4. Broadcast live telemetry for real active drones ───────────────
+            updates = []
+            for drone_id, telem in real_drones.items():
+                if not telem.get("mission_id"):
+                    continue
+                updates.append({
+                    "id": drone_id,
+                    "lat": round(telem.get("latitude"), 6) if telem.get("latitude") is not None else None,
+                    "lng": round(telem.get("longitude"), 6) if telem.get("longitude") is not None else None,
+                    "battery_pct": round(telem.get("battery_pct") or 0.0, 1),
+                    "altitude_m": round(telem.get("altitude_m") or 0.0, 1),
+                    "abs_alt": round(telem.get("abs_alt") or 0.0, 1) if telem.get("abs_alt") is not None else None,
+                    "speed_mps": round(telem.get("speed_mps") or 0.0, 2),
+                    "gb_yaw": round(telem.get("gb_yaw") or 0.0, 1) if telem.get("gb_yaw") is not None else None,
+                    "gb_pitch": round(telem.get("gb_pitch") or 0.0, 1) if telem.get("gb_pitch") is not None else None,
+                    "gb_roll": round(telem.get("gb_roll") or 0.0, 1) if telem.get("gb_roll") is not None else None,
+                    "focal_len": telem.get("focal_len"),
+                    "dzoom_ratio": telem.get("dzoom_ratio"),
+                    "gps_lock": telem.get("gps_lock", True) if (telem.get("latitude") is not None and telem.get("longitude") is not None) else False,
+                    "status": "live",
+                    "mission_id": telem.get("mission_id"),
+                    "mission_name": telem.get("mission_name"),
+                    "operator_name": telem.get("operator"),
+                    "jurisdiction": telem.get("location"),
+                    "is_real": True,
+                })
+
+            if updates:
+                await hub.broadcast(
+                    {
+                        "type": "telemetry",
+                        "drones": updates,
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+
+            # occasionally inject a new alert for active missions
+            active_mission_drones = [d for d in updates if d.get("mission_id")]
+            if random.random() < 0.28 and active_mission_drones:
+                d = random.choice(active_mission_drones)
                 a = {
                     "id": f"A-{uuid.uuid4().hex[:8].upper()}",
                     "mission_id": d.mission_id,
