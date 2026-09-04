@@ -98,7 +98,7 @@ export default function Dashboard() {
     { label: "Storage", value: edgeStatus?.storage_pct !== undefined ? Math.round(edgeStatus.storage_pct) : "--", status: edgeStatus?.storage_pct > 85 ? "red" : edgeStatus?.storage_pct > 70 ? "amber" : "green", unit: "%" },
     { label: "Upload Queue", value: edgeStatus?.upload_queue !== undefined ? edgeStatus.upload_queue : "--", status: "neutral", unit: "" },
     { label: "Selected Frames", value: edgeStatus?.frames_selected !== undefined ? edgeStatus.frames_selected.toLocaleString() : "--", status: "green", unit: "" },
-    { label: "Discarded Frames", value: edgeStatus?.frames_total !== undefined && edgeStatus?.frames_selected !== undefined ? Math.max(0, edgeStatus.frames_total - edgeStatus.frames_selected).toLocaleString() : "--", status: "neutral", unit: "" },
+    { label: "Discarded Frames", value: edgeStatus?.frames_discarded !== undefined ? edgeStatus.frames_discarded.toLocaleString() : edgeStatus?.frames_total !== undefined && edgeStatus?.frames_selected !== undefined ? Math.max(0, edgeStatus.frames_total - edgeStatus.frames_selected).toLocaleString() : "--", status: "neutral", unit: "" },
     { label: "Drone Battery", value: telemetry && telemetry.battery_pct > 0 ? Math.round(telemetry.battery_pct) : "--", status: telemetry?.battery_pct > 50 ? "green" : telemetry?.battery_pct > 20 ? "amber" : "red", unit: "%" },
   ];
 

@@ -257,12 +257,14 @@ class PipelineManager:
         self.cognitive_selector: Optional[CognitiveFrameSelector] = None
         self.sender_thread: Optional[EdgeSenderThread] = None
         self.frames_selected: int = 0
+        self.pipeline_frames_in: int = 0
         self.server_send_enabled: bool = False
         self.pipeline_bypass: bool = False
         self._bypass_frame_counter: int = 0
         self._start_wall: float = 0
         self.history_deque = collections.deque(maxlen=60)
         self._history_thread: Optional[threading.Thread] = None
+        self.mission_history: List[dict] = []
 
     # ── Mission lifecycle ─────────────────────────────────────────────────
 
@@ -275,6 +277,7 @@ class PipelineManager:
             self._start_wall = time.time()
             self._running = True
             self.frames_selected = 0
+            self.pipeline_frames_in = 0
 
             # ── Auto-generate drone_id from mission_id ────────────────────
             drone_id = f"DRN-{req.mission_id}"
@@ -393,11 +396,11 @@ class PipelineManager:
                             if ok:
                                 tel = vf.telemetry or {}
                                 self.sender_thread.put_raw_frame(bytes(buf), telemetry=tel)
-                                self.frames_selected += 1
                         except Exception:
                             pass
                     return  # skip change detection + cognitive pipeline
 
+                self.pipeline_frames_in += 1
                 if self.change_engine is not None:
                     try:
                         self.change_engine.push_frame(vf)
@@ -501,6 +504,23 @@ class PipelineManager:
                 "start_time": start_time_str,
             }
 
+            # Add / update record in mission_history
+            mission_record = {
+                "mission_id": req.mission_id,
+                "mission_name": req.mission_name,
+                "drone_id": drone_id,
+                "operator": req.operator,
+                "location": req.location,
+                "frames_received": 0,
+                "frames_selected": 0,
+                "frames_discarded": 0,
+                "start_time": start_time_str,
+                "end_time": "--:--:--",
+                "status": "active"
+            }
+            self.mission_history = [m for m in self.mission_history if m.get("mission_id") != req.mission_id]
+            self.mission_history.insert(0, mission_record)
+
             log.info("mission_started", **self.active_mission)
             return {"status": "started", **self.active_mission}
 
@@ -514,6 +534,17 @@ class PipelineManager:
             mission_id = self.active_mission.get("mission_id", "") if self.active_mission else ""
             video_source_type = self.active_mission.get("video_source_type", "") if self.active_mission else ""
             video_source_path = self.active_mission.get("video_source", "") if self.active_mission else ""
+
+            # ── Update history record for ended mission ───────────────────
+            frames_discarded = max(0, self.pipeline_frames_in - self.frames_selected)
+            for m in self.mission_history:
+                if m.get("mission_id") == mission_id:
+                    m["frames_received"] = frames_processed
+                    m["frames_selected"] = self.frames_selected
+                    m["frames_discarded"] = frames_discarded
+                    m["end_time"] = end_time_str
+                    m["status"] = "completed"
+                    break
 
             # ── Stop components (reverse order) ───────────────────────────
             if self.source is not None:
@@ -555,6 +586,7 @@ class PipelineManager:
             self.sender_thread = None
             self.server_send_enabled = False
             self.pipeline_bypass = False
+            self.pipeline_frames_in = 0
             self._bypass_frame_counter = 0
 
             log.info("mission_ended", mission_id=mission_id, frames_processed=frames_processed)
@@ -564,6 +596,22 @@ class PipelineManager:
                 "end_time": end_time_str,
                 "frames_processed": frames_processed,
             }
+
+    def get_mission_history(self) -> list:
+        with self.lock:
+            # Update live stats for active mission if currently running
+            if self._running and self.active_mission:
+                active_id = self.active_mission.get("mission_id")
+                curr_received = self.source._frame_index if self.source else 0
+                curr_selected = self.frames_selected
+                curr_discarded = max(0, self.pipeline_frames_in - curr_selected)
+                for m in self.mission_history:
+                    if m.get("mission_id") == active_id:
+                        m["frames_received"] = curr_received
+                        m["frames_selected"] = curr_selected
+                        m["frames_discarded"] = curr_discarded
+                        break
+            return list(self.mission_history)
 
     def _history_loop(self):
         while self._running:
@@ -607,7 +655,7 @@ class PipelineManager:
                     "buffer_fill_pct": 0, "buffer_frames": 0, "buffer_max_frames": 0,
                     "cpu_pct": round(psutil.cpu_percent(), 1), "gpu_pct": 0, "gpu_mem_used_mb": 0, "gpu_mem_total_mb": 0,
                     "storage_pct": storage_pct, "bitrate_mbps": 0.0,
-                    "upload_queue": 0, "frames_selected": 0, "frames_total": 0,
+                    "upload_queue": 0, "frames_selected": 0, "frames_discarded": 0, "pipeline_frames_in": 0, "frames_total": 0,
                     "change_events_total": 0}
 
         # GPU stats
@@ -637,6 +685,7 @@ class PipelineManager:
 
         fps = round(self.source.source_fps, 1) if self.source else 0.0
         bitrate_mbps = round(fps * 0.14, 1) if fps > 0 else 0.0
+        frames_discarded = max(0, self.pipeline_frames_in - self.frames_selected)
 
         return {
             "active": True,
@@ -654,6 +703,8 @@ class PipelineManager:
             "storage_pct": storage_pct,
             "upload_queue": 0,
             "frames_selected": self.frames_selected,
+            "frames_discarded": frames_discarded,
+            "pipeline_frames_in": self.pipeline_frames_in,
             "frames_total": self.source._frame_index if self.source else 0,
             "change_events_total": cd_events,
         }
@@ -933,6 +984,11 @@ def get_active_mission(auth: dict = Depends(verify_edge_auth)):
             **pipeline.active_mission,
         }
     return {"active": False}
+
+
+@app.get("/api/edge/mission/history")
+def get_edge_mission_history(auth: dict = Depends(verify_edge_auth)):
+    return pipeline.get_mission_history()
 
 
 @app.get("/api/edge/status")

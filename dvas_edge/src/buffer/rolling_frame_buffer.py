@@ -472,6 +472,8 @@ class RollingFrameBuffer:
             "total_written":     self._frame_count,
         }
 
+    get_stats = get_buffer_stats
+
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------

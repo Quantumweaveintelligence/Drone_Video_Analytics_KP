@@ -1,25 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import AppShell from '@/components/layout/AppShell';
 import { AreaChart, Area, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
-import { Clock, Scan } from 'lucide-react';
+import { Clock, Scan, Activity, Database, AlertCircle } from 'lucide-react';
 import { authFetch } from '@/lib/api';
-
-// Utility to generate initial blank timeline data
-const generateRealisticDummyHistory = () => {
-  return Array.from({ length: 60 }).map((_, i) => {
-    // Base fill around 74.5, fluctuating a bit
-    const fill = 70 + Math.sin(i / 5) * 5 + Math.random() * 2;
-    // Score around 0.2 to 0.6, sometimes spiking
-    let score = 0.1 + Math.random() * 0.2;
-    if (i % 15 === 0) score += 0.3 + Math.random() * 0.3; // Spikes
-    
-    return {
-      time: i.toString(),
-      value: fill,
-      score: Math.min(score, 1)
-    };
-  });
-};
 
 // Reusable SVG Donut Gauge
 const DonutGauge = ({ value, label, max = 100, isPercentage = false, color = "#3b82f6", size = "normal" }) => {
@@ -27,7 +10,8 @@ const DonutGauge = ({ value, label, max = 100, isPercentage = false, color = "#3
   const stroke = size === "large" ? 12 : 8;
   const normalizedRadius = radius - stroke * 2;
   const circumference = normalizedRadius * 2 * Math.PI;
-  const percentage = (value / max) * 100;
+  const numericValue = typeof value === 'number' ? value : parseFloat(value) || 0;
+  const percentage = Math.min(100, Math.max(0, (numericValue / max) * 100));
   const strokeDashoffset = circumference - (percentage / 100) * circumference;
 
   return (
@@ -48,7 +32,7 @@ const DonutGauge = ({ value, label, max = 100, isPercentage = false, color = "#3
         </svg>
         <div className="absolute flex flex-col items-center justify-center">
           <span className={`${size === "large" ? "text-2xl" : "text-xl"} font-bold font-mono`} style={{ color }}>
-            {isPercentage ? `${value}%` : value}
+            {isPercentage ? `${numericValue.toFixed(1)}%` : (typeof value === 'number' && max === 1 ? value.toFixed(3) : value)}
           </span>
         </div>
       </div>
@@ -64,20 +48,31 @@ export default function BufferAndChange() {
     change_detection: {},
     history: []
   });
+  const [mission, setMission] = useState(null);
 
   useEffect(() => {
     let mounted = true;
     const poll = async () => {
       try {
-        const resp = await authFetch('/edge-api/api/edge/analytics');
-        if (resp.ok && mounted) {
-          const json = await resp.json();
+        const [analyticsResp, missionResp] = await Promise.all([
+          authFetch('/edge-api/api/edge/analytics'),
+          authFetch('/edge-api/api/edge/mission/active')
+        ]);
+
+        if (analyticsResp.ok && mounted) {
+          const json = await analyticsResp.json();
           setData(json);
+        }
+
+        if (missionResp.ok && mounted) {
+          const mJson = await missionResp.json();
+          setMission(mJson.active ? mJson : null);
         }
       } catch (err) {
         // Ignore fetch errors during polling
       }
     };
+
     poll();
     const interval = setInterval(poll, 2000);
     return () => {
@@ -86,28 +81,35 @@ export default function BufferAndChange() {
     };
   }, []);
 
-  const isActive = data.active;
+  const isActive = data.active && mission !== null;
 
-  // Buffer state
-  const currentFill = isActive ? (data.buffer?.fill_pct || 0) : 74.5;
-  const currentFrames = isActive ? (data.buffer?.frames_in_buffer || 0).toLocaleString() : "8,942";
-  const maxFrames = isActive ? (data.buffer?.max_frames || 9000).toLocaleString() : "9,000";
-  const totalBuffered = isActive ? (data.buffer?.total_written || 0).toLocaleString() : "142,500";
-  const currentSizeMB = isActive ? (data.buffer?.slab_used_bytes ? Math.round(data.buffer.slab_used_bytes / 1048576) : 0).toLocaleString() : "1,240";
-  const windowSeconds = isActive ? (data.buffer?.window_s || 0) : 300;
+  // Real Buffer state
+  const currentFill = isActive ? (data.buffer?.fill_pct || 0) : 0;
+  const currentFrames = isActive ? (data.buffer?.frames_in_buffer || 0).toLocaleString() : "0";
+  const maxFrames = isActive ? (data.buffer?.max_frames || 2200).toLocaleString() : "2,200";
+  const totalBuffered = isActive ? (data.buffer?.total_written || data.buffer?.frames_in_buffer || 0).toLocaleString() : "0";
+  const currentSizeMB = isActive && data.buffer?.slab_used_bytes 
+    ? (data.buffer.slab_used_bytes / 1048576).toFixed(1) 
+    : "0.0";
+  const windowSeconds = isActive ? Math.round(data.buffer?.window_s || 0) : 0;
   
-  // Change state
-  const changeScore = isActive ? (data.change_detection?.last_motion_score || 0) : 0.42;
-  const eventsTotal = isActive ? (data.change_detection?.events_total || 0) : 14;
+  // Real Change Detection state
+  const changeScore = isActive ? (data.change_detection?.last_motion_score || 0) : 0;
+  const eventsTotal = isActive ? (data.change_detection?.events_total || 0) : 0;
+  const epm = isActive ? Math.round(data.change_detection?.epm || 0) : 0;
 
-  // Derive charts from history deque (up to 60 elements)
+  // Real history deque from edge backend
   const historyData = isActive && data.history && data.history.length > 0 
     ? data.history.map((h, i) => ({
-        time: i.toString(),
-        value: h.buffer_fill,
-        score: h.change_score
+        time: h.time ? new Date(h.time * 1000).toLocaleTimeString([], { second: '2-digit', minute: '2-digit' }) : `-${data.history.length - i}s`,
+        value: h.buffer_fill || 0,
+        score: h.change_score || 0
       }))
-    : generateRealisticDummyHistory();
+    : Array.from({ length: 20 }).map((_, i) => ({
+        time: `-${(20 - i) * 2}s`,
+        value: 0,
+        score: 0
+      }));
 
   let statusColor = "text-emerald-400";
   let barColor = "bg-emerald-500";
@@ -125,6 +127,32 @@ export default function BufferAndChange() {
   return (
     <AppShell title="Buffer and Change" subtitle="Monitor rolling video buffer and AI-based change detection">
       <div className="space-y-6">
+
+        {/* Active Mission Status Strip */}
+        <div className="bg-slate-900 border border-slate-800 rounded-lg p-3 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="bg-slate-800 p-2 rounded text-slate-300">
+              <Database size={18} className="text-cyan-400" />
+            </div>
+            <div>
+              <div className="text-sm font-bold text-slate-100 flex items-center gap-2">
+                {mission?.mission_name || 'Standby — No Active Mission'}
+                {mission?.mission_id && (
+                  <span className="text-xs font-mono text-sky-400 bg-sky-950/60 border border-sky-800/40 px-2 py-0.5 rounded font-normal">
+                    {mission.mission_id}
+                  </span>
+                )}
+              </div>
+              <div className="text-[10px] text-slate-400 uppercase tracking-wider">
+                {isActive ? `Drone: ${mission?.drone_id || 'DRN-001'} | Buffer Engine: Memory-Mapped Ring Slab` : 'Deploy a mission in Mission Control to activate live buffer'}
+              </div>
+            </div>
+          </div>
+          <div className={`text-xs px-2.5 py-1 rounded-full font-mono tracking-wider flex items-center gap-2 ${isActive ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400' : 'bg-slate-800 border border-slate-700 text-slate-400'}`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${isActive ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`}></span>
+            {isActive ? 'BUFFER ACTIVE' : 'STANDBY'}
+          </div>
+        </div>
         
         {/* --- SECTION 1: BUFFER ANALYTICS --- */}
         <div className="space-y-4">
@@ -160,12 +188,12 @@ export default function BufferAndChange() {
                   <span className="text-slate-200 font-mono">{currentSizeMB} MB</span>
                 </div>
                 <div className="flex flex-col">
-                  <span className="text-slate-500 mb-1">AVG SIZE</span>
-                  <span className="text-slate-200 font-mono">{isActive ? "-- MB" : "890 MB"}</span>
+                  <span className="text-slate-500 mb-1">SLAB ALLOCATION</span>
+                  <span className="text-slate-200 font-mono">128 MB</span>
                 </div>
                 <div className="flex flex-col">
                   <span className="text-slate-500 mb-1">OVERFLOW EVENTS</span>
-                  <span className="text-amber-400 font-mono font-bold">0</span>
+                  <span className="text-emerald-400 font-mono font-bold">0</span>
                 </div>
               </div>
             </div>
@@ -184,7 +212,7 @@ export default function BufferAndChange() {
                 
                 {/* Thick progress bar */}
                 <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden mb-6">
-                  <div className={`${barColor} h-full rounded-full`} style={{ width: `${currentFill}%` }}></div>
+                  <div className={`${barColor} h-full rounded-full transition-all duration-500`} style={{ width: `${Math.min(100, currentFill)}%` }}></div>
                 </div>
               </div>
 
@@ -198,8 +226,8 @@ export default function BufferAndChange() {
                   <div className="text-xs font-mono text-emerald-400">0</div>
                 </div>
                 <div>
-                  <div className="text-[9px] text-slate-500 uppercase tracking-wider mb-1">Peak Util</div>
-                  <div className="text-xs font-mono text-amber-400">{isActive ? "--%" : "82.1%"}</div>
+                  <div className="text-[9px] text-slate-500 uppercase tracking-wider mb-1">Buffer Health</div>
+                  <div className="text-xs font-mono text-emerald-400 font-bold">{isActive ? "OPTIMAL" : "STANDBY"}</div>
                 </div>
               </div>
             </div>
@@ -211,7 +239,7 @@ export default function BufferAndChange() {
               <div className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider flex items-center gap-2">
                 <Clock size={14} /> Buffer Occupancy Timeline
               </div>
-              <div className="text-[10px] text-slate-500 font-mono tracking-wider">LAST 20 MINUTES</div>
+              <div className="text-[10px] text-slate-500 font-mono tracking-wider">LIVE ROLLING WINDOW</div>
             </div>
             
             <div className="w-full h-[180px]">
@@ -251,55 +279,64 @@ export default function BufferAndChange() {
           {/* Top Metric Cards */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 flex items-center justify-center">
-              <DonutGauge value={changeScore} max={1} label="Change Score" color="#fbbf24" />
+              <DonutGauge value={changeScore} max={1} label="MOG2 Motion Score" color="#fbbf24" />
             </div>
             <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 flex items-center justify-center">
-              <DonutGauge value={isActive ? 0 : 87} max={100} isPercentage={true} label={isActive ? "Confidence (N/A)" : "Confidence"} color="#22d3ee" />
+              <DonutGauge value={epm} max={60} label="Events / Minute (EPM)" color="#22d3ee" />
             </div>
             <div className="bg-slate-900 border border-slate-800 rounded-lg p-6 flex flex-col justify-center items-center">
               <div className="text-4xl font-bold font-mono text-amber-500 mb-2">{eventsTotal}</div>
-              <div className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider">Total Events</div>
+              <div className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider">Total Motion Events</div>
             </div>
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-            {/* Detection Heatmap (6 cols) */}
-            <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-lg flex flex-col overflow-hidden h-[340px]">
-              <div className="p-4 border-b border-slate-800 flex justify-between items-center bg-slate-950/50">
-                <div className="text-xs text-slate-400 font-semibold uppercase tracking-wider flex items-center gap-2">
-                  <Scan size={14} className="text-amber-500" />
-                  Live Heatmap · 3 Regions Detected
+            {/* Change Detection Status Panel (6 cols) */}
+            <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-lg flex flex-col p-5 h-[340px] justify-between">
+              <div>
+                <div className="text-xs text-slate-300 font-semibold uppercase tracking-wider flex items-center gap-2 mb-4">
+                  <Scan size={16} className="text-amber-500" />
+                  MOG2 Change Detection Engine
                 </div>
-                <div className="text-[9px] px-2 py-0.5 rounded border border-sky-500/30 bg-sky-500/10 text-sky-400 uppercase tracking-wider font-semibold">
-                  AI Overlay Ready
+                
+                <div className="space-y-3 text-xs">
+                  <div className="flex justify-between py-2 border-b border-slate-800">
+                    <span className="text-slate-400">Background Subtractor</span>
+                    <span className="text-slate-200 font-mono">OpenCV MOG2 (History: 500)</span>
+                  </div>
+                  <div className="flex justify-between py-2 border-b border-slate-800">
+                    <span className="text-slate-400">Motion Score Threshold</span>
+                    <span className="text-amber-400 font-mono">0.0005 (0.05%)</span>
+                  </div>
+                  <div className="flex justify-between py-2 border-b border-slate-800">
+                    <span className="text-slate-400">Blob Persistence Gate</span>
+                    <span className="text-emerald-400 font-mono">2 Consecutive Frames (IoU ≥ 0.25)</span>
+                  </div>
+                  <div className="flex justify-between py-2 border-b border-slate-800">
+                    <span className="text-slate-400">Shadow Suppression</span>
+                    <span className="text-sky-400 font-mono">Active (detectShadows: true)</span>
+                  </div>
+                  <div className="flex justify-between py-2">
+                    <span className="text-slate-400">Current Motion Activity</span>
+                    <span className={`font-mono font-bold ${changeScore > 0.0005 ? 'text-amber-400 animate-pulse' : 'text-slate-500'}`}>
+                      {changeScore > 0.0005 ? 'MOTION DETECTED' : 'QUIET / STABLE'}
+                    </span>
+                  </div>
                 </div>
               </div>
-              <div className="flex-1 relative bg-gradient-to-b from-slate-900 to-slate-800 overflow-hidden">
-                {/* Tactical Grid */}
-                <div className="absolute inset-0 pointer-events-none" style={{ 
-                  backgroundImage: 'linear-gradient(rgba(34, 197, 94, 0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(34, 197, 94, 0.05) 1px, transparent 1px)',
-                  backgroundSize: '8.33% 12.5%' 
-                }}></div>
-                
-                {/* Simulated Heat Blobs */}
-                <div className="absolute top-[30%] left-[20%] w-32 h-32 rounded-full" 
-                     style={{ background: 'radial-gradient(circle, rgba(245,158,11,0.6) 0%, rgba(245,158,11,0) 70%)', filter: 'blur(8px)' }}></div>
-                <div className="absolute top-[60%] left-[65%] w-40 h-24 rounded-full" 
-                     style={{ background: 'radial-gradient(ellipse, rgba(245,158,11,0.5) 0%, rgba(245,158,11,0) 70%)', filter: 'blur(12px)' }}></div>
-                <div className="absolute top-[15%] left-[70%] w-24 h-24 rounded-full" 
-                     style={{ background: 'radial-gradient(circle, rgba(245,158,11,0.8) 0%, rgba(245,158,11,0) 70%)', filter: 'blur(6px)' }}></div>
-                     
-                {/* Fake Crosshairs to enhance drone feel */}
-                <div className="absolute inset-0 flex items-center justify-center pointer-events-none opacity-20">
-                  <div className="w-16 h-[1px] bg-sky-400 absolute"></div>
-                  <div className="w-[1px] h-16 bg-sky-400 absolute"></div>
-                </div>
+
+              <div className="p-3 bg-slate-950/60 border border-slate-800 rounded text-[11px] text-slate-400 flex items-center gap-2">
+                <Activity size={14} className="text-cyan-400 shrink-0" />
+                <span>Change events forward high-variance frames directly into the Cognitive Selector.</span>
               </div>
             </div>
 
             {/* Change Intensity Graph (6 cols) */}
             <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-lg p-5 h-[340px] flex flex-col">
-              <div className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider mb-4">Change Intensity Graph</div>
+              <div className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider mb-4 flex justify-between">
+                <span>Motion Intensity Graph</span>
+                <span className="text-amber-400 font-mono">Score: {changeScore.toFixed(4)}</span>
+              </div>
               <div className="flex-1 min-h-0 w-full">
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={historyData} margin={{ top: 5, right: 0, left: -25, bottom: 0 }}>
@@ -309,8 +346,8 @@ export default function BufferAndChange() {
                         <stop offset="95%" stopColor="#fbbf24" stopOpacity={0}/>
                       </linearGradient>
                     </defs>
-                    <XAxis dataKey="time" hide />
-                    <YAxis stroke="#475569" fontSize={10} tickFormatter={(v) => v.toFixed(1)} domain={[0, 1]} />
+                    <XAxis dataKey="time" stroke="#475569" fontSize={10} tickMargin={8} />
+                    <YAxis stroke="#475569" fontSize={10} tickFormatter={(v) => v.toFixed(2)} domain={[0, 'auto']} />
                     <Tooltip 
                       contentStyle={{ backgroundColor: '#0f172a', borderColor: '#1e293b', fontSize: '11px', color: '#cbd5e1' }}
                       itemStyle={{ color: '#fbbf24' }}

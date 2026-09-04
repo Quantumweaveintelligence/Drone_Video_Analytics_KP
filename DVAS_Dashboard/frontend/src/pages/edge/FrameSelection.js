@@ -1,102 +1,148 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import AppShell from '@/components/layout/AppShell';
 import { 
-  AreaChart, Area, LineChart, Line, PieChart, Pie, Cell, 
+  LineChart, Line, PieChart, Pie, Cell, 
   ResponsiveContainer, XAxis, YAxis, Tooltip, Legend 
 } from "recharts";
-import { Image as ImageIcon } from 'lucide-react';
-import { api } from '@/lib/api';
+import { Image as ImageIcon, History } from 'lucide-react';
+import { authFetch } from '@/lib/api';
 
-const COLORS = ['#1e3a8a', '#94a3b8']; // navy blue, light blue-grey
+const COLORS = ['#34d399', '#475569']; // emerald-400 (Selected), slate-600 (Discarded)
 
 export default function FrameSelection() {
   const [timelineData, setTimelineData] = useState(Array.from({ length: 20 }).map((_, i) => ({
-    time: `-${(20 - i) * 3}s`,
+    time: `-${(20 - i) * 2}s`,
     selected: 0,
     discarded: 0,
     total: 0
   })));
   
   const [stats, setStats] = useState({
-    framesReceived: 0, // This is frames_total from the edge
-    framesSelected: 0, // This is frames_received by the ingest server
-    framesDiscarded: 0,
+    framesReceived: 0, // Total raw frames captured from the video file or RTMP stream
+    framesSelected: 0, // Total frames selected by the Cognitive Selection algorithm
+    framesDiscarded: 0, // Frames Received - Frames Selected
   });
 
-  const [activeDrone, setActiveDrone] = useState(null);
+  const [missionHistory, setMissionHistory] = useState(() => {
+    try {
+      const saved = localStorage.getItem('dvas_frame_selection_history');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
 
-  // Fetch the first available drone to monitor
+  const prevStatsRef = useRef({
+    framesReceived: 0,
+    framesSelected: 0,
+    framesDiscarded: 0,
+    initialized: false
+  });
+
+  // Poll for live edge stats & mission history
   useEffect(() => {
-    const fetchDrones = async () => {
-      try {
-        const data = await api.get('/ingest-server/status');
-        if (data && data.drones && data.drones.length > 0) {
-          setActiveDrone(data.drones[0].drone_id);
-        }
-      } catch (err) {
-        console.error("Failed to fetch drones:", err);
-      }
-    };
-    fetchDrones();
-  }, []);
-
-  // Poll for live stats
-  useEffect(() => {
-    if (!activeDrone) return;
-
-    let previousStats = {
-      framesReceived: 0,
-      framesSelected: 0
-    };
-
     const fetchStats = async () => {
       try {
-        const data = await api.get(`/ingest-server/status/${activeDrone}`);
-        if (data && data.ingest_stats) {
-          const s = data.ingest_stats;
-          
-          const totalEdgeFrames = s.frames_total || 0; // The new field added from edge metadata
-          const ingestFrames = s.frames_received || 0;
-          const discarded = Math.max(0, totalEdgeFrames - ingestFrames);
+        const [statusResp, historyResp, activeResp] = await Promise.all([
+          authFetch('/edge-api/api/edge/status'),
+          authFetch('/edge-api/api/edge/mission/history'),
+          authFetch('/edge-api/api/edge/mission/active')
+        ]);
+
+        let totalFrames = 0;
+        let selectedFrames = 0;
+        let discarded = 0;
+
+        if (statusResp.ok) {
+          const data = await statusResp.json();
+          totalFrames = data.frames_total || 0;
+          selectedFrames = data.frames_selected || 0;
+          discarded = data.frames_discarded !== undefined
+            ? data.frames_discarded
+            : Math.max(0, (data.pipeline_frames_in || totalFrames) - selectedFrames);
 
           setStats({
-            framesReceived: totalEdgeFrames,
-            framesSelected: ingestFrames,
+            framesReceived: totalFrames,
+            framesSelected: selectedFrames,
             framesDiscarded: discarded
           });
 
-          // Calculate delta for the timeline
-          const deltaTotal = totalEdgeFrames - previousStats.framesReceived;
-          const deltaSelected = ingestFrames - previousStats.framesSelected;
-          const deltaDiscarded = Math.max(0, deltaTotal - deltaSelected);
-          
-          if (previousStats.framesReceived > 0) {
+          // Calculate delta for the live timeline
+          if (prevStatsRef.current.initialized) {
+            const deltaTotal = Math.max(0, totalFrames - prevStatsRef.current.framesReceived);
+            const deltaSelected = Math.max(0, selectedFrames - prevStatsRef.current.framesSelected);
+            const deltaDiscarded = Math.max(0, discarded - prevStatsRef.current.framesDiscarded);
+
             setTimelineData(prev => {
-              const newData = [...prev.slice(1), {
-                time: new Date().toLocaleTimeString([], { hour12: false, second: '2-digit', minute: '2-digit' }),
+              const nowStr = new Date().toLocaleTimeString([], { hour12: false, second: '2-digit', minute: '2-digit' });
+              return [...prev.slice(1), {
+                time: nowStr,
                 selected: deltaSelected,
                 discarded: deltaDiscarded,
                 total: deltaTotal
               }];
-              return newData;
             });
+          } else {
+            prevStatsRef.current.initialized = true;
           }
 
-          previousStats = {
-            framesReceived: totalEdgeFrames,
-            framesSelected: ingestFrames
-          };
+          prevStatsRef.current.framesReceived = totalFrames;
+          prevStatsRef.current.framesSelected = selectedFrames;
+          prevStatsRef.current.framesDiscarded = discarded;
         }
+
+        // Process mission history
+        let serverHistory = [];
+        if (historyResp.ok) {
+          serverHistory = await historyResp.json();
+        }
+
+        let activeMission = null;
+        if (activeResp.ok) {
+          const activeData = await activeResp.json();
+          if (activeData.active) {
+            activeMission = activeData;
+          }
+        }
+
+        setMissionHistory(prev => {
+          let merged = Array.isArray(serverHistory) && serverHistory.length > 0 ? [...serverHistory] : [...prev];
+          
+          if (activeMission) {
+            const activeId = activeMission.mission_id;
+            const existingIdx = merged.findIndex(m => m.mission_id === activeId);
+            const liveRecord = {
+              mission_id: activeId,
+              mission_name: activeMission.mission_name || activeMission.name || 'Active Mission',
+              drone_id: activeMission.drone_id,
+              frames_received: totalFrames,
+              frames_selected: selectedFrames,
+              frames_discarded: discarded,
+              status: 'active'
+            };
+
+            if (existingIdx >= 0) {
+              merged[existingIdx] = liveRecord;
+            } else {
+              merged.unshift(liveRecord);
+            }
+          }
+
+          localStorage.setItem('dvas_frame_selection_history', JSON.stringify(merged));
+          return merged;
+        });
+
       } catch (err) {
-        console.error("Failed to fetch drone stats:", err);
+        console.error("Failed to fetch live edge stats:", err);
       }
     };
 
     fetchStats();
-    const interval = setInterval(fetchStats, 3000);
+    const interval = setInterval(fetchStats, 2000);
     return () => clearInterval(interval);
-  }, [activeDrone]);
+  }, []);
 
+  // TX Reduction: Percentage of frames that are being discarded
   const txReduction = stats.framesReceived > 0 
     ? ((stats.framesDiscarded / stats.framesReceived) * 100).toFixed(1) 
     : "0.0";
@@ -113,9 +159,6 @@ export default function FrameSelection() {
     { name: 'Selected', value: stats.framesSelected },
     { name: 'Discarded', value: stats.framesDiscarded }
   ];
-
-  const sumSelected = timelineData.reduce((acc, curr) => acc + curr.selected, 0);
-  const avgSelectionPerMin = Math.round((sumSelected / timelineData.length) * (60 / 3));
 
   return (
     <AppShell title="Frame Selection Analytics" subtitle="Cognitive frame selector efficiency metrics">
@@ -208,50 +251,72 @@ export default function FrameSelection() {
           
         </div>
 
-        {/* Bottom Full Width Stats & Chart Card */}
+        {/* Frame Log (Mission History) */}
         <div className="bg-slate-900 border border-slate-800 rounded-lg p-5 flex flex-col">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6 pb-6 border-b border-slate-800">
-            <div>
-              <div className="text-[10px] text-slate-500 uppercase font-semibold tracking-wider mb-1">Bandwidth Saved</div>
-              <div className="text-2xl font-bold font-mono text-amber-500">{txReduction}%</div>
+          <div className="flex items-center justify-between mb-4 pb-3 border-b border-slate-800">
+            <div className="flex items-center gap-2">
+              <History size={16} className="text-sky-400" />
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">Mission Frame Log</h3>
             </div>
-            <div>
-              <div className="text-[10px] text-slate-500 uppercase font-semibold tracking-wider mb-1">Avg Selection / Min</div>
-              <div className="text-2xl font-bold font-mono text-emerald-400">{avgSelectionPerMin} <span className="text-sm text-slate-500 font-sans">frames</span></div>
-            </div>
-            <div>
-              <div className="text-[10px] text-slate-500 uppercase font-semibold tracking-wider mb-1">Compression Ratio</div>
-              <div className="text-2xl font-bold font-mono text-cyan-400">{compressionRatio}x</div>
+            <div className="text-[11px] text-slate-500 font-mono">
+              {missionHistory.length} {missionHistory.length === 1 ? 'Mission' : 'Missions'} Logged
             </div>
           </div>
-          
-          <div className="text-[10px] text-slate-500 uppercase font-semibold tracking-wider mb-4">Selected Frames (Per Interval)</div>
-          <div className="w-full h-[120px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={timelineData} margin={{ top: 5, right: 0, left: -25, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="colorSel" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#34d399" stopOpacity={0.4}/>
-                    <stop offset="95%" stopColor="#34d399" stopOpacity={0}/>
-                  </linearGradient>
-                </defs>
-                <XAxis dataKey="time" hide />
-                <YAxis stroke="#475569" fontSize={10} />
-                <Tooltip 
-                  contentStyle={{ backgroundColor: '#0f172a', borderColor: '#1e293b', fontSize: '11px', color: '#cbd5e1' }}
-                  itemStyle={{ color: '#34d399' }}
-                />
-                <Area 
-                  type="monotone" 
-                  dataKey="selected" 
-                  stroke="#34d399" 
-                  strokeWidth={2} 
-                  fillOpacity={1} 
-                  fill="url(#colorSel)" 
-                  isAnimationActive={false} 
-                />
-              </AreaChart>
-            </ResponsiveContainer>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse">
+              <thead>
+                <tr className="border-b border-slate-800/80 text-[10px] uppercase font-semibold text-slate-500 tracking-wider">
+                  <th className="pb-3 pl-2">Mission ID</th>
+                  <th className="pb-3">Mission Name</th>
+                  <th className="pb-3">Status</th>
+                  <th className="pb-3 text-right">Frames Received</th>
+                  <th className="pb-3 text-right">Frames Selected</th>
+                  <th className="pb-3 text-right">Frames Discarded</th>
+                  <th className="pb-3 text-right pr-2">TX Reduction</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/50 text-xs font-mono">
+                {missionHistory.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="py-8 text-center text-slate-500 text-xs font-sans">
+                      No mission frame records available. Start a mission in Mission Control to view live frame telemetry.
+                    </td>
+                  </tr>
+                ) : (
+                  missionHistory.map((m, idx) => {
+                    const received = m.frames_received || 0;
+                    const selected = m.frames_selected || 0;
+                    const discarded = m.frames_discarded !== undefined ? m.frames_discarded : Math.max(0, received - selected);
+                    const reduction = received > 0 ? ((discarded / received) * 100).toFixed(1) : "0.0";
+                    const isActive = m.status === 'active';
+
+                    return (
+                      <tr key={m.mission_id || idx} className="hover:bg-slate-800/30 transition-colors">
+                        <td className="py-3 pl-2 text-sky-400 font-semibold">{m.mission_id}</td>
+                        <td className="py-3 text-slate-200 font-sans">{m.mission_name || 'Unnamed Mission'}</td>
+                        <td className="py-3">
+                          {isActive ? (
+                            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] bg-emerald-500/10 border border-emerald-500/20 text-emerald-400">
+                              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                              ACTIVE
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] bg-slate-800 border border-slate-700 text-slate-400">
+                              COMPLETED
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-3 text-right text-cyan-400">{received.toLocaleString()}</td>
+                        <td className="py-3 text-right text-emerald-400 font-bold">{selected.toLocaleString()}</td>
+                        <td className="py-3 text-right text-slate-400">{discarded.toLocaleString()}</td>
+                        <td className="py-3 text-right pr-2 text-amber-400 font-semibold">{reduction}%</td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
           </div>
         </div>
 
