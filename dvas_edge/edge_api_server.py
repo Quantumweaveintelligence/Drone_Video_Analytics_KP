@@ -983,7 +983,7 @@ async def stream_live(request: Request, auth: dict = Depends(verify_edge_auth)):
 # ---------------------------------------------------------------------------
 # Ingest Server Proxy
 # ---------------------------------------------------------------------------
-INGEST_BASE_URL = os.getenv("INGEST_URL", "http://10.123.225.250/ingest").replace("/frame", "")
+INGEST_BASE_URL = os.getenv("INGEST_URL", "http://10.10.55.115/ingest").replace("/frame", "")
 
 @app.get("/api/ingest-server/status")
 async def proxy_ingest_status(auth: dict = Depends(verify_edge_auth)):

@@ -65,20 +65,20 @@ metrics:
 # ============================================================
 # Ingest Server Connection — edge_sender.py targets
 # LAN demo: direct HTTP to ingest server (no VPN / no TLS)
-#   Ingest server LAN IP : 10.123.225.250
+#   Ingest server LAN IP : 10.10.55.115
 #   Edge laptop LAN IP   : 10.51.27.155
 # ============================================================
 
 ingest:
   # HTTP endpoint for frame upload — goes through NGINX on ingest server
-  url: "http://10.123.225.250/ingest/frame"
+  url: "http://10.10.55.115/ingest/frame"
 
   # Mission lifecycle endpoints
-  mission_start_url: "http://10.123.225.250/ingest/mission/start"
-  mission_end_url:   "http://10.123.225.250/ingest/mission/end"
+  mission_start_url: "http://10.10.55.115/ingest/mission/start"
+  mission_end_url:   "http://10.10.55.115/ingest/mission/end"
 
   # Keycloak token endpoint — direct to Keycloak container port on ingest server
-  token_url: "http://10.123.225.250:8080/realms/kerala-police-drone/protocol/openid-connect/token"
+  token_url: "http://10.10.55.115:8080/realms/kerala-police-drone/protocol/openid-connect/token"
 
   # Keycloak client credentials — match values configured in Keycloak on Ubuntu
   client_id:     "drone-ingest-client"
