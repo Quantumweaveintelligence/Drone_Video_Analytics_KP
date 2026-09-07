@@ -33,7 +33,7 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://dvas:dvas_secret@postgres:5432/dvas
       - JWT_SECRET=super-secret-dvas-key-change-in-prod
-      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://10.10.55.115:3000}
       - INGEST_SERVER_URL=${INGEST_SERVER_URL:-http://drone_nginx}
       - EDGE_SERVER_URL=http://edge:8765
       - ANALYTICS_GATEWAY_URL=${ANALYTICS_GATEWAY_URL:-http://analytics-gateway:8100}

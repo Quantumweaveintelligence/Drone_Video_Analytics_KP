@@ -74,10 +74,12 @@ app.include_router(ws.router)
 app.include_router(ingest_api)
 
 # ---------- CORS ----------
+cors_origins = [o.strip() for o in CORS_ORIGINS if o.strip() and o.strip() != "*"]
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=cors_origins or ["http://localhost:3000"],
+    allow_origin_regex=r"^https?://.*(:[0-9]+)?$",
     allow_methods=["*"],
     allow_headers=["*"],
 )

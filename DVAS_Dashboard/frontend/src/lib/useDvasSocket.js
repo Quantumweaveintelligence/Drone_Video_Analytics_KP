@@ -16,11 +16,28 @@ export function useDvasSocket(onMessage) {
     let heartbeat;
     const connect = async () => {
       if (closed) return;
-      
-      const wsBase = API.replace(/^http/, "ws");
-      const url = `${wsBase}/ws`;
 
-      const ws = new WebSocket(url);
+      let url = "";
+      try {
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const host = window.location.host;
+        const apiPath = API || "/api";
+        url = apiPath.startsWith("http")
+          ? `${apiPath.replace(/^http/, "ws")}/ws`
+          : `${protocol}//${host}${apiPath.startsWith("/") ? "" : "/"}${apiPath}/ws`;
+      } catch (e) {
+        console.warn("Failed to construct WebSocket URL:", e);
+        return;
+      }
+
+      let ws;
+      try {
+        ws = new WebSocket(url);
+      } catch (err) {
+        console.warn("WebSocket initialization failed on this client:", err);
+        return;
+      }
+
       ref.current = ws;
       ws.onopen = () => {
         setConnected(true);

@@ -1657,6 +1657,7 @@ export default function AuditLogPage() {
   const [totalLogs, setTotalLogs] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
   const [loading, setLoading] = useState(true);
+  const [queryError, setQueryError] = useState(null);
 
   // KPIs, Anomaly Alerts & Trends
   const [summary, setSummary] = useState({ total_events: 0, failed_actions: 0, critical_events: 0, warnings: 0, active_legal_holds: 0 });
@@ -1820,8 +1821,12 @@ export default function AuditLogPage() {
       setTotalLogs(logsRes.data.total || 0);
       setTotalPages(logsRes.data.total_pages || 1);
       setSummary(summaryRes.data || {});
+      setQueryError(null);
     } catch (err) {
       console.error('Audit query error:', err);
+      const status = err?.response?.status;
+      const detail = err?.response?.data?.detail || err?.message || 'Failed to communicate with the Audit API service';
+      setQueryError({ status, detail });
       setLogs([]);
     } finally {
       setLoading(false);
@@ -1850,8 +1855,8 @@ export default function AuditLogPage() {
 
   // ── Real-Time Live Tail Integration via useDvasSocket ──
   useDvasSocket((msg) => {
-    if (msg?.type === 'audit_event' && liveTailActive && !liveTailPaused && msg.event) {
-      const incoming = msg.event;
+    const incoming = msg?.event || msg?.data;
+    if (msg?.type === 'audit_event' && liveTailActive && !liveTailPaused && incoming) {
       setLogs((prev) => [incoming, ...prev.slice(0, pageSize - 1)]);
       setTotalLogs((t) => t + 1);
       setNewLogIds((prev) => new Set([...prev, incoming.id]));
@@ -2920,6 +2925,75 @@ export default function AuditLogPage() {
                     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}>
                       <RefreshCw size={22} className="animate-spin" style={{ color: 'var(--dvas-blue)' }} />
                       <span style={{ fontSize: 12, color: 'var(--dvas-text-dim)' }}>Loading tamper-evident ledger from server…</span>
+                    </div>
+                  </td>
+                </tr>
+              ) : queryError ? (
+                <tr>
+                  <td colSpan={9} style={{ padding: '40px 20px', textAlign: 'center' }}>
+                    <div style={{
+                      maxWidth: 520,
+                      margin: '0 auto',
+                      padding: '20px 24px',
+                      background: 'rgba(239, 68, 68, 0.08)',
+                      border: '1px solid rgba(239, 68, 68, 0.3)',
+                      borderRadius: 8,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      alignItems: 'center',
+                      gap: 12,
+                    }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#f87171', fontWeight: 600, fontSize: 15 }}>
+                        <AlertTriangle size={20} />
+                        <span>Unable to load Audit Ledger ({queryError.status ? `HTTP ${queryError.status}` : 'Network / CORS Error'})</span>
+                      </div>
+                      <div style={{ fontSize: 13, color: 'var(--dvas-text-dim)', lineHeight: 1.5 }}>
+                        {queryError.status === 401 ? (
+                          'Your session has expired or authentication credentials were not provided. Please log in again.'
+                        ) : queryError.status === 403 ? (
+                          'Access restricted: Only Senior Officers and System Administrators have clearance under Section 65B to inspect the system audit trail.'
+                        ) : (
+                          `Error: ${queryError.detail}. Please verify network connectivity and backend CORS configuration.`
+                        )}
+                      </div>
+                      <div style={{ display: 'flex', gap: 10, marginTop: 4 }}>
+                        {queryError.status === 401 ? (
+                          <button
+                            onClick={() => navigate('/login')}
+                            style={{
+                              padding: '6px 14px',
+                              background: '#38bdf8',
+                              color: '#0f172a',
+                              border: 'none',
+                              borderRadius: 6,
+                              fontWeight: 600,
+                              fontSize: 12,
+                              cursor: 'pointer',
+                            }}
+                          >
+                            Return to Login
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => fetchAuditLogs()}
+                            style={{
+                              padding: '6px 14px',
+                              background: 'var(--dvas-blue)',
+                              color: '#0f172a',
+                              border: 'none',
+                              borderRadius: 6,
+                              fontWeight: 600,
+                              fontSize: 12,
+                              cursor: 'pointer',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 6,
+                            }}
+                          >
+                            <RefreshCw size={14} /> Retry Query
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </td>
                 </tr>

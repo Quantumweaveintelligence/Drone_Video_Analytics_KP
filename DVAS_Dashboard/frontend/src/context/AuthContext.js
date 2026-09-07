@@ -22,6 +22,10 @@ export function AuthProvider({ children }) {
 
   const login = async (email, password) => {
     const { data } = await api.post("/auth/login", { email, password });
+    if (data?.access_token) {
+      localStorage.setItem("dvas_token", data.access_token);
+      localStorage.setItem("token", data.access_token);
+    }
     setUser(data);
     return data;
   };
@@ -55,6 +59,8 @@ export function AuthProvider({ children }) {
     }
 
     try { await api.post("/auth/logout"); } catch {}
+    localStorage.removeItem("dvas_token");
+    localStorage.removeItem("token");
     setUser(false);
   };
 
