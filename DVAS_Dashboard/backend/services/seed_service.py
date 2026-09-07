@@ -3,7 +3,7 @@ Seed service for populating the database.
 """
 import uuid, random, logging
 from datetime import datetime, timezone, timedelta
-from sqlalchemy import select, delete, func
+from sqlalchemy import select, delete, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from database import engine, async_session_factory
 from models import Base, AuditLog, Mission, Drone, Alert, Evidence, Export
@@ -66,6 +66,18 @@ async def seed_data():
     # Create all tables (including the new missions schema)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'audit_logs' AND column_name = 'compliance_tags'
+                ) THEN
+                    ALTER TABLE audit_logs ADD COLUMN compliance_tags JSONB DEFAULT '[]'::jsonb;
+                    CREATE INDEX IF NOT EXISTS idx_audit_compliance_tags ON audit_logs USING gin (compliance_tags);
+                END IF;
+            END $$;
+        """))
 
     async with async_session_factory() as session:
         user_ids_by_email = {u["email"]: "seed-id" for u in SEED_USERS}
