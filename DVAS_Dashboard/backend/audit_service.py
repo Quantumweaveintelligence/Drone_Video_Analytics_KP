@@ -29,9 +29,9 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any, Union
 from fpdf import FPDF
 
-from sqlalchemy import select, func, or_, and_, desc, asc, delete
+from sqlalchemy import select, func, or_, and_, desc, asc, delete, text
 from database import async_session_factory
-from models import AuditLog, AuditFilterPreset
+from models import AuditLog, AuditFilterPreset, AuditLegalHold
 
 logger = logging.getLogger("dvas.audit")
 
@@ -49,6 +49,7 @@ _ACTION_MAP = {
     "user_create":              ("create",  "user_mgmt",        "critical"),
     "user_suspend":             ("delete",  "user_mgmt",        "critical"),
     "user_patch":               ("update",  "user_mgmt",        "critical"),
+    "permission_change":        ("update",  "security",         "critical"),
 
     # Alerts / operations
     "alert_ack":                ("update",  "operations",       "info"),
@@ -67,7 +68,7 @@ _ACTION_MAP = {
     "watchlist_add":            ("create",  "operations",       "warning"),
     "watchlist_remove":         ("delete",  "operations",       "warning"),
 
-    # Audit log meta-actions
+    # Audit log meta-actions & compliance
     "audit_log_view":           ("read",    "security",         "info"),
     "audit_log_export_csv":     ("export",  "security",         "info"),
     "audit_log_export_json":    ("export",  "security",         "info"),
@@ -75,6 +76,10 @@ _ACTION_MAP = {
     "audit_chain_verify":       ("read",    "security",         "info"),
     "audit_preset_create":      ("create",  "security",         "info"),
     "audit_preset_delete":      ("delete",  "security",         "info"),
+    "audit_legal_hold_place":   ("create",  "compliance",       "warning"),
+    "audit_legal_hold_release": ("delete",  "compliance",       "warning"),
+    "audit_purge":              ("delete",  "compliance",       "critical"),
+    "audit_archive_export":     ("export",  "compliance",       "warning"),
 }
 
 _ENDPOINT_MAP = {
@@ -87,6 +92,7 @@ _ENDPOINT_MAP = {
     "user_create":              "POST /api/users",
     "user_suspend":             "DELETE /api/users/{id}",
     "user_patch":               "PATCH /api/users/{id}",
+    "permission_change":        "PATCH /api/users/{id}",
     "model_config_update":      "POST /api/models",
     "watchlist_add":            "POST /api/analytics/watchlist",
     "watchlist_remove":         "DELETE /api/analytics/watchlist/{plate}",
@@ -99,7 +105,33 @@ _ENDPOINT_MAP = {
     "audit_chain_verify":       "GET /api/audit-logs/verify",
     "audit_preset_create":      "POST /api/audit-presets",
     "audit_preset_delete":      "DELETE /api/audit-presets/{id}",
+    "audit_legal_hold_place":   "POST /api/audit-logs/{id}/legal-hold",
+    "audit_legal_hold_release": "DELETE /api/audit-logs/{id}/legal-hold",
+    "audit_purge":              "POST /api/audit-logs/archive/execute",
+    "audit_archive_export":     "GET /api/audit-logs/archive/export",
 }
+
+
+def _infer_compliance_tags(action: str, action_type: str, category: str, target_type: Optional[str] = None) -> List[str]:
+    """Infers statutory compliance tags (IEA_65B, DPDPA, IT_ACT_2000, GDPR, LEGAL_HOLD)."""
+    tags = set()
+    a = (action or "").lower()
+    cat = (category or "").lower()
+    tgt = (target_type or "").lower()
+
+    if "export" in a or "download" in a or cat == "evidence" or tgt in ("evidence", "export"):
+        tags.add("IEA_65B")
+    if cat in ("user_mgmt", "authentication") or tgt == "user" or "user" in a or "login" in a:
+        tags.add("DPDPA")
+        tags.add("IT_ACT_2000")
+    if cat in ("security", "configuration") or "verify" in a or "preset" in a or "patch" in a:
+        tags.add("IT_ACT_2000")
+    if "hold" in a:
+        tags.add("IEA_65B")
+        tags.add("LEGAL_HOLD")
+    if not tags:
+        tags.add("IT_ACT_2000")
+    return sorted(list(tags))
 
 
 def _classify_action(action: str) -> tuple:
@@ -208,8 +240,8 @@ def _audit_hash(entry: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _row_to_dict(r: AuditLog) -> dict:
-    """Serialize AuditLog ORM object to plain dictionary."""
+def _row_to_dict(r: AuditLog, legal_hold: Optional[dict] = None) -> dict:
+    """Serialize AuditLog ORM object to plain dictionary, attaching legal hold & compliance tags."""
     if r is None:
         return {}
     return {
@@ -245,6 +277,10 @@ def _row_to_dict(r: AuditLog) -> dict:
         "source_endpoint": r.source_endpoint or "",
         "request_id": r.request_id or "",
         "correlation_id": r.correlation_id or "",
+        # Compliance & Legal Holds
+        "compliance_tags": r.compliance_tags or [],
+        "is_legal_hold": legal_hold is not None,
+        "legal_hold": legal_hold,
         # Chain
         "prev_hash": r.prev_hash,
         "hash": r.hash,
@@ -310,12 +346,13 @@ async def write_audit_v2(
     source_endpoint: Optional[str] = None,
     request_id: Optional[str] = None,
     correlation_id: Optional[str] = None,
+    compliance_tags: Optional[List[str]] = None,
     ip: str = "-",
     session_id: Optional[str] = None,
     device_id: Optional[str] = None,
     request=None,
 ) -> dict:
-    """Append-only tamper-evident audit logger."""
+    """Append-only tamper-evident audit logger with compliance tagging and live WebSocket broadcast."""
     inferred_type, inferred_cat, inferred_sev = _classify_action(action)
     if action_type is None:
         action_type = inferred_type
@@ -323,6 +360,9 @@ async def write_audit_v2(
         category = inferred_cat
     if severity is None:
         severity = inferred_sev
+
+    if compliance_tags is None:
+        compliance_tags = _infer_compliance_tags(action, action_type, category, target_type)
 
     if request is not None:
         if ip == "-":
@@ -375,6 +415,7 @@ async def write_audit_v2(
             "source_endpoint": source_endpoint,
             "request_id": request_id,
             "correlation_id": correlation_id,
+            "compliance_tags": compliance_tags,
             "prev_hash": prev_hash,
         }
 
@@ -383,6 +424,41 @@ async def write_audit_v2(
         await session.commit()
 
         logger.debug("audit_v2 logged %s (id=%s)", action, entry_dict["id"])
+
+        # Broadcast asynchronously to active WebSocket clients (e.g. Live Tail explorer)
+        try:
+            import asyncio
+            from services.websocket_hub import hub
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(hub.broadcast({
+                    "type": "audit_event",
+                    "data": {
+                        "id": entry_dict["id"],
+                        "ts": entry_dict["ts"],
+                        "actor_id": entry_dict["actor_id"],
+                        "actor_email": entry_dict["actor_email"],
+                        "actor_name": entry_dict["actor_name"],
+                        "actor_role": entry_dict["actor_role"],
+                        "action": entry_dict["action"],
+                        "action_type": entry_dict["action_type"],
+                        "category": entry_dict["category"],
+                        "severity": entry_dict["severity"],
+                        "target": entry_dict["target"],
+                        "target_type": entry_dict["target_type"],
+                        "target_name": entry_dict["target_name"],
+                        "status": entry_dict["status"],
+                        "error_code": entry_dict["error_code"],
+                        "ip": entry_dict["ip"],
+                        "compliance_tags": compliance_tags,
+                        "is_legal_hold": False,
+                    }
+                }))
+            except RuntimeError:
+                pass
+        except Exception as ws_err:
+            logger.debug("Live WebSocket audit broadcast skipped: %s", ws_err)
+
         return entry_dict
 
 
@@ -403,6 +479,8 @@ def _build_filter_clauses(
     status: Optional[Union[str, List[str]]] = None,
     source_module: Optional[Union[str, List[str]]] = None,
     target_type: Optional[Union[str, List[str]]] = None,
+    compliance_tag: Optional[Union[str, List[str]]] = None,
+    is_legal_hold: Optional[Union[str, bool]] = None,
     correlation_id: Optional[str] = None,
     request_id: Optional[str] = None,
     user: Optional[dict] = None,
@@ -460,6 +538,25 @@ def _build_filter_clauses(
     _apply_in_clause(AuditLog.source_module, source_module)
     _apply_in_clause(AuditLog.target_type, target_type)
 
+    # Compliance tag filter (checks JSONB array)
+    if compliance_tag:
+        if isinstance(compliance_tag, str):
+            c_tags = [t.strip() for t in compliance_tag.split(",") if t.strip()]
+        else:
+            c_tags = [str(t).strip() for t in list(compliance_tag) if str(t).strip()]
+        if c_tags:
+            tag_clauses = [AuditLog.compliance_tags.contains([ct]) for ct in c_tags]
+            clauses.append(or_(*tag_clauses))
+
+    # Legal hold filter
+    if is_legal_hold is not None and str(is_legal_hold).strip() != "":
+        subq = select(AuditLegalHold.audit_log_id).where(AuditLegalHold.active == True)
+        val_str = str(is_legal_hold).lower()
+        if val_str in ("true", "1", "yes", "held"):
+            clauses.append(AuditLog.id.in_(subq))
+        elif val_str in ("false", "0", "no", "unheld"):
+            clauses.append(AuditLog.id.notin_(subq))
+
     if correlation_id:
         clauses.append(AuditLog.correlation_id == str(correlation_id)[:64])
     if request_id:
@@ -481,6 +578,8 @@ async def query_audit_logs(
     status: Optional[Union[str, List[str]]] = None,
     source_module: Optional[Union[str, List[str]]] = None,
     target_type: Optional[Union[str, List[str]]] = None,
+    compliance_tag: Optional[Union[str, List[str]]] = None,
+    is_legal_hold: Optional[Union[str, bool]] = None,
     correlation_id: Optional[str] = None,
     request_id: Optional[str] = None,
     sort_by: str = "ts",
@@ -490,7 +589,7 @@ async def query_audit_logs(
     user: Optional[dict] = None,
 ) -> dict:
     """
-    Execute server-side filtered, paginated query on audit_logs table.
+    Execute server-side filtered, paginated query on audit_logs table with legal holds attached.
     """
     page = max(1, page)
     page_size = max(1, min(page_size, 500))
@@ -507,6 +606,8 @@ async def query_audit_logs(
         status=status,
         source_module=source_module,
         target_type=target_type,
+        compliance_tag=compliance_tag,
+        is_legal_hold=is_legal_hold,
         correlation_id=correlation_id,
         request_id=request_id,
         user=user,
@@ -542,8 +643,27 @@ async def query_audit_logs(
         query_stmt = query_stmt.order_by(order_expr).offset((page - 1) * page_size).limit(page_size)
 
         rows_result = await session.execute(query_stmt)
-        items = [_row_to_dict(r) for r in rows_result.scalars().all()]
+        rows = list(rows_result.scalars().all())
 
+        # Efficient batch lookup of active legal holds for this page
+        log_ids = [r.id for r in rows]
+        hold_map = {}
+        if log_ids:
+            holds_stmt = select(AuditLegalHold).where(
+                and_(AuditLegalHold.audit_log_id.in_(log_ids), AuditLegalHold.active == True)
+            )
+            holds_res = await session.execute(holds_stmt)
+            for h in holds_res.scalars().all():
+                hold_map[h.audit_log_id] = {
+                    "id": h.id,
+                    "case_number": h.case_number,
+                    "hold_reason": h.hold_reason,
+                    "placed_by": h.placed_by,
+                    "placed_by_name": h.placed_by_name,
+                    "placed_at": h.placed_at,
+                }
+
+        items = [_row_to_dict(r, legal_hold=hold_map.get(r.id)) for r in rows]
         total_pages = math.ceil(total / page_size) if total > 0 else 1
 
         return {
@@ -565,6 +685,8 @@ async def query_audit_logs(
                     "status": status,
                     "source_module": source_module,
                     "target_type": target_type,
+                    "compliance_tag": compliance_tag,
+                    "is_legal_hold": is_legal_hold,
                     "correlation_id": correlation_id,
                     "request_id": request_id,
                 }.items() if v is not None
@@ -618,6 +740,10 @@ async def get_audit_summary(
         )
         info = (await session.execute(info_stmt)).scalar_one()
 
+        # Count active legal holds
+        holds_stmt = select(func.count(AuditLegalHold.id)).where(AuditLegalHold.active == True)
+        active_legal_holds = (await session.execute(holds_stmt)).scalar_one()
+
         # Compute anomalies in the last 24h
         anom_res = await detect_anomalies(hours=24)
         anomalies_count = anom_res.get("anomaly_count", 0)
@@ -629,6 +755,7 @@ async def get_audit_summary(
             "warnings": warning,
             "info_events": info,
             "anomalies_detected": anomalies_count,
+            "active_legal_holds": active_legal_holds,
         }
 
 
@@ -735,6 +862,9 @@ async def verify_chain_integrity(limit: int = 1000) -> dict:
 
 async def get_distinct_values(column_name: str) -> List[str]:
     """Retrieve distinct non-null values for a column (for filter dropdowns)."""
+    if column_name == "compliance_tags":
+        return ["DPDPA", "IEA_65B", "IT_ACT_2000", "LEGAL_HOLD", "GDPR"]
+
     col_map = {
         "action_type": AuditLog.action_type,
         "category": AuditLog.category,
@@ -766,7 +896,7 @@ def get_retention_policy() -> dict:
         "retention_period_days": 365,
         "immutable": True,
         "hash_algorithm": "SHA-256 (Merkle / Hash-Chain)",
-        "legal_compliance": ["Indian Evidence Act Section 65B", "IT Act 2000 (Section 43A / 79)"],
+        "legal_compliance": ["Indian Evidence Act Section 65B", "IT Act 2000 (Section 43A / 79)", "Digital Personal Data Protection Act (DPDPA) 2023"],
         "last_purge_date": None,
         "next_scheduled_purge": "2027-01-01T00:00:00Z",
     }
@@ -807,6 +937,8 @@ async def export_audit_logs_csv(filters: dict, user: Optional[dict] = None) -> s
         "Source Module",
         "Source Endpoint",
         "Request ID",
+        "Legal Hold",
+        "Compliance Tags",
         "SHA-256 Hash",
     ])
 
@@ -828,6 +960,8 @@ async def export_audit_logs_csv(filters: dict, user: Optional[dict] = None) -> s
             item.get("source_module", ""),
             item.get("source_endpoint", ""),
             item.get("request_id", ""),
+            "YES" if item.get("is_legal_hold") else "NO",
+            ", ".join(item.get("compliance_tags", [])),
             item.get("hash", ""),
         ])
 
@@ -921,12 +1055,12 @@ async def delete_preset(preset_id: str, user_id: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rule-Based Anomaly Detection (7 Patterns)
+# Rule-Based Anomaly Detection (8 Patterns)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def detect_anomalies(hours: int = 24) -> dict:
     """
-    Evaluate 7 rule-based security anomaly patterns over the last N hours.
+    Evaluate 8 rule-based security anomaly patterns over the last N hours.
     """
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     async with async_session_factory() as session:
@@ -1034,6 +1168,66 @@ async def detect_anomalies(hours: int = 24) -> dict:
             "last_seen": watchlist_acts[-1].get("ts"),
             "event_ids": [w["id"] for w in watchlist_acts[:5]],
         })
+
+    # Pattern 6: Privilege Escalation Attempt (user role change to administrator or permission modification)
+    priv_escalations = [
+        l for l in logs
+        if (l.get("action") in ("user_patch", "user_create", "permission_change") and
+            "system_administrator" in str(l.get("after_values", {})))
+        or (l.get("action") == "permission_change" and l.get("status") != "success")
+    ]
+    for pe in priv_escalations:
+        anomalies.append({
+            "id": f"anom-priv-esc-{pe['id']}",
+            "pattern": "privilege_escalation_attempt",
+            "severity": "critical",
+            "title": f"Privilege Escalation Detected ({pe['action']})",
+            "description": f"Actor '{pe.get('actor_email')}' modified administrative permissions or escalated roles.",
+            "actor": pe.get("actor_email"),
+            "first_seen": pe.get("ts"),
+            "last_seen": pe.get("ts"),
+            "event_ids": [pe["id"]],
+        })
+
+    # Pattern 7: Mass Deletions (> 3 delete actions within 15 min)
+    deletes = [l for l in logs if l.get("action_type") == "delete" or "delete" in l.get("action", "") or "suspend" in l.get("action", "")]
+    if len(deletes) >= 3:
+        anomalies.append({
+            "id": "anom-mass-deletes",
+            "pattern": "mass_deletion_surge",
+            "severity": "critical",
+            "title": f"Mass Deletion Surge ({len(deletes)} records)",
+            "description": f"High volume of destructive delete/suspend actions ({len(deletes)} events) detected in monitored timeframe.",
+            "actor": "Various",
+            "first_seen": deletes[0].get("ts"),
+            "last_seen": deletes[-1].get("ts"),
+            "event_ids": [d["id"] for d in deletes[:5]],
+        })
+
+    # Pattern 8: Cryptographic Chain Discontinuity (fast probe)
+    try:
+        chain_probe = await verify_chain_integrity(limit=100)
+        if not chain_probe.get("is_chain_valid", True):
+            anomalies.append({
+                "id": "anom-chain-breach",
+                "pattern": "cryptographic_chain_breach",
+                "severity": "critical",
+                "title": "Cryptographic Hash Chain Discontinuity Detected!",
+                "description": f"Tamper evidence alert: {chain_probe.get('tampered_count', 0)} block(s) failed sequential verification.",
+                "actor": "System Integrity Monitor",
+                "first_seen": datetime.now(timezone.utc).isoformat(),
+                "last_seen": datetime.now(timezone.utc).isoformat(),
+                "event_ids": [t.get("id") for t in chain_probe.get("tampered_entries", [])[:5]],
+            })
+    except Exception as e:
+        logger.debug("Chain probe skipped: %s", e)
+
+    return {
+        "anomalies": anomalies,
+        "anomaly_count": len(anomalies),
+        "scanned_period_hours": hours,
+        "scanned_events_count": len(logs),
+    }
 
     return {
         "anomalies": anomalies,
@@ -1160,3 +1354,390 @@ def generate_audit_section65b_pdf(items: List[dict], user: dict, filter_desc: st
     pdf.cell(0, 3.5, f"DVAS-65B-CERT-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}", ln=1, align="R")
 
     return bytes(pdf.output(dest="S"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Activity Trend & Analytics
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def get_audit_trends(range_val: str = "24h", user: Optional[dict] = None) -> dict:
+    """Compute hourly or daily activity trend histograms and top actor stats."""
+    hours = 24
+    if range_val == "7d":
+        hours = 24 * 7
+    elif range_val == "30d":
+        hours = 24 * 30
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    clauses = [AuditLog.ts >= since]
+
+    async with async_session_factory() as session:
+        stmt = (
+            select(AuditLog)
+            .where(and_(*clauses))
+            .order_by(AuditLog.ts.asc())
+        )
+        result = await session.execute(stmt)
+        logs = [_row_to_dict(r) for r in result.scalars().all()]
+
+    timeline_map = {}
+    actors_map = {}
+    action_types_map = {}
+    severity_map = {"critical": 0, "warning": 0, "info": 0}
+    status_map = {"success": 0, "failure": 0}
+
+    is_daily = hours > 24
+
+    for l in logs:
+        ts = l.get("ts", "")
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            bucket_key = dt.strftime("%d %b") if is_daily else dt.strftime("%H:00")
+        except Exception:
+            bucket_key = "Other"
+
+        bucket = timeline_map.setdefault(bucket_key, {"time": bucket_key, "total": 0, "failed": 0, "critical": 0})
+        bucket["total"] += 1
+
+        status = (l.get("status") or "success").lower()
+        if status != "success":
+            bucket["failed"] += 1
+            status_map["failure"] += 1
+        else:
+            status_map["success"] += 1
+
+        sev = (l.get("severity") or "info").lower()
+        if sev == "critical":
+            bucket["critical"] += 1
+        severity_map[sev] = severity_map.get(sev, 0) + 1
+
+        act_name = l.get("actor_name") or l.get("actor_email") or "System"
+        act_role = l.get("actor_role") or "internal"
+        actors_map.setdefault(act_name, {"actor": act_name, "role": act_role, "count": 0})["count"] += 1
+
+        at = l.get("action_type") or "system"
+        action_types_map[at] = action_types_map.get(at, 0) + 1
+
+    top_actors = sorted(actors_map.values(), key=lambda x: x["count"], reverse=True)[:5]
+    timeline = list(timeline_map.values())
+    total_scanned = len(logs)
+    failed_rate = round((status_map["failure"] / total_scanned * 100), 1) if total_scanned > 0 else 0.0
+
+    return {
+        "range": range_val,
+        "total_scanned": total_scanned,
+        "timeline": timeline,
+        "top_actors": top_actors,
+        "by_action_type": action_types_map,
+        "by_severity": severity_map,
+        "by_status": status_map,
+        "failed_rate_percent": failed_rate,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Access & Meta-Audit Logging (Audit of the Auditors)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ACCESS_LOG_BUCKET: Dict[str, float] = {}
+
+async def log_audit_access(actor: dict, request=None, referrer: Optional[str] = None) -> bool:
+    """Log access to the Audit Log Explorer (audit of the auditors), debounced to 5 mins per actor."""
+    actor_id = actor.get("id") or actor.get("email") or "anon"
+    now = datetime.now(timezone.utc).timestamp()
+    last_logged = _ACCESS_LOG_BUCKET.get(actor_id, 0)
+
+    # 5-minute debounce per user session to avoid flooding the log
+    if now - last_logged < 300:
+        return False
+
+    _ACCESS_LOG_BUCKET[actor_id] = now
+    ref_desc = f" (Referrer: {referrer})" if referrer else ""
+    await write_audit_v2(
+        actor=actor,
+        action="audit_log_view",
+        action_type="read",
+        category="security",
+        severity="info",
+        target="Audit Log Explorer",
+        target_type="system",
+        target_id="audit_explorer",
+        target_name="Audit Log Explorer UI",
+        details=f"Officer accessed full Audit Log Explorer{ref_desc}",
+        source_module="dashboard",
+        source_endpoint="GET /api/audit-logs",
+        request=request,
+    )
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Legal Hold & Forensic Chain-of-Custody
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def place_legal_hold(*, audit_log_id: str, case_number: str, reason: str, actor: dict) -> dict:
+    """Place a statutory legal hold on an audit entry, preventing deletion under retention policies."""
+    async with async_session_factory() as session:
+        log_res = await session.execute(select(AuditLog).where(AuditLog.id == audit_log_id))
+        log_entry = log_res.scalar_one_or_none()
+        if not log_entry:
+            raise ValueError(f"Audit log entry {audit_log_id} not found")
+
+        existing_res = await session.execute(
+            select(AuditLegalHold).where(
+                and_(AuditLegalHold.audit_log_id == audit_log_id, AuditLegalHold.active == True)
+            )
+        )
+        if existing_res.scalar_one_or_none():
+            raise ValueError("Audit log entry already has an active legal hold")
+
+        hold_id = str(uuid.uuid4())
+        now_iso = datetime.now(timezone.utc).isoformat()
+        hold = AuditLegalHold(
+            id=hold_id,
+            audit_log_id=audit_log_id,
+            case_number=case_number,
+            hold_reason=reason,
+            placed_by=actor.get("id") or "unknown",
+            placed_by_name=actor.get("name") or actor.get("email") or "Officer",
+            placed_at=now_iso,
+            active=True,
+        )
+        session.add(hold)
+        await session.commit()
+
+    await write_audit_v2(
+        actor=actor,
+        action="audit_legal_hold_place",
+        action_type="create",
+        category="compliance",
+        severity="warning",
+        target=f"Audit Log {audit_log_id[:8]}",
+        target_type="audit_log",
+        target_id=audit_log_id,
+        target_name=f"Legal Hold (Case {case_number})",
+        details=f"Legal hold placed under case {case_number}. Reason: {reason}",
+        source_module="dashboard",
+        source_endpoint=f"POST /api/audit-logs/{audit_log_id}/legal-hold",
+    )
+    return {
+        "id": hold_id,
+        "audit_log_id": audit_log_id,
+        "case_number": case_number,
+        "hold_reason": reason,
+        "placed_by": actor.get("id"),
+        "placed_at": now_iso,
+        "active": True,
+    }
+
+
+async def release_legal_hold(*, audit_log_id: str, release_reason: str, actor: dict) -> dict:
+    """Release an active legal hold on an audit entry."""
+    async with async_session_factory() as session:
+        res = await session.execute(
+            select(AuditLegalHold).where(
+                and_(AuditLegalHold.audit_log_id == audit_log_id, AuditLegalHold.active == True)
+            )
+        )
+        hold = res.scalar_one_or_none()
+        if not hold:
+            raise ValueError("No active legal hold found for this audit log entry")
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        hold.active = False
+        hold.released_by = actor.get("id")
+        hold.released_at = now_iso
+        hold.release_reason = release_reason
+        await session.commit()
+
+    await write_audit_v2(
+        actor=actor,
+        action="audit_legal_hold_release",
+        action_type="delete",
+        category="compliance",
+        severity="warning",
+        target=f"Audit Log {audit_log_id[:8]}",
+        target_type="audit_log",
+        target_id=audit_log_id,
+        target_name="Legal Hold Released",
+        details=f"Legal hold released. Justification: {release_reason}",
+        source_module="dashboard",
+        source_endpoint=f"DELETE /api/audit-logs/{audit_log_id}/legal-hold",
+    )
+    return {"ok": True, "released_at": now_iso}
+
+
+async def get_chain_of_custody(log_id: str) -> dict:
+    """Generate cryptographic provenance and chain-of-custody envelope for legal/forensic use."""
+    async with async_session_factory() as session:
+        log_res = await session.execute(select(AuditLog).where(AuditLog.id == log_id))
+        log = log_res.scalar_one_or_none()
+        if not log:
+            raise ValueError("Audit log entry not found")
+
+        hold_res = await session.execute(
+            select(AuditLegalHold).where(
+                and_(AuditLegalHold.audit_log_id == log_id, AuditLegalHold.active == True)
+            )
+        )
+        hold = hold_res.scalar_one_or_none()
+
+    doc = _row_to_dict(log, legal_hold={
+        "case_number": hold.case_number,
+        "hold_reason": hold.hold_reason,
+        "placed_by": hold.placed_by_name or hold.placed_by,
+        "placed_at": hold.placed_at,
+    } if hold else None)
+
+    expected_hash = _audit_hash(doc)
+    is_valid = (doc.get("hash") == expected_hash)
+
+    return {
+        "log_id": log.id,
+        "timestamp_utc": log.ts,
+        "actor": {
+            "id": log.actor_id,
+            "name": log.actor_name,
+            "email": log.actor_email,
+            "role": log.actor_role,
+            "ip": log.ip,
+            "session_id": log.actor_session_id,
+            "device_id": log.actor_device_id,
+        },
+        "action": log.action,
+        "action_type": log.action_type,
+        "target": {
+            "type": log.target_type,
+            "id": log.target_id,
+            "name": log.target_name or log.target,
+        },
+        "cryptographic_proof": {
+            "current_hash_sha256": log.hash,
+            "previous_hash_sha256": log.prev_hash,
+            "expected_hash_sha256": expected_hash,
+            "hash_matches_content": is_valid,
+            "chain_algorithm": "SHA-256 Merkle Chain",
+            "statutory_compliance": "Indian Evidence Act Section 65B(4)",
+            "certifying_authority": "Kerala Police Department - DVAS Command Centre",
+        },
+        "legal_hold": doc.get("legal_hold"),
+        "compliance_tags": doc.get("compliance_tags", []),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Statutory Archive & Purge Engine
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def dry_run_purge(older_than_days: int = 365, user: Optional[dict] = None) -> dict:
+    """Dry-run calculation of purgeable records older than retention threshold."""
+    if older_than_days < 365:
+        raise ValueError("Statutory retention policy mandates minimum 365 days retention before purge.")
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+    async with async_session_factory() as session:
+        tot_res = await session.execute(
+            select(func.count(AuditLog.id)).where(AuditLog.ts <= cutoff)
+        )
+        total_matching = tot_res.scalar_one()
+
+        subq = select(AuditLegalHold.audit_log_id).where(AuditLegalHold.active == True)
+        held_res = await session.execute(
+            select(func.count(AuditLog.id)).where(
+                and_(AuditLog.ts <= cutoff, AuditLog.id.in_(subq))
+            )
+        )
+        legal_held_count = held_res.scalar_one()
+        purgeable_count = max(0, total_matching - legal_held_count)
+
+    return {
+        "retention_period_days": older_than_days,
+        "cutoff_timestamp": cutoff,
+        "total_records_in_window": total_matching,
+        "legal_held_records_preserved": legal_held_count,
+        "purgeable_records_count": purgeable_count,
+        "can_purge": purgeable_count > 0,
+        "statutory_note": f"Records younger than {cutoff} or marked under Legal Hold will be strictly preserved.",
+    }
+
+
+async def export_archive_bundle(older_than_days: int = 365, user: Optional[dict] = None) -> dict:
+    """Generate downloadable JSON archive bundle of records to be purged, with SHA-256 checksum."""
+    if older_than_days < 365:
+        raise ValueError("Minimum retention is 365 days.")
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+    async with async_session_factory() as session:
+        subq = select(AuditLegalHold.audit_log_id).where(AuditLegalHold.active == True)
+        stmt = (
+            select(AuditLog)
+            .where(and_(AuditLog.ts <= cutoff, AuditLog.id.notin_(subq)))
+            .order_by(AuditLog.ts.asc())
+        )
+        res = await session.execute(stmt)
+        rows = res.scalars().all()
+        items = [_row_to_dict(r) for r in rows]
+
+    serialized = json.dumps(items, sort_keys=True)
+    bundle_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    archive_manifest = {
+        "archive_id": str(uuid.uuid4()),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_by": user.get("email") if user else "system_administrator",
+        "retention_policy_days": older_than_days,
+        "cutoff_timestamp": cutoff,
+        "record_count": len(items),
+        "manifest_sha256": bundle_hash,
+        "records": items,
+    }
+    return archive_manifest
+
+
+async def execute_statutory_purge(*, older_than_days: int = 365, confirmation_phrase: str, actor: dict) -> dict:
+    """Execute controlled statutory purge of expired audit logs that are NOT under legal hold."""
+    if confirmation_phrase != "CONFIRM STATUTORY PURGE":
+        raise ValueError("Invalid confirmation phrase. Must be exactly 'CONFIRM STATUTORY PURGE'.")
+
+    if actor.get("role") != "system_administrator":
+        raise PermissionError("Only system_administrator can execute statutory purge.")
+
+    if older_than_days < 365:
+        raise ValueError("Cannot purge records within statutory 365-day retention period.")
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+
+    async with async_session_factory() as session:
+        await session.execute(text("SET LOCAL dvas.allow_audit_purge = 'true';"))
+
+        subq = select(AuditLegalHold.audit_log_id).where(AuditLegalHold.active == True)
+        del_stmt = (
+            delete(AuditLog)
+            .where(and_(AuditLog.ts <= cutoff, AuditLog.id.notin_(subq)))
+        )
+        res = await session.execute(del_stmt)
+        deleted_count = res.rowcount
+        await session.commit()
+
+    await write_audit_v2(
+        actor=actor,
+        action="audit_purge",
+        action_type="delete",
+        category="compliance",
+        severity="critical",
+        target=f"Statutory Purge ({deleted_count} records)",
+        target_type="system",
+        target_name="Audit Log Purge",
+        details=f"Statutory purge executed by {actor.get('email')}. Deleted {deleted_count} logs older than {cutoff}. Legal holds preserved.",
+        source_module="dashboard",
+        source_endpoint="POST /api/audit-logs/archive/execute",
+    )
+
+    return {
+        "success": True,
+        "purged_count": deleted_count,
+        "cutoff_timestamp": cutoff,
+        "executed_at": datetime.now(timezone.utc).isoformat(),
+    }
+

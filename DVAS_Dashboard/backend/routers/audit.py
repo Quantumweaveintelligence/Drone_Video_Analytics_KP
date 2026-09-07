@@ -17,8 +17,18 @@ from audit_service import (
     generate_audit_section65b_pdf, detect_anomalies,
     check_rate_limit, write_audit_v2,
     save_preset, list_presets, delete_preset,
+    get_audit_trends, log_audit_access,
+    place_legal_hold, release_legal_hold, get_chain_of_custody,
+    dry_run_purge, export_archive_bundle, execute_statutory_purge,
 )
-from schemas.models import PresetCreateIn
+from schemas.models import (
+    PresetCreateIn,
+    LegalHoldCreateIn,
+    LegalHoldReleaseIn,
+    PurgeDryRunIn,
+    PurgeExecuteIn,
+    AuditAccessLogIn,
+)
 
 logger = logging.getLogger("dvas")
 router = APIRouter(prefix="/api", tags=["Audit Log Explorer"])
@@ -38,6 +48,8 @@ async def list_audit(
     status: Optional[str] = None,
     source_module: Optional[str] = None,
     target_type: Optional[str] = None,
+    compliance_tag: Optional[str] = None,
+    is_legal_hold: Optional[str] = None,
     correlation_id: Optional[str] = None,
     request_id: Optional[str] = None,
     sort_by: str = "ts",
@@ -58,6 +70,8 @@ async def list_audit(
         status=status,
         source_module=source_module,
         target_type=target_type,
+        compliance_tag=compliance_tag,
+        is_legal_hold=is_legal_hold,
         correlation_id=correlation_id,
         request_id=request_id,
         sort_by=sort_by,
@@ -141,6 +155,42 @@ async def audit_source_modules(
     return await get_distinct_values("source_module")
 
 
+@router.get("/audit-logs/roles")
+async def audit_roles(
+    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+):
+    """Return distinct user roles for filter dropdown."""
+    return await get_distinct_values("actor_role")
+
+
+@router.get("/audit-logs/compliance-tags")
+async def audit_compliance_tags(
+    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+):
+    """Return distinct compliance tags for filter dropdown."""
+    return await get_distinct_values("compliance_tags")
+
+
+@router.get("/audit-logs/trends")
+async def audit_trends(
+    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    range: str = "24h",
+):
+    """Aggregate activity trend histograms and top actor stats."""
+    return await get_audit_trends(range_val=range, user=user)
+
+
+@router.post("/audit-logs/access-log")
+async def audit_access_log_endpoint(
+    body: AuditAccessLogIn,
+    request: Request,
+    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+):
+    """Log officer access to the Audit Log Explorer (audit of the auditors)."""
+    logged = await log_audit_access(actor=user, request=request, referrer=body.referrer)
+    return {"logged": logged}
+
+
 @router.get("/audit-logs/anomalies")
 async def audit_anomalies(
     user: dict = Depends(require_roles("senior_officer", "system_administrator")),
@@ -164,6 +214,8 @@ async def audit_export_csv(
     status: Optional[str] = None,
     source_module: Optional[str] = None,
     target_type: Optional[str] = None,
+    compliance_tag: Optional[str] = None,
+    is_legal_hold: Optional[str] = None,
     correlation_id: Optional[str] = None,
     request_id: Optional[str] = None,
     request: Request = None,
@@ -185,6 +237,8 @@ async def audit_export_csv(
         "status": status,
         "source_module": source_module,
         "target_type": target_type,
+        "compliance_tag": compliance_tag,
+        "is_legal_hold": is_legal_hold,
         "correlation_id": correlation_id,
         "request_id": request_id,
     }
@@ -224,6 +278,8 @@ async def audit_export_json(
     status: Optional[str] = None,
     source_module: Optional[str] = None,
     target_type: Optional[str] = None,
+    compliance_tag: Optional[str] = None,
+    is_legal_hold: Optional[str] = None,
     correlation_id: Optional[str] = None,
     request_id: Optional[str] = None,
     request: Request = None,
@@ -245,6 +301,8 @@ async def audit_export_json(
         "status": status,
         "source_module": source_module,
         "target_type": target_type,
+        "compliance_tag": compliance_tag,
+        "is_legal_hold": is_legal_hold,
         "correlation_id": correlation_id,
         "request_id": request_id,
     }
@@ -274,6 +332,8 @@ async def audit_export_pdf(
     status: Optional[str] = None,
     source_module: Optional[str] = None,
     target_type: Optional[str] = None,
+    compliance_tag: Optional[str] = None,
+    is_legal_hold: Optional[str] = None,
     request: Request = None,
 ):
     """Stream Section 65B Certified PDF Evidence Certificate for filtered audit records."""
@@ -293,6 +353,8 @@ async def audit_export_pdf(
         "status": status,
         "source_module": source_module,
         "target_type": target_type,
+        "compliance_tag": compliance_tag,
+        "is_legal_hold": is_legal_hold,
     }
     res = await query_audit_logs(
         **filters,
@@ -384,3 +446,110 @@ async def delete_audit_preset(
     if not success:
         raise HTTPException(404, "Preset not found or not owned by you")
     return {"ok": True}
+
+
+# ---------- Statutory Legal Holds & Forensic Chain-of-Custody ----------
+
+@router.post("/audit-logs/{log_id}/legal-hold")
+async def place_legal_hold_endpoint(
+    log_id: str,
+    body: LegalHoldCreateIn,
+    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+):
+    """Place a statutory legal hold on an audit record, preventing deletion under retention policies."""
+    try:
+        return await place_legal_hold(
+            audit_log_id=log_id,
+            case_number=body.case_number,
+            reason=body.hold_reason,
+            actor=user,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/audit-logs/{log_id}/legal-hold")
+async def release_legal_hold_endpoint(
+    log_id: str,
+    body: LegalHoldReleaseIn,
+    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+):
+    """Release an active statutory legal hold on an audit record."""
+    try:
+        return await release_legal_hold(
+            audit_log_id=log_id,
+            release_reason=body.release_reason,
+            actor=user,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/audit-logs/{log_id}/chain-of-custody")
+async def audit_chain_of_custody_endpoint(
+    log_id: str,
+    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+):
+    """Generate complete cryptographic provenance and chain-of-custody envelope."""
+    try:
+        return await get_chain_of_custody(log_id=log_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+# ---------- Statutory Archive & Purge (Super-Admin Restricted) ----------
+
+@router.post("/audit-logs/archive/dry-run")
+async def purge_dry_run_endpoint(
+    body: PurgeDryRunIn,
+    user: dict = Depends(require_roles("system_administrator")),
+):
+    """Dry-run calculation of purgeable records older than retention threshold (min 365 days)."""
+    try:
+        return await dry_run_purge(older_than_days=body.older_than_days, user=user)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/audit-logs/archive/export")
+async def purge_export_endpoint(
+    older_than_days: int = 365,
+    user: dict = Depends(require_roles("system_administrator")),
+):
+    """Stream verifiable JSON archive bundle with SHA-256 manifest of records to be purged."""
+    try:
+        import json
+        manifest = await export_archive_bundle(older_than_days=older_than_days, user=user)
+        fname = f"dvas_audit_archive_{older_than_days}d_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+        content = json.dumps(manifest, indent=2)
+        return StreamingResponse(
+            iter([content]),
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="{fname}"',
+                "Cache-Control": "no-store, no-cache, must-revalidate, private",
+                "Pragma": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/audit-logs/archive/execute")
+async def purge_execute_endpoint(
+    body: PurgeExecuteIn,
+    user: dict = Depends(require_roles("system_administrator")),
+):
+    """Execute controlled statutory purge of expired records that are NOT under legal hold."""
+    try:
+        return await execute_statutory_purge(
+            older_than_days=body.older_than_days,
+            confirmation_phrase=body.confirmation_phrase,
+            actor=user,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+

@@ -9,7 +9,7 @@ router = APIRouter(tags=["WebSocket"])
 
 @router.websocket("/api/ws")
 async def ws_endpoint(websocket: WebSocket, token: str = ""):
-    raw_token = token or websocket.cookies.get("dvas_access_token", "")
+    raw_token = token or websocket.query_params.get("token") or websocket.cookies.get("dvas_access_token", "")
     payload = _authz_ws(raw_token)
     if not payload:
         await websocket.close(code=4401)

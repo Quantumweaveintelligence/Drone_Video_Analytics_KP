@@ -12,6 +12,7 @@ from sqlalchemy import (
     Integer,
     Text,
     DateTime,
+    ForeignKey,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase
@@ -62,10 +63,30 @@ class AuditLog(Base):
     request_id = Column(String, index=True)                    # UUID per HTTP request
     correlation_id = Column(String, index=True)                # groups related actions (session/transaction)
 
+    # ── Compliance & Legal ──
+    compliance_tags = Column(JSONB, default=list)              # e.g. ["IEA_65B", "DPDPA", "IT_ACT_2000"]
+
     # ── Integrity (hash chain) ──
     ip = Column(String, default="-")
     prev_hash = Column(String)
     hash = Column(String)
+
+
+class AuditLegalHold(Base):
+    """Statutory Legal Hold markers preventing deletion under retention policies."""
+    __tablename__ = "audit_legal_holds"
+
+    id = Column(String, primary_key=True)
+    audit_log_id = Column(String, ForeignKey("audit_logs.id"), nullable=False, index=True)
+    case_number = Column(String, nullable=False, index=True)
+    hold_reason = Column(Text, nullable=False)
+    placed_by = Column(String, nullable=False)
+    placed_by_name = Column(String)
+    placed_at = Column(String, nullable=False)
+    active = Column(Boolean, default=True, nullable=False, index=True)
+    released_by = Column(String, nullable=True)
+    released_at = Column(String, nullable=True)
+    release_reason = Column(Text, nullable=True)
 
 
 class AuditFilterPreset(Base):
