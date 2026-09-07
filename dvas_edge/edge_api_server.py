@@ -825,6 +825,7 @@ CORS_ORIGINS = [origin.strip() for origin in _RAW_CORS.split(",") if origin.stri
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
+    allow_origin_regex=r"^https?://.*(:[0-9]+)?$",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],

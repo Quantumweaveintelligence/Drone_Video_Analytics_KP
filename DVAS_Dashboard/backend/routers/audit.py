@@ -33,10 +33,12 @@ from schemas.models import (
 logger = logging.getLogger("dvas")
 router = APIRouter(prefix="/api", tags=["Audit Log Explorer"])
 
+AUDIT_VIEW_ROLES = ("senior_officer", "system_administrator", "control_room_officer", "drone_operator")
+
 
 @router.get("/audit-logs")
 async def list_audit(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
     q: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -84,7 +86,7 @@ async def list_audit(
 
 @router.get("/audit-logs/summary")
 async def audit_summary(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
     q: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -100,7 +102,7 @@ async def audit_summary(
 
 @router.get("/audit-logs/verify")
 async def verify_audit_chain_endpoint(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
     limit: int = 1000,
 ):
     """Return overall SHA-256 cryptographic chain integrity summary."""
@@ -109,7 +111,7 @@ async def verify_audit_chain_endpoint(
 
 @router.get("/audit-logs/retention-policy")
 async def audit_retention_policy(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
 ):
     """Return audit trail statutory retention policy details."""
     return get_retention_policy()
@@ -117,7 +119,7 @@ async def audit_retention_policy(
 
 @router.get("/audit-logs/action-types")
 async def audit_action_types(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
 ):
     """Return distinct action types for filter dropdown."""
     return await get_distinct_values("action_type")
@@ -125,7 +127,7 @@ async def audit_action_types(
 
 @router.get("/audit-logs/categories")
 async def audit_categories(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
 ):
     """Return distinct categories for filter dropdown."""
     return await get_distinct_values("category")
@@ -133,7 +135,7 @@ async def audit_categories(
 
 @router.get("/audit-logs/severities")
 async def audit_severities(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
 ):
     """Return distinct severities for filter dropdown."""
     return await get_distinct_values("severity")
@@ -141,7 +143,7 @@ async def audit_severities(
 
 @router.get("/audit-logs/target-types")
 async def audit_target_types(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
 ):
     """Return distinct target types for filter dropdown."""
     return await get_distinct_values("target_type")
@@ -149,7 +151,7 @@ async def audit_target_types(
 
 @router.get("/audit-logs/sources")
 async def audit_source_modules(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
 ):
     """Return distinct source modules for filter dropdown."""
     return await get_distinct_values("source_module")
@@ -157,7 +159,7 @@ async def audit_source_modules(
 
 @router.get("/audit-logs/roles")
 async def audit_roles(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
 ):
     """Return distinct user roles for filter dropdown."""
     return await get_distinct_values("actor_role")
@@ -165,7 +167,7 @@ async def audit_roles(
 
 @router.get("/audit-logs/compliance-tags")
 async def audit_compliance_tags(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
 ):
     """Return distinct compliance tags for filter dropdown."""
     return await get_distinct_values("compliance_tags")
@@ -173,7 +175,7 @@ async def audit_compliance_tags(
 
 @router.get("/audit-logs/trends")
 async def audit_trends(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
     range: str = "24h",
 ):
     """Aggregate activity trend histograms and top actor stats."""
@@ -184,7 +186,7 @@ async def audit_trends(
 async def audit_access_log_endpoint(
     body: AuditAccessLogIn,
     request: Request,
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
 ):
     """Log officer access to the Audit Log Explorer (audit of the auditors)."""
     logged = await log_audit_access(actor=user, request=request, referrer=body.referrer)
@@ -193,7 +195,7 @@ async def audit_access_log_endpoint(
 
 @router.get("/audit-logs/anomalies")
 async def audit_anomalies(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
     hours: int = 24,
 ):
     """Evaluate and return rule-based security anomaly patterns over the last N hours."""
@@ -202,7 +204,7 @@ async def audit_anomalies(
 
 @router.get("/audit-logs/export/csv")
 async def audit_export_csv(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
     q: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -266,7 +268,7 @@ async def audit_export_csv(
 
 @router.get("/audit-logs/export/json")
 async def audit_export_json(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
     q: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -320,7 +322,7 @@ async def audit_export_json(
 
 @router.get("/audit-logs/export/pdf")
 async def audit_export_pdf(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
     q: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -394,7 +396,7 @@ async def audit_export_pdf(
 @router.get("/audit-logs/related/{correlation_id}")
 async def audit_related_events(
     correlation_id: str,
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
 ):
     """Retrieve correlated events for timeline view."""
     return await get_related_events(correlation_id=correlation_id, user=user)
@@ -403,7 +405,7 @@ async def audit_related_events(
 @router.get("/audit-logs/{log_id}")
 async def audit_single_log(
     log_id: str,
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
 ):
     """Retrieve single audit log entry by ID."""
     entry = await get_single_entry(log_id=log_id, user=user)
@@ -416,7 +418,7 @@ async def audit_single_log(
 
 @router.get("/audit-presets")
 async def get_audit_presets(
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
 ):
     """List saved and shared filter presets for the current user."""
     return await list_presets(user_id=user["id"])
@@ -425,7 +427,7 @@ async def get_audit_presets(
 @router.post("/audit-presets")
 async def create_audit_preset(
     body: PresetCreateIn,
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
 ):
     """Save a new filter preset."""
     return await save_preset(
@@ -439,7 +441,7 @@ async def create_audit_preset(
 @router.delete("/audit-presets/{preset_id}")
 async def delete_audit_preset(
     preset_id: str,
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
 ):
     """Delete a saved filter preset owned by the current user."""
     success = await delete_preset(preset_id=preset_id, user_id=user["id"])
@@ -488,7 +490,7 @@ async def release_legal_hold_endpoint(
 @router.get("/audit-logs/{log_id}/chain-of-custody")
 async def audit_chain_of_custody_endpoint(
     log_id: str,
-    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
+    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
 ):
     """Generate complete cryptographic provenance and chain-of-custody envelope."""
     try:
