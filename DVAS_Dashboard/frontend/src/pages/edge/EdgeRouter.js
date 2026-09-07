@@ -10,7 +10,6 @@ import Incidents from "./Incidents";
 import EvidenceManagement from "./EvidenceManagement";
 import SystemHealth from "./SystemHealth";
 import LogsAudit from "./LogsAudit";
-import AuditLogPage from "@/pages/AuditLogPage";
 import Settings from "./Settings";
 
 export default function EdgeRouter() {
@@ -26,7 +25,7 @@ export default function EdgeRouter() {
       <Route path="incidents" element={<Incidents />} />
       <Route path="evidence-management" element={<EvidenceManagement />} />
       <Route path="system-health" element={<SystemHealth />} />
-      <Route path="logs-audit" element={<AuditLogPage />} />
+      <Route path="logs-audit" element={<LogsAudit />} />
       <Route path="settings" element={<Settings />} />
       <Route path="*" element={<Navigate to="dashboard" replace />} />
     </Routes>
