@@ -53,6 +53,47 @@ except Exception:
     _GPU_HANDLE = None
     _GPU_AVAILABLE = False
 
+# ── System Metrics & History Sampler ──────────────────────────────────────────
+SERVER_START_TIME = time.time()
+SYSTEM_HISTORY_DEQUE = collections.deque(maxlen=30)
+
+def _system_metrics_collector():
+    # Initial pre-seed so history chart is immediately available
+    for _ in range(5):
+        try:
+            c = round(psutil.cpu_percent(interval=None), 1)
+            m = round(psutil.virtual_memory().percent, 1)
+            g = 0.0
+            if _GPU_AVAILABLE and _GPU_HANDLE:
+                try:
+                    g = float(pynvml.nvmlDeviceGetUtilizationRates(_GPU_HANDLE).gpu)
+                except Exception:
+                    pass
+            t_str = datetime.datetime.now().strftime("%H:%M:%S")
+            SYSTEM_HISTORY_DEQUE.append({"time": t_str, "cpu": c, "gpu": g, "memory": m})
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+    while True:
+        try:
+            c = round(psutil.cpu_percent(interval=None), 1)
+            m = round(psutil.virtual_memory().percent, 1)
+            g = 0.0
+            if _GPU_AVAILABLE and _GPU_HANDLE:
+                try:
+                    g = float(pynvml.nvmlDeviceGetUtilizationRates(_GPU_HANDLE).gpu)
+                except Exception:
+                    pass
+            t_str = datetime.datetime.now().strftime("%H:%M:%S")
+            SYSTEM_HISTORY_DEQUE.append({"time": t_str, "cpu": c, "gpu": g, "memory": m})
+        except Exception:
+            pass
+        time.sleep(2.0)
+
+_system_sampler = threading.Thread(target=_system_metrics_collector, name="SystemMetricsCollector", daemon=True)
+_system_sampler.start()
+
 # ── Pipeline components ──────────────────────────────────────────────────────
 from src.video.real_video_source import RealVideoSource
 from src.buffer.rolling_frame_buffer import RollingFrameBuffer
@@ -1021,6 +1062,112 @@ def get_analytics(auth: dict = Depends(verify_edge_auth)):
         "history": history,
         "buffer": buffer_stats,
         "change_detection": change_stats
+    }
+
+
+@app.get("/api/edge/system-health")
+def get_system_health(auth: dict = Depends(verify_edge_auth)):
+    now = time.time()
+    elapsed = int(now - SERVER_START_TIME)
+    days = elapsed // 86400
+    hours = (elapsed % 86400) // 3600
+    minutes = (elapsed % 3600) // 60
+    seconds = elapsed % 60
+    if days > 0:
+        uptime_str = f"{days}d {hours}h {minutes}m {seconds}s"
+    elif hours > 0:
+        uptime_str = f"{hours}h {minutes}m {seconds}s"
+    else:
+        uptime_str = f"{minutes}m {seconds}s"
+
+    # CPU
+    cpu_pct = round(psutil.cpu_percent(interval=None), 1)
+    cpu_temp = None
+    try:
+        if hasattr(psutil, "sensors_temperatures"):
+            temps = psutil.sensors_temperatures()
+            if temps:
+                for k, v in temps.items():
+                    if v:
+                        cpu_temp = round(v[0].current, 1)
+                        break
+    except Exception:
+        pass
+
+    # RAM
+    mem = psutil.virtual_memory()
+    memory_pct = round(mem.percent, 1)
+    memory_used_mb = round(mem.used / (1024 * 1024))
+    memory_total_mb = round(mem.total / (1024 * 1024))
+
+    # Storage
+    try:
+        disk = psutil.disk_usage("/data") if os.path.exists("/data") else psutil.disk_usage("/")
+        storage_pct = round(disk.percent, 1)
+        storage_used_gb = round(disk.used / (1024**3), 1)
+        storage_total_gb = round(disk.total / (1024**3), 1)
+    except Exception:
+        storage_pct = 0.0
+        storage_used_gb = 0.0
+        storage_total_gb = 0.0
+
+    # GPU
+    gpu_pct, gpu_mem_used, gpu_mem_total, gpu_temp = 0.0, 0, 0, None
+    if _GPU_AVAILABLE and _GPU_HANDLE:
+        try:
+            util = pynvml.nvmlDeviceGetUtilizationRates(_GPU_HANDLE)
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(_GPU_HANDLE)
+            gpu_pct = float(util.gpu)
+            gpu_mem_used = mem_info.used // (1024 * 1024)
+            gpu_mem_total = mem_info.total // (1024 * 1024)
+            gpu_temp = pynvml.nvmlDeviceGetTemperature(_GPU_HANDLE, pynvml.NVML_TEMPERATURE_GPU)
+        except Exception:
+            pass
+
+    # Component services status
+    is_active = pipeline._running
+    stream_status = "OK" if (is_active and pipeline.source and pipeline.source.is_connected) else ("STANDBY" if not is_active else "CONNECTING")
+    buffer_status = "OK" if (is_active and pipeline.buffer) else "STANDBY"
+    cfs_status = "OK" if (is_active and pipeline.cognitive_selector) else "STANDBY"
+    cd_status = "OK" if (is_active and pipeline.change_engine) else "STANDBY"
+    sender_status = "OK" if (is_active and pipeline.sender_thread and pipeline.sender_thread.is_alive()) else "STANDBY"
+    telemetry_status = "OK" if is_active else "STANDBY"
+
+    services = [
+        {"name": "Stream Manager", "status": stream_status},
+        {"name": "Rolling Buffer", "status": buffer_status},
+        {"name": "Cognitive Selector", "status": cfs_status},
+        {"name": "Change Detector", "status": cd_status},
+        {"name": "Ingest Client", "status": sender_status},
+        {"name": "Telemetry Feed", "status": telemetry_status},
+        {"name": "FastAPI Edge Server", "status": "OK"},
+        {"name": "Keycloak Security", "status": "OK"},
+    ]
+
+    node_health = "HEALTHY"
+    if cpu_pct > 90 or memory_pct > 90 or storage_pct > 95:
+        node_health = "WARNING"
+
+    return {
+        "cpu_pct": cpu_pct,
+        "cpu_temp": cpu_temp,
+        "gpu_pct": gpu_pct,
+        "gpu_temp": gpu_temp,
+        "gpu_mem_used_mb": gpu_mem_used,
+        "gpu_mem_total_mb": gpu_mem_total,
+        "memory_pct": memory_pct,
+        "memory_used_mb": memory_used_mb,
+        "memory_total_mb": memory_total_mb,
+        "storage_pct": storage_pct,
+        "storage_used_gb": storage_used_gb,
+        "storage_total_gb": storage_total_gb,
+        "uptime_seconds": elapsed,
+        "uptime_str": uptime_str,
+        "software_version": "3.2.0-edge",
+        "node_health": node_health,
+        "time_sync": "SYNCED",
+        "services": services,
+        "history": list(SYSTEM_HISTORY_DEQUE),
     }
 
 
