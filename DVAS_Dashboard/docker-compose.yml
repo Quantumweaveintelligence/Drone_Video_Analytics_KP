@@ -31,7 +31,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      - DATABASE_URL=postgresql+asyncpg://dvas:dvas_secret@postgres:5432/dvas
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://dvas:dvas_secret@postgres:5432/dvas}
+      - EDGE_SYNC_HOSTS=${EDGE_SYNC_HOSTS:-10.10.55.112}
       - JWT_SECRET=super-secret-dvas-key-change-in-prod
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://10.10.55.115:3000}
       - INGEST_SERVER_URL=${INGEST_SERVER_URL:-http://drone_nginx}

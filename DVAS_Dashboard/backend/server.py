@@ -23,6 +23,7 @@ from database import engine
 from models import Base
 from services.seed_service import seed_data
 from services.telemetry_pump import start_telemetry_pump
+from services.audit_sync import start_audit_sync_service
 from ingest_proxy import ingest_api
 
 from routers import auth, drones, alerts, audit, analytics, edge, infra, ws
@@ -56,6 +57,10 @@ async def _startup():
 @app.on_event("startup")
 async def _start_pump():
     start_telemetry_pump()
+
+@app.on_event("startup")
+async def _start_sync():
+    start_audit_sync_service()
 
 # ---------- Root ----------
 @app.get("/api/")

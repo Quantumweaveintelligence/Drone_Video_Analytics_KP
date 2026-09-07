@@ -555,3 +555,21 @@ async def purge_execute_endpoint(
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
 
+
+# ---------- Edge Ground Station Audit Sync Endpoint ----------
+
+@router.post("/audit-logs/sync")
+async def audit_sync_endpoint(
+    payload: dict,
+    request: Request,
+    user: dict = Depends(require_roles("senior_officer", "system_administrator", "drone_operator")),
+):
+    """Ingest a batch of audit log entries pushed from an edge ground station."""
+    from services.audit_sync import sync_records_batch
+    records = payload.get("records", [])
+    if not isinstance(records, list):
+        raise HTTPException(status_code=400, detail="records must be a list of audit objects")
+    synced = await sync_records_batch(records)
+    return {"synced": synced, "received": len(records)}
+
+
