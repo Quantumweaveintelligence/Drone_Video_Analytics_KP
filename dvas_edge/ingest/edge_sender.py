@@ -360,8 +360,9 @@ class IngestClient:
         mission_name: Optional[str] = None,
         location:     Optional[str] = None,
         operator:     Optional[str] = None,
+        geofence:     Optional[dict] = None,
     ) -> None:
-        """Register mission start with the ingest server."""
+        """Register mission start with the ingest server, optionally including geofence."""
         mission_start_url = os.getenv(
             "INGEST__MISSION_START_URL",
             os.getenv("MISSION_START_URL", "http://10.123.225.251/ingest/mission/start")
@@ -376,6 +377,8 @@ class IngestClient:
             payload["mission_name"] = mission_name
         if location:
             payload["location"] = location
+        if geofence:
+            payload["geofence"] = geofence
         client = await self._get_client()
         resp = await client.post(
             mission_start_url,
@@ -383,7 +386,29 @@ class IngestClient:
             json=payload,
         )
         resp.raise_for_status()
-        log.info("mission_started", extra={"mission": self.mission_id})
+        log.info("mission_started", extra={"mission": self.mission_id, "has_geofence": bool(geofence)})
+
+    async def send_geofence_update(self, geofence: dict) -> None:
+        """Send mid-flight updated geofence to the ingest server."""
+        base_url = os.getenv(
+            "INGEST__MISSION_START_URL",
+            os.getenv("MISSION_START_URL", "http://10.123.225.251/ingest/mission/start")
+        )
+        geofence_url = base_url.replace("/start", "/geofence")
+        token = await self.get_token()
+        payload = {
+            "drone_id":   self.drone_id,
+            "mission_id": self.mission_id,
+            "geofence":   geofence,
+        }
+        client = await self._get_client()
+        resp = await client.post(
+            geofence_url,
+            headers={"Authorization": f"Bearer {token}"},
+            json=payload,
+        )
+        resp.raise_for_status()
+        log.info("geofence_updated_sent", extra={"mission": self.mission_id})
 
     async def end_mission(self) -> None:
         """Register mission end with the ingest server."""

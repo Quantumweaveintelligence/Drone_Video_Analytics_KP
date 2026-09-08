@@ -125,8 +125,8 @@ export default function LiveMonitoring() {
                 </div>
                 <div className="px-2 py-1 bg-slate-900 border border-slate-800 rounded flex items-center gap-1">
                   <span className="text-slate-500">INGEST:</span>
-                  <span className={metrics.connected ? "text-emerald-400 font-semibold" : "text-slate-500"}>
-                    {metrics.connected ? 'ACTIVE' : 'IDLE'}
+                  <span className={mission?.server_send_enabled ? "text-emerald-400 font-semibold" : "text-amber-400 font-semibold"}>
+                    {mission?.server_send_enabled ? 'ACTIVE' : 'STANDBY'}
                   </span>
                 </div>
               </div>
@@ -134,6 +134,14 @@ export default function LiveMonitoring() {
 
             {/* Video Player Box */}
             <div className="relative w-full aspect-video bg-black rounded-lg overflow-hidden border border-slate-800 shadow-2xl">
+              {/* Overlay banner when paused waiting for Server Send */}
+              {mission?.active && !mission?.server_send_enabled && (streamInfo.type === 'FILE' || mission?.is_paused) && (
+                <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 px-3 py-1.5 bg-amber-950/80 border border-amber-500/60 text-amber-300 text-xs font-mono rounded backdrop-blur flex items-center gap-2 shadow-xl">
+                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping"></span>
+                  <span>PAUSED — First Frame Preview (Awaiting Server Send: ON)</span>
+                </div>
+              )}
+
               {/* MJPEG stream from dvas_edge */}
               <img
                 src={streamUrl}

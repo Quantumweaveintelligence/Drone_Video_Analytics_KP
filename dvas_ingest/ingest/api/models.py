@@ -142,6 +142,13 @@ class MissionStartRequest(BaseModel):
     latitude:   Optional[float] = None
     longitude:  Optional[float] = None
     notes:      Optional[str]  = None
+    geofence:   Optional[dict] = None
+
+
+class GeofenceUpdateRequest(BaseModel):
+    drone_id:   str
+    mission_id: str
+    geofence:   dict
 
 
 class MissionEndRequest(BaseModel):

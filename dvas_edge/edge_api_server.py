@@ -115,6 +115,11 @@ class MissionStartRequest(BaseModel):
     video_source_type: str = "file"   # "rtmp" or "file"
     operator: str = ""
     location: str = ""
+    geofence: Optional[dict] = None
+
+
+class MissionGeofenceRequest(BaseModel):
+    geofence: dict
 
 
 class ToggleIngestRequest(BaseModel):
@@ -131,22 +136,63 @@ _QueueItem = Union[SelectedFrame, tuple, None]
 
 
 class EdgeSenderThread(threading.Thread):
-    def __init__(self, client: IngestClient, max_queue: int = 64) -> None:
+    def __init__(self, client: IngestClient, server_send_initial: bool = False, max_queue: int = 64) -> None:
         super().__init__(name="EdgeSenderThread", daemon=True)
         self._client   = client
         self._buffer   = OfflineBuffer()
         self._buffer.clear()  # Purge stale frames from previous missions
         self._loop:    Optional[asyncio.AbstractEventLoop] = None
         self._running  = True
+        self._mission_started = False
+        self._server_send_initial = server_send_initial
         self._mission_name: Optional[str] = None
         self._location:     Optional[str] = None
         self._operator:     Optional[str] = None
+        self._geofence:     Optional[dict] = None
 
-    def set_mission_details(self, mission_name: str = None, location: str = None, operator: str = None) -> None:
+    def set_mission_details(self, mission_name: str = None, location: str = None, operator: str = None, geofence: dict = None) -> None:
         """Store mission details so they can be sent at start_mission time."""
         self._mission_name = mission_name
         self._location = location
         self._operator = operator
+        if geofence is not None:
+            self._geofence = geofence
+
+    def set_geofence(self, geofence: Optional[dict]) -> None:
+        """Update the active geofence and notify ingest server if already streaming."""
+        self._geofence = geofence
+        if self._mission_started and self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self._client.send_geofence_update(geofence), self._loop
+            )
+
+    def on_server_send_enabled(self, geofence: Optional[dict] = None) -> None:
+        """Triggered when SERVER SEND: ON is activated by the operator."""
+        if geofence is not None:
+            self._geofence = geofence
+        if not self._mission_started and self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self._do_start_mission(), self._loop
+            )
+        elif self._mission_started and self._geofence and self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self._client.send_geofence_update(self._geofence), self._loop
+            )
+
+    async def _do_start_mission(self) -> None:
+        if self._mission_started:
+            return
+        try:
+            await self._client.start_mission(
+                mission_name=self._mission_name,
+                location=self._location,
+                operator=self._operator,
+                geofence=self._geofence,
+            )
+            self._mission_started = True
+            log.info("edge_sender_mission_started_on_ingest", extra={"mission": self._client.mission_id, "has_geofence": bool(self._geofence)})
+        except Exception as e:
+            log.warning(f"edge_sender_start_mission_failed: {e}")
 
     def put_frame(self, frame: SelectedFrame, telemetry: dict = None) -> None:
         """Queue a SelectedFrame (from cognitive pipeline) with optional telemetry."""
@@ -185,14 +231,8 @@ class EdgeSenderThread(threading.Thread):
         self._loop.close()
 
     async def _async_run(self) -> None:
-        try:
-            await self._client.start_mission(
-                mission_name=self._mission_name,
-                location=self._location,
-                operator=self._operator,
-            )
-        except Exception:
-            pass
+        if self._server_send_initial:
+            await self._do_start_mission()
 
         semaphore = asyncio.Semaphore(5)
         in_flight_ids = set()
@@ -306,6 +346,7 @@ class PipelineManager:
         self.history_deque = collections.deque(maxlen=60)
         self._history_thread: Optional[threading.Thread] = None
         self.mission_history: List[dict] = []
+        self.geofence: Optional[dict] = None
 
     # ── Mission lifecycle ─────────────────────────────────────────────────
 
@@ -319,6 +360,7 @@ class PipelineManager:
             self._running = True
             self.frames_selected = 0
             self.pipeline_frames_in = 0
+            self.geofence = req.geofence
 
             # ── Auto-generate drone_id from mission_id ────────────────────
             drone_id = f"DRN-{req.mission_id}"
@@ -377,8 +419,8 @@ class PipelineManager:
             self.cognitive_selector = None
             if cfs_cfg.enabled and cd_cfg.enabled:
                 def _on_selected_frame(frame: SelectedFrame) -> None:
-                    self.frames_selected += 1
                     if self.server_send_enabled and self.sender_thread is not None:
+                        self.frames_selected += 1
                         # Get real telemetry from the video source (SRT data or zeros)
                         tel = self.source.get_current_telemetry() if self.source else {}
                         self.sender_thread.put_frame(frame, telemetry=tel)
@@ -415,6 +457,11 @@ class PipelineManager:
                     self.buffer.write_video_frame(vf)
                 except Exception:
                     pass
+
+                # If server send is disabled and source is paused (video file on hold),
+                # do not pass frame to change engine or increment pipeline counters
+                if not self.server_send_enabled and self.source and self.source.is_paused:
+                    return
 
                 # Pipeline bypass: send frames directly at target FPS (~5 fps)
                 if self.pipeline_bypass:
@@ -508,6 +555,7 @@ class PipelineManager:
                 video_source=clean_video_source,
                 on_frame=_on_frame,
                 on_complete=self.end_mission,
+                initial_play_state=self.server_send_enabled,
             )
 
             # ── Edge Sender Thread ─────────────────────────────────────────
@@ -517,11 +565,15 @@ class PipelineManager:
                 drone_id=drone_id,
                 mission_id=req.mission_id
             )
-            self.sender_thread = EdgeSenderThread(client=client)
+            self.sender_thread = EdgeSenderThread(
+                client=client,
+                server_send_initial=self.server_send_enabled,
+            )
             self.sender_thread.set_mission_details(
                 mission_name=req.mission_name,
                 location=req.location,
                 operator=req.operator,
+                geofence=self.geofence,
             )
             self.sender_thread.start()
 
@@ -543,6 +595,7 @@ class PipelineManager:
                 "video_source": req.video_source,
                 "video_source_type": req.video_source_type,
                 "start_time": start_time_str,
+                "geofence": self.geofence,
             }
 
             # Add / update record in mission_history
@@ -629,6 +682,7 @@ class PipelineManager:
             self.pipeline_bypass = False
             self.pipeline_frames_in = 0
             self._bypass_frame_counter = 0
+            self.geofence = None
 
             log.info("mission_ended", mission_id=mission_id, frames_processed=frames_processed)
             return {
@@ -676,6 +730,20 @@ class PipelineManager:
                 pass
             time.sleep(1.0)
 
+    # ── Server Send (Ingest Transmission) Control ────────────────────────
+    def set_server_send(self, enabled: bool) -> bool:
+        with self.lock:
+            self.server_send_enabled = enabled
+            if self.source is not None:
+                if enabled:
+                    self.source.resume()
+                else:
+                    self.source.pause()
+            if enabled and self.sender_thread is not None:
+                self.sender_thread.on_server_send_enabled(self.geofence)
+            log.info("server_send_toggled", enabled=enabled, source_active=self.source is not None)
+            return self.server_send_enabled
+
     # ── Status / Telemetry ────────────────────────────────────────────────
 
     def get_status(self) -> dict:
@@ -693,6 +761,7 @@ class PipelineManager:
 
         if not self._running:
             return {"active": False, "connected": False, "fps": 0, "decode_latency_ms": 0,
+                    "is_paused": False, "server_send_enabled": False,
                     "buffer_fill_pct": 0, "buffer_frames": 0, "buffer_max_frames": 0,
                     "cpu_pct": round(psutil.cpu_percent(), 1), "gpu_pct": 0, "gpu_mem_used_mb": 0, "gpu_mem_total_mb": 0,
                     "storage_pct": storage_pct, "bitrate_mbps": 0.0,
@@ -724,7 +793,7 @@ class PipelineManager:
             except Exception:
                 pass
 
-        fps = round(self.source.source_fps, 1) if self.source else 0.0
+        fps = 0.0 if (self.source and self.source.is_paused) else (round(self.source.source_fps, 1) if self.source else 0.0)
         bitrate_mbps = round(fps * 0.14, 1) if fps > 0 else 0.0
         frames_discarded = max(0, self.pipeline_frames_in - self.frames_selected)
 
@@ -734,6 +803,8 @@ class PipelineManager:
             "fps": fps,
             "bitrate_mbps": bitrate_mbps,
             "decode_latency_ms": 0.0,
+            "is_paused": self.source.is_paused if self.source else False,
+            "server_send_enabled": self.server_send_enabled,
             "buffer_fill_pct": round(buf_frames / max(max_frames, 1) * 100, 1),
             "buffer_frames": buf_frames,
             "buffer_max_frames": max_frames,
@@ -999,8 +1070,38 @@ def end_mission(auth: dict = Depends(verify_edge_auth)):
 
 @app.post("/api/edge/mission/toggle-ingest")
 def toggle_ingest(req: ToggleIngestRequest, auth: dict = Depends(verify_edge_auth)):
-    pipeline.server_send_enabled = req.enabled
-    return {"server_send_enabled": pipeline.server_send_enabled}
+    enabled = pipeline.set_server_send(req.enabled)
+    return {"server_send_enabled": enabled}
+
+
+@app.post("/api/edge/mission/geofence")
+def set_mission_geofence(req: MissionGeofenceRequest, auth: dict = Depends(verify_edge_auth)):
+    if not pipeline._running or not pipeline.active_mission:
+        raise HTTPException(status_code=400, detail="No active mission to attach geofence to")
+    
+    pipeline.geofence = req.geofence
+    pipeline.active_mission["geofence"] = req.geofence
+    if pipeline.sender_thread is not None:
+        pipeline.sender_thread.set_geofence(req.geofence)
+        
+    zone_id = "UNKNOWN"
+    try:
+        features = req.geofence.get("features", [])
+        if features:
+            zone_id = features[0].get("properties", {}).get("zone_id", "RESTRICTED_ZONE")
+    except Exception:
+        pass
+
+    log.info("edge_geofence_saved", zone_id=zone_id, mission_id=pipeline.active_mission.get("mission_id"))
+    return {"status": "ok", "has_geofence": True, "zone_id": zone_id}
+
+
+@app.get("/api/edge/mission/geofence")
+def get_mission_geofence(auth: dict = Depends(verify_edge_auth)):
+    return {
+        "has_geofence": bool(pipeline.geofence),
+        "geofence": pipeline.geofence,
+    }
 
 
 class TogglePipelineRequest(BaseModel):
@@ -1023,6 +1124,8 @@ def get_active_mission(auth: dict = Depends(verify_edge_auth)):
             "active": True,
             "server_send_enabled": pipeline.server_send_enabled,
             "pipeline_enabled": not pipeline.pipeline_bypass,
+            "is_paused": pipeline.source.is_paused if pipeline.source else False,
+            "has_geofence": bool(pipeline.geofence),
             **pipeline.active_mission,
         }
     return {"active": False}

@@ -1,10 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import AppShell from '@/components/layout/AppShell';
-import { MapContainer, TileLayer, Marker, Popup, Polyline, CircleMarker, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Polyline, CircleMarker, Polygon, useMap, useMapEvents } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { AreaChart, Area, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
-import { Compass, MapPin } from 'lucide-react';
+import { Compass, MapPin, Radio, Play, Pause, ShieldAlert, Undo2, Trash2, Check, Pencil, Lock } from 'lucide-react';
 import { authFetch } from '@/lib/api';
 
 // Fix Leaflet's default icon path issues in React
@@ -29,8 +29,27 @@ function RecenterMap({ lat, lng }) {
   return null;
 }
 
+// Interactive polygon drawing on map click
+function PolygonDrawer({ isDrawing, onAddPoint }) {
+  useMapEvents({
+    click(e) {
+      if (isDrawing) {
+        onAddPoint(e.latlng);
+      }
+    }
+  });
+  return null;
+}
+
 export default function GpsTelemetry() {
   const [mission, setMission] = useState(null);
+  const [serverSend, setServerSend] = useState(false);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [drawnPoints, setDrawnPoints] = useState([]);
+  const [savedGeofence, setSavedGeofence] = useState(null);
+  const [isSavingGeofence, setIsSavingGeofence] = useState(false);
+  const [geofenceFeedback, setGeofenceFeedback] = useState(null);
+
   const [telemetry, setTelemetry] = useState({
     lat: KERALA_LAT,
     lng: KERALA_LNG,
@@ -53,6 +72,7 @@ export default function GpsTelemetry() {
     }))
   );
 
+  // Sync active mission, telemetry, and server send state
   useEffect(() => {
     const timer = setInterval(async () => {
       try {
@@ -65,8 +85,13 @@ export default function GpsTelemetry() {
 
         if (missionData.active) {
           setMission(missionData);
+          setServerSend(Boolean(missionData.server_send_enabled));
         } else {
           setMission(null);
+          setServerSend(false);
+          setSavedGeofence(null);
+          setIsDrawing(false);
+          setDrawnPoints([]);
         }
 
         const altVal = (tel && tel.altitude_m !== undefined && tel.altitude_m !== null && !isNaN(tel.altitude_m)) ? Number(tel.altitude_m) : 0;
@@ -89,9 +114,15 @@ export default function GpsTelemetry() {
         });
 
         if (tel?.latitude && tel?.longitude) {
+          const newLat = Number(tel.latitude);
+          const newLng = Number(tel.longitude);
           setPath(prev => {
-            const newPath = [...prev, { lat: Number(tel.latitude), lng: Number(tel.longitude) }];
-            if (newPath.length > 30) newPath.shift();
+            const last = prev[prev.length - 1];
+            if (last && Math.abs(last.lat - newLat) < 0.000001 && Math.abs(last.lng - newLng) < 0.000001) {
+              return prev;
+            }
+            const newPath = [...prev, { lat: newLat, lng: newLng }];
+            if (newPath.length > 50) newPath.shift();
             return newPath;
           });
         }
@@ -112,6 +143,138 @@ export default function GpsTelemetry() {
     }, 1000);
     return () => clearInterval(timer);
   }, []);
+
+  // Fetch existing geofence on mount or when active mission changes
+  useEffect(() => {
+    if (mission?.active && (mission?.has_geofence || mission?.geofence)) {
+      if (mission.geofence) {
+        setSavedGeofence(mission.geofence);
+      } else {
+        authFetch('/edge-api/api/edge/mission/geofence')
+          .then(r => r.json())
+          .then(d => {
+            if (d.has_geofence && d.geofence) {
+              setSavedGeofence(d.geofence);
+            }
+          })
+          .catch(() => {});
+      }
+    }
+  }, [mission?.active, mission?.has_geofence, mission?.geofence]);
+
+  const handleToggleServerSend = async () => {
+    try {
+      const resp = await authFetch('/edge-api/api/edge/mission/toggle-ingest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !serverSend })
+      });
+      const data = await resp.json();
+      setServerSend(data.server_send_enabled);
+      if (data.server_send_enabled) {
+        setIsDrawing(false);
+      }
+    } catch (err) {
+      console.error('Failed to toggle server send:', err);
+    }
+  };
+
+  const handleAddPoint = (latlng) => {
+    setDrawnPoints(prev => [...prev, { lat: Number(latlng.lat), lng: Number(latlng.lng) }]);
+  };
+
+  const handleUndoPoint = () => {
+    setDrawnPoints(prev => prev.slice(0, -1));
+  };
+
+  const handleClearDrawing = async () => {
+    setDrawnPoints([]);
+    setIsDrawing(false);
+    if (savedGeofence) {
+      try {
+        await authFetch('/edge-api/api/edge/mission/geofence', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ geofence: null })
+        });
+        setSavedGeofence(null);
+        setGeofenceFeedback({ type: 'info', message: 'Geofence cleared.' });
+        setTimeout(() => setGeofenceFeedback(null), 3000);
+      } catch (err) {
+        console.error('Failed to clear geofence:', err);
+      }
+    }
+  };
+
+  const handleSaveGeofence = async () => {
+    if (drawnPoints.length < 3) {
+      setGeofenceFeedback({ type: 'error', message: 'At least 3 vertices required.' });
+      setTimeout(() => setGeofenceFeedback(null), 3000);
+      return;
+    }
+
+    setIsSavingGeofence(true);
+    try {
+      const missionId = mission?.mission_id || mission?.id || `MISSION_${Date.now()}`;
+      const zoneId = `ZONE_${missionId}`;
+      const zoneName = `Restricted Zone (${mission?.mission_name || 'Active Mission'})`;
+
+      // Convert [lat, lng] to WGS84 GeoJSON [lng, lat] and close ring
+      const coords = drawnPoints.map(p => [Number(p.lng.toFixed(6)), Number(p.lat.toFixed(6))]);
+      coords.push([coords[0][0], coords[0][1]]); // closed ring
+
+      const geojsonPayload = {
+        type: "FeatureCollection",
+        features: [
+          {
+            type: "Feature",
+            properties: {
+              zone_id: zoneId,
+              name: zoneName,
+              creation_mode: "MAP_DRAWN",
+              reference_metadata: {
+                mission_id: missionId,
+                drone_id: mission?.drone_id || `DRN-${missionId}`,
+                operator: mission?.operator || 'operator_001',
+                created_at: new Date().toISOString(),
+                initial_drone_lat: telemetry.lat,
+                initial_drone_lon: telemetry.lng,
+                initial_drone_alt_m: telemetry.alt
+              }
+            },
+            geometry: {
+              type: "Polygon",
+              coordinates: [coords]
+            }
+          }
+        ]
+      };
+
+      const resp = await authFetch('/edge-api/api/edge/mission/geofence', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ geofence: geojsonPayload })
+      });
+      const data = await resp.json();
+
+      if (data.status === 'ok') {
+        setSavedGeofence(geojsonPayload);
+        setIsDrawing(false);
+        setDrawnPoints([]);
+        setGeofenceFeedback({
+          type: 'success',
+          message: `Zone ${zoneId} saved! Transmits when Server Send: ON.`
+        });
+        setTimeout(() => setGeofenceFeedback(null), 4000);
+      }
+    } catch (err) {
+      console.error('Failed to save geofence:', err);
+      setGeofenceFeedback({ type: 'error', message: 'Failed to save geofence to edge server.' });
+      setTimeout(() => setGeofenceFeedback(null), 3500);
+    } finally {
+      setIsSavingGeofence(false);
+    }
+  };
 
   return (
     <AppShell title="GPS & Telemetry" subtitle="Real-time position tracking and sensor data visualisation">
@@ -160,6 +323,47 @@ export default function GpsTelemetry() {
                 <span className="text-[10px] text-slate-500 uppercase tracking-wider">Signal</span>
                 <span className="text-sm font-mono text-emerald-400">{telemetry.signal}%</span>
               </div>
+
+              {/* Server Send Transmission Control Card */}
+              <div className="pt-3 border-t border-slate-800/80 mt-2">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider flex items-center gap-1.5">
+                    <Radio size={13} className={serverSend ? "text-emerald-400 animate-pulse" : "text-slate-500"} />
+                    Server Send
+                  </span>
+                  <span className={`text-[10px] font-mono px-2 py-0.5 rounded font-bold ${serverSend ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30" : "bg-amber-500/20 text-amber-400 border border-amber-500/30"}`}>
+                    {serverSend ? "ACTIVE" : "STANDBY"}
+                  </span>
+                </div>
+                <button
+                  onClick={handleToggleServerSend}
+                  disabled={!mission?.active}
+                  className={`w-full py-2 px-3 rounded text-xs font-semibold flex items-center justify-center gap-2 transition-all ${
+                    !mission?.active
+                      ? "bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700/50"
+                      : serverSend
+                      ? "bg-red-950/50 hover:bg-red-900/70 text-red-300 border border-red-700/50"
+                      : "bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/20"
+                  }`}
+                >
+                  {serverSend ? (
+                    <>
+                      <Pause size={14} /> DEACTIVATE (PAUSE PLAYBACK)
+                    </>
+                  ) : (
+                    <>
+                      <Play size={14} /> ACTIVATE (RESUME PLAYBACK)
+                    </>
+                  )}
+                </button>
+                <div className="text-[10px] text-slate-500 mt-1.5 leading-relaxed text-center">
+                  {serverSend
+                    ? "Transmitting frames to Ingest Server. Deactivate to pause & edit geofence."
+                    : savedGeofence
+                    ? "Zone armed. Activating will transmit geofence to Ingest Server and resume playback."
+                    : "Mission in Standby. Draw polygon to set restricted zone or activate without zone."}
+                </div>
+              </div>
             </div>
             
             <div className="mt-6 pt-4 border-t border-slate-800 text-center">
@@ -171,7 +375,7 @@ export default function GpsTelemetry() {
           </div>
 
           {/* Map (9 columns) */}
-          <div className="lg:col-span-9 bg-slate-900 border border-slate-800 rounded-lg p-2 h-[420px] relative z-0">
+          <div className={`lg:col-span-9 bg-slate-900 border border-slate-800 rounded-lg p-2 h-[420px] relative z-0 ${isDrawing ? 'cursor-crosshair' : ''}`}>
             <MapContainer 
               center={[KERALA_LAT, KERALA_LNG]} 
               zoom={15} 
@@ -220,13 +424,161 @@ export default function GpsTelemetry() {
                   </div>
                 </Popup>
               </Marker>
+
+              {/* Drawn / saved geofence polygon */}
+              {savedGeofence?.features?.[0]?.geometry?.coordinates?.[0]?.length > 2 && (
+                <Polygon 
+                  positions={savedGeofence.features[0].geometry.coordinates[0].map(pt => [pt[1], pt[0]])}
+                  pathOptions={{ 
+                    color: serverSend ? '#ef4444' : '#f59e0b',
+                    fillColor: serverSend ? '#ef4444' : '#f59e0b',
+                    fillOpacity: 0.18,
+                    weight: 2,
+                    dashArray: serverSend ? undefined : '5, 5'
+                  }}
+                >
+                  <Popup className="dvas-map-popup">
+                    <div className="font-sans text-xs">
+                      <div className="font-bold text-red-600 flex items-center gap-1">
+                        <ShieldAlert size={14} /> {savedGeofence.features[0].properties.zone_id}
+                      </div>
+                      <div className="text-slate-600 font-medium mt-0.5">{savedGeofence.features[0].properties.name}</div>
+                      <div className="text-[10px] text-slate-500 mt-1">
+                        Status: <span className="font-semibold text-slate-700">{serverSend ? 'ACTIVE (MONITORING INTRUSION)' : 'ARMED (STANDBY)'}</span>
+                      </div>
+                    </div>
+                  </Popup>
+                </Polygon>
+              )}
+
+              {/* Active drawing points & lines in progress */}
+              {isDrawing && drawnPoints.map((pt, idx) => (
+                <CircleMarker 
+                  key={`draw-pt-${idx}`} 
+                  center={[pt.lat, pt.lng]} 
+                  radius={5}
+                  pathOptions={{ color: '#f59e0b', fillColor: '#fbbf24', fillOpacity: 0.9, weight: 2 }}
+                />
+              ))}
+              {isDrawing && drawnPoints.length > 1 && (
+                <Polyline 
+                  positions={drawnPoints.map(p => [p.lat, p.lng])}
+                  pathOptions={{ color: '#f59e0b', weight: 2, dashArray: '4, 4' }}
+                />
+              )}
+              {isDrawing && drawnPoints.length >= 3 && (
+                <Polygon 
+                  positions={drawnPoints.map(p => [p.lat, p.lng])}
+                  pathOptions={{ color: '#f59e0b', fillColor: '#f59e0b', fillOpacity: 0.1, weight: 1, dashArray: '4, 4' }}
+                />
+              )}
+              <PolygonDrawer isDrawing={isDrawing} onAddPoint={handleAddPoint} />
             </MapContainer>
 
-            {/* Floating map labels over the map */}
+            {/* Floating map labels over the map (Top Left) */}
             <div className="absolute top-4 left-4 z-[400] flex gap-2 pointer-events-none">
               <div className="px-3 py-1.5 bg-white/90 backdrop-blur shadow-sm border border-slate-200 text-slate-800 text-xs font-semibold rounded flex items-center gap-1.5">
                 <MapPin size={14} className="text-sky-500" /> {mission?.location || 'Tactical Sector (Standby)'}
               </div>
+              {mission?.active && !mission?.server_send_enabled && (mission?.video_source_type === 'file' || mission?.is_paused) && (
+                <div className="px-3 py-1.5 bg-amber-500/90 text-slate-950 font-mono text-xs font-semibold rounded shadow-md flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-slate-950 animate-ping"></span>
+                  STANDBY — Initial GPS Loaded (Awaiting Server Send: ON)
+                </div>
+              )}
+            </div>
+
+            {/* Top Right Floating Geofence Toolbar */}
+            <div className="absolute top-4 right-4 z-[400] flex flex-col items-end gap-2">
+              {/* Feedback notification pill */}
+              {geofenceFeedback && (
+                <div className={`px-3 py-1.5 rounded text-xs font-semibold shadow-md flex items-center gap-1.5 backdrop-blur border ${
+                  geofenceFeedback.type === 'success' ? 'bg-emerald-950/90 text-emerald-300 border-emerald-500/40' :
+                  geofenceFeedback.type === 'error' ? 'bg-red-950/90 text-red-300 border-red-500/40' :
+                  'bg-slate-900/90 text-slate-200 border-slate-700'
+                }`}>
+                  {geofenceFeedback.message}
+                </div>
+              )}
+
+              {/* Locked state during active streaming */}
+              {mission?.active && serverSend && (
+                <div className="px-3 py-1.5 bg-slate-950/85 backdrop-blur text-slate-300 text-xs font-semibold rounded border border-slate-700 shadow-md flex items-center gap-2">
+                  <Lock size={13} className="text-amber-400" />
+                  <span>Geofence Locked (Pause to Edit)</span>
+                  {savedGeofence && (
+                    <span className="text-[10px] font-mono bg-red-950/70 text-red-400 border border-red-800/60 px-1.5 py-0.5 rounded">
+                      {savedGeofence.features[0].properties.zone_id}
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {/* Editable state when Standby or Paused */}
+              {mission?.active && !serverSend && (
+                <div className="bg-slate-950/90 backdrop-blur p-2 rounded-lg border border-slate-700/80 shadow-lg flex items-center gap-2">
+                  {!isDrawing ? (
+                    <>
+                      <button
+                        onClick={() => {
+                          setIsDrawing(true);
+                          setDrawnPoints([]);
+                        }}
+                        className="px-2.5 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold rounded flex items-center gap-1.5 shadow"
+                      >
+                        <Pencil size={13} /> {savedGeofence ? 'Redraw Zone' : 'Draw Geofence'}
+                      </button>
+                      {savedGeofence && (
+                        <>
+                          <div className="text-[11px] font-mono text-amber-400 px-2 flex items-center gap-1">
+                            <ShieldAlert size={13} className="text-red-400" />
+                            <span>Zone Armed ({savedGeofence.features[0].geometry.coordinates[0].length - 1} pts)</span>
+                          </div>
+                          <button
+                            onClick={handleClearDrawing}
+                            className="p-1.5 hover:bg-slate-800 text-slate-400 hover:text-red-400 rounded transition-colors"
+                            title="Remove Geofence"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <div className="text-xs text-amber-300 font-mono px-2 flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping"></span>
+                        Click map ({drawnPoints.length} pts)
+                      </div>
+                      <button
+                        onClick={handleUndoPoint}
+                        disabled={drawnPoints.length === 0}
+                        className="px-2 py-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-300 text-xs rounded flex items-center gap-1"
+                        title="Undo last vertex"
+                      >
+                        <Undo2 size={13} /> Undo
+                      </button>
+                      <button
+                        onClick={() => {
+                          setIsDrawing(false);
+                          setDrawnPoints([]);
+                        }}
+                        className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded flex items-center gap-1"
+                        title="Cancel drawing"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={handleSaveGeofence}
+                        disabled={drawnPoints.length < 3 || isSavingGeofence}
+                        className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:hover:bg-emerald-600 text-white text-xs font-bold rounded flex items-center gap-1.5 shadow"
+                      >
+                        <Check size={13} /> {isSavingGeofence ? 'Saving...' : 'Save Zone'}
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </div>

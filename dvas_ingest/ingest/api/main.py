@@ -26,6 +26,8 @@ import asyncio
 import base64
 import json
 import logging
+import os
+from pathlib import Path
 import time
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Optional
@@ -77,6 +79,7 @@ from models import (
     MissionEndRequest,
     MissionResponse,
     MissionStartRequest,
+    GeofenceUpdateRequest,
     ReadinessResponse,
     SystemStatusResponse,
     WSStatusEvent,
@@ -586,38 +589,63 @@ async def mission_start(
         "location":    req.location,
         "latitude":    req.latitude,
         "longitude":   req.longitude,
+        "geofence":    req.geofence,
     }
+
+    # Persist geofence to disk and Redis if provided
+    if req.geofence:
+        try:
+            geofence_dir = Path("/data/geofences") if os.path.exists("/data") else Path("data/geofences")
+            geofence_dir.mkdir(parents=True, exist_ok=True)
+            geofence_path = geofence_dir / f"{req.mission_id}_geofence.json"
+            geofence_path.write_text(json.dumps(req.geofence, indent=2), encoding="utf-8")
+            log.info("geofence_persisted_disk", extra={"path": str(geofence_path), "mission": req.mission_id})
+        except Exception as e:
+            log.warning("geofence_disk_save_failed", extra={"error": str(e)})
+
+        if _qm and hasattr(_qm, "_redis") and _qm._redis:
+            try:
+                await _qm._redis.set(f"drone:geofence:{req.drone_id}", json.dumps(req.geofence))
+                log.info("geofence_saved_redis", extra={"drone_id": req.drone_id})
+            except Exception as e:
+                log.warning("geofence_redis_save_failed", extra={"error": str(e)})
+
     if _qm:
         _qm.start_mission(req.drone_id, req.mission_id)
     ACTIVE_MISSIONS.set(len(_active_missions))
 
     await _publish_event("mission_start", req.drone_id, {
-        "mission_id": req.mission_id,
+        "mission_id":   req.mission_id,
         "mission_name": req.mission_name,
-        "operator":   req.operator or extract_username(claims),
-        "location":   req.location,
-        "notes":      req.notes,
+        "operator":     req.operator or extract_username(claims),
+        "location":     req.location,
+        "notes":        req.notes,
+        "has_geofence": bool(req.geofence),
+        "geofence":     req.geofence,
     })
 
     asyncio.create_task(ws_manager.broadcast({
-        "event":      "mission_start",
-        "drone_id":   req.drone_id,
-        "mission_id": req.mission_id,
+        "event":        "mission_start",
+        "drone_id":     req.drone_id,
+        "mission_id":   req.mission_id,
         "mission_name": req.mission_name,
-        "operator":   req.operator or extract_username(claims),
-        "location":   req.location,
-        "timestamp":  ts,
-        "data":       {"latitude": req.latitude, "longitude": req.longitude},
+        "operator":     req.operator or extract_username(claims),
+        "location":     req.location,
+        "timestamp":    ts,
+        "has_geofence": bool(req.geofence),
+        "geofence":     req.geofence,
+        "data":         {"latitude": req.latitude, "longitude": req.longitude},
     }))
 
     log.info(
         "mission_started",
         extra={
-            "drone_id":   req.drone_id,
-            "mission_id": req.mission_id,
+            "drone_id":     req.drone_id,
+            "mission_id":   req.mission_id,
             "mission_name": req.mission_name,
-            "operator":   req.operator or extract_username(claims),
-            "location":   req.location,
+            "operator":     req.operator or extract_username(claims),
+            "location":     req.location,
+            "has_geofence": bool(req.geofence),
         },
     )
     return MissionResponse(
@@ -626,6 +654,52 @@ async def mission_start(
         mission_id = req.mission_id,
         timestamp  = ts,
     )
+
+
+@app.post(
+    "/ingest/mission/geofence",
+    status_code = status.HTTP_200_OK,
+    summary     = "Update active geofence during mission pause",
+    tags        = ["Mission"],
+)
+async def update_mission_geofence(
+    req:    GeofenceUpdateRequest,
+    claims: dict = Depends(validate_token),
+) -> dict:
+    """Updates the active geofence when a mission is paused mid-flight."""
+    if req.drone_id in _active_missions:
+        _active_missions[req.drone_id]["geofence"] = req.geofence
+
+    try:
+        geofence_dir = Path("/data/geofences") if os.path.exists("/data") else Path("data/geofences")
+        geofence_dir.mkdir(parents=True, exist_ok=True)
+        geofence_path = geofence_dir / f"{req.mission_id}_geofence.json"
+        geofence_path.write_text(json.dumps(req.geofence, indent=2), encoding="utf-8")
+        log.info("geofence_updated_disk", extra={"path": str(geofence_path), "mission": req.mission_id})
+    except Exception as e:
+        log.warning("geofence_disk_save_failed", extra={"error": str(e)})
+
+    if _qm and hasattr(_qm, "_redis") and _qm._redis:
+        try:
+            await _qm._redis.set(f"drone:geofence:{req.drone_id}", json.dumps(req.geofence))
+            log.info("geofence_updated_redis", extra={"drone_id": req.drone_id})
+        except Exception as e:
+            log.warning("geofence_redis_save_failed", extra={"error": str(e)})
+
+    await _publish_event("geofence_updated", req.drone_id, {
+        "mission_id": req.mission_id,
+        "geofence":   req.geofence,
+    })
+
+    asyncio.create_task(ws_manager.broadcast({
+        "event":      "geofence_updated",
+        "drone_id":   req.drone_id,
+        "mission_id": req.mission_id,
+        "geofence":   req.geofence,
+        "timestamp":  time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+    }))
+
+    return {"status": "updated", "drone_id": req.drone_id, "mission_id": req.mission_id}
 
 
 async def _monitor_queue_drain(drone_id: str, mission_id: str, max_wait_sec: float = 30.0) -> None:

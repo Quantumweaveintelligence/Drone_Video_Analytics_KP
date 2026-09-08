@@ -331,6 +331,7 @@ class RealVideoSource:
         on_frame: Optional[Callable[[VideoFrame], None]] = None,
         on_complete: Optional[Callable[[], None]] = None,
         heartbeat_interval_frames: int = 60,
+        initial_play_state: bool = True,
     ) -> None:
         self.drone_id = drone_id
         self.video_source = video_source
@@ -354,6 +355,13 @@ class RealVideoSource:
         self._stop_event = threading.Event()
         self._reader_thread: Optional[threading.Thread] = None
         self._write_thread: Optional[threading.Thread] = None
+
+        # Play / Pause state (for video file gating on Server Send)
+        self._play_event = threading.Event()
+        if self._is_rtmp or initial_play_state:
+            self._play_event.set()
+        else:
+            self._play_event.clear()
 
         # Counters
         self._frame_index: int = 0
@@ -453,9 +461,28 @@ class RealVideoSource:
         self._reader_thread.start()
         log.info("real_source_reader_started", drone_id=self.drone_id)
 
+    def pause(self) -> None:
+        """Pause frame playback (only applies to video files)."""
+        if not self._is_rtmp:
+            self._play_event.clear()
+            log.info("real_source_paused", drone_id=self.drone_id, frame_index=self._frame_index)
+
+    def resume(self) -> None:
+        """Resume frame playback."""
+        self._play_event.set()
+        log.info("real_source_resumed", drone_id=self.drone_id, frame_index=self._frame_index)
+
+    @property
+    def is_paused(self) -> bool:
+        """Check if frame playback is currently held/paused."""
+        if self._is_rtmp:
+            return False
+        return not self._play_event.is_set()
+
     def stop(self) -> None:
         """Signal the threads to stop and wait for them."""
         self._stop_event.set()
+        self._play_event.set()  # Unblock reader thread if waiting in paused state
         if self._reader_thread is not None and self._reader_thread is not threading.current_thread():
             self._reader_thread.join(timeout=10.0)
         if self._write_thread is not None:
@@ -654,6 +681,22 @@ class RealVideoSource:
                 # ── Prometheus ────────────────────────────────────────────
                 DRONE_DECODE_LATENCY.labels(drone_id=self.drone_id).observe(decode_latency_ms)
                 DRONE_FRAMES_TOTAL.labels(drone_id=self.drone_id).inc()
+
+                # ── Pause check (local video files gated on Server Send) ──
+                if not self._is_rtmp and not self._play_event.is_set():
+                    log.info(
+                        "real_source_holding_frame",
+                        drone_id=self.drone_id,
+                        frame_index=self._frame_index - 1,
+                    )
+                    while not self._stop_event.is_set() and not self._play_event.is_set():
+                        self._stop_event.wait(timeout=0.1)
+                    if self._stop_event.is_set():
+                        break
+                    # Reset FPS window on resume
+                    self._fps_window_start = time.monotonic()
+                    self._fps_frame_count = 0
+                    continue
 
                 # ── Heartbeat FPS ─────────────────────────────────────────
                 if self._fps_frame_count >= self.heartbeat_interval_frames:

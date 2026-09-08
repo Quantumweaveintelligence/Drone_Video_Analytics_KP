@@ -401,6 +401,11 @@ export default function MissionControl() {
                       End Mission
                     </button>
                   </div>
+                  {!serverSend && activeMission.videoSourceType === 'file' && (
+                    <div className="text-[11px] text-amber-400/90 text-center font-mono tracking-wide bg-amber-500/10 border border-amber-500/20 py-1.5 px-2 rounded">
+                      Video playback & live telemetry are holding on Frame 1. Activate Server Send to begin transmission.
+                    </div>
+                  )}
 
                   {/* Pipeline Toggle */}
                   <button 
