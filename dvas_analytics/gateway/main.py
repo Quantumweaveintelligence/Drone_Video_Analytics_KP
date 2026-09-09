@@ -50,10 +50,11 @@ app.add_middleware(
 
 # Service definitions
 _SERVICES = {
-    "crowd":   cfg.CROWD_URL,
-    "person":  cfg.PERSON_URL,
-    "vehicle": cfg.VEHICLE_URL,
-    "anpr":    cfg.ANPR_URL,
+    "crowd":     cfg.CROWD_URL,
+    "person":    cfg.PERSON_URL,
+    "vehicle":   cfg.VEHICLE_URL,
+    "anpr":      cfg.ANPR_URL,
+    "intrusion": cfg.INTRUSION_URL,
 }
 
 # Redis stream names for each service
@@ -62,6 +63,7 @@ _ANALYTICS_STREAMS = [
     "analytics:person:results",
     "analytics:vehicle:results",
     "analytics:anpr:results",
+    "analytics:intrusion:results",
     "drone:events:confirmed",
 ]
 
@@ -147,14 +149,26 @@ async def summary():
         "SELECT COUNT(*) as cnt FROM confirmed_events WHERE ts > now() - interval '1 hour'"
     )
 
+    # Active intrusion events (last 5 min)
+    try:
+        intrusion_row = await pool.fetchrow(
+            "SELECT COUNT(*) as cnt FROM intrusion_events "
+            "WHERE state_to IN ('ENTERING','INSIDE','DWELLING') "
+            "AND ts > now() - interval '5 minutes'"
+        )
+        intrusion_count = intrusion_row["cnt"] if intrusion_row else 0
+    except Exception:
+        intrusion_count = 0  # Table may not exist yet
+
     return {
-        "ts":                  datetime.now(timezone.utc).isoformat(),
-        "active_persons":      person_row["cnt"] if person_row else 0,
-        "active_vehicles":     vehicle_row["cnt"] if vehicle_row else 0,
-        "plates_read_today":   plates_row["cnt"] if plates_row else 0,
-        "current_crowd_count": float(crowd_count),
-        "theft_alerts_today":  theft_row["cnt"] if theft_row else 0,
-        "events_last_hour":    events_row["cnt"] if events_row else 0,
+        "ts":                     datetime.now(timezone.utc).isoformat(),
+        "active_persons":         person_row["cnt"] if person_row else 0,
+        "active_vehicles":        vehicle_row["cnt"] if vehicle_row else 0,
+        "plates_read_today":      plates_row["cnt"] if plates_row else 0,
+        "current_crowd_count":    float(crowd_count),
+        "theft_alerts_today":     theft_row["cnt"] if theft_row else 0,
+        "events_last_hour":       events_row["cnt"] if events_row else 0,
+        "active_intrusions":      intrusion_count,
     }
 
 
@@ -270,7 +284,7 @@ async def events_stream(drone_id: Optional[str] = Query(default=None)):
 async def prometheus_metrics():
     """
     Prometheus-compatible text format metrics.
-    Aggregates basic counters from Postgres for all 4 services.
+    Aggregates basic counters from Postgres for all 5 analytics services.
     """
     pool = await get_pool()
 
@@ -280,6 +294,12 @@ async def prometheus_metrics():
     plates_row  = await pool.fetchrow("SELECT COUNT(*) as cnt FROM plate_reads")
     crowd_rows  = await get_crowd_history(limit=1)
     crowd_count = crowd_rows[0]["estimated_count"] if crowd_rows else 0
+
+    try:
+        intrusion_row = await pool.fetchrow("SELECT COUNT(*) as cnt FROM intrusion_events")
+        intrusion_count = intrusion_row["cnt"] if intrusion_row else 0
+    except Exception:
+        intrusion_count = 0
 
     ts_ms = int(time.time() * 1000)
     lines = [
@@ -298,6 +318,9 @@ async def prometheus_metrics():
         "# HELP dvas_crowd_count_current Latest crowd count estimate",
         "# TYPE dvas_crowd_count_current gauge",
         f"dvas_crowd_count_current {crowd_count} {ts_ms}",
+        "# HELP dvas_intrusion_events_total Total intrusion state transitions",
+        "# TYPE dvas_intrusion_events_total counter",
+        f"dvas_intrusion_events_total {intrusion_count} {ts_ms}",
     ]
     return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 

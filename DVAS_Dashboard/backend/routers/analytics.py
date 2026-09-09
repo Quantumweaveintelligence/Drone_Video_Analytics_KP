@@ -11,7 +11,7 @@ from models import Mission
 from core.security import get_current_user, _row_to_dict
 from core.analytics_client import _analytics_get, _analytics_post, _analytics_put, _analytics_delete, _service_headers
 from core.config import (
-    ANALYTICS_BASE, CROWD_URL, PERSON_URL, VEHICLE_URL, ANPR_URL,
+    ANALYTICS_BASE, CROWD_URL, PERSON_URL, VEHICLE_URL, ANPR_URL, INTRUSION_URL,
 )
 from audit_service import write_audit_v2
 from schemas.models import WatchlistAddIn
@@ -43,12 +43,14 @@ async def analytics_models_status(user: dict = Depends(get_current_user)):
         _analytics_get(f"{PERSON_URL}/health"),
         _analytics_get(f"{VEHICLE_URL}/health"),
         _analytics_get(f"{ANPR_URL}/health"),
+        _analytics_get(f"{INTRUSION_URL}/health"),
     )
     return {
         "crowd":   results[0],
         "person":  results[1],
         "vehicle": results[2],
         "anpr":    results[3],
+        "intrusion": results[4],
     }
 
 
@@ -825,3 +827,135 @@ async def mission_stats(
         "total_vehicles": result.get("total", 0) if isinstance(result, dict) else 0,
         "total_plates_read": result.get("total_plates_read", 0) if isinstance(result, dict) else 0,
     }
+
+
+# ── Intrusion Detection ───────────────────────────────────────────────
+
+@router.get("/analytics/intrusion/health")
+async def intrusion_health(user: dict = Depends(get_current_user)):
+    """Intrusion analyzer service health."""
+    return await _analytics_get(f"{INTRUSION_URL}/health")
+
+
+@router.get("/analytics/intrusion/live")
+async def intrusion_live(
+    drone_id: str = "",
+    user: dict = Depends(get_current_user),
+):
+    """Live intrusion tracks and states for a drone."""
+    return await _analytics_get(
+        f"{INTRUSION_URL}/intrusion/live?drone_id={drone_id}"
+    )
+
+
+@router.get("/analytics/intrusion/annotated")
+async def intrusion_annotated(
+    drone_id: str = "",
+    user: dict = Depends(get_current_user),
+):
+    """Latest annotated JPEG frame with geofence + bounding boxes (binary proxy)."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{INTRUSION_URL}/intrusion/annotated/latest",
+                params={"drone_id": drone_id},
+                timeout=8.0,
+                headers=_service_headers(),
+            )
+            if r.status_code == 200:
+                return Response(
+                    content=r.content,
+                    media_type="image/jpeg",
+                    headers={
+                        "Cache-Control": "no-cache, no-store, must-revalidate",
+                        "X-Drone-ID": r.headers.get("X-Drone-ID", drone_id),
+                        "X-Frame-Age": r.headers.get("X-Frame-Age", ""),
+                    },
+                )
+            raise HTTPException(r.status_code, r.text[:200])
+    except httpx.ConnectError:
+        raise HTTPException(503, "Intrusion analyzer unreachable")
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Intrusion analyzer timeout")
+
+
+@router.get("/analytics/intrusion/zone/status")
+async def intrusion_zone_status(
+    drone_id: str = "",
+    user: dict = Depends(get_current_user),
+):
+    """Active geofence zone status."""
+    return await _analytics_get(
+        f"{INTRUSION_URL}/intrusion/zone/status?drone_id={drone_id}"
+    )
+
+
+@router.get("/analytics/intrusion/events")
+async def intrusion_events(
+    drone_id: str = "",
+    mission_id: str = "",
+    limit: int = 50,
+    user: dict = Depends(get_current_user),
+):
+    """Historical intrusion events for post-mission review."""
+    return await _analytics_get(
+        f"{INTRUSION_URL}/intrusion/events?"
+        f"drone_id={drone_id}&mission_id={mission_id}&limit={limit}"
+    )
+
+
+@router.get("/analytics/intrusion/analytics")
+async def intrusion_analytics(
+    mission_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Full analytics JSON for a completed mission."""
+    return await _analytics_get(
+        f"{INTRUSION_URL}/intrusion/analytics?mission_id={mission_id}"
+    )
+
+
+@router.post("/analytics/intrusion/config")
+async def intrusion_config_update(
+    request: Request,
+    drone_id: str = "",
+    user: dict = Depends(get_current_user),
+):
+    """Update intrusion detection config (senior_officer+ only)."""
+    if user["role"] not in ("senior_officer", "system_administrator"):
+        raise HTTPException(403, "Config changes require elevated role")
+    body = await request.json()
+    result = await _analytics_post(
+        f"{INTRUSION_URL}/intrusion/config?drone_id={drone_id}", body
+    )
+    await write_audit_v2(
+        actor=user,
+        action="intrusion_config_update",
+        action_type="configuration",
+        category="analytics",
+        severity="medium",
+        target="intrusion_config",
+        target_type="intrusion_config",
+        details=str(body),
+        source_module="dashboard",
+        source_endpoint="/api/analytics/intrusion/config",
+        request=request,
+    )
+    return result
+
+
+@router.get("/analytics/intrusion/stream/start")
+async def intrusion_stream_start(user: dict = Depends(get_current_user)):
+    """Start intrusion detection stream."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{INTRUSION_URL}/stream/start")
+
+
+@router.get("/analytics/intrusion/stream/stop")
+async def intrusion_stream_stop(user: dict = Depends(get_current_user)):
+    """Stop intrusion detection stream."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{INTRUSION_URL}/stream/stop")
+

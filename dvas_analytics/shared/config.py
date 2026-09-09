@@ -76,6 +76,13 @@ class Config:
     PERSON_URL:  str = os.getenv("PERSON_URL",  "http://person-analyzer:8102")
     VEHICLE_URL: str = os.getenv("VEHICLE_URL", "http://vehicle-analyzer:8103")
     ANPR_URL:    str = os.getenv("ANPR_URL",    "http://anpr-analyzer:8104")
+    INTRUSION_URL: str = os.getenv("INTRUSION_URL", "http://intrusion-analyzer:8105")
+
+    # ── Intrusion Detection ───────────────────────────────────────────────
+    BUCKET_INTRUSION:  str = os.getenv("BUCKET_INTRUSION",  "dvas-intrusion")
+    INTRUSION_CONFIRM_FRAMES:    int   = int(os.getenv("INTRUSION_CONFIRM_FRAMES", "3"))
+    INTRUSION_DWELL_THRESHOLD_S: float = float(os.getenv("INTRUSION_DWELL_THRESHOLD_S", "3.0"))
+    INTRUSION_DEFAULT_PRESET:    str   = os.getenv("INTRUSION_DEFAULT_PRESET", "default")
 
     # ── Logging ────────────────────────────────────────────────────────────
     LOG_LEVEL: str  = os.getenv("LOG_LEVEL", "INFO")

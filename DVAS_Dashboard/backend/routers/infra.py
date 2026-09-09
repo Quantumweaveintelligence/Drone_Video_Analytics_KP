@@ -11,7 +11,7 @@ from database import async_session_factory
 from models import Drone, ModelConfig
 from core.security import get_current_user, require_roles, _row_to_dict
 from core.config import (
-    CROWD_URL, PERSON_URL, VEHICLE_URL, ANPR_URL,
+    CROWD_URL, PERSON_URL, VEHICLE_URL, ANPR_URL, INTRUSION_URL,
     MINIO_PROXY_ENDPOINT, MINIO_PROXY_ACCESS, MINIO_PROXY_SECRET, MINIO_PROXY_SECURE,
     limiter,
 )
@@ -96,6 +96,7 @@ AVAILABLE_MODELS = [
     {"key": "vehicle",      "label": "Vehicle Detection & Tracking", "gpu_pct": 22, "throughput_fps": 68, "default": True},
     {"key": "crowd",        "label": "CSRNet Crowd Density",          "gpu_pct": 20, "throughput_fps": 8,  "default": True},
     {"key": "plate",        "label": "Number-Plate (ANPR)",          "gpu_pct": 20, "throughput_fps": 40, "default": False},
+    {"key": "intrusion",    "label": "GeoTrax Intrusion Detection",  "gpu_pct": 15, "throughput_fps": 45, "default": False},
 ]
 
 
@@ -107,6 +108,7 @@ def _build_service_map():
         "vehicle": VEHICLE_URL,
         "crowd":   CROWD_URL,
         "plate":   ANPR_URL,
+        "intrusion": INTRUSION_URL,
     }
 
 
@@ -121,6 +123,7 @@ async def _get_service_stream_status() -> dict:
         "person":  f"{PERSON_URL}/health",
         "vehicle": f"{VEHICLE_URL}/health",
         "plate":   f"{ANPR_URL}/health",
+        "intrusion": f"{INTRUSION_URL}/health",
     }
     status = {}
     async with httpx.AsyncClient(timeout=4.0) as client:
@@ -141,7 +144,7 @@ async def _apply_stream_changes(requested_active: list) -> dict:
     Returns dict of {model_key: action_taken} e.g. {"crowd": "started", "plate": "already_stopped"}
     """
     # Unique services to act on (face→person, plate→anpr, deduplicate)
-    service_keys = {"crowd", "person", "vehicle", "plate"}
+    service_keys = {"crowd", "person", "vehicle", "plate", "intrusion"}
     # face uses person-analyzer — if face OR person is active, person runs
     effective_active = set(requested_active)
     if "face" in effective_active:
@@ -155,6 +158,7 @@ async def _apply_stream_changes(requested_active: list) -> dict:
         "person":  PERSON_URL,
         "vehicle": VEHICLE_URL,
         "plate":   ANPR_URL,
+        "intrusion": INTRUSION_URL,
     }
 
     async with httpx.AsyncClient(timeout=8.0) as client:

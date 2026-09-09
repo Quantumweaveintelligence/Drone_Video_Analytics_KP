@@ -19,6 +19,7 @@ CROWD_URL = os.getenv("CROWD_ANALYTICS_URL", "http://crowd-analyzer:8101")
 PERSON_URL = os.getenv("PERSON_ANALYTICS_URL", "http://person-analyzer:8102")
 VEHICLE_URL = os.getenv("VEHICLE_ANALYTICS_URL", "http://vehicle-analyzer:8103")
 ANPR_URL = os.getenv("ANPR_ANALYTICS_URL", "http://anpr-analyzer:8104")
+INTRUSION_URL = os.getenv("INTRUSION_ANALYTICS_URL", "http://intrusion-analyzer:8105")
 
 # ---------- MinIO ----------
 MINIO_PROXY_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")

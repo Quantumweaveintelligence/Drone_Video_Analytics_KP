@@ -133,7 +133,7 @@ services:
     container_name: drone_valkey
     networks: [drone-net]
     restart: unless-stopped
-    command: valkey-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    command: valkey-server --appendonly yes --maxmemory 1536mb --maxmemory-policy allkeys-lru
     volumes:
       - valkey_data:/data
     healthcheck:
@@ -576,6 +576,54 @@ services:
       retries:      5
       start_period: 180s  # PaddleOCR model download on first run
 
+  # ── Intrusion Detection & Geofence Monitoring (YOLOv8s + State Machine) ───
+  intrusion-analyzer:
+    build:
+      context:    ../dvas_analytics
+      dockerfile: intrusion/Dockerfile
+    container_name: drone_intrusion_analyzer
+    networks: [drone-net]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8105:8105"   # REST API — Intrusion detection (localhost only)
+    environment:
+      DATABASE_URL: postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
+      REDIS_URL:    redis://valkey:6379/0
+      DRONE_IDS:    "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005,DRN-001,DRN-002,DRN-003,DRN-004,DRN-005}"
+      INTRUSION_MODEL:          /analytics/intrusion/models/geotrax_hbb_yolov8s_1920_v1.pt
+      INTRUSION_DEFAULT_PRESET: "${INTRUSION_PRESET:-default}"
+      LOG_LEVEL:    INFO
+      ANALYTICS_SERVICE_KEY: "${ANALYTICS_SERVICE_KEY}"
+      MINIO_ENDPOINT:   minio:9000
+      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-minioadmin}"
+      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-minioadmin}"
+      MINIO_SECURE:     "false"
+      BUCKET_INTRUSION: dvas-intrusion
+      INTRUSION_CONFIRM_FRAMES:    "${INTRUSION_CONFIRM_FRAMES:-3}"
+      INTRUSION_DWELL_THRESHOLD_S: "${INTRUSION_DWELL_THRESHOLD_S:-3.0}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver:       nvidia
+              count:        1
+              capabilities: [gpu]
+    volumes:
+      - analytics_evidence:/data/evidence
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test:         ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8105/health')"]
+      interval:     30s
+      timeout:      10s
+      retries:      3
+      start_period: 90s   # YOLOv8s model load time
+
   # ════════════════════════════════════════════════════════════════════════════
   # OBJECT STORAGE — MinIO (S3-compatible)
   # Stores: face crops, vehicle crops, plate images, crowd heatmaps, evidence
@@ -621,6 +669,7 @@ services:
         mc mb --ignore-existing local/dvas-plates &&
         mc mb --ignore-existing local/dvas-heatmaps &&
         mc mb --ignore-existing local/dvas-vehicles &&
+        mc mb --ignore-existing local/dvas-intrusion &&
         mc anonymous set download local/dvas-evidence &&
         echo '[minio-init] All buckets ready.'
       "
@@ -650,6 +699,7 @@ services:
       PERSON_URL:   http://person-analyzer:8102
       VEHICLE_URL:  http://vehicle-analyzer:8103
       ANPR_URL:     http://anpr-analyzer:8104
+      INTRUSION_URL: http://intrusion-analyzer:8105
       MINIO_ENDPOINT:   minio:9000
       MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-minioadmin}"
       MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-minioadmin}"
@@ -668,6 +718,8 @@ services:
       vehicle-analyzer:
         condition: service_healthy
       anpr-analyzer:
+        condition: service_healthy
+      intrusion-analyzer:
         condition: service_healthy
     healthcheck:
       test:         ["CMD", "curl", "-f", "http://localhost:8100/health"]

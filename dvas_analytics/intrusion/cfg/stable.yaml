@@ -1,0 +1,18 @@
+# intrusion_detection configuration (stable.yaml)
+ultralytics:
+  model: models/geotrax_hbb_yolov8s_1920_v1.pt
+  conf: 0.25
+  iou: 0.7
+  imgsz: 1920
+
+extraction:
+  motorcycle_min_conf: 0.75
+
+tracker:
+  active: botsort
+  botsort:
+    tracker_type: botsort
+    track_high_thresh: 0.25
+    track_low_thresh: 0.1
+    new_track_thresh: 0.25
+    track_buffer: 60

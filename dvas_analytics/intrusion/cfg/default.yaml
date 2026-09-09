@@ -1,0 +1,77 @@
+# intrusion_detection pipeline configuration (default.yaml)
+
+input:
+  ortho_folder: null
+  master_folder: null
+  segmentation_folder: null
+
+output:
+  folder: results
+  tracks_postfix: ''
+  georeferenced_postfix: ''
+  stab_transform_postfix: _vid_transf
+  geo_transform_postfix: _geo_transf
+  visualization_postfix: ''
+  metadata_postfix: ''
+
+processing:
+  cut_frame_left: 0
+  cut_frame_right: null
+
+batch:
+  folders_exclude: ['results']
+  exclude_patterns: null
+
+extraction:
+  model: models/geotrax_hbb_yolov8s_1920_v1.pt
+  class_rename: null
+  stabilize: true
+  save_stab: true
+  min_track_length: 3
+  interpolate: false
+  motorcycle_min_conf: 0.75  # Default threshold for motorcycle detections to suppress pedestrian noise
+  sahi:
+    enable: false
+    slice_height: 1080
+    slice_width: 1920
+    overlap_height_ratio: 0.2
+    overlap_width_ratio: 0.2
+    perform_standard_pred: true
+    postprocess_type: GREEDYNMM
+    postprocess_match_metric: IOS
+
+ultralytics:
+  model: models/geotrax_hbb_yolov8s_1920_v1.pt
+  conf: 0.25
+  iou: 0.7
+  imgsz: 1920
+  half: false
+  device: null
+  max_det: 300
+  classes: null
+
+tracker:
+  active: botsort
+
+  botsort:
+    tracker_type: botsort
+    track_high_thresh: 0.25
+    track_low_thresh: 0.1
+    new_track_thresh: 0.25
+    track_buffer: 30
+    match_thresh: 0.8
+    fuse_score: true
+    gmc_method: sparseOptFlow
+    proximity_thresh: 0.5
+    appearance_thresh: 0.8
+    with_reid: false
+    model: auto
+
+  bytetrack:
+    tracker_type: bytetrack
+    track_high_thresh: 0.25
+    track_low_thresh: 0.1
+    new_track_thresh: 0.25
+    track_buffer: 30
+    match_thresh: 0.8
+    fuse_score: true

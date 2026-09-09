@@ -68,6 +68,10 @@ class QueueManager:
         self._connected: bool                     = False
         self._stats:     Dict[str, DroneQueueStats] = {}
 
+    @property
+    def _redis(self) -> Optional[aioredis.Redis]:
+        return self._client
+
     # ── Connection lifecycle ──────────────────────────────────────────────────
 
     async def connect(self) -> None:

@@ -261,3 +261,38 @@ export function useTheftAlerts(intervalMs = 10000) {
 export function useAnalyticsHealth(intervalMs = 15000) {
   return useAnalyticsFetch('/analytics/health', intervalMs);
 }
+
+// ── Intrusion Detection hooks ──────────────────────────────────────────────
+export function useIntrusionHealth(intervalMs = 10000) {
+  return useAnalyticsFetch('/analytics/intrusion/health', intervalMs);
+}
+
+export function useIntrusionLive(droneId = '', intervalMs = 3000) {
+  const path = droneId
+    ? `/analytics/intrusion/live?drone_id=${droneId}`
+    : '/analytics/intrusion/live';
+  return useAnalyticsFetch(path, intervalMs);
+}
+
+export function useIntrusionZoneStatus(droneId = '', intervalMs = 5000) {
+  const path = droneId
+    ? `/analytics/intrusion/zone/status?drone_id=${droneId}`
+    : '/analytics/intrusion/zone/status';
+  return useAnalyticsFetch(path, intervalMs);
+}
+
+export function useIntrusionEvents(droneId = '', missionId = '', limit = 50, intervalMs = 10000) {
+  const parts = [];
+  if (droneId) parts.push(`drone_id=${droneId}`);
+  if (missionId) parts.push(`mission_id=${missionId}`);
+  parts.push(`limit=${limit}`);
+  const path = `/analytics/intrusion/events?${parts.join('&')}`;
+  return useAnalyticsFetch(path, intervalMs);
+}
+
+export function useIntrusionAnalytics(missionId = '', intervalMs = 30000) {
+  const path = missionId
+    ? `/analytics/intrusion/analytics?mission_id=${missionId}`
+    : null;
+  return useAnalyticsFetch(path, intervalMs, !!missionId);
+}

@@ -206,6 +206,30 @@ async def lifespan(app: FastAPI):
         for did in KNOWN_DRONES:
             await _qm.declare_drone_queue(did)
         log.info("ingest_server_ready — redis_streams_declared", extra={"drones": len(KNOWN_DRONES)})
+
+        # Restore saved geofences from disk to Redis on startup
+        try:
+            geofence_dir = Path("/data/geofences") if os.path.exists("/data/geofences") else Path("data/geofences")
+            if geofence_dir.exists():
+                redis_client = getattr(_qm, "_client", None) or getattr(_qm, "_redis", None)
+                if redis_client:
+                    for gfile in geofence_dir.glob("*_geofence.json"):
+                        try:
+                            gdata = json.loads(gfile.read_text(encoding="utf-8"))
+                            mid = gfile.stem.replace("_geofence", "")
+                            raw_geo = json.dumps(gdata)
+                            await redis_client.set(f"drone:geofence:{mid}", raw_geo)
+                            await redis_client.set(f"drone:geofence:DRN-{mid}", raw_geo)
+                            feats = gdata.get("features", [])
+                            if feats:
+                                props = feats[0].get("properties", {})
+                                ref_did = props.get("reference_metadata", {}).get("drone_id")
+                                if ref_did:
+                                    await redis_client.set(f"drone:geofence:{ref_did}", raw_geo)
+                        except Exception:
+                            pass
+        except Exception as geofence_restore_err:
+            log.warning("geofence_startup_restore_warning", extra={"error": str(geofence_restore_err)})
     except Exception as exc:
         log.error("startup_redis_connect_failed", extra={"error": str(exc)})
         # Continue anyway — will reconnect on first frame
@@ -603,10 +627,27 @@ async def mission_start(
         except Exception as e:
             log.warning("geofence_disk_save_failed", extra={"error": str(e)})
 
-        if _qm and hasattr(_qm, "_redis") and _qm._redis:
+        redis_client = getattr(_qm, "_client", None) or getattr(_qm, "_redis", None)
+        if redis_client:
             try:
-                await _qm._redis.set(f"drone:geofence:{req.drone_id}", json.dumps(req.geofence))
-                log.info("geofence_saved_redis", extra={"drone_id": req.drone_id})
+                raw_geo = json.dumps(req.geofence)
+                keys_to_set = {f"drone:geofence:{req.drone_id}"}
+                if req.mission_id:
+                    keys_to_set.add(f"drone:geofence:{req.mission_id}")
+                    keys_to_set.add(f"drone:geofence:DRN-{req.mission_id}")
+                if req.drone_id.startswith("DRN-"):
+                    keys_to_set.add(f"drone:geofence:DRONE_KL_{req.drone_id[4:]}")
+                elif req.drone_id.startswith("DRONE_KL_"):
+                    keys_to_set.add(f"drone:geofence:DRN-{req.drone_id[9:]}")
+                features = req.geofence.get("features", [])
+                if features:
+                    ref_meta = features[0].get("properties", {}).get("reference_metadata", {})
+                    ref_did = ref_meta.get("drone_id")
+                    if ref_did:
+                        keys_to_set.add(f"drone:geofence:{ref_did}")
+                for k in keys_to_set:
+                    await redis_client.set(k, raw_geo)
+                log.info("geofence_saved_redis", extra={"drone_id": req.drone_id, "keys": list(keys_to_set)})
             except Exception as e:
                 log.warning("geofence_redis_save_failed", extra={"error": str(e)})
 
@@ -679,10 +720,27 @@ async def update_mission_geofence(
     except Exception as e:
         log.warning("geofence_disk_save_failed", extra={"error": str(e)})
 
-    if _qm and hasattr(_qm, "_redis") and _qm._redis:
+    redis_client = getattr(_qm, "_client", None) or getattr(_qm, "_redis", None)
+    if redis_client:
         try:
-            await _qm._redis.set(f"drone:geofence:{req.drone_id}", json.dumps(req.geofence))
-            log.info("geofence_updated_redis", extra={"drone_id": req.drone_id})
+            raw_geo = json.dumps(req.geofence)
+            keys_to_set = {f"drone:geofence:{req.drone_id}"}
+            if req.mission_id:
+                keys_to_set.add(f"drone:geofence:{req.mission_id}")
+                keys_to_set.add(f"drone:geofence:DRN-{req.mission_id}")
+            if req.drone_id.startswith("DRN-"):
+                keys_to_set.add(f"drone:geofence:DRONE_KL_{req.drone_id[4:]}")
+            elif req.drone_id.startswith("DRONE_KL_"):
+                keys_to_set.add(f"drone:geofence:DRN-{req.drone_id[9:]}")
+            features = req.geofence.get("features", [])
+            if features:
+                ref_meta = features[0].get("properties", {}).get("reference_metadata", {})
+                ref_did = ref_meta.get("drone_id")
+                if ref_did:
+                    keys_to_set.add(f"drone:geofence:{ref_did}")
+            for k in keys_to_set:
+                await redis_client.set(k, raw_geo)
+            log.info("geofence_updated_redis", extra={"drone_id": req.drone_id, "keys": list(keys_to_set)})
         except Exception as e:
             log.warning("geofence_redis_save_failed", extra={"error": str(e)})
 

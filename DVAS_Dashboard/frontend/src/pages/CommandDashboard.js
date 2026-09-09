@@ -9,6 +9,7 @@ import MultiDroneView from "@/components/MultiDroneView";
 import CrowdAnalytics from "@/components/CrowdAnalytics";
 import TrafficAnalytics from "@/components/TrafficAnalytics";
 import PersonTrackingAnalytics from "@/components/PersonTrackingAnalytics";
+import IntrusionAnalytics from "@/components/IntrusionAnalytics";
 import { useActiveStreams } from "@/hooks/useActiveStreams";
 import {
   MapPin, Radio as Broadcast, Bell, Film as FilmSlate,
@@ -17,7 +18,7 @@ import {
   Cpu, ShieldCheck, User as UserIcon, Users as UsersIcon, Car, Hash,
   UserSearch, RefreshCw, Play, Square, CheckCircle2,
   Activity, Battery, BatteryLow, BatteryMedium, BatteryFull,
-  Wifi, WifiOff, Clock, Radio,
+  Wifi, WifiOff, Clock, Radio, Shield,
 } from "lucide-react";
 import LiveFrame from "../components/LiveFrame";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, BarChart, Bar } from "recharts";
@@ -33,13 +34,14 @@ const ALL_PAGES = [
   { key: "crowd",     label: "Crowd Analytics",      Icon: UsersIcon,       roles: ["control_room_officer","senior_officer"] },
   { key: "traffic",   label: "Traffic & ANPR",       Icon: Car,             roles: ["control_room_officer","senior_officer"] },
   { key: "person",    label: "Person Tracking",      Icon: UserSearch,      roles: ["control_room_officer","senior_officer"] },
+  { key: "intrusion", label: "Intrusion Detection",  Icon: Shield,          roles: ["control_room_officer","senior_officer"] },
   { key: "models",    label: "Detection Models",     Icon: Cpu,             roles: ["control_room_officer","senior_officer"] },
   { key: "exports",   label: "Exports",              Icon: ArrowSquareOut,  roles: ["control_room_officer","senior_officer"] },
   { key: "aggregated",label: "Aggregated View",      Icon: ChartBar,        roles: ["senior_officer"] },
   { key: "reports",   label: "Reports",              Icon: FilmSlate,       roles: ["control_room_officer","senior_officer"] },
 ];
 
-const MODEL_ICONS = { person: UserIcon, face: ShieldCheck, vehicle: Car, crowd: UsersIcon, plate: Hash };
+const MODEL_ICONS = { person: UserIcon, face: ShieldCheck, vehicle: Car, crowd: UsersIcon, plate: Hash, intrusion: Shield };
 
 function KPI({ label, value, tone = "text-sky-400" }) {
   return (
@@ -612,6 +614,10 @@ export default function CommandDashboard() {
         <PersonTrackingAnalytics drones={drones} />
       )}
 
+      {tab === "intrusion" && (
+        <IntrusionAnalytics activeDrone={selectedDrone} drones={mergedDrones || drones} missions={missions} user={user} />
+      )}
+
       {tab === "models" && <ModelsPage user={user} t={t} />}
 
       {tab === "exports" && (
@@ -855,7 +861,7 @@ function ModelsPage({ user, t }) {
         <div className="border border-slate-800 bg-slate-900 p-4">
           <div className="dvas-label">Running Now</div>
           <div className={`mono text-2xl mt-1 font-semibold ${runningCount > 0 ? "text-emerald-400" : "text-slate-500"}`}>
-            {runningCount}<span className="text-slate-500 text-sm"> / 4</span>
+            {runningCount}<span className="text-slate-500 text-sm"> / 5</span>
           </div>
           <div className="mono text-[9px] text-slate-500 mt-1">live stream loops</div>
         </div>

@@ -163,6 +163,7 @@ function actionTypeBadge(actionType) {
     logout:            { color: '#a78bfa', bg: 'rgba(167, 139, 250, 0.12)' },
     export:            { color: '#fb923c', bg: 'rgba(251, 146, 60, 0.12)' },
     permission_change: { color: '#f43f5e', bg: 'rgba(244, 63, 94, 0.15)' },
+    configuration:     { color: '#22d3ee', bg: 'rgba(34, 211, 238, 0.12)' },
     read:              { color: '#94a3b8', bg: 'rgba(148, 163, 184, 0.12)' },
     system:            { color: '#94a3b8', bg: 'rgba(148, 163, 184, 0.12)' },
   };
@@ -2732,7 +2733,7 @@ export default function AuditLogPage() {
           {/* Category Filter */}
           <MultiSelect
             label="Category"
-            options={categoriesList.length ? categoriesList : ['authentication', 'user_mgmt', 'operations', 'evidence', 'configuration', 'security']}
+            options={categoriesList.length ? categoriesList : ['authentication', 'user_mgmt', 'operations', 'evidence', 'configuration', 'security', 'analytics']}
             selected={selectedCategories}
             onChange={setSelectedCategories}
             testId="category-filter"
@@ -2742,7 +2743,7 @@ export default function AuditLogPage() {
           {/* Action Type Filter */}
           <MultiSelect
             label="Action Type"
-            options={actionTypesList.length ? actionTypesList : ['create', 'update', 'delete', 'login', 'logout', 'export', 'permission_change', 'read', 'system']}
+            options={actionTypesList.length ? actionTypesList : ['create', 'update', 'delete', 'login', 'logout', 'export', 'permission_change', 'read', 'system', 'configuration']}
             selected={selectedActionTypes}
             onChange={setSelectedActionTypes}
             testId="action-type-filter"
