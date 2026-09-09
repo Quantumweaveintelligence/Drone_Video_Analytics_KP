@@ -9,7 +9,7 @@ import {
   Shield, Map as MapIcon, Gauge, ShieldCheck, LogOut, Send as Drone,
   Sun, Moon, Bell, PanelLeftClose, PanelLeftOpen, Activity,
   Languages, AlertTriangle, ChevronDown, LayoutDashboard, Target,
-  Video, Compass, Clock, Scan, Image, UploadCloud, Archive, Server, ClipboardList, Settings
+  Video, Compass, Clock, Scan, Image, Archive, Server, ClipboardList, Settings
 } from "lucide-react";
 
 const NAV = {
@@ -20,7 +20,6 @@ const NAV = {
     { to: "/edge/gps-telemetry", labelKey: "nav.gpsTelemetry", labelFallback: "GPS & Telemetry", Icon: Compass },
     { to: "/edge/buffer-and-change", labelKey: "nav.bufferAndChange", labelFallback: "Buffer and Change", Icon: Scan },
     { to: "/edge/frame-selection", labelKey: "nav.frameSelection", labelFallback: "Frame Selection Analytics", Icon: Image },
-    { to: "/edge/upload-monitoring", labelKey: "nav.uploadMonitoring", labelFallback: "Upload Monitoring", Icon: UploadCloud },
     { to: "/edge/incidents", labelKey: "nav.incidents", labelFallback: "Incidents", Icon: AlertTriangle },
     { to: "/edge/evidence-management", labelKey: "nav.evidenceManagement", labelFallback: "Evidence Management", Icon: Archive },
     { to: "/edge/system-health", labelKey: "nav.systemHealth", labelFallback: "System Health", Icon: Server },

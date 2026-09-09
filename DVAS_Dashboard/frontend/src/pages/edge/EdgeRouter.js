@@ -5,7 +5,6 @@ import LiveMonitoring from "./LiveMonitoring";
 import GpsTelemetry from "./GpsTelemetry";
 import BufferAndChange from "./BufferAndChange";
 import FrameSelection from "./FrameSelection";
-import UploadMonitoring from "./UploadMonitoring";
 import Incidents from "./Incidents";
 import EvidenceManagement from "./EvidenceManagement";
 import SystemHealth from "./SystemHealth";
@@ -21,7 +20,6 @@ export default function EdgeRouter() {
       <Route path="gps-telemetry" element={<GpsTelemetry />} />
       <Route path="buffer-and-change" element={<BufferAndChange />} />
       <Route path="frame-selection" element={<FrameSelection />} />
-      <Route path="upload-monitoring" element={<UploadMonitoring />} />
       <Route path="incidents" element={<Incidents />} />
       <Route path="evidence-management" element={<EvidenceManagement />} />
       <Route path="system-health" element={<SystemHealth />} />
