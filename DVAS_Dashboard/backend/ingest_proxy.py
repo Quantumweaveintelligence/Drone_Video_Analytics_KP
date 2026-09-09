@@ -299,25 +299,31 @@ async def ingest_streams_active():
             if d.get("online") is True or (d.get("ingest_stats", {}).get("frames_received") or d.get("frames_received") or 0) > 0
         ]
         if active:
+            drones = []
+            for d in active:
+                entry = {
+                    "drone_id":       d["drone_id"],
+                    "frames_received": d.get("ingest_stats", {}).get("frames_received", d.get("frames_received", 0)),
+                    "frame_count":     d.get("ingest_stats", {}).get("frames_received", d.get("frame_count", 0)),
+                    "mission_id":      d.get("mission_id"),
+                    "last_seen":       d.get("ingest_stats", {}).get("last_frame_at", d.get("last_frame_at")),
+                    "messages_ready":  d.get("queue", {}).get("messages_ready", 0),
+                    "online":          d.get("online", False),
+                    "latitude":        d.get("latitude"),
+                    "longitude":       d.get("longitude"),
+                    "altitude_m":      d.get("altitude_m"),
+                    "gb_yaw":          d.get("gb_yaw"),
+                    "gps_lock":        d.get("gps_lock", True),
+                }
+                entry["status"] = "live" if entry.get("online") else "offline"
+                entry.setdefault("messages_ready", 0)
+                if "consumer_lag" in d: entry["consumer_lag"] = d["consumer_lag"]
+                if "drain_started_at" in d: entry["drain_started_at"] = d["drain_started_at"]
+                if "mission_status" in d: entry["mission_status"] = d["mission_status"]
+                drones.append(entry)
             return {
-                "drones": [
-                    {
-                        "drone_id":       d["drone_id"],
-                        "frames_received": d.get("ingest_stats", {}).get("frames_received", d.get("frames_received", 0)),
-                        "frame_count":     d.get("ingest_stats", {}).get("frames_received", d.get("frame_count", 0)),
-                        "mission_id":      d.get("mission_id"),
-                        "last_seen":       d.get("ingest_stats", {}).get("last_frame_at", d.get("last_frame_at")),
-                        "messages_ready":  d.get("queue", {}).get("messages_ready", 0),
-                        "online":          d.get("online", False),
-                        "latitude":        d.get("latitude"),
-                        "longitude":       d.get("longitude"),
-                        "altitude_m":      d.get("altitude_m"),
-                        "gb_yaw":          d.get("gb_yaw"),
-                        "gps_lock":        d.get("gps_lock", True),
-                    }
-                    for d in active
-                ],
-                "count": len(active),
+                "drones": drones,
+                "count": len(drones),
             }
     except HTTPException:
         pass
@@ -325,7 +331,12 @@ async def ingest_streams_active():
 
     # ── 3. In-memory telemetry (may be empty after restart) ───────────────────
     try:
-        return await _proxy_get("/ingest/telemetry", timeout=3.0)
+        data = await _proxy_get("/ingest/telemetry", timeout=3.0)
+        for entry in data.get("drones", []):
+            entry["status"] = "live" if entry.get("mission_id") else "offline"
+            entry.setdefault("messages_ready", 0)
+            entry.setdefault("mission_status", "active" if entry.get("mission_id") else "offline")
+        return data
     except HTTPException:
         return {"drones": [], "count": 0}
 
@@ -393,10 +404,14 @@ async def proxy_purge_stream(
 ):
     """
     Force-purges a drone stream queue from Valkey and takes it offline immediately.
-    Any authenticated user can perform this action.
+    Restricted to specific roles.
     """
     from core.security import get_current_user
-    await get_current_user(request)  # just verify authenticated
+    user = await get_current_user(request)
+    allowed_roles = ["senior_officer", "system_administrator", "control_room_officer"]
+    if user.get("role") not in allowed_roles and not any(r in user.get("realm_roles", []) for r in allowed_roles):
+        raise HTTPException(status_code=403, detail="Insufficient permissions to purge streams")
+
     url = f"{INGEST_SERVER_URL}/ingest/streams/{drone_id}/purge"
     token = await _get_service_token()
     headers = {"Authorization": f"Bearer {token}"} if token else {}
@@ -404,6 +419,37 @@ async def proxy_purge_stream(
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(url, headers=headers)
             if resp.status_code == 200:
+                try:
+                    from audit_service import write_audit_v2
+                    await write_audit_v2(
+                        actor={
+                            "id": user.get("sub", user.get("user_id", "unknown")),
+                            "name": user.get("preferred_username", user.get("username", "unknown")),
+                            "role": user.get("role"),
+                            "email": user.get("email")
+                        },
+                        action="stream_purge",
+                        category="operations",
+                        target_type="drone_stream",
+                        target_id=drone_id,
+                        details=f"Manually purged video stream queue for drone {drone_id}",
+                        request=request
+                    )
+                except Exception as e:
+                    logger.warning(f"Audit log write failed for stream purge: {e}")
+
+                try:
+                    from services.websocket_hub import hub
+                    import datetime
+                    await hub.broadcast(json.dumps({
+                        "type": "stream_purged",
+                        "drone_id": drone_id,
+                        "purged_by": user.get("preferred_username", "unknown"),
+                        "ts": datetime.datetime.utcnow().isoformat()
+                    }))
+                except Exception as e:
+                    logger.warning(f"Websocket broadcast failed for stream purge: {e}")
+
                 return resp.json()
             raise HTTPException(resp.status_code, "Failed to purge stream")
     except HTTPException:

@@ -31,7 +31,7 @@ from shared.db import (
 )
 from shared.redis_client import (
     close_client, publish_analytics_result, publish_confirmed_event,
-    xread_frames, hget_vehicle_track, hset_vehicle_track,
+    xread_frames, xreadgroup_frames, ack_frames, hget_vehicle_track, hset_vehicle_track,
     scan_active_stream_drones,
 )
 from shared import minio_client as minio
@@ -350,15 +350,18 @@ async def _stream_loop():
             if drone_id not in last_ids:
                 last_ids[drone_id] = "0"
             try:
-                new_id, frames = await xread_frames(
-                    drone_id, last_ids[drone_id], count=2, block_ms=100
+                frames = await xreadgroup_frames(
+                    "analytics", "anpr-analyzer", drone_id, ">", count=2, block_ms=100
                 )
-                last_ids[drone_id] = new_id
 
+                if not frames:
+                    continue
+
+                all_entry_ids = [eid for eid, _ in frames]
                 # If multiple frames arrived, process the newest frame to keep real-time latency minimal
                 frames_to_process = frames[-1:] if len(frames) > 1 else frames
 
-                for f in frames_to_process:
+                for entry_id, f in frames_to_process:
                     raw = f.get("jpeg_b64", "")
                     if not raw:
                         continue

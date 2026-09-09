@@ -34,7 +34,7 @@ from shared.db import (
     upsert_dedup_run, get_dedup_run, get_dedup_runs,
 )
 from shared.redis_client import (
-    close_client, publish_analytics_result, publish_confirmed_event, xread_frames,
+    close_client, publish_analytics_result, publish_confirmed_event, xread_frames, xreadgroup_frames, ack_frames,
     scan_active_stream_drones,
 )
 from shared import minio_client as minio

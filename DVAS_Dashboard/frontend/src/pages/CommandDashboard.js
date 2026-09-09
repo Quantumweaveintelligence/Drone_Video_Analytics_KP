@@ -20,7 +20,7 @@ import {
   Activity, Battery, BatteryLow, BatteryMedium, BatteryFull,
   Wifi, WifiOff, Clock, Radio, Shield,
 } from "lucide-react";
-import LiveFrame from "../components/LiveFrame";
+import { useJpegPoller } from "@/hooks/useJpegPoller";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, BarChart, Bar } from "recharts";
 
 // Tab visibility — 4-role model
@@ -59,84 +59,20 @@ const MINI_BACKOFF = [600, 1200, 2400, 5000, 10000, 20000];
 const MINI_WATCHDOG_MS = 8000;
 
 function MiniStreamCell({ drone }) {
-  const [blobUrl, setBlobUrl]   = useState(null);
-  const [hasFrame, setHasFrame] = useState(false);
-  const [feedDead, setFeedDead] = useState(false);
-  const [lastSeen, setLastSeen] = useState(null);
-
-  const timerRef    = useRef(null);
-  const watchRef    = useRef(null);
-  const errRef      = useRef(0);
-  const prevBlobRef = useRef(null);
-  const mountedRef  = useRef(true);
-
   const isOffline  = drone.status === "offline";
   const isDegraded = drone.status === "degraded";
+  const isDraining = drone.status === "draining" || (drone.messages_ready ?? 0) > 0;
+  
+  const url = isOffline ? null : `${API}/ingest-server/frame/${encodeURIComponent(drone.id)}/latest`;
+  const { blobUrl, hasFrame, feedDead } = useJpegPoller(url, 800, !isOffline);
+  const [lastSeen, setLastSeen] = useState(null);
 
   useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-      clearTimeout(timerRef.current);
-      clearTimeout(watchRef.current);
-      if (prevBlobRef.current) URL.revokeObjectURL(prevBlobRef.current);
-    };
-  }, []);
+    if (hasFrame) setLastSeen(new Date());
+  }, [hasFrame, blobUrl]);
 
-  useEffect(() => {
-    clearTimeout(timerRef.current);
-    clearTimeout(watchRef.current);
-    if (prevBlobRef.current) { URL.revokeObjectURL(prevBlobRef.current); prevBlobRef.current = null; }
-    errRef.current = 0;
-    setBlobUrl(null);
-    setHasFrame(false);
-    setFeedDead(isOffline);
-
-    if (isOffline) return;
-
-    const schedule = (delay) => {
-      if (!mountedRef.current) return;
-      timerRef.current = setTimeout(doFetch, delay);
-    };
-
-    const doFetch = async () => {
-      if (!mountedRef.current) return;
-      const token = localStorage.getItem("dvas_token") || "";
-      const url   = `${API}/ingest-server/frame/${encodeURIComponent(drone.id)}/latest?_t=${Date.now()}`;
-      try {
-        const res = await fetch(url, {
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
-          credentials: "include",
-        });
-        if (!mountedRef.current) return;
-        if (res.ok) {
-          const blob = await res.blob();
-          const next = URL.createObjectURL(blob);
-          if (prevBlobRef.current) URL.revokeObjectURL(prevBlobRef.current);
-          prevBlobRef.current = next;
-          setBlobUrl(next);
-          setHasFrame(true);
-          setFeedDead(false);
-          setLastSeen(new Date());
-          errRef.current = 0;
-          clearTimeout(watchRef.current);
-          watchRef.current = setTimeout(() => { if (mountedRef.current) setFeedDead(true); }, MINI_WATCHDOG_MS);
-          schedule(800);
-        } else { throw new Error(`HTTP ${res.status}`); }
-      } catch {
-        if (!mountedRef.current) return;
-        errRef.current++;
-        if (errRef.current > 5) setFeedDead(true);
-        schedule(MINI_BACKOFF[Math.min(errRef.current - 1, MINI_BACKOFF.length - 1)]);
-      }
-    };
-
-    doFetch();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [drone.id, isOffline]);
-
-  const statusColor = isDegraded ? "#f59e0b" : isOffline || feedDead ? "#ef4444" : "#10b981";
-  const borderColor = isDegraded
+  const statusColor = isDraining ? "#fbbf24" : isDegraded ? "#f59e0b" : isOffline || feedDead ? "#ef4444" : "#10b981";
+  const borderColor = isDraining || isDegraded
     ? "border-amber-500/40"
     : isOffline || feedDead
     ? "border-red-500/30"
@@ -219,24 +155,30 @@ function MiniStreamCell({ drone }) {
           )}
         </div>
 
-        {/* Top-right: Status + streaming dot */}
-        <div className="absolute top-1.5 right-1.5 z-20 flex items-center gap-1">
-          {hasFrame && !feedDead && (
+        <div className="absolute top-1.5 right-1.5 z-20 flex flex-col items-end gap-1">
+          <div className="flex items-center gap-1">
+            {hasFrame && !feedDead && (
+              <span
+                className="w-1.5 h-1.5 rounded-full"
+                style={{ background: isDraining ? "#fbbf24" : "#10b981", animation: "pulse 1.2s infinite" }}
+              />
+            )}
             <span
-              className="w-1.5 h-1.5 rounded-full"
-              style={{ background: "#10b981", animation: "pulse 1.2s infinite" }}
-            />
+              className="mono text-[8px] px-1.5 py-0.5 rounded font-bold uppercase"
+              style={{
+                background: "rgba(6,14,26,0.80)",
+                color: statusColor,
+                border: `1px solid ${statusColor}30`,
+              }}
+            >
+              {isOffline || feedDead ? "OFFLINE" : isDraining ? "DRAINING" : isDegraded ? "DEGRADED" : "LIVE"}
+            </span>
+          </div>
+          {isDraining && (
+            <span className="mono text-[8px] px-1.5 py-0.5 rounded font-bold bg-amber-900/60 text-amber-300">
+              {drone.messages_ready ?? 0} frames
+            </span>
           )}
-          <span
-            className="mono text-[8px] px-1.5 py-0.5 rounded font-bold uppercase"
-            style={{
-              background: "rgba(6,14,26,0.80)",
-              color: statusColor,
-              border: `1px solid ${statusColor}30`,
-            }}
-          >
-            {isOffline || feedDead ? "OFFLINE" : isDegraded ? "DEGRADED" : "LIVE"}
-          </span>
         </div>
       </div>
 
@@ -279,7 +221,7 @@ function MultiDroneGrid({ dbDrones, selectedDroneId, onSelectDrone }) {
   const { mergeWithDrones, loading, streams } = useActiveStreams();
   const merged = mergeWithDrones(dbDrones);
   // Only assign slots to active streaming or draining drones
-  const activeDrones = merged.filter((d) => d.status === "live" || d.status === "draining" || (d.messages_ready ?? 0) > 0);
+  const activeDrones = merged.filter((d) => d.status === "live" || d.status === "degraded" || d.status === "draining" || (d.messages_ready ?? 0) > 0);
   const slots  = activeDrones.slice(0, 4);
 
   return (
@@ -394,7 +336,7 @@ export default function CommandDashboard() {
 
   const { mergeWithDrones } = useActiveStreams();
   const mergedDrones = mergeWithDrones(drones);
-  const liveMissionsCount = mergedDrones.filter((d) => d.status === "live" && Boolean(d.mission_id)).length;
+  const liveMissionsCount = mergedDrones.filter((d) => ["live", "draining"].includes(d.status) && Boolean(d.mission_id)).length;
 
   const load = async () => {
     try {

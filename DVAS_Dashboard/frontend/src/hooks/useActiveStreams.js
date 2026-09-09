@@ -15,6 +15,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { api } from "@/lib/api";
+import { useDvasSocket } from "@/lib/useDvasSocket";
 
 const POLL_INTERVAL = 5000;   // 5 s — ingest status changes infrequently
 const STALE_THRESHOLD = 20000; // 20 s — last_seen older than this → treat as stale
@@ -29,18 +30,10 @@ function isRecentlySeen(lastSeen) {
 function resolveDroneStatus(stream, fallbackStatus = "offline") {
   if (!stream) return fallbackStatus;
   
+  if (stream.status === "draining") return "draining";  // draining takes priority
   const recent = isRecentlySeen(stream.last_seen);
-  
-  // If frames arrived recently, the stream is live — regardless of backend status field
-  // (backend may have stale _active_missions state after restart)
   if (recent) return "live";
-  
-  // Backend explicitly says draining and has frames remaining
-  if (stream.status === "draining" && (stream.messages_ready ?? 0) > 0) {
-    return "draining";
-  }
-  
-  // Not recently seen, no draining — offline
+  if ((stream.messages_ready ?? 0) > 0) return "draining";
   return "offline";
 }
 
@@ -77,6 +70,30 @@ export function useActiveStreams() {
       clearInterval(id);
     };
   }, [fetchStreams]);
+
+  // Subscribe to WebSocket for sub-second UI updates
+  useDvasSocket((msg) => {
+    if (msg.type === "drone_draining" || msg.event === "drone_draining") {
+      setStreams(prev => prev.map(s => {
+        if (s.drone_id === msg.drone_id) {
+          return {
+            ...s,
+            status: "draining",
+            messages_ready: msg.messages_ready ?? s.messages_ready,
+            consumer_lag: msg.consumer_lag ?? s.consumer_lag
+          };
+        }
+        return s;
+      }));
+    } else if (msg.type === "drone_offline" || msg.event === "drone_offline") {
+      setStreams(prev => prev.map(s => {
+        if (s.drone_id === msg.drone_id) {
+          return { ...s, status: "offline" };
+        }
+        return s;
+      }));
+    }
+  });
 
   /** O(1) lookup map: drone_id → stream object */
   const streamMap = new Map(streams.map((s) => [s.drone_id, s]));

@@ -65,7 +65,7 @@ export default function LiveMap({ drones, height = 480, selectedDroneId = null }
     return (drones || []).filter(
       (d) =>
         d &&
-        d.status === "live" &&
+        ["live", "draining"].includes(d.status) &&
         Boolean(d.mission_id) &&
         typeof d.lat === "number" &&
         typeof d.lng === "number" &&

@@ -81,6 +81,7 @@ class TrackIntrusionState:
         self.first_seen_timestamp_s: Optional[float] = None
         self.entry_timestamp_s: Optional[float] = None
         self.exit_timestamp_s: Optional[float] = None
+        self.last_notified_state: str = "OUTSIDE"
         self.trajectory: List[dict] = []  # [{ts, lat, lon}]
 
     def update(

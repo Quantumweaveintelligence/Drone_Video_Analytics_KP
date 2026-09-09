@@ -15,6 +15,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
+import uuid
 
 import cv2
 import numpy as np
@@ -30,7 +31,7 @@ from shared.config import cfg, get_drone_aliases
 from shared.db import close_pool, ensure_drone, get_pool
 from shared.redis_client import (
     close_client, publish_analytics_result, publish_confirmed_event,
-    xread_frames, scan_active_stream_drones, get_client,
+    xread_frames, xreadgroup_frames, ack_frames, scan_active_stream_drones, get_client,
 )
 from shared import minio_client as minio
 
@@ -220,19 +221,21 @@ async def _stream_loop():
             if drone_id not in last_ids:
                 last_ids[drone_id] = "0"
             try:
-                new_id, frames = await xread_frames(
-                    drone_id, last_ids[drone_id], count=1, block_ms=10,
+                frames = await xreadgroup_frames(
+                    "analytics", "intrusion-analyzer", drone_id, ">", count=1, block_ms=10
                 )
-                last_ids[drone_id] = new_id
 
-                for f in frames:
+                processed_ids = []
+                for entry_id, f in frames:
                     raw = f.get("jpeg_b64", "")
                     if not raw:
+                        processed_ids.append(entry_id)
                         continue
                     img_bytes = base64.b64decode(raw)
                     nparr = np.frombuffer(img_bytes, np.uint8)
                     frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     if frame is None:
+                        processed_ids.append(entry_id)
                         continue
 
                     # ── Extract metadata ──────────────────────────────
@@ -425,6 +428,7 @@ async def _stream_loop():
                                 gimbal_yaw=g_yaw, gimbal_pitch=g_pitch,
                                 gimbal_roll=g_roll,
                             )
+                            g_lat, g_lon = float(g_lat), float(g_lon)
 
                             # Evaluate intrusion state
                             intrusion_state = IntrusionState.OUTSIDE
@@ -519,14 +523,13 @@ async def _stream_loop():
                             if ts_obj is None:
                                 continue
 
-                            # Check if state just changed by looking at trajectory
-                            traj = ts_obj.trajectory
-                            if len(traj) < 2:
-                                continue
-                            cur_state_str = traj[-1].get("state", "OUTSIDE")
-                            prev_state_str = traj[-2].get("state", "OUTSIDE")
+                            # Check if state changed relative to last notified state
+                            cur_state_str = str(det.get("intrusion_state", "OUTSIDE"))
+                            prev_state_str = getattr(ts_obj, "last_notified_state", "OUTSIDE")
                             if cur_state_str == prev_state_str:
                                 continue
+
+                            ts_obj.last_notified_state = cur_state_str
 
                             # State transition detected!
                             log.info(
@@ -561,48 +564,68 @@ async def _stream_loop():
                                         $11,$12,$13,$14,$15,$16,$17
                                     )""",
                                     drone_id,
-                                    mission_id,
-                                    gm.zone_id,
-                                    tid,
-                                    det["class"],
-                                    prev_state_str,
-                                    cur_state_str,
-                                    det["confidence"],
-                                    det["geolocation"]["latitude"],
-                                    det["geolocation"]["longitude"],
+                                    str(mission_id) if mission_id else None,
+                                    str(gm.zone_id) if gm.zone_id else "RESTRICTED_ZONE_01",
+                                    int(tid),
+                                    str(det["class"]),
+                                    str(prev_state_str),
+                                    str(cur_state_str),
+                                    float(det["confidence"]),
+                                    float(det["geolocation"]["latitude"]),
+                                    float(det["geolocation"]["longitude"]),
                                     (datetime.fromtimestamp(ts_obj.entry_timestamp_s, tz=timezone.utc)
                                      if ts_obj.entry_timestamp_s else None),
                                     (datetime.fromtimestamp(ts_obj.exit_timestamp_s, tz=timezone.utc)
                                      if ts_obj.exit_timestamp_s else None),
-                                    ts_obj.dwell_duration_s,
-                                    _json.dumps(ts_obj.trajectory[-10:]),  # Last 10 waypoints
+                                    float(ts_obj.dwell_duration_s),
+                                    _json.dumps(ts_obj.trajectory[-10:], default=str),  # Safe float/datetime serialization
                                     snapshot_key,
-                                    frame_seq,
+                                    int(frame_seq),
                                     ts,
                                 )
                             except Exception as db_err:
                                 log.warning("DB insert error: %s", db_err)
 
-                            # Publish confirmed event on DWELLING
-                            if cur_state_str == "DWELLING":
+                            # Publish confirmed event on intrusion transitions
+                            if cur_state_str in ("ENTERING", "INSIDE", "DWELLING", "EXITED"):
                                 try:
-                                    await publish_confirmed_event(
-                                        drone_id, "intrusion_dwelling",
-                                        det["confidence"], ts, tid,
-                                    )
-                                except Exception:
-                                    pass
+                                    await publish_confirmed_event({
+                                        "event_id": str(uuid.uuid4()),
+                                        "event_type": "intrusion_alert",
+                                        "drone_id": drone_id,
+                                        "mission_id": str(mission_id) if mission_id else "",
+                                        "zone_id": str(gm.zone_id) if gm.zone_id else "RESTRICTED_ZONE_01",
+                                        "track_id": int(tid),
+                                        "track_class": det["class"],
+                                        "state": cur_state_str,
+                                        "state_from": prev_state_str,
+                                        "state_to": cur_state_str,
+                                        "confidence": float(det["confidence"]),
+                                        "dwell_duration_s": float(ts_obj.dwell_duration_s),
+                                        "latitude": float(det["geolocation"]["latitude"]),
+                                        "longitude": float(det["geolocation"]["longitude"]),
+                                        "snapshot_key": snapshot_key,
+                                        "frame_sequence": int(frame_seq),
+                                        "ts": ts.isoformat(),
+                                    })
+                                except Exception as pub_err:
+                                    log.warning("Failed to publish confirmed event: %s", pub_err)
 
                     except Exception as ev_err:
                         log.warning("Event processing error: %s", ev_err)
 
                     # ── Publish analytics result to SSE stream ─────────
+                    active_breaches = [
+                        d for d in frame_detections
+                        if d.get("is_intruding") or (d.get("intrusion_state") in ("ENTERING", "INSIDE", "DWELLING"))
+                    ]
                     result_payload = {
                         "drone_id": drone_id,
-                        "mission_id": mission_id,
+                        "mission_id": str(mission_id) if mission_id else "",
                         "ts": ts.isoformat(),
-                        "frame_sequence": frame_seq,
+                        "frame_sequence": int(frame_seq),
                         "detections": frame_detections,
+                        "active_breaches": active_breaches,
                         "active_intrusions": sm.get_active_intrusion_count(),
                         "monitoring_mode": "MONITORING",
                         "geofence_zone_id": gm.zone_id,
@@ -613,6 +636,13 @@ async def _stream_loop():
                         log.warning("Failed to publish result: %s", pub_err)
 
                     _frames_processed += 1
+                    processed_ids.append(entry_id)
+
+                    if processed_ids:
+                        try:
+                            await ack_frames(drone_id, "analytics", *processed_ids)
+                        except Exception as ack_err:
+                            log.warning("ACK error for %s: %s", drone_id, ack_err)
 
             except asyncio.CancelledError:
                 return

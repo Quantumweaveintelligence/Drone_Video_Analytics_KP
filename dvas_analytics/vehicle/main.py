@@ -29,7 +29,7 @@ from shared.db import (
 )
 from shared.redis_client import (
     close_client, publish_analytics_result, publish_confirmed_event,
-    xread_frames, hset_vehicle_track, hget_vehicle_track,
+    xread_frames, xreadgroup_frames, ack_frames, hset_vehicle_track, hget_vehicle_track,
     scan_active_stream_drones,
 )
 from shared import minio_client as minio
@@ -307,19 +307,21 @@ async def _stream_loop():
             if drone_id not in last_ids:
                 last_ids[drone_id] = "0"
             try:
-                new_id, frames = await xread_frames(
-                    drone_id, last_ids[drone_id], count=4, block_ms=100
+                frames = await xreadgroup_frames(
+                    "analytics", "vehicle-analyzer", drone_id, ">", count=4, block_ms=100
                 )
-                last_ids[drone_id] = new_id
 
-                for f in frames:
+                processed_ids = []
+                for entry_id, f in frames:
                     raw = f.get("jpeg_b64", "")
                     if not raw:
+                        processed_ids.append(entry_id)
                         continue
                     img_bytes = base64.b64decode(raw)
                     nparr  = np.frombuffer(img_bytes, np.uint8)
                     frame  = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     if frame is None:
+                        processed_ids.append(entry_id)
                         continue
 
                     result = analyzer.analyze_frame(frame, drone_id=drone_id, save_crops=True)

@@ -6,9 +6,9 @@
 -- ─── Intrusion Events (state transitions with rich metadata) ──────────────
 CREATE TABLE IF NOT EXISTS intrusion_events (
     event_id         UUID NOT NULL DEFAULT gen_random_uuid(),
-    mission_id       UUID REFERENCES missions(mission_id),
+    mission_id       TEXT,
     drone_id         TEXT NOT NULL REFERENCES drones(drone_id),
-    zone_id          UUID REFERENCES zones(zone_id),
+    zone_id          TEXT,
     track_id         INT NOT NULL,
     track_class      TEXT NOT NULL,
     state_from       TEXT NOT NULL,
@@ -43,9 +43,9 @@ CREATE INDEX IF NOT EXISTS idx_intrusion_events_track
 -- ─── Intrusion Mission Summaries (per-mission aggregate) ──────────────────
 CREATE TABLE IF NOT EXISTS intrusion_mission_summaries (
     id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    mission_id                UUID REFERENCES missions(mission_id),
+    mission_id                TEXT,
     drone_id                  TEXT NOT NULL REFERENCES drones(drone_id),
-    zone_id                   UUID REFERENCES zones(zone_id),
+    zone_id                   TEXT,
     total_detections_by_class JSONB,
     total_intrusion_events    INT NOT NULL DEFAULT 0,
     avg_dwell_time_s          REAL,

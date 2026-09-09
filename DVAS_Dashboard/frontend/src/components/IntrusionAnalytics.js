@@ -38,111 +38,9 @@ import {
 import { api, authFetch } from '@/lib/api';
 import { useAnalyticsFetch, useAnalyticsSSE } from '@/lib/useAnalytics';
 import { useActiveStreams } from '@/hooks/useActiveStreams';
+import { useJpegPoller } from '@/hooks/useJpegPoller';
 
-/* ─── Inline JPEG Poller Hook ─────────────────────────────────────── */
-function useJpegPoller(endpoint, droneId, intervalMs = 800, enabled = true) {
-  const [blobUrl, setBlobUrl] = useState(null);
-  const [hasFrame, setHasFrame] = useState(false);
-  const [feedDead, setFeedDead] = useState(true);
-  const [fps, setFps] = useState(0);
 
-  const frameCountRef = useRef(0);
-  const lastTimeRef = useRef(Date.now());
-  const timerRef = useRef(null);
-
-  useEffect(() => {
-    if (!enabled || !droneId) {
-      setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
-      setHasFrame(false);
-      setFeedDead(true);
-      setFps(0);
-      return;
-    }
-
-    let isSubscribed = true;
-    let abortCtrl = new AbortController();
-
-    const fetchFrame = async () => {
-      try {
-        const token = localStorage.getItem('dvas_token') || '';
-        const sep = endpoint.includes('?') ? '&' : '?';
-        const url = `/api${endpoint}${sep}drone_id=${encodeURIComponent(droneId)}&_t=${Date.now()}`;
-
-        const res = await fetch(url, {
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
-          signal: abortCtrl.signal,
-          credentials: 'include',
-        });
-
-        let activeRes = res;
-        if (!activeRes.ok && activeRes.status === 404) {
-          try {
-            const rawUrl = `/api/ingest-server/frame/${encodeURIComponent(droneId)}/latest?_t=${Date.now()}`;
-            const fallbackRes = await fetch(rawUrl, {
-              headers: token ? { Authorization: `Bearer ${token}` } : {},
-              signal: abortCtrl.signal,
-              credentials: 'include',
-            });
-            if (fallbackRes.ok) {
-              activeRes = fallbackRes;
-            }
-          } catch (e) {
-            // Ignore fallback errors
-          }
-        }
-
-        if (!activeRes.ok) {
-          if (isSubscribed) {
-            setFeedDead(true);
-            setHasFrame(false);
-          }
-          return;
-        }
-
-        const blob = await activeRes.blob();
-        if (blob.size === 0) return;
-
-        if (isSubscribed) {
-          const nextUrl = URL.createObjectURL(blob);
-          setBlobUrl(prev => {
-            if (prev) URL.revokeObjectURL(prev);
-            return nextUrl;
-          });
-          setHasFrame(true);
-          setFeedDead(false);
-
-          frameCountRef.current += 1;
-          const now = Date.now();
-          if (now - lastTimeRef.current >= 1000) {
-            setFps(Math.round((frameCountRef.current * 1000) / (now - lastTimeRef.current)));
-            frameCountRef.current = 0;
-            lastTimeRef.current = now;
-          }
-        }
-      } catch (err) {
-        if (err.name !== 'AbortError' && isSubscribed) {
-          setFeedDead(true);
-          setHasFrame(false);
-        }
-      }
-    };
-
-    fetchFrame();
-    timerRef.current = setInterval(fetchFrame, intervalMs);
-
-    return () => {
-      isSubscribed = false;
-      abortCtrl.abort();
-      if (timerRef.current) clearInterval(timerRef.current);
-      setBlobUrl(prev => {
-        if (prev) URL.revokeObjectURL(prev);
-        return null;
-      });
-    };
-  }, [endpoint, droneId, intervalMs, enabled]);
-
-  return { blobUrl, hasFrame, feedDead, fps };
-}
 
 /* ─── Main IntrusionAnalytics Component ───────────────────────────── */
 export default function IntrusionAnalytics({ activeDrone: initialDrone, drones = [], missions: initialMissions = [], user = {} }) {
@@ -167,6 +65,8 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
             status: s.status || 'live',
             isLive: true,
             frames_received: s.frames_received || s.frame_count || 0,
+            messages_ready: s.messages_ready ?? 0,
+            consumer_lag: s.consumer_lag || null,
           });
         }
       });
@@ -187,6 +87,8 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
             status: d.status || 'offline',
             isLive,
             frames_received: d.frames_received || d.frame_count || 0,
+            messages_ready: d.messages_ready ?? 0,
+            consumer_lag: d.consumer_lag || null,
           });
         }
       });
@@ -249,23 +151,74 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
     lastBreachTime: null,
   });
 
+  // ─── Initial historical events fetch when selected drone changes ───────
+  useEffect(() => {
+    if (!selectedDrone) return;
+    let cancelled = false;
+    api.get(`/analytics/intrusion/events?drone_id=${encodeURIComponent(selectedDrone)}&limit=25`)
+      .then(res => {
+        if (cancelled) return;
+        const events = res.data?.events || [];
+        if (events.length > 0) {
+          const items = events.map(e => ({
+            id: e.event_id || `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+            ts: e.ts || new Date().toISOString(),
+            trackId: e.track_id || 'N/A',
+            className: e.track_class || 'Target',
+            state: (e.state_to || e.state || 'INSIDE').toUpperCase(),
+            confidence: Number(e.confidence || 0.85),
+            dwell: Number(e.dwell_duration_s || 0),
+            latitude: e.latitude,
+            longitude: e.longitude,
+            snapshotKey: e.snapshot_key,
+          }));
+          setLiveAlerts(prev => {
+            const existingIds = new Set(prev.map(p => p.id));
+            const newFromDb = items.filter(it => !existingIds.has(it.id));
+            return [...prev, ...newFromDb].slice(0, 80);
+          });
+          setLiveStats(prev => ({
+            ...prev,
+            totalBreachesToday: Math.max(prev.totalBreachesToday, events.length),
+            lastBreachTime: events[0]?.ts || prev.lastBreachTime,
+          }));
+        }
+      })
+      .catch(() => {
+        // Silently ignore if events table is empty or error
+      });
+    return () => { cancelled = true; };
+  }, [selectedDrone]);
+
   const handleSSEEvent = useCallback((event) => {
     try {
-      const data = JSON.parse(event.data);
-      // Match intrusion stream events
-      if (data.stream === 'intrusion' || data.type === 'intrusion_alert' || data.state) {
+      // event is already a parsed JS object from useAnalyticsSSE, but handle both object and string
+      const raw = typeof event === 'string' ? JSON.parse(event) : event;
+      if (!raw) return;
+
+      const stream = raw.stream;
+      const payload = raw.payload || raw;
+
+      // Case 1: Confirmed intrusion event from drone:events:confirmed (or direct alert)
+      if (
+        payload.event_type === 'intrusion_alert' ||
+        payload.state_to ||
+        (payload.state && (stream === 'events' || stream === 'intrusion'))
+      ) {
         const item = {
-          id: Date.now() + Math.random().toString(36).substring(7),
-          ts: new Date().toISOString(),
-          trackId: data.track_id || data.id || 'N/A',
-          className: data.track_class || data.class_name || 'Target',
-          state: data.state || data.state_to || 'INSIDE',
-          confidence: data.confidence || 0.85,
-          dwell: data.dwell_duration_s || 0,
-          ...data,
+          id: payload.event_id || `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+          ts: payload.ts || new Date().toISOString(),
+          trackId: payload.track_id || payload.id || 'N/A',
+          className: payload.track_class || payload.class_name || payload.class || 'Target',
+          state: (payload.state_to || payload.state || 'INSIDE').toUpperCase(),
+          confidence: Number(payload.confidence || 0.85),
+          dwell: Number(payload.dwell_duration_s || payload.dwell || 0),
+          latitude: payload.latitude,
+          longitude: payload.longitude,
+          snapshotKey: payload.snapshot_key,
         };
 
-        setLiveAlerts(prev => [item, ...prev].slice(0, 80));
+        setLiveAlerts(prev => [item, ...prev.filter(x => x.id !== item.id)].slice(0, 80));
 
         setLiveStats(prev => {
           const isEntering = item.state === 'ENTERING' || item.state === 'INSIDE';
@@ -278,21 +231,52 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
             lastBreachTime: item.ts,
           };
         });
+        return;
+      }
+
+      // Case 2: Frame results from analytics:intrusion:results (stream === 'intrusion')
+      if (stream === 'intrusion') {
+        const breaches = Array.isArray(payload.active_breaches)
+          ? payload.active_breaches
+          : Array.isArray(payload.detections)
+          ? payload.detections.filter(d => d.is_intruding || (d.intrusion_state && d.intrusion_state !== 'OUTSIDE'))
+          : [];
+
+        if (breaches.length > 0) {
+          const newAlerts = breaches.map(b => ({
+            id: `live-${b.track_id}-${payload.frame_sequence || Math.floor(Date.now() / 2000)}`,
+            ts: payload.ts || new Date().toISOString(),
+            trackId: b.track_id,
+            className: b.class || b.track_class || 'Target',
+            state: (b.intrusion_state || b.state || 'INSIDE').toUpperCase(),
+            confidence: Number(b.confidence || 0.85),
+            dwell: Number(b.dwell_duration_s || 0),
+          }));
+
+          setLiveAlerts(prev => {
+            const existingIds = new Set(prev.map(p => p.id));
+            const toAdd = newAlerts.filter(a => !existingIds.has(a.id));
+            return toAdd.length > 0 ? [...toAdd, ...prev].slice(0, 80) : prev;
+          });
+        }
+
+        if (typeof payload.active_intrusions === 'number') {
+          setLiveStats(prev => ({
+            ...prev,
+            activeIntrusions: payload.active_intrusions,
+          }));
+        }
       }
     } catch (e) {
-      // Ignore non-JSON SSE heartbeats
+      console.warn('[IntrusionSSE] Error handling event:', e);
     }
   }, []);
 
   useAnalyticsSSE(handleSSEEvent, selectedDrone);
 
   // ─── Annotated Frame Poller ────────────────────────────────────────
-  const { blobUrl, hasFrame, feedDead, fps } = useJpegPoller(
-    '/analytics/intrusion/annotated',
-    selectedDrone,
-    800,
-    subTab === 'live'
-  );
+  const pollUrl = selectedDrone ? `/api/analytics/intrusion/annotated?drone_id=${encodeURIComponent(selectedDrone)}` : null;
+  const { blobUrl, hasFrame, feedDead, fps } = useJpegPoller(pollUrl, 800, subTab === 'live');
 
   // ─── Stream Control Actions ────────────────────────────────────────
   const [streamToggling, setStreamToggling] = useState(false);
@@ -595,6 +579,7 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
                   droneList.map(d => {
                     const isSelected = selectedDrone === d.id;
                     const isLive = d.isLive || d.status === 'live';
+                    const isDraining = d.status === 'draining';
                     return (
                       <button
                         key={d.id}
@@ -606,12 +591,19 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
                         }`}
                         title={`Drone: ${d.id}${d.mission_id ? ` · Mission: ${d.mission_id}` : ''}${isLive ? ' (Live Stream)' : ''}`}
                       >
-                        <span className={`w-1.5 h-1.5 rounded-full ${isLive ? 'bg-emerald-400 animate-pulse' : (isSelected ? 'bg-slate-950' : 'bg-slate-500')}`} />
+                        {isDraining ? (
+                          <span className={`w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse`} />
+                        ) : (
+                          <span className={`w-1.5 h-1.5 rounded-full ${isLive ? 'bg-emerald-400 animate-pulse' : (isSelected ? 'bg-slate-950' : 'bg-slate-500')}`} />
+                        )}
                         <span>{d.id}</span>
                         {d.mission_id && (
                           <span className={`text-[10px] px-1 py-0.2 rounded font-mono ${isSelected ? 'bg-slate-950/40 text-slate-900' : 'bg-slate-900 text-cyan-400'}`}>
                             {d.mission_id}
                           </span>
+                        )}
+                        {isDraining && (
+                          <span className="text-[8px] bg-amber-800/60 text-amber-300 px-1.5 py-0.5 rounded ml-1 font-bold">DRAINING</span>
                         )}
                       </button>
                     );
@@ -729,6 +721,33 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
                   </span>
                 </div>
               </div>
+
+              {(() => {
+                const selectedDroneObj = droneList.find(d => d.id === selectedDrone);
+                if (selectedDroneObj?.status === 'draining') {
+                  const remaining = selectedDroneObj.consumer_lag ? Object.values(selectedDroneObj.consumer_lag).reduce((sum, v) => sum + v, 0) : (selectedDroneObj.messages_ready ?? 0);
+                  return (
+                    <div className="px-4 py-1.5 bg-amber-900/40 border-b border-amber-500/20 flex items-center justify-center gap-2">
+                      {remaining > 0 ? (
+                        <>
+                          <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                          <span className="mono text-[10px] font-bold text-amber-300 tracking-wider">
+                            DRAINING — {remaining} frames remaining in queue
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                          <span className="mono text-[10px] font-bold text-emerald-400 tracking-wider">
+                            PROCESSING COMPLETE
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  );
+                }
+                return null;
+              })()}
 
               {/* Video Player Display */}
               <div className="relative bg-black flex items-center justify-center min-h-[420px] max-h-[560px] overflow-hidden">

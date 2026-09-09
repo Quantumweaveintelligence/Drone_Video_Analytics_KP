@@ -99,6 +99,59 @@ async def xread_frames(
     return new_last_id, frames
 
 
+async def xreadgroup_frames(group: str, consumer: str, drone_id: str,
+                            last_id: str = ">", count: int = 1, block_ms: int = 100):
+    """Read frames using consumer group. Returns list of (entry_id, fields) tuples."""
+    client = _get_raw_client()
+    stream_key = f"drone:frames:{drone_id}"
+    try:
+        result = await client.xreadgroup(
+            groupname=group, consumername=consumer,
+            streams={stream_key: last_id},
+            count=count, block=block_ms
+        )
+        if not result:
+            return []
+        
+        entries = result[0][1] if result else []
+        
+        # Decode entry_ids from raw client, and also decode field keys
+        decoded_entries = []
+        for entry_id, fields in entries:
+            eid = entry_id.decode() if isinstance(entry_id, bytes) else entry_id
+            decoded = {"entry_id": eid, "drone_id": drone_id}
+            for k, v in fields.items():
+                key = k.decode() if isinstance(k, bytes) else k
+                if key == "frame":
+                    continue
+                if isinstance(v, bytes):
+                    try:
+                        decoded[key] = v.decode("utf-8")
+                    except UnicodeDecodeError:
+                        continue
+                else:
+                    decoded[key] = v
+            decoded_entries.append((eid, decoded))
+            
+        return decoded_entries
+    except Exception as e:
+        if "NOGROUP" in str(e):
+            try:
+                await client.xgroup_create(stream_key, group, id="0", mkstream=True)
+            except Exception:
+                pass
+            return []
+        raise
+
+async def ack_frames(drone_id: str, group: str, *message_ids):
+    """Acknowledge processed frames in the consumer group."""
+    if not message_ids:
+        return
+    client = get_client()
+    stream_key = f"drone:frames:{drone_id}"
+    await client.xack(stream_key, group, *message_ids)
+
+
 async def publish_confirmed_event(event: Dict[str, Any]) -> None:
     """Publish a confirmed event to drone:events:confirmed stream."""
     client = get_client()

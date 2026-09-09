@@ -27,7 +27,7 @@ from shared.db import (
 )
 from shared.redis_client import (
     close_client, get_client, publish_analytics_result,
-    publish_confirmed_event, xread_frames,
+    publish_confirmed_event, xread_frames, xreadgroup_frames, ack_frames
 )
 from shared import minio_client as minio
 from crowd.analyzer import CrowdAnalyzer
@@ -198,18 +198,21 @@ async def _stream_loop():
             if drone_id not in last_ids:
                 last_ids[drone_id] = "0"
             try:
-                new_id, frames = await xread_frames(
-                    drone_id, last_ids[drone_id], count=4, block_ms=100
+                frames = await xreadgroup_frames(
+                    "analytics", "crowd-analyzer", drone_id, ">", count=4, block_ms=100
                 )
-                last_ids[drone_id] = new_id
-                for f in frames:
+                
+                processed_ids = []
+                for entry_id, f in frames:
                     raw = f.get("jpeg_b64", "")
                     if not raw:
+                        processed_ids.append(entry_id)
                         continue
                     img_bytes = base64.b64decode(raw)
                     nparr = np.frombuffer(img_bytes, np.uint8)
                     frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     if frame is None:
+                        processed_ids.append(entry_id)
                         continue
 
                     # Run inference in worker thread pool so FastAPI event loop is never blocked
@@ -259,6 +262,10 @@ async def _stream_loop():
                                   if k not in ("heatmap_b64", "peak_frame")}
                     await publish_analytics_result("crowd", sse_result)
                     _frames_processed += 1
+                    processed_ids.append(entry_id)
+
+                if processed_ids:
+                    await ack_frames(drone_id, "analytics", *processed_ids)
 
             except asyncio.CancelledError:
                 return

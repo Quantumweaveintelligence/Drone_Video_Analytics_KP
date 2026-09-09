@@ -139,9 +139,46 @@ class QueueManager:
             await self._client.xdel(key, eid)
         except Exception:
             pass   # stream may already exist
+            
+        await self.ensure_consumer_group(drone_id)
+            
         if drone_id not in self._stats:
             self._stats[drone_id] = DroneQueueStats(drone_id=drone_id)
         log.debug("stream_declared key=%s maxlen=%d", key, QUEUE_MAX_LEN)
+
+    async def ensure_consumer_group(self, drone_id: str, group_name: str = "analytics"):
+        """Create consumer group if it doesn't exist. Called on stream creation."""
+        stream_key = f"drone:frames:{drone_id}"
+        try:
+            await self._client.xgroup_create(stream_key, group_name, id="0", mkstream=True)
+        except Exception as e:
+            if "BUSYGROUP" not in str(e):
+                log.warning(f"Consumer group create error for {drone_id}: {e}")
+
+    async def get_consumer_lag(self, drone_id: str) -> dict:
+        """Returns {consumer_name: pending_count} for all registered consumers."""
+        stream_key = f"drone:frames:{drone_id}"
+        try:
+            info = await self._client.xinfo_groups(stream_key)
+            return {g.get("name", "unknown"): g.get("pending", 0) for g in info}
+        except Exception:
+            return {}
+
+    async def is_fully_consumed(self, drone_id: str) -> bool:
+        """True when all consumers in the 'analytics' group have ACKed all entries."""
+        stream_key = f"drone:frames:{drone_id}"
+        try:
+            groups = await self._client.xinfo_groups(stream_key)
+            if not groups:
+                return True
+            for g in groups:
+                pending = g.get("pending", 0)
+                lag = g.get("lag", 0)
+                if pending > 0 or lag > 0:
+                    return False
+            return True
+        except Exception:
+            return False
 
     # ── Frame publishing ──────────────────────────────────────────────────────
 

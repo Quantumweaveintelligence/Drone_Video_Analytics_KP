@@ -190,7 +190,8 @@ class _WSManager:
 ws_manager = _WSManager()
 
 # ── Active missions tracker ───────────────────────────────────────────────────
-_active_missions: dict[str, dict] = {}   # drone_id → {mission_id, started_at, operator}
+_active_missions: dict[str, dict] = {}
+_drain_tasks: dict = {}   # drone_id → {mission_id, started_at, operator}
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -205,6 +206,7 @@ async def lifespan(app: FastAPI):
         await _qm.connect()
         for did in KNOWN_DRONES:
             await _qm.declare_drone_queue(did)
+        asyncio.create_task(_auto_cleanup_consumed_streams())
         log.info("ingest_server_ready — redis_streams_declared", extra={"drones": len(KNOWN_DRONES)})
 
         # Restore saved geofences from disk to Redis on startup
@@ -230,6 +232,40 @@ async def lifespan(app: FastAPI):
                             pass
         except Exception as geofence_restore_err:
             log.warning("geofence_startup_restore_warning", extra={"error": str(geofence_restore_err)})
+
+        # Restore active missions from Valkey
+        try:
+            valkey = getattr(_qm, "_client", None) or getattr(_qm, "_redis", None)
+            if valkey:
+                cursor = 0
+                while True:
+                    cursor, keys = await valkey.scan(cursor, match="mission:active:*", count=100)
+                    for key in keys:
+                        data = await valkey.hgetall(key)
+                        if not data:
+                            continue
+                        decoded = {}
+                        for k, v in data.items():
+                            k_str = k.decode() if isinstance(k, bytes) else k
+                            v_str = v.decode() if isinstance(v, bytes) else v
+                            decoded[k_str] = v_str
+                        key_str = key.decode() if isinstance(key, bytes) else key
+                        drone_id = key_str.split(":")[-1]
+                        _active_missions[drone_id] = decoded
+                        
+                        _latest_metadata.setdefault(drone_id, {}).update({
+                            "mission_id": decoded.get("mission_id"),
+                            "mission_name": decoded.get("mission_name"),
+                            "operator": decoded.get("operator"),
+                            "location": decoded.get("location"),
+                            "mission_status": decoded.get("status", "active"),
+                        })
+                        log.info(f"[RECOVERY] Restored mission for {drone_id}: {decoded.get('mission_id')}")
+                    if cursor == 0:
+                        break
+        except Exception as e:
+            log.warning(f"Failed to restore missions from Valkey: {e}")
+
     except Exception as exc:
         log.error("startup_redis_connect_failed", extra={"error": str(exc)})
         # Continue anyway — will reconnect on first frame
@@ -599,6 +635,12 @@ async def mission_start(
     Registers a new mission for a drone. Publishes a `mission_start` event
     to the `drone.events.confirmed` queue and broadcasts to WS clients.
     """
+    # Cancel any pending drain from a previous mission on the same drone
+    if req.drone_id in _drain_tasks:
+        old_task = _drain_tasks.pop(req.drone_id)
+        old_task.cancel()
+        log.info(f"[MISSION-START] Cancelled pending drain for {req.drone_id} (new mission starting)")
+
     ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
 
     # Reset ingest statistics for the new mission
@@ -615,6 +657,20 @@ async def mission_start(
         "longitude":   req.longitude,
         "geofence":    req.geofence,
     }
+
+    try:
+        valkey = getattr(_qm, "_client", None) or getattr(_qm, "_redis", None)
+        if valkey:
+            await valkey.hset(f"mission:active:{req.drone_id}", mapping={
+                "mission_id": str(req.mission_id),
+                "mission_name": str(req.mission_name or ""),
+                "operator": str(req.operator or extract_username(claims) or ""),
+                "location": str(req.location or ""),
+                "status": "active",
+                "started_at": ts
+            })
+    except Exception as e:
+        log.warning(f"Failed to persist mission to Valkey: {e}")
 
     # Persist geofence to disk and Redis if provided
     if req.geofence:
@@ -760,41 +816,75 @@ async def update_mission_geofence(
     return {"status": "updated", "drone_id": req.drone_id, "mission_id": req.mission_id}
 
 
-async def _monitor_queue_drain(drone_id: str, mission_id: str, max_wait_sec: float = 30.0) -> None:
+async def _auto_cleanup_consumed_streams():
+    """Periodically check for fully-consumed draining streams and auto-clean."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            for drone_id in list(_active_missions.keys()):
+                mission = _active_missions[drone_id]
+                if mission.get("status") != "draining":
+                    continue
+                if await _qm.is_fully_consumed(drone_id):
+                    log.info(f"[AUTO-CLEANUP] {drone_id}: Fully consumed — purging")
+                    await _qm.purge_stream(drone_id)
+                    try:
+                        valkey = getattr(_qm, "_client", None) or getattr(_qm, "_redis", None)
+                        if valkey:
+                            await valkey.delete(f"mission:active:{drone_id}")
+                    except Exception as e:
+                        log.warning(f"Failed to clean mission from Valkey: {e}")
+                    mid = mission.get("mission_id", "unknown")
+                    _active_missions.pop(drone_id, None)
+                    for key in ("mission_id", "mission_name", "operator", "location", "mission_status", "drain_started_at"):
+                        _latest_metadata.get(drone_id, {}).pop(key, None)
+                    await ws_manager.broadcast({"event": "mission_drained", "drone_id": drone_id, "mission_id": mid})
+        except Exception as e:
+            log.warning(f"[AUTO-CLEANUP] Error: {e}")
+
+async def _monitor_queue_drain(drone_id: str, mission_id: str, max_wait_sec: float = 300.0):
     """
-    Background worker that monitors the per-drone queue after mission_end.
-    Allows consumer analytics services to process remaining buffered frames.
-    Once queue depth reaches 0 (or timeout expires), the stream is purged from Valkey.
+    Consumer-group-aware drain. Waits until all analytics consumers have ACKed
+    all pending entries, OR until max_wait_sec (5 min).
+    Does NOT auto-purge on timeout — stream preserved for manual officer purge.
     """
-    t_start = time.monotonic()
-    log.info("queue_drain_started", extra={"drone_id": drone_id, "mission_id": mission_id})
-    while time.monotonic() - t_start < max_wait_sec:
-        await asyncio.sleep(1.0)
-        depth = await _qm.get_queue_depth(drone_id) if _qm else 0
-        if depth == 0:
-            log.info("queue_drain_complete", extra={"drone_id": drone_id, "mission_id": mission_id})
-            break
+    start = time.monotonic()
+    while (time.monotonic() - start) < max_wait_sec:
+        try:
+            if await _qm.is_fully_consumed(drone_id):
+                current_mission = _active_missions.get(drone_id, {})
+                if current_mission.get("mission_id") != mission_id:
+                    log.info(f"[DRAIN] {drone_id}: Mission {mission_id} superseded by {current_mission.get('mission_id')} — aborting drain cleanup")
+                    _drain_tasks.pop(drone_id, None)
+                    return
 
-    # Final cleanup — purge ephemeral stream from Valkey
-    if _qm:
-        await _qm.purge_stream(drone_id)
-        _qm.end_mission(drone_id, mission_id)
-
-    _active_missions.pop(drone_id, None)
-    if drone_id in _latest_metadata:
-        _latest_metadata[drone_id].pop("mission_id", None)
-        _latest_metadata[drone_id].pop("mission_name", None)
-        _latest_metadata[drone_id].pop("operator", None)
-        _latest_metadata[drone_id].pop("location", None)
-
-    ACTIVE_MISSIONS.set(len(_active_missions))
-    await ws_manager.broadcast({
-        "event":       "mission_drained",
-        "drone_id":    drone_id,
-        "mission_id":  mission_id,
-        "timestamp":   time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-    })
-
+                log.info(f"[DRAIN] {drone_id}/{mission_id}: All consumers finished — auto-cleaning")
+                await _qm.purge_stream(drone_id)
+                try:
+                    valkey = getattr(_qm, "_client", None) or getattr(_qm, "_redis", None)
+                    if valkey:
+                        await valkey.delete(f"mission:active:{drone_id}")
+                except Exception as e:
+                    log.warning(f"Failed to clean mission from Valkey: {e}")
+                _active_missions.pop(drone_id, None)
+                for key in ("mission_id", "mission_name", "operator", "location", "mission_status", "drain_started_at"):
+                    _latest_metadata.get(drone_id, {}).pop(key, None)
+                await ws_manager.broadcast({
+                    "event": "mission_drained",
+                    "drone_id": drone_id,
+                    "mission_id": mission_id
+                })
+                _drain_tasks.pop(drone_id, None)
+                return
+        except asyncio.CancelledError:
+            log.info(f"[DRAIN] {drone_id}/{mission_id}: Drain cancelled (new mission started?)")
+            _drain_tasks.pop(drone_id, None)
+            return
+        except Exception as e:
+            log.warning(f"[DRAIN] {drone_id}: Error checking consumer lag: {e}")
+        await asyncio.sleep(2.0)
+    log.warning(f"[DRAIN] {drone_id}/{mission_id}: Drain timeout after {max_wait_sec}s — stream preserved for manual purge")
+    _drain_tasks.pop(drone_id, None)
 
 @app.post(
     "/ingest/mission/end",
@@ -817,7 +907,20 @@ async def mission_end(
     if req.drone_id in _active_missions:
         _active_missions[req.drone_id]["status"] = "draining"
 
-    asyncio.create_task(_monitor_queue_drain(req.drone_id, req.mission_id))
+    try:
+        valkey = getattr(_qm, "_client", None) or getattr(_qm, "_redis", None)
+        if valkey:
+            await valkey.hset(f"mission:active:{req.drone_id}", "status", "draining")
+    except Exception as e:
+        log.warning(f"Failed to update mission status in Valkey: {e}")
+    
+    if req.drone_id in _latest_metadata:
+        _latest_metadata[req.drone_id]["mission_status"] = "draining"
+        _latest_metadata[req.drone_id]["drain_started_at"] = ts
+
+    if req.drone_id in _drain_tasks:
+        _drain_tasks[req.drone_id].cancel()
+    _drain_tasks[req.drone_id] = asyncio.create_task(_monitor_queue_drain(req.drone_id, req.mission_id))
 
     await _publish_event("mission_end", req.drone_id, {
         "mission_id":  req.mission_id,
@@ -1046,6 +1149,12 @@ async def purge_drone_stream(
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Queue unavailable")
     
     await _qm.purge_stream(drone_id)
+    try:
+        valkey = getattr(_qm, "_client", None) or getattr(_qm, "_redis", None)
+        if valkey:
+            await valkey.delete(f"mission:active:{drone_id}")
+    except Exception as e:
+        log.warning(f"Failed to clean mission from Valkey: {e}")
     _qm.end_mission(drone_id, "")
     _active_missions.pop(drone_id, None)
     if drone_id in _latest_metadata:

@@ -27,6 +27,7 @@ import {
   useCrowdModel, useAnalyticsSSE, switchCrowdModel, useCrowdHealth,
 } from '../lib/useAnalytics';
 import { useActiveStreams } from '../hooks/useActiveStreams';
+import { useJpegPoller } from '../hooks/useJpegPoller';
 import { api } from '../lib/api';
 
 /* ───────────────────────────────────────────────────────────────
@@ -97,91 +98,7 @@ function fmtDuration(seconds) {
    useJpegPoller — EXACT copy from PersonTrackingAnalytics.js
    with added meta (X-Crowd-Count header extraction)
    ────────────────────────────────────────────────────────────── */
-function useJpegPoller(url, intervalMs, enabled) {
-  const [blobUrl, setBlobUrl] = useState(null);
-  const [ok, setOk] = useState(false);
-  const [meta, setMeta] = useState({});
-  const tickRef = useRef(null);
-  const errRef = useRef(0);
-  const feedDeadRef = useRef(false);
 
-  const doFetch = useCallback(async () => {
-    if (!enabled || !url) return;
-    try {
-      const token = localStorage.getItem('dvas_token') || '';
-      const sep = url.includes('?') ? '&' : '?';
-      const res = await fetch(`${url}${sep}_t=${Date.now()}`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-        credentials: 'include',
-      });
-      if (res.ok) {
-        const blob = await res.blob();
-        const next = URL.createObjectURL(blob);
-        setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return next; });
-        setOk(true);
-        errRef.current = 0;
-        feedDeadRef.current = false;
-
-        // Extract crowd-count metadata from response headers
-        const crowdCount = res.headers.get('X-Crowd-Count');
-        const densityLabel = res.headers.get('X-Density-Label');
-        const droneId = res.headers.get('X-Drone-ID');
-        if (crowdCount != null) {
-          const parsed = parseFloat(crowdCount);
-          if (!isNaN(parsed)) {
-            setMeta({
-              crowdCount: parsed,
-              densityLabel: densityLabel || '',
-              droneId: droneId || '',
-              _ts: Date.now(),
-            });
-          }
-        }
-      } else if (res.status === 404) {
-        // Feed is offline — immediately invalidate and mark dead
-        setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
-        setOk(false);
-        feedDeadRef.current = true;
-      } else {
-        errRef.current++;
-        if (errRef.current > 3) setOk(false);
-      }
-    } catch {
-      errRef.current++;
-      if (errRef.current > 3) setOk(false);
-    }
-  }, [url, enabled]);
-
-  useEffect(() => {
-    if (!enabled) {
-      setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
-      setOk(false);
-      setMeta({});
-      errRef.current = 0;
-      feedDeadRef.current = false;
-      return;
-    }
-    errRef.current = 0;
-    feedDeadRef.current = false;
-    doFetch();
-    tickRef.current = setInterval(() => {
-      if (feedDeadRef.current) return;
-      doFetch();
-    }, intervalMs);
-
-    const slowRetry = setInterval(() => {
-      if (feedDeadRef.current) doFetch();
-    }, 10000);
-
-    return () => {
-      clearInterval(tickRef.current);
-      clearInterval(slowRetry);
-      setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
-    };
-  }, [enabled, url, intervalMs]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  return { blobUrl, ok, meta };
-}
 
 /* ───────────────────────────────────────────────────────────────
    PANEL WRAPPER
@@ -343,20 +260,29 @@ function LiveFeedSection({
         {/* Dynamic drone selector pills */}
         <div className="flex items-center gap-1 ml-2 flex-wrap">
           {droneList.length > 0 ? (
-            droneList.map(d => (
-              <button
-                key={d.id}
-                onClick={() => setActiveDrone(d.id)}
-                className="mono text-[10px] px-2.5 py-1 rounded transition-all font-semibold"
-                style={{
-                  background: activeDrone === d.id ? 'rgba(56,189,248,0.15)' : 'var(--dvas-surface-2)',
-                  color: activeDrone === d.id ? '#38bdf8' : 'var(--dvas-text-muted)',
-                  border: `1px solid ${activeDrone === d.id ? 'rgba(56,189,248,0.35)' : 'var(--dvas-border)'}`,
-                }}
-              >
-                {d.id}
-              </button>
-            ))
+            droneList.map(d => {
+              const isDraining = d.status === 'draining';
+              return (
+                <button
+                  key={d.id}
+                  onClick={() => setActiveDrone(d.id)}
+                  className="mono text-[10px] px-2.5 py-1 rounded transition-all font-semibold flex items-center gap-1"
+                  style={{
+                    background: activeDrone === d.id ? 'rgba(56,189,248,0.15)' : 'var(--dvas-surface-2)',
+                    color: activeDrone === d.id ? '#38bdf8' : 'var(--dvas-text-muted)',
+                    border: `1px solid ${activeDrone === d.id ? 'rgba(56,189,248,0.35)' : 'var(--dvas-border)'}`,
+                  }}
+                >
+                  {isDraining && (
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400 dvas-live-dot shrink-0" />
+                  )}
+                  {d.id}
+                  {isDraining && (
+                    <span className="text-[8px] bg-amber-800/60 text-amber-300 px-1.5 py-0.5 rounded ml-1 font-bold">DRAINING</span>
+                  )}
+                </button>
+              )
+            })
           ) : (
             <span className="mono text-[10px] text-slate-500 italic">No active drone streams</span>
           )}
@@ -401,6 +327,33 @@ function LiveFeedSection({
           </div>
         )}
       </div>
+
+      {(() => {
+        const selectedDroneObj = droneList.find(d => d.id === activeDrone);
+        if (selectedDroneObj?.status === 'draining') {
+          const remaining = selectedDroneObj.consumer_lag ? Object.values(selectedDroneObj.consumer_lag).reduce((sum, v) => sum + v, 0) : (selectedDroneObj.messages_ready ?? 0);
+          return (
+            <div className="px-4 py-1.5 bg-amber-900/40 border-b border-amber-500/20 flex items-center justify-center gap-2">
+              {remaining > 0 ? (
+                <>
+                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                  <span className="mono text-[10px] font-bold text-amber-300 tracking-wider">
+                    DRAINING — {remaining} frames remaining in queue
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                  <span className="mono text-[10px] font-bold text-emerald-400 tracking-wider">
+                    PROCESSING COMPLETE
+                  </span>
+                </>
+              )}
+            </div>
+          );
+        }
+        return null;
+      })()}
 
       {/* Video viewport */}
       <div className="relative bg-black flex items-center justify-center" style={{ height: 420 }}>

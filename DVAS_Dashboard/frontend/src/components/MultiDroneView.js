@@ -6,7 +6,7 @@
  * ─────────────────────────────────────────────────────────
  */
 
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { API } from "@/lib/api";
 import {
   Radio,
@@ -42,10 +42,12 @@ import {
   User as UserIcon,
   RefreshCw,
   Trash2,
+  Check,
 } from "lucide-react";
 
 
 import { useActiveStreams } from "@/hooks/useActiveStreams";
+import { useJpegPoller } from "@/hooks/useJpegPoller";
 
 /* ─────────────────────────────────────────────
    STATIC / FALLBACK DATA
@@ -288,64 +290,9 @@ function SignalBars({ strength }) {
    so live frames load reliably with or without cookie support.
    ───────────────────────────────────────────── */
 
-const FEED_BACKOFF = [500, 1000, 2000, 4000, 8000, 16000, 30000];
-const FEED_WATCHDOG_MS = 6000;
-
 function useDroneFeed(droneId, disabled, intervalMs = 700) {
-  const [blobUrl,  setBlobUrl]  = useState(null);
-  const [hasFrame, setHasFrame] = useState(false);
-  const [feedDead, setFeedDead] = useState(false);
-  const timerRef    = useRef(null);
-  const watchRef    = useRef(null);
-  const errRef      = useRef(0);
-  const prevRef     = useRef(null);
-  const mountedRef  = useRef(true);
-
-  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; clearTimeout(timerRef.current); clearTimeout(watchRef.current); if (prevRef.current) URL.revokeObjectURL(prevRef.current); }; }, []);
-
-  useEffect(() => {
-    clearTimeout(timerRef.current); clearTimeout(watchRef.current);
-    if (prevRef.current) { URL.revokeObjectURL(prevRef.current); prevRef.current = null; }
-    errRef.current = 0; setBlobUrl(null); setHasFrame(false); setFeedDead(!!disabled);
-    if (disabled) return;
-
-    const schedule = (d) => { if (mountedRef.current) timerRef.current = setTimeout(doFetch, d); };
-    const doFetch = async () => {
-      if (!mountedRef.current) return;
-      const token = localStorage.getItem("dvas_token") || "";
-      const url = `${API}/ingest-server/frame/${encodeURIComponent(droneId)}/latest?_t=${Date.now()}`;
-      try {
-        const res = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {}, credentials: "include" });
-        if (!mountedRef.current) return;
-        if (res.ok) {
-          const next = URL.createObjectURL(await res.blob());
-          setBlobUrl((prev) => {
-            if (prev) URL.revokeObjectURL(prev);
-            return next;
-          });
-          setHasFrame(true); setFeedDead(false); errRef.current = 0;
-          clearTimeout(watchRef.current);
-          watchRef.current = setTimeout(() => { if (mountedRef.current) setFeedDead(true); }, FEED_WATCHDOG_MS);
-          schedule(intervalMs);
-        } else if (res.status === 404) {
-          // Stream is offline or drained — immediately invalidate stale frame
-          setBlobUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return null; });
-          setHasFrame(false);
-          setFeedDead(true);
-          errRef.current = 7;
-          schedule(5000);
-        } else { throw new Error(`HTTP ${res.status}`); }
-      } catch {
-        if (!mountedRef.current) return;
-        errRef.current++; if (errRef.current > 3) setFeedDead(true);
-        schedule(FEED_BACKOFF[Math.min(errRef.current - 1, FEED_BACKOFF.length - 1)]);
-      }
-    };
-    doFetch();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [droneId, disabled, intervalMs]);
-
-  return { blobUrl, hasFrame, feedDead };
+  const url = `${API}/ingest-server/frame/${encodeURIComponent(droneId)}/latest`;
+  return useJpegPoller(url, intervalMs, !disabled);
 }
 
 function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge }) {
@@ -470,23 +417,32 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge }) {
         </div>
 
         {/* Top-right: Status pill + streaming dot + Purge button */}
-        <div className="absolute top-3 right-3 z-10 flex items-center gap-1.5">
-          {(drone.status === "draining" || (drone.messages_ready && drone.messages_ready > 0)) && (
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onPurge?.(drone.id);
-              }}
-              title="Delete stream and discard remaining queue immediately"
-              className="mono text-[9px] px-1.5 py-0.5 rounded flex items-center gap-1 transition-all bg-red-500/20 text-red-400 border border-red-500/40 hover:bg-red-500/30"
-            >
-              <Trash2 size={9} /> Purge
-            </button>
+        <div className="absolute top-3 right-3 z-10 flex flex-col items-end gap-1.5">
+          <div className="flex items-center gap-1.5">
+            {(drone.status === "draining" || (drone.messages_ready && drone.messages_ready > 0)) && (
+              // TODO: restrict to senior_officer/system_administrator
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onPurge?.(drone.id);
+                }}
+                title="Delete stream and discard remaining queue immediately"
+                className="mono text-[9px] px-1.5 py-0.5 rounded flex items-center gap-1 transition-all bg-red-500/20 text-red-400 border border-red-500/40 hover:bg-red-500/30"
+              >
+                <Trash2 size={9} /> Purge
+              </button>
+            )}
+            {hasFrame && !feedDead && !isOffline && (
+              <span className="w-2 h-2 rounded-full bg-teal-400" style={{ animation: "pulse 1.2s infinite" }} />
+            )}
+            <StatusPill status={isOffline ? "offline" : feedDead ? "offline" : drone.status} />
+          </div>
+          {drone.status === "draining" && (
+            <span className="text-[10px] bg-amber-900/60 text-amber-300 px-2 py-0.5 rounded-full flex items-center gap-1 font-bold">
+              <Clock className="w-2.5 h-2.5" />
+              {drone.consumer_lag ? Object.values(drone.consumer_lag).reduce((sum, v) => sum + v, 0) : (drone.messages_ready ?? 0)} frames
+            </span>
           )}
-          {hasFrame && !feedDead && !isOffline && (
-            <span className="w-2 h-2 rounded-full bg-teal-400" style={{ animation: "pulse 1.2s infinite" }} />
-          )}
-          <StatusPill status={isOffline ? "offline" : feedDead ? "offline" : drone.status} />
         </div>
 
 
@@ -1108,10 +1064,11 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
   // Start with DB drones (from Postgres, telemetry-pumped)
   // Then merge with real ingest streams (adds missing drones, enriches existing ones)
   const baseList = liveDrones && liveDrones.length > 0 ? liveDrones : [];
-  let merged   = mergeWithDrones(baseList);
+  let merged   = useMemo(() => mergeWithDrones(baseList), [streams, baseList, mergeWithDrones]);
 
   // Filter to active streaming or draining drones
-  merged = merged.filter(d => d.status === "live" || d.status === "degraded" || d.status === "draining" || (d.messages_ready ?? 0) > 0);
+  const [purgedDrones, setPurgedDrones] = useState(new Set());
+  merged = merged.filter(d => (d.status === "live" || d.status === "degraded" || d.status === "draining" || (d.messages_ready ?? 0) > 0) && !purgedDrones.has(d.id));
 
   const drones = merged.sort((a, b) => {
     const ord = { live: 0, degraded: 1, draining: 2, offline: 3 };
@@ -1136,15 +1093,22 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
   const [selectedDroneId, setSelectedDroneId] = useState(null);
   const [playingEvent, setPlayingEvent] = useState(null);
   const [galleryType, setGalleryType] = useState(null); // 'persons' | 'faces' | null
+  const [purgeConfirm, setPurgeConfirm] = useState(null);
+  const [toast, setToast] = useState(null);
 
   const handlePurgeStream = useCallback(async (droneId) => {
     try {
       const token = localStorage.getItem("dvas_token") || "";
-      await fetch(`${API}/ingest-server/streams/${encodeURIComponent(droneId)}/purge`, {
+      const res = await fetch(`${API}/ingest-server/streams/${encodeURIComponent(droneId)}/purge`, {
         method: "POST",
         headers: token ? { Authorization: `Bearer ${token}` } : {},
         credentials: "include",
       });
+      if (res.ok) {
+        setPurgedDrones(prev => new Set(prev).add(droneId));
+        setToast(`Stream purged for ${droneId}`);
+        setTimeout(() => setToast(null), 4000);
+      }
     } catch (e) {
       console.error("Failed to purge stream", e);
     }
@@ -1193,7 +1157,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
                   isSelected={isSelected}
                   hasSelection={!!selectedDroneId}
                   onSelect={setSelectedDroneId}
-                  onPurge={handlePurgeStream}
+                  onPurge={setPurgeConfirm}
                 />
               </div>
             );
@@ -1367,6 +1331,41 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* ── Purge Confirmation Modal ── */}
+      {purgeConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+          <div className="bg-gray-900 border border-red-800/50 rounded-xl p-6 max-w-md mx-4 shadow-2xl">
+            <div className="flex items-center gap-3 mb-4">
+              <AlertTriangle className="w-6 h-6 text-red-400" />
+              <h3 className="text-lg font-semibold text-white">Purge Stream</h3>
+            </div>
+            <p className="text-gray-300 text-sm mb-2">
+              This will permanently delete all queued frames for drone <span className="font-mono text-amber-300">{purgeConfirm}</span>.
+            </p>
+            <p className="text-gray-400 text-xs mb-6">
+              Any unprocessed analytics data will be lost. This action cannot be undone.
+            </p>
+            <div className="flex justify-end gap-3">
+              <button onClick={() => setPurgeConfirm(null)}
+                className="px-4 py-2 text-sm text-gray-400 hover:text-white transition-colors">
+                Cancel
+              </button>
+              <button onClick={() => { handlePurgeStream(purgeConfirm); setPurgeConfirm(null); }}
+                className="px-4 py-2 text-sm bg-red-600 hover:bg-red-500 text-white rounded-lg transition-colors">
+                Purge Stream
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Toast Notification ── */}
+      {toast && (
+        <div className="fixed bottom-6 right-6 z-[100] bg-emerald-900/90 border border-emerald-600/40 text-emerald-200 px-4 py-3 rounded-lg shadow-xl text-sm flex items-center gap-2 animate-fade-in">
+          <Check className="w-4 h-4" /> {toast}
         </div>
       )}
 

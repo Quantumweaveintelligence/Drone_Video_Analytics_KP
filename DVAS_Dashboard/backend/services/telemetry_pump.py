@@ -12,6 +12,9 @@ from core.config import INGEST_URL
 
 logger = logging.getLogger(__name__)
 
+_offline_countdown: dict = {}  # drone_id -> remaining polls before offline
+_GRACE_POLLS = 3  # Wait 3 polls (9 seconds) before marking offline
+
 
 async def _telemetry_pump():
     """Background broadcaster: pushes drone telemetry + occasional new alerts to all clients.
@@ -45,18 +48,33 @@ async def _telemetry_pump():
                 if svc_token:
                     headers["Authorization"] = f"Bearer {svc_token}"
 
-                async with _httpx.AsyncClient(timeout=2.0) as client:
-                    resp = await client.get(f"{INGEST_URL_local}/ingest/telemetry", headers=headers)
+                async with _httpx.AsyncClient(timeout=3.0) as client:
+                    resp = await client.get(f"{INGEST_URL_local}/ingest/streams/active", headers=headers, timeout=3.0)
                     if resp.status_code == 200:
                         data = resp.json()
-                        for d in data.get("drones", []):
-                            real_drones[d["drone_id"]] = d
+                        streams = data if isinstance(data, list) else data.get("drones", [])
+                        for s in streams:
+                            did = s.get("drone_id", "")
+                            if not did:
+                                continue
+                            real_drones[did] = s
+                    else:
+                        resp = await client.get(f"{INGEST_URL_local}/ingest/telemetry", headers=headers, timeout=2.0)
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            for d in data.get("drones", []):
+                                real_drones[d["drone_id"]] = d
             except Exception as te:
                 logger.debug("Could not fetch ingest telemetry: %s", te)
+
+            if not real_drones:
+                logger.warning("Telemetry poll returned empty — skipping stale detection this cycle")
+                continue
 
             # ── 2. Upsert real drones into the DB ──────────────────────────────
             async with async_session_factory() as session:
                 for drone_id, telem in real_drones.items():
+                    _offline_countdown.pop(drone_id, None)  # Clear any pending countdown
                     lat = telem.get("latitude")
                     lng = telem.get("longitude")
                     if lat is None or lng is None:
@@ -65,19 +83,44 @@ async def _telemetry_pump():
                     battery = telem.get("battery_pct") if telem.get("battery_pct") is not None else 85.0
                     altitude = telem.get("altitude_m") if telem.get("altitude_m") is not None else 120.0
                     speed_mps = telem.get("speed_mps") or 0.0
-                    # If mission_id is absent, the drone is not actively on a mission
-                    # and should be considered offline for the dashboard.
                     mission_id = telem.get("mission_id")
                     mission_name = telem.get("mission_name")
                     operator_name = telem.get("operator")
                     jurisdiction = telem.get("location")
-                    drone_status = "live" if mission_id else "offline"
+                    
+                    if mission_id:
+                        drone_status = "live"
+                    elif telem.get("mission_status") == "draining":
+                        drone_status = "draining"
+                    else:
+                        drone_status = "offline"
 
                     # Check if drone already exists in DB
                     result = await session.execute(
                         select(Drone).where(Drone.id == drone_id)
                     )
                     existing = result.scalar_one_or_none()
+                    old_status = existing.status if existing else "offline"
+                    
+                    import json
+                    if drone_status == "draining" and old_status != "draining":
+                        await hub.broadcast(
+                            {
+                                "type": "drone_draining", 
+                                "drone_id": drone_id,
+                                "mission_id": telem.get("mission_id"),
+                                "ts": datetime.now(timezone.utc).isoformat()
+                            }
+                        )
+                    if drone_status == "offline" and old_status in ("live", "draining"):
+                        await hub.broadcast(
+                            {
+                                "type": "drone_offline",
+                                "drone_id": drone_id, 
+                                "ts": datetime.now(timezone.utc).isoformat()
+                            }
+                        )
+
                     if existing:
                         await session.execute(
                             update(Drone)
@@ -121,15 +164,28 @@ async def _telemetry_pump():
                     stale_stmt = stale_stmt.where(Drone.id.not_in(list(real_drones.keys())))
                 stale_result = await session.execute(stale_stmt)
                 stale_drones = stale_result.scalars().all()
+                commit_needed = False
                 for sd in stale_drones:
-                    sd.status = "offline"
-                if stale_drones:
+                    drone_id = sd.id
+                    if drone_id not in _offline_countdown:
+                        _offline_countdown[drone_id] = _GRACE_POLLS
+                        logger.debug(f"[GRACE] {drone_id}: Starting offline countdown ({_GRACE_POLLS} polls remaining)")
+                    else:
+                        _offline_countdown[drone_id] -= 1
+                        if _offline_countdown[drone_id] <= 0:
+                            sd.status = "offline"
+                            del _offline_countdown[drone_id]
+                            logger.info(f"[GRACE] {drone_id}: Grace period expired — marking offline")
+                            commit_needed = True
+                        else:
+                            logger.debug(f"[GRACE] {drone_id}: {_offline_countdown[drone_id]} polls remaining")
+                if commit_needed:
                     await session.commit()
 
             # ── 4. Broadcast live telemetry for real active drones ───────────────
             updates = []
             for drone_id, telem in real_drones.items():
-                if not telem.get("mission_id"):
+                if not telem.get("mission_id") and telem.get("mission_status") != "draining":
                     continue
                 updates.append({
                     "id": drone_id,
@@ -168,9 +224,9 @@ async def _telemetry_pump():
                 d = random.choice(active_mission_drones)
                 a = {
                     "id": f"A-{uuid.uuid4().hex[:8].upper()}",
-                    "mission_id": d.mission_id,
-                    "jurisdiction": d.jurisdiction,
-                    "drone_id": d.id,
+                    "mission_id": d.get("mission_id"),
+                    "jurisdiction": d.get("jurisdiction"),
+                    "drone_id": d.get("id"),
                     "type": random.choice(alert_types),
                     "confidence": round(random.uniform(0.72, 0.98), 2),
                     "zone": random.choice(zones),

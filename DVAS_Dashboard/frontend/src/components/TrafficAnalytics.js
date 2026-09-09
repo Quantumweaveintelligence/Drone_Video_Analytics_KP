@@ -8,10 +8,14 @@ import {
   CartesianGrid, PieChart, Pie, Cell,
 } from 'recharts';
 import {
-  Car, Activity, AlertTriangle, Hash,
-  Gauge, ShieldAlert, Clock, RefreshCw, Plus, Trash2,
-  CheckCircle2, Camera, Search, Download, Archive, ChevronLeft, ChevronRight, Folder
+  Car, AlertTriangle, Activity, MapPin, 
+  BarChart2, Zap, Clock, Maximize2, Radio, Target, History, RefreshCw, X,
+  Hash, Gauge, ShieldAlert, CheckCircle2, Camera, Search, Download, Archive, ChevronLeft, ChevronRight, Folder,
+  Plus, Trash2
 } from 'lucide-react';
+
+import { useJpegPoller } from '../hooks/useJpegPoller';
+import { useActiveStreams } from '../hooks/useActiveStreams';
 import { api } from '../lib/api';
 
 /* ─── constants ─────────────────────────────────────────────────── */
@@ -118,77 +122,7 @@ function Panel({ title, icon: Icon, iconClass = 'text-teal-400', children, right
   );
 }
 
-/* ─── hook: poll a JPEG endpoint, return blob URL + ok flag ──── */
-function useJpegPoller(url, intervalMs, enabled) {
-  const [blobUrl, setBlobUrl] = useState(null);
-  const [ok, setOk] = useState(false);
-  const tickRef = useRef(null);
-  const errRef = useRef(0);
-  const feedDeadRef = useRef(false);
 
-  const doFetch = useCallback(async () => {
-    if (!enabled || !url) return;
-    try {
-      const token = localStorage.getItem('dvas_token') || localStorage.getItem('token') || '';
-      const sep = url.includes('?') ? '&' : '?';
-      const res = await fetch(`${url}${sep}_t=${Date.now()}`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-        credentials: 'include',
-      });
-      if (res.ok) {
-        const blob = await res.blob();
-        const next = URL.createObjectURL(blob);
-        setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return next; });
-        setOk(true);
-        errRef.current = 0;
-        feedDeadRef.current = false;
-      } else if (res.status === 404) {
-        // Feed is offline — immediately invalidate and mark dead
-        setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
-        setOk(false);
-        feedDeadRef.current = true;
-      } else {
-        errRef.current++;
-        if (errRef.current > 3) setOk(false);
-      }
-    } catch {
-      errRef.current++;
-      if (errRef.current > 3) setOk(false);
-    }
-  }, [url, enabled]);
-
-  useEffect(() => {
-    if (!enabled) {
-      setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
-      setOk(false);
-      errRef.current = 0;
-      feedDeadRef.current = false;
-      return;
-    }
-    errRef.current = 0;
-    feedDeadRef.current = false;
-    doFetch();
-    tickRef.current = setInterval(() => {
-      // When feed is confirmed dead (404), poll very slowly (every ~10s)
-      if (feedDeadRef.current) return;
-      doFetch();
-    }, intervalMs);
-
-    // Slow background retry for dead feeds — check every 10s if feed comes back
-    const slowRetry = setInterval(() => {
-      if (feedDeadRef.current) doFetch();
-    }, 10000);
-
-    return () => {
-      clearInterval(tickRef.current);
-      clearInterval(slowRetry);
-      setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
-    };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled, url, intervalMs]);
-
-  return { blobUrl, ok };
-}
 
 /* ─── Annotated Frame Viewer ─────────────────────────────────────── */
 function AnnotatedFrameViewer({ droneId, mode = 'vehicle', streamRunning, isLive }) {
@@ -1048,50 +982,7 @@ function WatchlistPanel({ alerts, watchlist, onAdd, onRemove, adding }) {
   );
 }
 
-/* ─── hook: discover active drones from ingest telemetry ──────── */
-function useActiveDrones() {
-  const [drones, setDrones] = useState([]);
-  const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    let mounted = true;
-    const poll = async () => {
-      try {
-        // /api/ingest-server/streams/active scans Valkey for drone:frames:*
-        // keys — reliable even after ingest server restart (unlike /telemetry
-        // which uses an in-memory dict that clears on restart).
-        const res = await api.get('/ingest-server/streams/active');
-        const raw = res.data?.drones || [];
-        if (mounted && raw.length > 0) {
-          setDrones(raw);
-        } else if (mounted) {
-          // streams/active returned empty — fall back to DB drone list so the
-          // selector is never completely blank
-          try {
-            const dbRes = await api.get('/drones');
-            const dbDrones = (dbRes.data || []).map(d => ({
-              drone_id: d.id || d.drone_id,
-              frames_received: 0,
-              frame_count: 0,
-              status: d.status || 'unknown',
-              mission_id: d.mission_id || null,
-            }));
-            if (mounted) setDrones(dbDrones);
-          } catch { /* keep previous list */ }
-        }
-      } catch {
-        // Silently keep previous list on error
-      } finally {
-        if (mounted) setLoading(false);
-      }
-    };
-    poll();
-    const id = setInterval(poll, 5000);
-    return () => { mounted = false; clearInterval(id); };
-  }, []);
-
-  return { drones, loading };
-}
 
 /* ─── Main Component ──────────────────────────────────────────────── */
 /* ─── MissionHistory ──────────────────────────────────────────────────────── */
@@ -1553,9 +1444,16 @@ function MissionHistory() {
     </div>
   );
 }
-
 export default function TrafficAnalytics() {
-  const { drones: activeDrones, loading: dronesLoading } = useActiveDrones();
+  const { streams, loading: dronesLoading } = useActiveStreams();
+  const activeDrones = streams.map(s => ({
+    drone_id: s.drone_id,
+    mission_id: s.mission_id,
+    status: s.status,
+    messages_ready: s.messages_ready,
+    consumer_lag: s.consumer_lag,
+    frames_received: s.status === 'live' || (s.messages_ready || 0) > 0 ? 1 : 0
+  }));
   const [activeDrone, setActiveDrone] = useState(null);
   const [activeMissionId, setActiveMissionId] = useState(null); // current mission_id for selected drone
   const [feedMode, setFeedMode]       = useState('vehicle');
@@ -1683,6 +1581,7 @@ export default function TrafficAnalytics() {
             {activeDrones.map(d => {
               const isLive = (d.frames_received || 0) > 0;
               const isSelected = activeDrone === d.drone_id;
+              const isDraining = d.status === 'draining';
               return (
                 <button key={d.drone_id} onClick={() => setActiveDrone(d.drone_id)}
                   className="mono text-[10px] px-2 py-1 rounded transition-all flex items-center gap-1"
@@ -1692,10 +1591,16 @@ export default function TrafficAnalytics() {
                     color: isSelected ? '#a78bfa' : isLive ? 'var(--dvas-text)' : 'var(--dvas-text-muted)',
                     border: `1px solid ${isSelected ? 'rgba(139,92,246,0.35)':'var(--dvas-border)'}`,
                   }}>
-                  {isLive && (
+                  {isLive && !isDraining && (
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 dvas-live-dot shrink-0" />
                   )}
+                  {isDraining && (
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400 dvas-live-dot shrink-0" />
+                  )}
                   {d.drone_id.replace(/DRONE_KL_/i, 'DRN-').replace(/DRONE_/i, 'DRN-')}
+                  {isDraining && (
+                    <span className="text-[8px] bg-amber-800/60 text-amber-300 px-1.5 py-0.5 rounded ml-1 font-bold">DRAINING</span>
+                  )}
                 </button>
               );
             })}
@@ -1737,6 +1642,32 @@ export default function TrafficAnalytics() {
             })}
           </div>
         </div>
+        {(() => {
+          const selectedDroneObj = activeDrones.find(d => d.drone_id === activeDrone);
+          const remaining = selectedDroneObj?.consumer_lag ? Object.values(selectedDroneObj.consumer_lag).reduce((sum, v) => sum + v, 0) : (selectedDroneObj?.messages_ready ?? 0);
+          if (selectedDroneObj?.status === 'draining') {
+            return (
+              <div className="px-4 py-1.5 bg-amber-900/40 border-b border-amber-500/20 flex items-center justify-center gap-2">
+                {remaining > 0 ? (
+                  <>
+                    <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                    <span className="mono text-[10px] font-bold text-amber-300 tracking-wider">
+                      DRAINING — {remaining} frames remaining in queue
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                    <span className="mono text-[10px] font-bold text-emerald-400 tracking-wider">
+                      PROCESSING COMPLETE
+                    </span>
+                  </>
+                )}
+              </div>
+            );
+          }
+          return null;
+        })()}
         <div style={{ height: 400, background:'#0a0a0f' }}>
           <AnnotatedFrameViewer
             droneId={activeDrone}
