@@ -11,6 +11,7 @@ export default function MissionControl() {
   const [form, setForm] = useState({ name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: 'ALPHA' });
   const [videoFile, setVideoFile] = useState(null);
   const [srtFile, setSrtFile] = useState(null);
+  const [maxUploadMb, setMaxUploadMb] = useState(2048);
 
   const [missionLog, setMissionLog] = useState(() => {
     const saved = localStorage.getItem('dvas_mission_log');
@@ -26,6 +27,23 @@ export default function MissionControl() {
     }
     return [];
   });
+
+  useEffect(() => {
+    const fetchSettings = async () => {
+      try {
+        const resp = await authFetch('/edge-api/api/edge/settings');
+        if (resp.ok) {
+          const data = await resp.json();
+          if (data?.storage?.max_upload_size_mb) {
+            setMaxUploadMb(data.storage.max_upload_size_mb);
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to load edge settings:', err);
+      }
+    };
+    fetchSettings();
+  }, []);
 
   useEffect(() => {
     const fetchHistoricalMissions = async () => {
@@ -95,6 +113,24 @@ export default function MissionControl() {
     }));
   };
 
+  const handleVideoFileChange = (e) => {
+    const file = e.target.files[0];
+    if (!file) {
+      setVideoFile(null);
+      return;
+    }
+    const maxBytes = maxUploadMb * 1024 * 1024;
+    if (file.size > maxBytes) {
+      const actualMb = (file.size / (1024 * 1024)).toFixed(1);
+      setErrorMsg(`Selected video (${actualMb} MB) exceeds maximum allowed limit of ${maxUploadMb} MB. Adjust limit in Settings or choose a smaller file.`);
+      e.target.value = '';
+      setVideoFile(null);
+      return;
+    }
+    setErrorMsg('');
+    setVideoFile(file);
+  };
+
   const handleStartMission = async () => {
     if (!form.name) return;
     if (form.video_source_type === 'rtmp' && !form.video_source) return;
@@ -106,6 +142,12 @@ export default function MissionControl() {
       let finalVideoSource = form.video_source;
 
       if (form.video_source_type === 'file') {
+        const maxBytes = maxUploadMb * 1024 * 1024;
+        if (videoFile.size > maxBytes) {
+          setErrorMsg(`File size (${(videoFile.size / (1024 * 1024)).toFixed(1)} MB) exceeds allowed limit of ${maxUploadMb} MB.`);
+          setLoading(false);
+          return;
+        }
         setUploadProgress('Uploading video...');
         if (srtFile) {
           const srtFormData = new FormData();
@@ -488,10 +530,10 @@ export default function MissionControl() {
                     <input 
                       type="file" 
                       accept=".mp4,.avi,.mov"
-                      onChange={e => setVideoFile(e.target.files[0])}
+                      onChange={handleVideoFileChange}
                       className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm text-slate-200"
                     />
-                    <p className="text-[9px] text-slate-600 mt-1">Supported: .mp4, .avi, .mov</p>
+                    <p className="text-[9px] text-slate-500 mt-1">Supported: .mp4, .avi, .mov • Max size: {maxUploadMb} MB</p>
                   </div>
                   <div>
                     <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">SRT Telemetry File (Optional)</label>

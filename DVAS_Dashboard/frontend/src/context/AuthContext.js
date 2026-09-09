@@ -11,7 +11,11 @@ export function AuthProvider({ children }) {
     (async () => {
       try {
         const { data } = await api.get("/auth/me");
-        setUser(data);
+        const savedLoginTs = localStorage.getItem("dvas_login_ts") || new Date().toISOString();
+        if (!localStorage.getItem("dvas_login_ts")) {
+          localStorage.setItem("dvas_login_ts", savedLoginTs);
+        }
+        setUser({ ...data, login_ts: savedLoginTs });
       } catch {
         setUser(false);
       } finally {
@@ -22,12 +26,15 @@ export function AuthProvider({ children }) {
 
   const login = async (email, password) => {
     const { data } = await api.post("/auth/login", { email, password });
+    const loginTs = new Date().toISOString();
     if (data?.access_token) {
       localStorage.setItem("dvas_token", data.access_token);
       localStorage.setItem("token", data.access_token);
     }
-    setUser(data);
-    return data;
+    localStorage.setItem("dvas_login_ts", loginTs);
+    const enrichedUser = { ...data, login_ts: loginTs };
+    setUser(enrichedUser);
+    return enrichedUser;
   };
 
   const logout = async () => {
@@ -61,6 +68,7 @@ export function AuthProvider({ children }) {
     try { await api.post("/auth/logout"); } catch {}
     localStorage.removeItem("dvas_token");
     localStorage.removeItem("token");
+    localStorage.removeItem("dvas_login_ts");
     setUser(false);
   };
 

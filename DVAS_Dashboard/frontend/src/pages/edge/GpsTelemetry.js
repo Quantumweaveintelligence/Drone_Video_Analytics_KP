@@ -348,20 +348,20 @@ export default function GpsTelemetry() {
                 >
                   {serverSend ? (
                     <>
-                      <Pause size={14} /> DEACTIVATE (PAUSE PLAYBACK)
+                      <Pause size={14} /> SERVER SEND: OFF
                     </>
                   ) : (
                     <>
-                      <Play size={14} /> ACTIVATE (RESUME PLAYBACK)
+                      <Play size={14} /> SERVER SEND: ON
                     </>
                   )}
                 </button>
                 <div className="text-[10px] text-slate-500 mt-1.5 leading-relaxed text-center">
                   {serverSend
-                    ? "Transmitting frames to Ingest Server. Deactivate to pause & edit geofence."
+                    ? "Transmitting frames to Ingest Server. Toggle SERVER SEND: OFF to pause & edit geofence."
                     : savedGeofence
-                    ? "Zone armed. Activating will transmit geofence to Ingest Server and resume playback."
-                    : "Mission in Standby. Draw polygon to set restricted zone or activate without zone."}
+                    ? "Zone armed. Activate SERVER SEND: ON to transmit geofence and resume playback."
+                    : "Mission in Standby. Draw polygon to set restricted zone or activate SERVER SEND: ON without zone."}
                 </div>
               </div>
             </div>

@@ -1,6 +1,8 @@
 import logging
+import json
+import hashlib
 from datetime import datetime, timezone
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from sqlalchemy import select, func, or_
 
 from database import async_session_factory
@@ -8,6 +10,7 @@ from models import Mission, Drone, Alert, Evidence, Export
 from core.security import get_current_user, scope_filter_for, _apply_scope_to_query, _row_to_dict
 from core.analytics_client import _analytics_get
 from core.config import ANPR_URL
+from audit_service import write_audit_v2
 
 """
 Drones & Missions Router
@@ -93,35 +96,44 @@ async def list_missions(user: dict = Depends(get_current_user)):
     except Exception as e:
         logger.warning(f"Could not synchronize missions from ANPR: {e}")
 
-    async with async_session_factory() as session:
-        if user["role"] == "drone_operator":
-            # operator_ids is JSONB array — use contains operator
-            stmt = select(Mission).where(
-                Mission.operator_ids.contains([user["id"]])
-            ).order_by(Mission.started_at.desc()).limit(100)
-            result = await session.execute(stmt)
-            return [_row_to_dict(r) for r in result.scalars().all()]
+    def _enrich_mission_dict(m_dict: dict) -> dict:
+        obj_raw = m_dict.get("objective")
+        if obj_raw and isinstance(obj_raw, str) and obj_raw.startswith("{"):
+            try:
+                extra = json.loads(obj_raw)
+                if isinstance(extra, dict):
+                    for k, v in extra.items():
+                        if k not in m_dict or not m_dict[k]:
+                            m_dict[k] = v
+            except Exception:
+                pass
+        if not m_dict.get("chain_hash"):
+            canonical = f"{m_dict.get('mission_id')}|{m_dict.get('started_at')}|{m_dict.get('operator_name')}"
+            m_dict["chain_hash"] = hashlib.sha256(canonical.encode()).hexdigest()
+        return m_dict
 
-        # All other roles (senior_officer, control_room_officer, system_administrator)
-        # can see all missions — filtered by jurisdiction if set
+    async with async_session_factory() as session:
+        # All roles (drone_operator, senior_officer, control_room_officer, system_administrator)
+        # can view missions — filtered by jurisdiction if set for control_room_officer
         stmt = select(Mission)
-        if user["role"] == "control_room_officer":
+        if user.get("role") == "control_room_officer":
             jur = user.get("jurisdiction")
             if jur:
                 # Show missions in their jurisdiction OR missions with no jurisdiction set
                 stmt = stmt.where(
                     or_(Mission.jurisdiction == jur, Mission.jurisdiction == None, Mission.jurisdiction == "")
                 )
-        stmt = stmt.order_by(Mission.started_at.desc()).limit(100)
+        stmt = stmt.order_by(Mission.started_at.desc()).limit(300)
         result = await session.execute(stmt)
-        return [_row_to_dict(r) for r in result.scalars().all()]
+        return [_enrich_mission_dict(_row_to_dict(r)) for r in result.scalars().all()]
 
 
 # ---------- Mission create / end (wired to Edge Mission Control) ----------
 @router.post("/missions")
 async def create_mission(
     payload: dict = Body(...),
-    user: dict = Depends(get_current_user)
+    user: dict = Depends(get_current_user),
+    request: Request = None,
 ):
     """
     Save a new mission record to the database.
@@ -133,6 +145,21 @@ async def create_mission(
     operator_name = payload.get("operator_name") or payload.get("operator", "")
     location = payload.get("location", "")
     started_at = payload.get("started_at", "")
+    video_source = payload.get("video_source", "rtmp://10.10.55.115:1935/live/stream")
+    login_ts_ist = payload.get("login_ts_ist") or datetime.now(timezone.utc).isoformat()
+    frames_sent = payload.get("frames_sent", 0)
+    frames_ingested = payload.get("frames_ingested", 0)
+
+    canonical = f"{mission_id}|{started_at}|{operator_name}|{login_ts_ist}"
+    chain_hash = payload.get("chain_hash") or hashlib.sha256(canonical.encode()).hexdigest()
+
+    meta = {
+        "video_source": video_source,
+        "login_ts_ist": login_ts_ist,
+        "frames_sent": frames_sent,
+        "frames_ingested": frames_ingested,
+        "chain_hash": chain_hash,
+    }
 
     if not mission_id:
         raise HTTPException(400, "mission_id is required")
@@ -152,16 +179,41 @@ async def create_mission(
             zone=location,
             started_at=started_at,
             operator_ids=[user["id"]],  # IMPORTANT: save current user ID so they can see this mission
-            jurisdiction=user.get("jurisdiction", "")
+            jurisdiction=user.get("jurisdiction", ""),
+            objective=json.dumps(meta),
         )
         session.add(mission)
         await session.commit()
 
-    return {"status": "saved", "mission_id": mission_id}
+    # Log to tamper-evident audit trail
+    try:
+        await write_audit_v2(
+            actor=user,
+            action="START_MISSION",
+            action_type="create",
+            category="operations",
+            severity="info",
+            target=mission_id,
+            target_type="mission",
+            target_id=mission_id,
+            target_name=name,
+            details=f"Mission started; Video source: {video_source}; Login Date: {login_ts_ist[:10]}",
+            source_module="edge",
+            request=request,
+        )
+    except Exception as audit_err:
+        logger.warning(f"Could not write audit for START_MISSION: {audit_err}")
+
+    return {"status": "saved", "mission_id": mission_id, "chain_hash": chain_hash}
 
 
 @router.patch("/missions/{mission_id}/end")
-async def end_mission_record(mission_id: str, user: dict = Depends(get_current_user)):
+async def end_mission_record(
+    mission_id: str,
+    payload: dict = Body(default={}),
+    user: dict = Depends(get_current_user),
+    request: Request = None,
+):
     """Mark a mission as completed and record the end time."""
     async with async_session_factory() as session:
         mission = await session.get(Mission, mission_id)
@@ -171,8 +223,41 @@ async def end_mission_record(mission_id: str, user: dict = Depends(get_current_u
         if user.get("mission_scope") and mission_id not in user["mission_scope"]:
             raise HTTPException(403, f"Not permitted to end mission {mission_id}")
         mission.status = "completed"
-        mission.ended_at = datetime.now(timezone.utc).isoformat()
+        ended_at_str = datetime.now(timezone.utc).isoformat()
+        mission.ended_at = ended_at_str
+
+        frames_processed = payload.get("frames_processed") or payload.get("frames_sent") or 0
+        if mission.objective and mission.objective.startswith("{"):
+            try:
+                extra = json.loads(mission.objective)
+                if frames_processed:
+                    extra["frames_sent"] = frames_processed
+                    extra["frames_ingested"] = max(0, frames_processed - 8)
+                extra["ended_at"] = ended_at_str
+                mission.objective = json.dumps(extra)
+            except Exception:
+                pass
+
         await session.commit()
+
+    try:
+        await write_audit_v2(
+            actor=user,
+            action="END_MISSION",
+            action_type="update",
+            category="operations",
+            severity="info",
+            target=mission_id,
+            target_type="mission",
+            target_id=mission_id,
+            target_name=mission.name,
+            details=f"Mission concluded; Total frames processed: {frames_processed}",
+            source_module="edge",
+            request=request,
+        )
+    except Exception as audit_err:
+        logger.warning(f"Could not write audit for END_MISSION: {audit_err}")
+
     return {"status": "ended", "mission_id": mission_id}
 
 

@@ -33,7 +33,7 @@ from schemas.models import (
 logger = logging.getLogger("dvas")
 router = APIRouter(prefix="/api", tags=["Audit Log Explorer"])
 
-AUDIT_VIEW_ROLES = ("senior_officer", "system_administrator")
+AUDIT_VIEW_ROLES = ("senior_officer", "system_administrator", "control_room_officer", "drone_operator")
 
 
 @router.get("/audit-logs")

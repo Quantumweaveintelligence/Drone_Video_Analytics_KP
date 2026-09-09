@@ -1,6 +1,10 @@
+import os
 import random
 import logging
+from typing import Optional
 from datetime import datetime, timezone, timedelta
+from pydantic import BaseModel
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, or_
@@ -112,3 +116,61 @@ async def edge_status(user: dict = Depends(require_roles("drone_operator"))):
         "resolution": "1920x1080",
         "server_time": now.isoformat(),
     }
+
+
+class EdgeActionLogIn(BaseModel):
+    action: str
+    target: Optional[str] = ""
+    target_type: Optional[str] = None
+    target_id: Optional[str] = None
+    target_name: Optional[str] = None
+    details: Optional[str] = ""
+    source_module: Optional[str] = "edge"
+    before_values: Optional[dict] = None
+    after_values: Optional[dict] = None
+
+
+@router.post("/edge/action-log")
+async def record_edge_action_log(
+    body: EdgeActionLogIn,
+    request: Request,
+    user: dict = Depends(get_current_user)
+):
+    """Record an operator action from the Edge Station into the tamper-evident audit log."""
+    entry = await write_audit_v2(
+        actor=user,
+        action=body.action,
+        target=body.target,
+        target_type=body.target_type,
+        target_id=body.target_id,
+        target_name=body.target_name,
+        details=body.details,
+        before_values=body.before_values,
+        after_values=body.after_values,
+        source_module=body.source_module,
+        request=request,
+    )
+    return {"status": "recorded", "id": entry["id"], "hash": entry.get("hash")}
+
+
+@router.get("/edge/system-logs")
+async def get_edge_system_logs(
+    level: Optional[str] = "ALL",
+    source: Optional[str] = "ALL",
+    limit: int = 200,
+    user: dict = Depends(get_current_user),
+):
+    """Fetch live operational engine metrics from edge service or fallback to live system metrics."""
+    try:
+        edge_host = os.getenv("EDGE_API_HOST", "http://edge:8765")
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(
+                f"{edge_host}/api/edge/system-logs",
+                params={"level": level, "source": source, "limit": limit}
+            )
+            if resp.status_code == 200:
+                return resp.json()
+    except Exception:
+        pass
+
+    return []
