@@ -194,3 +194,37 @@ class ModelConfig(Base):
     active = Column(JSONB, default=list)  # list of model keys
     updated_at = Column(String, nullable=True)
     updated_by = Column(String, nullable=True)
+
+
+class Incident(Base):
+    __tablename__ = "incidents"
+
+    id = Column(String, primary_key=True)
+    title = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    severity = Column(String, nullable=False)  # LOW, MEDIUM, HIGH, CRITICAL
+    category = Column(String, default="hardware")  # hardware, stream, telemetry, network, tactical
+    created_by = Column(String, nullable=False)
+    location = Column(String, nullable=True)
+    timestamp = Column(String, index=True)
+    mission_id = Column(String, nullable=True)
+    drone_id = Column(String, nullable=True)
+    status = Column(String, default="OPEN")  # OPEN, ACKNOWLEDGED, RESOLVED
+    sent_to_ingest = Column(Boolean, default=True)
+
+
+class AIModelSuggestion(Base):
+    __tablename__ = "ai_model_suggestions"
+
+    id = Column(String, primary_key=True)
+    models = Column(JSONB, default=list)        # ["crowd", "person", "intrusion", "anpr", "vehicle"]
+    model_names = Column(JSONB, default=list)  # ["Crowd Monitoring", ...]
+    priority = Column(String, default="normal") # normal, high, urgent
+    reason = Column(Text, nullable=True)
+    location = Column(String, nullable=True)
+    suggested_by = Column(String, nullable=False)
+    timestamp = Column(String, index=True)
+    status = Column(String, default="PENDING")   # PENDING, ACKNOWLEDGED, DEPLOYED_TO_GPU
+    drone_id = Column(String, nullable=True)
+    mission_id = Column(String, nullable=True)
+

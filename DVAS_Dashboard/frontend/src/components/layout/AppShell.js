@@ -8,7 +8,7 @@ import { api } from "@/lib/api";
 import {
   Shield, Map as MapIcon, Gauge, ShieldCheck, LogOut, Send as Drone,
   Sun, Moon, Bell, PanelLeftClose, PanelLeftOpen, Activity,
-  Languages, AlertTriangle, Search, ChevronDown, LayoutDashboard, Target,
+  Languages, AlertTriangle, ChevronDown, LayoutDashboard, Target,
   Video, Compass, Clock, Scan, Image, UploadCloud, Archive, Server, ClipboardList, Settings
 } from "lucide-react";
 
@@ -122,8 +122,9 @@ function NotificationBell() {
     if (msg.type !== "alert" || !msg.alert) return;
     if (!user) return;
     const a = msg.alert;
-    // SR sees all alerts; CRO sees only alerts within their assigned mission scope
+    // Admin & SR see all alerts; CRO sees only alerts within their assigned mission scope
     const inScope =
+      user.role === "system_administrator" ||
       user.role === "senior_officer" ||
       ((user.mission_scope || []).includes(a.mission_id));
     if (!inScope) return;
@@ -142,14 +143,20 @@ function NotificationBell() {
     return () => document.removeEventListener("mousedown", onDoc);
   }, [open]);
 
-  if (!user || user.role === "drone_operator" || user.role === "system_administrator") return null;
+  if (!user || user.role === "drone_operator") return null;
 
   const jumpToAlerts = () => {
     setOpen(false);
     setUnread(0);
-    nav("/command");
-    try { localStorage.setItem("dvas_cmd_tab", "alerts"); } catch (e) { /* noop */ }
-    window.dispatchEvent(new CustomEvent("dvas:cmd-tab", { detail: "alerts" }));
+    if (user?.role === "system_administrator") {
+      nav("/ingest");
+      try { localStorage.setItem("dvas_ingest_tab", "alerts"); } catch (e) {}
+      window.dispatchEvent(new CustomEvent("dvas:ingest-tab", { detail: "alerts" }));
+    } else {
+      nav("/command");
+      try { localStorage.setItem("dvas_cmd_tab", "alerts"); } catch (e) { /* noop */ }
+      window.dispatchEvent(new CustomEvent("dvas:cmd-tab", { detail: "alerts" }));
+    }
   };
 
   const preview = alerts.slice(0, 5);
@@ -273,33 +280,6 @@ function HealthDot() {
         style={{ background: color }}
       />
       <span>{t(h.labelKey)}</span>
-    </div>
-  );
-}
-
-/* ---------- Global search bar (⌘K stub) ---------- */
-function SearchBar() {
-  const { t } = useI18n();
-  const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
-  return (
-    <div
-      className="hidden md:flex items-center gap-2 h-9 px-3 rounded-lg flex-1 max-w-md"
-      data-testid="global-search"
-      style={{ background: "var(--dvas-elev)", color: "var(--dvas-text-muted)" }}
-    >
-      <Search size={14} />
-      <input
-        type="text"
-        placeholder={t("topbar.search")}
-        className="flex-1 bg-transparent outline-none border-0 text-sm placeholder:opacity-70"
-        style={{ color: "var(--dvas-text)" }}
-      />
-      <span
-        className="hidden lg:inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium mono"
-        style={{ background: "var(--dvas-surface)", color: "var(--dvas-text-muted)" }}
-      >
-        {isMac ? "⌘" : "Ctrl"} K
-      </span>
     </div>
   );
 }
@@ -494,8 +474,6 @@ export default function AppShell({ children, title, subtitle }) {
               </div>
             )}
           </div>
-
-          <SearchBar />
 
           <div className="ml-auto flex items-center gap-2">
             <HealthDot />

@@ -227,16 +227,25 @@ async def end_mission_record(
         mission.ended_at = ended_at_str
 
         frames_processed = payload.get("frames_processed") or payload.get("frames_sent") or 0
+        frames_ingested = payload.get("frames_ingested") if payload.get("frames_ingested") is not None else (
+            payload.get("frames_selected") if payload.get("frames_selected") is not None else max(0, frames_processed - 8)
+        )
+        video_source = payload.get("video_source")
+
+        extra = {}
         if mission.objective and mission.objective.startswith("{"):
             try:
                 extra = json.loads(mission.objective)
-                if frames_processed:
-                    extra["frames_sent"] = frames_processed
-                    extra["frames_ingested"] = max(0, frames_processed - 8)
-                extra["ended_at"] = ended_at_str
-                mission.objective = json.dumps(extra)
             except Exception:
-                pass
+                extra = {}
+
+        if frames_processed or "frames_sent" in payload or "frames_processed" in payload:
+            extra["frames_sent"] = frames_processed
+            extra["frames_ingested"] = frames_ingested
+        if video_source:
+            extra["video_source"] = video_source
+        extra["ended_at"] = ended_at_str
+        mission.objective = json.dumps(extra)
 
         await session.commit()
 

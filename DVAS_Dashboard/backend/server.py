@@ -26,7 +26,7 @@ from services.telemetry_pump import start_telemetry_pump
 from services.audit_sync import start_audit_sync_service
 from ingest_proxy import ingest_api
 
-from routers import auth, drones, alerts, audit, analytics, edge, infra, ws
+from routers import auth, drones, alerts, audit, analytics, edge, infra, ws, incidents
 
 # ---------- App ----------
 logging.basicConfig(level=logging.INFO)
@@ -77,6 +77,7 @@ app.include_router(edge.router)
 app.include_router(infra.router)
 app.include_router(ws.router)
 app.include_router(ingest_api)
+app.include_router(incidents.router)
 
 # ---------- CORS ----------
 cors_origins = [o.strip() for o in CORS_ORIGINS if o.strip() and o.strip() != "*"]

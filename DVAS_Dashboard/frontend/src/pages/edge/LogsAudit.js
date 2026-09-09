@@ -118,37 +118,18 @@ const GOVIND_DEFAULT_AUDIT = [
   }
 ];
 
-// Default Govind mission record
-const GOVIND_DEFAULT_MISSION = [
-  {
-    mission_id: "MSN-08092026-1014-ALPHA",
-    mission_name: "Perimeter Surveillance",
-    drone_id: "DRN-001",
-    operator: "Govind (govind@dvas.kp)",
-    login_ts_ist: "08-09-2026 09:15:22 IST",
-    started_at: "2026-09-08T04:44:05.000Z", // 10:14:05 IST
-    ended_at: "2026-09-08T06:02:40.000Z",   // 11:32:40 IST
-    duration: "01h 18m 35s",
-    video_source: "rtmp://10.10.55.115:1935/live/stream",
-    frames_sent: 135400,
-    frames_ingested: 135392,
-    status: "completed",
-    chain_hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852a98b"
-  }
-];
-
 export default function LogsAudit() {
   const { user } = useAuth();
   const [activeTab, setActiveTab] = useState('mission'); // 'mission' | 'audit' | 'system'
 
   // ── Table 1: Mission Log State ──────────────────────────────────────────────
-  const [missions, setMissions] = useState(GOVIND_DEFAULT_MISSION);
+  const [missions, setMissions] = useState([]);
   const [missionSearch, setMissionSearch] = useState('');
   const [missionDateFilter, setMissionDateFilter] = useState(''); // 'YYYY-MM-DD'
   const [missionTimeFilter, setMissionTimeFilter] = useState(''); // 'HH:MM'
   const [missionPage, setMissionPage] = useState(1);
   const [missionPageSize, setMissionPageSize] = useState(15);
-  const [loadingMissions, setLoadingMissions] = useState(false);
+  const [loadingMissions, setLoadingMissions] = useState(true);
 
   // ── Table 2: Audit Trail State ──────────────────────────────────────────────
   const [auditLogs, setAuditLogs] = useState(GOVIND_DEFAULT_AUDIT);
@@ -176,9 +157,10 @@ export default function LogsAudit() {
   const fetchMissions = useCallback(async () => {
     try {
       setLoadingMissions(true);
-      const [backendResp, edgeResp] = await Promise.allSettled([
+      const [backendResp, edgeResp, activeResp] = await Promise.allSettled([
         authFetch('/api/missions'),
-        authFetch('/edge-api/api/edge/mission/history')
+        authFetch('/edge-api/api/edge/mission/history'),
+        authFetch('/edge-api/api/edge/mission/active')
       ]);
 
       let combined = [];
@@ -231,9 +213,34 @@ export default function LogsAudit() {
         }
       }
 
-      if (combined.length > 0) {
-        setMissions(combined);
+      // Check live active mission on the edge node
+      if (activeResp.status === 'fulfilled' && activeResp.value.ok) {
+        const actData = await activeResp.value.json();
+        if (actData && actData.active && actData.mission_id) {
+          const existsIdx = combined.findIndex(x => x.mission_id === actData.mission_id);
+          const activeRecord = {
+            mission_id: actData.mission_id,
+            mission_name: actData.mission_name || "Active Mission",
+            drone_id: actData.drone_id || "DRN-001",
+            operator: actData.operator || (user?.email ? `${user?.name || 'Govind'} (${user?.email})` : "Govind (govind@dvas.kp)"),
+            login_ts_ist: formatIST(user?.login_ts),
+            started_at: actData.start_time,
+            ended_at: null,
+            video_source: actData.video_source || null,
+            frames_sent: actData.frames_received != null ? actData.frames_received : 0,
+            frames_ingested: actData.frames_selected != null ? actData.frames_selected : 0,
+            status: "active",
+            chain_hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852a98b"
+          };
+          if (existsIdx >= 0) {
+            combined[existsIdx] = { ...combined[existsIdx], ...activeRecord };
+          } else {
+            combined.unshift(activeRecord);
+          }
+        }
       }
+
+      setMissions(combined);
     } catch (e) {
       console.warn("Could not refresh live missions:", e);
     } finally {
@@ -804,66 +811,81 @@ export default function LogsAudit() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60 text-slate-300 font-sans">
-                  {paginatedMissions.map((m, idx) => (
-                    <tr key={m.mission_id || idx} className="hover:bg-slate-800/30 transition-colors">
-                      <td className="px-3.5 py-3 font-mono font-semibold text-sky-400">{m.mission_id}</td>
-                      <td className="px-3.5 py-3 font-medium text-slate-200">{m.mission_name}</td>
-                      <td className="px-3.5 py-3 font-mono text-slate-300">{m.drone_id}</td>
-                      <td className="px-3.5 py-3 text-slate-300">{m.operator}</td>
-                      <td className="px-3.5 py-3 font-mono text-slate-400 text-[11px]">{m.login_ts_ist || formatIST(user?.login_ts)}</td>
-                      <td className="px-3.5 py-3 font-mono text-slate-400 text-[11px]">{formatIST(m.started_at)}</td>
-                      <td className="px-3.5 py-3 font-mono text-slate-400 text-[11px]">
-                        {m.status === 'active' ? '--:--:--' : formatIST(m.ended_at)}
-                      </td>
-                      <td className="px-3.5 py-3 font-mono font-medium text-slate-300">
-                        {m.duration || formatDuration(m.started_at, m.ended_at)}
-                      </td>
-                      <td className="px-3.5 py-3 font-mono text-[11px] text-slate-400 max-w-[180px] truncate" title={m.video_source || "Not specified"}>
-                        {m.video_source ? (
-                          m.video_source
-                        ) : (
-                          <span className="text-slate-500 italic">--</span>
-                        )}
-                      </td>
-                      <td className="px-3.5 py-3 font-mono font-medium">
-                        {m.frames_sent != null || m.frames_ingested != null ? (
-                          <span className="text-emerald-400">
-                            {(m.frames_sent ?? 0).toLocaleString()} / {(m.frames_ingested ?? 0).toLocaleString()}
-                          </span>
-                        ) : (
-                          <span className="text-slate-500 font-sans italic text-[11px]" title="Legacy mission: frame counters not captured">
-                            -- / --
-                          </span>
-                        )}
-                      </td>
-                      <td className="px-3.5 py-3">
-                        {m.status === 'active' ? (
-                          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-mono tracking-wider bg-emerald-500/10 text-emerald-400 border border-emerald-500/25">
-                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span> ACTIVE
-                          </span>
-                        ) : (
-                          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-mono tracking-wider bg-slate-800 text-slate-300 border border-slate-700">
-                            COMPLETED
-                          </span>
-                        )}
-                      </td>
-                      <td className="px-3.5 py-3">
-                        <span 
-                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono tracking-wider bg-slate-950 text-emerald-400 border border-slate-700 hover:border-emerald-500/50 cursor-pointer transition-colors"
-                          title={`SHA-256 Cryptographic Hash Seal:\n${m.chain_hash}`}
-                        >
-                          <CheckCircle2 size={11} className="text-emerald-400" />
-                          <span>{m.chain_hash ? `${m.chain_hash.slice(0, 7)}...${m.chain_hash.slice(-4)}` : "e3b0c44...a98b"}</span>
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                  {filteredMissions.length === 0 && (
+                  {loadingMissions && missions.length === 0 ? (
                     <tr>
-                      <td colSpan={12} className="px-4 py-12 text-center text-slate-500">
-                        No operational missions match your search query or date/time filter.
+                      <td colSpan={12} className="px-4 py-16 text-center text-slate-400">
+                        <div className="flex flex-col items-center justify-center gap-2.5">
+                          <RefreshCw size={20} className="animate-spin text-sky-400" />
+                          <span className="text-xs font-mono tracking-wider text-slate-400">Loading operational missions...</span>
+                        </div>
                       </td>
                     </tr>
+                  ) : (
+                    <>
+                      {paginatedMissions.map((m, idx) => (
+                        <tr key={m.mission_id || idx} className="hover:bg-slate-800/30 transition-colors">
+                          <td className="px-3.5 py-3 font-mono font-semibold text-sky-400">{m.mission_id}</td>
+                          <td className="px-3.5 py-3 font-medium text-slate-200">{m.mission_name}</td>
+                          <td className="px-3.5 py-3 font-mono text-slate-300">{m.drone_id}</td>
+                          <td className="px-3.5 py-3 text-slate-300">{m.operator}</td>
+                          <td className="px-3.5 py-3 font-mono text-slate-400 text-[11px]">{m.login_ts_ist || formatIST(user?.login_ts)}</td>
+                          <td className="px-3.5 py-3 font-mono text-slate-400 text-[11px]">{formatIST(m.started_at)}</td>
+                          <td className="px-3.5 py-3 font-mono text-slate-400 text-[11px]">
+                            {m.status === 'active' ? '--:--:--' : formatIST(m.ended_at)}
+                          </td>
+                          <td className="px-3.5 py-3 font-mono font-medium text-slate-300">
+                            {m.duration || formatDuration(m.started_at, m.ended_at)}
+                          </td>
+                          <td className="px-3.5 py-3 font-mono text-[11px] text-slate-400 max-w-[200px] truncate" title={m.video_source || "Not specified"}>
+                            {m.video_source ? (
+                              m.video_source.startsWith('rtmp://')
+                                ? m.video_source
+                                : (m.video_source.split(/[/\\]/).pop() || m.video_source)
+                            ) : (
+                              <span className="text-slate-500 italic">--</span>
+                            )}
+                          </td>
+                          <td className="px-3.5 py-3 font-mono font-medium">
+                            {m.frames_sent != null || m.frames_ingested != null ? (
+                              <span className="text-emerald-400">
+                                {(m.frames_sent ?? 0).toLocaleString()} / {(m.frames_ingested ?? 0).toLocaleString()}
+                              </span>
+                            ) : (
+                              <span className="text-slate-500 font-sans italic text-[11px]" title="Legacy mission: frame counters not captured">
+                                -- / --
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-3.5 py-3">
+                            {m.status === 'active' ? (
+                              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-mono tracking-wider bg-emerald-500/10 text-emerald-400 border border-emerald-500/25">
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span> ACTIVE
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-mono tracking-wider bg-slate-800 text-slate-300 border border-slate-700">
+                                COMPLETED
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-3.5 py-3">
+                            <span 
+                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono tracking-wider bg-slate-950 text-emerald-400 border border-slate-700 hover:border-emerald-500/50 cursor-pointer transition-colors"
+                              title={`SHA-256 Cryptographic Hash Seal:\n${m.chain_hash}`}
+                            >
+                              <CheckCircle2 size={11} className="text-emerald-400" />
+                              <span>{m.chain_hash ? `${m.chain_hash.slice(0, 7)}...${m.chain_hash.slice(-4)}` : "e3b0c44...a98b"}</span>
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                      {filteredMissions.length === 0 && (
+                        <tr>
+                          <td colSpan={12} className="px-4 py-12 text-center text-slate-500">
+                            No operational missions match your search query or date/time filter.
+                          </td>
+                        </tr>
+                      )}
+                    </>
                   )}
                 </tbody>
               </table>

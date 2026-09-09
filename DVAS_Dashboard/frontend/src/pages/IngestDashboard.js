@@ -3,6 +3,7 @@ import AppShell from "@/components/layout/AppShell";
 import { api, ROLE_LABELS } from "@/lib/api";
 import { useI18n } from "@/context/I18nContext";
 import { useIngestServer } from "@/hooks/useIngestServer";
+import { useDvasSocket } from "@/lib/useDvasSocket";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, BarChart, Bar, CartesianGrid,
 } from "recharts";
@@ -10,7 +11,7 @@ import {
   CircuitBoard, AlertTriangle, Table as TableIcon, Activity, Cpu, ClipboardList,
   Users, Trash2, Plus, ShieldAlert, LayoutDashboard, Gauge, Database, HardDrive,
   Zap, CheckCircle2, XCircle, TrendingUp, Server, Wifi, WifiOff, Radio,
-  Power, PowerOff, RotateCcw, AlertOctagon, Terminal, ChevronDown,
+  Power, PowerOff, RotateCcw, AlertOctagon, Terminal, ChevronDown, Bell,
 } from "lucide-react";
 
 const sevColor = {
@@ -30,7 +31,7 @@ const PAGES = [
   { key: "users",  labelKey: "ingest.page.users",  Icon: Users },
 ];
 
-function TopNav({ page, setPage }) {
+function TopNav({ page, setPage, pendingSuggestionsCount = 0 }) {
   const { t } = useI18n();
   return (
     <nav
@@ -54,6 +55,11 @@ function TopNav({ page, setPage }) {
         >
           <span className="mono text-[10px] text-slate-600">{String(i + 1).padStart(2, "0")}</span>
           <Icon size={14} /> {t(labelKey)}
+          {key === "gpu" && pendingSuggestionsCount > 0 && (
+            <span className="px-1.5 py-0.2 rounded-full text-[9px] bg-sky-500 text-white font-mono font-bold animate-pulse">
+              {pendingSuggestionsCount}
+            </span>
+          )}
         </button>
       ))}
       <span className="ml-auto mono text-[10px] text-slate-500 pl-3 shrink-0 hidden md:inline">
@@ -75,6 +81,66 @@ export default function IngestDashboard() {
   const [ackedAlertIds, setAckedAlertIds] = useState([]);
   const [feedFilter, setFeedFilter] = useState("all");
   const [feedSort, setFeedSort] = useState("drone_id");
+  const [liveIncidents, setLiveIncidents] = useState([]);
+  const [activeBanner, setActiveBanner] = useState(null);
+  const [modelSuggestions, setModelSuggestions] = useState([]);
+  const [modelToast, setModelToast] = useState(null);
+
+  const playAlertChime = useCallback((severity) => {
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = severity === "CRITICAL" ? "sawtooth" : "sine";
+      osc.frequency.setValueAtTime(severity === "CRITICAL" ? 880 : 587.33, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(severity === "CRITICAL" ? 440 : 880, ctx.currentTime + 0.4);
+      gain.gain.setValueAtTime(0.18, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.4);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.4);
+    } catch (e) {
+      // Audio playback might require prior user interaction
+    }
+  }, []);
+
+  useDvasSocket((msg) => {
+    if (msg.type === "incident" && msg.incident) {
+      const inc = msg.incident;
+      setLiveIncidents((prev) => [inc, ...prev.filter(x => x.id !== inc.id)]);
+      setActiveBanner(inc);
+      if (inc.severity === "CRITICAL" || inc.severity === "HIGH") {
+        playAlertChime(inc.severity);
+      }
+    } else if (msg.type === "incident_ack") {
+      setLiveIncidents((prev) => prev.map(x => x.id === msg.incident_id ? { ...x, status: "ACKNOWLEDGED" } : x));
+      setActiveBanner((curr) => (curr?.id === msg.incident_id ? null : curr));
+    } else if (msg.type === "model_suggestion" && msg.suggestion) {
+      const sugg = msg.suggestion;
+      setModelSuggestions((prev) => [sugg, ...prev.filter(x => x.id !== sugg.id)]);
+      setModelToast(sugg);
+      setTimeout(() => setModelToast(null), 8000);
+    } else if (msg.type === "model_suggestion_status") {
+      setModelSuggestions((prev) => prev.map(x => x.id === msg.suggestion_id ? { ...x, status: msg.status } : x));
+    }
+  });
+
+  const loadIncidents = async () => {
+    try {
+      const { data } = await api.get("/incidents");
+      if (Array.isArray(data)) setLiveIncidents(data);
+    } catch (e) {}
+  };
+
+  const loadModelSuggestions = async () => {
+    try {
+      const { data } = await api.get("/analytics/suggestions");
+      if (Array.isArray(data)) setModelSuggestions(data);
+    } catch (e) {}
+  };
 
   const load = async () => {
     try {
@@ -97,11 +163,24 @@ export default function IngestDashboard() {
   };
 
   useEffect(() => {
-    load(); loadOverview();
+    load(); loadOverview(); loadIncidents(); loadModelSuggestions();
     const t = setInterval(() => { load(); if (page === "overview") loadOverview(); setTick(x => x + 1); }, 4000);
     return () => clearInterval(t);
   }, [page]);
-  useEffect(() => { if (page === "audit") loadAudit(); if (page === "users") loadUsers(); }, [page]);
+  useEffect(() => {
+    if (page === "audit") loadAudit();
+    if (page === "users") loadUsers();
+    if (page === "alerts") loadIncidents();
+    if (page === "gpu") loadModelSuggestions();
+  }, [page]);
+
+  useEffect(() => {
+    const onTab = (e) => {
+      if (e.detail) setPage(e.detail);
+    };
+    window.addEventListener("dvas:ingest-tab", onTab);
+    return () => window.removeEventListener("dvas:ingest-tab", onTab);
+  }, []);
 
   // Real throughput from ingest server status — rolling buffer of snapshots
   const throughputBufferRef = useRef([]);
@@ -123,6 +202,27 @@ export default function IngestDashboard() {
     return arr;
   }, [h, feedFilter, feedSort]);
 
+  const handleAcknowledgeIncident = async (incidentId) => {
+    try {
+      await api.post(`/incidents/${incidentId}/ack`);
+      setLiveIncidents((prev) => prev.map(x => x.id === incidentId ? { ...x, status: "ACKNOWLEDGED" } : x));
+      setActiveBanner((curr) => (curr?.id === incidentId ? null : curr));
+    } catch (err) {
+      console.error("Failed to acknowledge incident", err);
+    }
+  };
+
+  const handleUpdateSuggestionStatus = async (suggestionId, newStatus) => {
+    try {
+      await api.post(`/analytics/suggestions/${suggestionId}/status`, { status: newStatus });
+      setModelSuggestions((prev) => prev.map(s => s.id === suggestionId ? { ...s, status: newStatus } : s));
+    } catch (err) {
+      console.error("Failed to update suggestion status", err);
+    }
+  };
+
+  const pendingSuggestionsCount = modelSuggestions.filter(s => s.status === "PENDING").length;
+
   return (
     <AppShell title={t("ingest.title")} subtitle={t("ingest.subtitle")}>
       <div className="mb-4 border border-amber-500/40 bg-amber-500/5 p-3 flex items-start gap-2">
@@ -134,18 +234,128 @@ export default function IngestDashboard() {
         </div>
       </div>
 
+      {/* Model Suggestion Toast from Edge Operator */}
+      {modelToast && (
+        <div className="mb-4 p-3 border border-sky-500 bg-sky-950/85 rounded-lg flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs text-sky-200 font-mono shadow-lg">
+          <div className="flex items-center gap-2.5">
+            <Cpu size={16} className="text-sky-400 animate-pulse shrink-0" />
+            <span>
+              <strong>New AI Model Request from Edge:</strong> {modelToast.suggested_by} requested <strong>{(modelToast.model_names || []).join(", ")}</strong> at {modelToast.location}.
+            </span>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={() => { setPage("gpu"); setModelToast(null); }}
+              className="px-2.5 py-1 bg-sky-600 hover:bg-sky-500 text-white text-[11px] rounded transition-colors"
+            >
+              View on GPU Dashboard
+            </button>
+            <button onClick={() => setModelToast(null)} className="text-slate-400 hover:text-white px-1">✕</button>
+          </div>
+        </div>
+      )}
+
+      {/* High-Visibility Real-Time Incident Notification Banner */}
+      {activeBanner && (
+        <div
+          data-testid="ingest-incident-banner"
+          className={`mb-4 p-4 border rounded-lg transition-all animate-pulse shadow-lg ${
+            activeBanner.severity === "CRITICAL"
+              ? "border-red-500 bg-red-950/85 shadow-red-500/20 text-red-100"
+              : activeBanner.severity === "HIGH"
+              ? "border-amber-500 bg-amber-950/85 shadow-amber-500/20 text-amber-100"
+              : "border-sky-500 bg-sky-950/85 shadow-sky-500/20 text-sky-100"
+          }`}
+        >
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+            <div className="flex items-start gap-3">
+              <div className="relative mt-0.5 shrink-0">
+                <span className="flex h-3 w-3">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-3 w-3 bg-red-500"></span>
+                </span>
+              </div>
+              <div className="space-y-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className={`px-2 py-0.5 text-[10px] font-mono font-bold tracking-wider rounded border uppercase ${
+                    activeBanner.severity === "CRITICAL" ? "bg-red-500/20 border-red-500 text-red-300" :
+                    activeBanner.severity === "HIGH" ? "bg-amber-500/20 border-amber-500 text-amber-300" :
+                    "bg-sky-500/20 border-sky-500 text-sky-300"
+                  }`}>
+                    {activeBanner.severity} INCIDENT
+                  </span>
+                  <span className="text-sm font-bold text-white tracking-wide">
+                    {activeBanner.title}
+                  </span>
+                  {activeBanner.category && (
+                    <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 bg-slate-800/80 text-slate-300 border border-slate-700 rounded">
+                      {activeBanner.category.replace('_', ' ')}
+                    </span>
+                  )}
+                </div>
+                <div className="text-xs text-slate-300 leading-relaxed">
+                  {activeBanner.description || "Edge station reported an operational incident."}
+                </div>
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] font-mono text-slate-400">
+                  <span>📍 <strong className="text-slate-200">Location:</strong> {activeBanner.location || "Edge Station"}</span>
+                  <span>👤 <strong className="text-slate-200">Reported By:</strong> {activeBanner.created_by || "Edge Operator"}</span>
+                  <span>🕒 <strong className="text-slate-200">Time:</strong> {activeBanner.timestamp ? new Date(activeBanner.timestamp).toLocaleTimeString() : "Just now"}</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0 self-end md:self-center">
+              <button
+                data-testid="banner-ack-btn"
+                onClick={() => handleAcknowledgeIncident(activeBanner.id)}
+                className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold rounded flex items-center gap-1.5 transition-colors shadow"
+              >
+                <CheckCircle2 size={13} /> Acknowledge
+              </button>
+              <button
+                data-testid="banner-view-alerts-btn"
+                onClick={() => { setPage("alerts"); }}
+                className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium border border-slate-600 rounded transition-colors"
+              >
+                View in Alerts
+              </button>
+              <button
+                data-testid="banner-dismiss-btn"
+                onClick={() => setActiveBanner(null)}
+                title="Dismiss Banner"
+                className="p-1.5 text-slate-400 hover:text-white rounded hover:bg-slate-800 transition-colors"
+              >
+                <XCircle size={16} />
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="flex flex-col gap-4">
-        <TopNav page={page} setPage={setPage} />
+        <TopNav page={page} setPage={setPage} pendingSuggestionsCount={pendingSuggestionsCount} />
 
         <div className="min-w-0">
           {page === "server" && <ServerPage srv={ingestSrv} />}
           {page === "overview" && <OverviewPage ov={ov} />}
           {page === "feeds" && <FeedsPage feeds={feeds} filter={feedFilter} setFilter={setFeedFilter} setSort={setFeedSort} />}
           {page === "queue" && <QueuePage throughput={throughput} queue={h?.queue || []} ingestSrv={ingestSrv} />}
-          {page === "gpu" && <GpuPage gpu={h?.gpu || []} />}
-          {page === "alerts" && <AlertsPage alerts={(h?.alerts || []).filter(a => !ackedAlertIds.includes(a.id))} onAck={(id) => setAckedAlertIds(v => [...v, id])} />}
+          {page === "gpu" && (
+            <GpuPage
+              gpu={h?.gpu || []}
+              suggestions={modelSuggestions}
+              onUpdateStatus={handleUpdateSuggestionStatus}
+            />
+          )}
+          {page === "alerts" && (
+            <AlertsPage
+              alerts={(h?.alerts || []).filter(a => !ackedAlertIds.includes(a.id))}
+              onAck={(id) => setAckedAlertIds(v => [...v, id])}
+              incidents={liveIncidents}
+              onAckIncident={handleAcknowledgeIncident}
+            />
+          )}
           {page === "audit" && <AuditPage audit={audit} />}
-          {page === "users" && <UsersPage users={users} reload={loadUsers} />}
         </div>
       </div>
     </AppShell>
@@ -1217,9 +1427,123 @@ function QueuePage({ throughput, queue, ingestSrv }) {
   );
 }
 
-function GpuPage({ gpu }) {
+function GpuPage({ gpu, suggestions = [], onUpdateStatus }) {
+  const pendingSuggestionsCount = suggestions.filter(s => s.status === "PENDING").length;
+
   return (
     <div className="space-y-4">
+      {/* Edge Operator AI Model Suggestions Panel */}
+      <div className="border border-slate-800 bg-slate-900 rounded overflow-hidden font-mono">
+        <div className="p-3 border-b border-slate-800 flex items-center justify-between bg-slate-950/40">
+          <div className="flex items-center gap-2">
+            <Cpu size={16} className="text-sky-400" />
+            <span className="text-sm font-medium text-slate-100 font-sans">Edge Operator AI Model Suggestions</span>
+            {pendingSuggestionsCount > 0 && (
+              <span className="px-2 py-0.5 rounded-full text-[10px] bg-sky-500/20 text-sky-300 border border-sky-500/40 font-mono font-bold animate-pulse">
+                {pendingSuggestionsCount} Pending Request{pendingSuggestionsCount > 1 ? "s" : ""}
+              </span>
+            )}
+          </div>
+          <span className="text-[11px] text-slate-400 font-mono hidden md:inline">
+            Analytical Layer Models (Crowd, Person, Intrusion, ANPR, Vehicle)
+          </span>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs text-left">
+            <thead className="bg-slate-950/60 text-slate-400 text-[10px] uppercase border-b border-slate-800">
+              <tr>
+                <th className="px-3 py-2.5">Priority</th>
+                <th className="px-3 py-2.5">Requested AI Models</th>
+                <th className="px-3 py-2.5">Location / Place</th>
+                <th className="px-3 py-2.5">Operator Reason / Context</th>
+                <th className="px-3 py-2.5">Suggested By</th>
+                <th className="px-3 py-2.5">Time</th>
+                <th className="px-3 py-2.5">Status</th>
+                <th className="px-3 py-2.5 text-right">GPU Action</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-800/60">
+              {suggestions.length === 0 && (
+                <tr>
+                  <td colSpan={8} className="p-6 text-center text-slate-500 text-xs">
+                    No edge model suggestions received yet. When operators request AI models from the field, they will appear here.
+                  </td>
+                </tr>
+              )}
+              {suggestions.map((sugg) => (
+                <tr key={sugg.id} className="hover:bg-slate-800/30 transition-colors">
+                  <td className="px-3 py-3 whitespace-nowrap">
+                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase border ${
+                      sugg.priority === "urgent" ? "bg-red-500/20 border-red-500/40 text-red-300" :
+                      sugg.priority === "high" ? "bg-amber-500/20 border-amber-500/40 text-amber-300" :
+                      "bg-sky-500/20 border-sky-500/40 text-sky-300"
+                    }`}>
+                      {sugg.priority || "normal"}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3">
+                    <div className="flex flex-wrap gap-1 max-w-xs">
+                      {(sugg.model_names || sugg.models || []).map((m, idx) => (
+                        <span key={idx} className="px-1.5 py-0.5 text-[10px] bg-slate-800 text-sky-200 border border-slate-700 rounded">
+                          {m}
+                        </span>
+                      ))}
+                    </div>
+                  </td>
+                  <td className="px-3 py-3 whitespace-nowrap text-slate-300">
+                    📍 {sugg.location || "Edge Station"}
+                  </td>
+                  <td className="px-3 py-3 text-slate-400 max-w-xs truncate text-[11px]">
+                    {sugg.reason || "Operational monitoring request"}
+                  </td>
+                  <td className="px-3 py-3 whitespace-nowrap text-slate-400 text-[11px]">
+                    {sugg.suggested_by || "Edge Operator"}
+                  </td>
+                  <td className="px-3 py-3 whitespace-nowrap text-slate-500 text-[11px]">
+                    {sugg.timestamp ? new Date(sugg.timestamp).toLocaleTimeString() : "—"}
+                  </td>
+                  <td className="px-3 py-3 whitespace-nowrap">
+                    <span className={`px-2 py-0.5 rounded text-[10px] font-semibold border ${
+                      sugg.status === "DEPLOYED_TO_GPU"
+                        ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+                        : sugg.status === "ACKNOWLEDGED"
+                        ? "bg-slate-800 text-slate-300 border-slate-700"
+                        : "bg-amber-500/20 text-amber-300 border-amber-500/40 animate-pulse"
+                    }`}>
+                      {sugg.status === "DEPLOYED_TO_GPU" ? "DEPLOYED ON GPU" : sugg.status || "PENDING"}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 whitespace-nowrap text-right">
+                    <div className="flex items-center justify-end gap-1.5">
+                      {sugg.status !== "DEPLOYED_TO_GPU" && (
+                        <button
+                          onClick={() => onUpdateStatus && onUpdateStatus(sugg.id, "DEPLOYED_TO_GPU")}
+                          className="px-2.5 py-1 text-[11px] bg-emerald-600/30 hover:bg-emerald-600/50 text-emerald-200 border border-emerald-500/40 rounded transition-colors"
+                        >
+                          Deploy to GPU
+                        </button>
+                      )}
+                      {sugg.status === "PENDING" && (
+                        <button
+                          onClick={() => onUpdateStatus && onUpdateStatus(sugg.id, "ACKNOWLEDGED")}
+                          className="px-2 py-1 text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded transition-colors"
+                        >
+                          Ack
+                        </button>
+                      )}
+                      {sugg.status === "DEPLOYED_TO_GPU" && (
+                        <span className="text-emerald-400 text-[11px] font-semibold">✓ Active</span>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <div className="border border-slate-800 bg-slate-900 p-3">
         <div className="dvas-label mb-2">GPU Utilisation · per node</div>
         <div style={{ width: "100%", height: 240 }}>
@@ -1268,28 +1592,164 @@ function GpuPage({ gpu }) {
   );
 }
 
-function AlertsPage({ alerts, onAck }) {
+function AlertsPage({ alerts, onAck, incidents = [], onAckIncident }) {
   const { t } = useI18n();
+  const [activeTab, setActiveTab] = useState("edge"); // "edge" | "infra"
+  const openIncidents = incidents.filter(i => i.status !== "ACKNOWLEDGED");
+
   return (
-    <div className="border border-slate-800 bg-slate-900 font-mono">
-      <div className="p-3 border-b border-slate-800 text-sm flex items-center gap-2 font-sans">
-        <AlertTriangle size={16} className="text-amber-400" /> {t("ingest.alertsTitle")}
+    <div className="space-y-4 font-mono">
+      {/* Tab Switcher */}
+      <div className="flex items-center gap-2 border-b border-slate-800 pb-2">
+        <button
+          onClick={() => setActiveTab("edge")}
+          className={`px-3 py-1.5 text-xs rounded transition-colors flex items-center gap-2 ${
+            activeTab === "edge"
+              ? "bg-red-500/20 text-red-300 border border-red-500/40"
+              : "text-slate-400 hover:text-white"
+          }`}
+        >
+          <ShieldAlert size={14} className="text-red-400" />
+          <span>Edge Station Incidents</span>
+          {openIncidents.length > 0 && (
+            <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-red-500 text-white font-bold animate-pulse">
+              {openIncidents.length}
+            </span>
+          )}
+        </button>
+        <button
+          onClick={() => setActiveTab("infra")}
+          className={`px-3 py-1.5 text-xs rounded transition-colors flex items-center gap-2 ${
+            activeTab === "infra"
+              ? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
+              : "text-slate-400 hover:text-white"
+          }`}
+        >
+          <AlertTriangle size={14} className="text-amber-400" />
+          <span>Infrastructure Alerts</span>
+          {alerts.length > 0 && (
+            <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-amber-500/40 text-amber-300 font-bold">
+              {alerts.length}
+            </span>
+          )}
+        </button>
       </div>
-      <ul className="divide-y divide-slate-800">
-        {alerts.length === 0 && <li className="p-6 text-center text-slate-500 text-xs">{t("ingest.allAcked")}</li>}
-        {alerts.map(a => (
-          <li key={a.id} data-testid={`infra-alert-${a.id}`} className="p-3 flex items-start gap-3">
-            <span className={`px-1.5 py-0.5 border text-[10px] uppercase mono ${sevColor[a.severity]}`}>{a.severity}</span>
-            <div className="flex-1 min-w-0">
-              <div className="text-xs text-slate-200">{a.text}</div>
-              <div className="mono text-[10px] text-slate-500 mt-1">{a.ts.slice(11, 19)}</div>
+
+      {activeTab === "edge" && (
+        <div className="border border-slate-800 bg-slate-900 rounded">
+          <div className="p-3 border-b border-slate-800 text-sm flex items-center justify-between font-sans">
+            <div className="flex items-center gap-2">
+              <ShieldAlert size={16} className="text-red-400" />
+              <span className="font-medium text-slate-100">Live Edge Station Incidents</span>
+              <span className="text-xs text-slate-500">({incidents.length} total)</span>
             </div>
-            <button data-testid={`ack-infra-${a.id}`} onClick={() => onAck(a.id)} className="text-[11px] px-2 py-1 border border-slate-700 hover:border-sky-500">
-              {t("common.acknowledge")}
-            </button>
-          </li>
-        ))}
-      </ul>
+            <div className="text-[11px] text-slate-400">
+              Relayed from edge field laptops via Ingest API / WebSocket
+            </div>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs text-left">
+              <thead className="bg-slate-950/60 text-slate-400 text-[10px] uppercase border-b border-slate-800">
+                <tr>
+                  <th className="px-3 py-2.5">Severity</th>
+                  <th className="px-3 py-2.5">Incident & Description</th>
+                  <th className="px-3 py-2.5">Category</th>
+                  <th className="px-3 py-2.5">Location / Place</th>
+                  <th className="px-3 py-2.5">Reported By</th>
+                  <th className="px-3 py-2.5">Timestamp</th>
+                  <th className="px-3 py-2.5">Status</th>
+                  <th className="px-3 py-2.5 text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/60">
+                {incidents.length === 0 && (
+                  <tr>
+                    <td colSpan={8} className="p-6 text-center text-slate-500 text-xs font-mono">
+                      No edge incidents received yet.
+                    </td>
+                  </tr>
+                )}
+                {incidents.map((inc) => (
+                  <tr key={inc.id} className="hover:bg-slate-800/40 transition-colors">
+                    <td className="px-3 py-3 whitespace-nowrap">
+                      <span className={`px-2 py-0.5 border rounded text-[10px] font-bold uppercase ${
+                        inc.severity === "CRITICAL" ? "text-red-400 border-red-500/40 bg-red-500/10" :
+                        inc.severity === "HIGH" ? "text-amber-400 border-amber-500/40 bg-amber-500/10" :
+                        inc.severity === "MEDIUM" ? "text-sky-400 border-sky-500/40 bg-sky-500/10" :
+                        "text-slate-400 border-slate-600 bg-slate-800/40"
+                      }`}>
+                        {inc.severity}
+                      </span>
+                    </td>
+                    <td className="px-3 py-3 min-w-[200px]">
+                      <div className="font-semibold text-slate-200">{inc.title}</div>
+                      <div className="text-[11px] text-slate-400 max-w-md truncate">{inc.description || "—"}</div>
+                    </td>
+                    <td className="px-3 py-3 whitespace-nowrap">
+                      <span className="px-1.5 py-0.5 bg-slate-800 text-slate-300 rounded border border-slate-700 text-[10px] uppercase">
+                        {(inc.category || "general").replace("_", " ")}
+                      </span>
+                    </td>
+                    <td className="px-3 py-3 whitespace-nowrap text-slate-300">
+                      📍 {inc.location || "Edge Station"}
+                    </td>
+                    <td className="px-3 py-3 whitespace-nowrap text-slate-400 font-mono text-[11px]">
+                      {inc.created_by || "Edge Operator"}
+                    </td>
+                    <td className="px-3 py-3 whitespace-nowrap text-slate-400 font-mono text-[11px]">
+                      {inc.timestamp ? new Date(inc.timestamp).toLocaleString() : "—"}
+                    </td>
+                    <td className="px-3 py-3 whitespace-nowrap">
+                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border ${
+                        inc.status === "ACKNOWLEDGED"
+                          ? "bg-slate-800 text-slate-400 border-slate-700"
+                          : "bg-red-500/20 text-red-300 border-red-500/40 animate-pulse"
+                      }`}>
+                        {inc.status || "OPEN"}
+                      </span>
+                    </td>
+                    <td className="px-3 py-3 whitespace-nowrap text-right">
+                      {inc.status !== "ACKNOWLEDGED" ? (
+                        <button
+                          onClick={() => onAckIncident && onAckIncident(inc.id)}
+                          className="px-2.5 py-1 text-[11px] bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 border border-emerald-500/40 rounded transition-colors"
+                        >
+                          Acknowledge
+                        </button>
+                      ) : (
+                        <span className="text-slate-500 text-[11px]">Acknowledged</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {activeTab === "infra" && (
+        <div className="border border-slate-800 bg-slate-900 font-mono">
+          <div className="p-3 border-b border-slate-800 text-sm flex items-center gap-2 font-sans">
+            <AlertTriangle size={16} className="text-amber-400" /> {t("ingest.alertsTitle")}
+          </div>
+          <ul className="divide-y divide-slate-800">
+            {alerts.length === 0 && <li className="p-6 text-center text-slate-500 text-xs">{t("ingest.allAcked")}</li>}
+            {alerts.map(a => (
+              <li key={a.id} data-testid={`infra-alert-${a.id}`} className="p-3 flex items-start gap-3">
+                <span className={`px-1.5 py-0.5 border text-[10px] uppercase mono ${sevColor[a.severity]}`}>{a.severity}</span>
+                <div className="flex-1 min-w-0">
+                  <div className="text-xs text-slate-200">{a.text}</div>
+                  <div className="mono text-[10px] text-slate-500 mt-1">{a.ts.slice(11, 19)}</div>
+                </div>
+                <button data-testid={`ack-infra-${a.id}`} onClick={() => onAck(a.id)} className="text-[11px] px-2 py-1 border border-slate-700 hover:border-sky-500">
+                  {t("common.acknowledge")}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   );
 }

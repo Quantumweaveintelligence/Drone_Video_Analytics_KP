@@ -34,6 +34,7 @@ from typing import AsyncGenerator, Optional
 
 import httpx
 from fastapi import (
+    Body,
     Depends,
     FastAPI,
     File,
@@ -816,6 +817,86 @@ async def update_mission_geofence(
     return {"status": "updated", "drone_id": req.drone_id, "mission_id": req.mission_id}
 
 
+@app.post(
+    "/ingest/incident",
+    status_code = status.HTTP_201_CREATED,
+    summary     = "Report an operational incident from edge station",
+    tags        = ["Incident"],
+)
+async def ingest_incident(
+    req:    dict = Body(...),
+    claims: dict = Depends(validate_token_flexible),
+) -> dict:
+    """
+    Accepts an edge incident report, logs it, and broadcasts an incident event to WebSocket clients.
+    """
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+    inc_id = req.get("id") or f"INC-{int(time.time())}"
+
+    event_payload = {
+        "event_type": "edge_incident",
+        "incident_id": inc_id,
+        "title": req.get("title", "Operational Incident"),
+        "severity": req.get("severity", "MEDIUM"),
+        "category": req.get("category", "hardware"),
+        "location": req.get("location", "Edge Station"),
+        "created_by": req.get("created_by", "Edge Operator"),
+        "timestamp": req.get("timestamp", ts),
+        "description": req.get("description", ""),
+        "drone_id": req.get("drone_id"),
+        "mission_id": req.get("mission_id"),
+    }
+
+    asyncio.create_task(ws_manager.broadcast({
+        "event": "edge_incident",
+        "incident": event_payload,
+        "timestamp": ts,
+    }))
+
+    log.info("edge_incident_reported", extra={"incident_id": inc_id, "severity": event_payload["severity"]})
+    return {"status": "ok", "incident_id": inc_id, "received_at": ts}
+
+
+@app.post(
+    "/ingest/model-suggestion",
+    status_code = status.HTTP_201_CREATED,
+    summary     = "Receive AI model suggestion from edge station",
+    tags        = ["Analytics"],
+)
+async def ingest_model_suggestion(
+    req:    dict = Body(...),
+    claims: dict = Depends(validate_token_flexible),
+) -> dict:
+    """
+    Accepts an edge operator AI model recommendation, logs it, and broadcasts
+    a model_suggestion event to WebSocket clients (including GPU dashboard).
+    """
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+    sugg_id = req.get("id") or f"SUGG-{int(time.time())}"
+
+    event_payload = {
+        "event_type": "model_suggestion",
+        "suggestion_id": sugg_id,
+        "models": req.get("models", []),
+        "model_names": req.get("model_names", []),
+        "priority": req.get("priority", "normal"),
+        "reason": req.get("reason", ""),
+        "location": req.get("location", "Edge Ground Station"),
+        "suggested_by": req.get("suggested_by", "Edge Operator"),
+        "timestamp": req.get("timestamp", ts),
+        "status": req.get("status", "PENDING"),
+    }
+
+    asyncio.create_task(ws_manager.broadcast({
+        "event": "model_suggestion",
+        "suggestion": event_payload,
+        "timestamp": ts,
+    }))
+
+    log.info("edge_model_suggestion_received", extra={"suggestion_id": sugg_id, "models": event_payload["models"]})
+    return {"status": "ok", "suggestion_id": sugg_id, "received_at": ts}
+
+
 async def _auto_cleanup_consumed_streams():
     """Periodically check for fully-consumed draining streams and auto-clean."""
     while True:
@@ -841,6 +922,7 @@ async def _auto_cleanup_consumed_streams():
                     await ws_manager.broadcast({"event": "mission_drained", "drone_id": drone_id, "mission_id": mid})
         except Exception as e:
             log.warning(f"[AUTO-CLEANUP] Error: {e}")
+
 
 async def _monitor_queue_drain(drone_id: str, mission_id: str, max_wait_sec: float = 300.0):
     """

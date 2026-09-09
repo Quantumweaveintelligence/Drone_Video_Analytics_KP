@@ -959,3 +959,180 @@ async def intrusion_stream_stop(user: dict = Depends(get_current_user)):
         raise HTTPException(403, "Not permitted")
     return await _analytics_get(f"{INTRUSION_URL}/stream/stop")
 
+
+# ── AI Model Suggestions from Edge to Ingest / GPU Dashboard ─────────────────
+
+async def _forward_suggestion_to_ingest(suggestion_dict: dict) -> bool:
+    try:
+        from ingest_proxy import _get_service_token, INGEST_SERVER_URL
+        token = await _get_service_token()
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        url = f"{INGEST_SERVER_URL}/ingest/model-suggestion"
+        async with httpx.AsyncClient(timeout=3.5) as client:
+            resp = await client.post(url, json=suggestion_dict, headers=headers)
+            return resp.is_success
+    except Exception as exc:
+        logger.warning(f"Could not forward model suggestion to Ingest Server: {exc}")
+        return False
+
+
+@router.get("/analytics/suggestions")
+async def list_model_suggestions(
+    limit: int = 50,
+    user: dict = Depends(get_current_user)
+):
+    """List operator AI model suggestions ordered by newest first."""
+    from database import async_session_factory
+    from models import AIModelSuggestion
+    from sqlalchemy import select, desc
+    async with async_session_factory() as session:
+        stmt = select(AIModelSuggestion).order_by(desc(AIModelSuggestion.timestamp)).limit(limit)
+        res = await session.execute(stmt)
+        return [_row_to_dict(r) for r in res.scalars().all()]
+
+
+@router.post("/analytics/suggestions")
+async def create_model_suggestion(
+    payload: dict,
+    user: dict = Depends(get_current_user),
+    request: Request = None,
+):
+    """
+    Edge operator suggests analytical AI models (Crowd, Person, Intrusion, ANPR, Vehicle).
+    Persists suggestion, relays to Ingest Server, and broadcasts live to GPU dashboard.
+    """
+    import uuid
+    from datetime import datetime, timezone
+    from database import async_session_factory
+    from models import AIModelSuggestion
+    from services.websocket_hub import hub
+
+    models = payload.get("models", [])
+    if not models:
+        raise HTTPException(400, "At least one AI model must be selected")
+
+    model_names = payload.get("model_names", [m.replace('_', ' ').title() for m in models])
+    priority = payload.get("priority", "normal").lower()
+    reason = payload.get("reason", "").strip()
+    location = payload.get("location") or payload.get("place") or "Edge Ground Station"
+    ts = payload.get("timestamp") or datetime.now(timezone.utc).isoformat()
+    drone_id = payload.get("drone_id")
+    mission_id = payload.get("mission_id")
+
+    suggested_by = (
+        user.get("name")
+        or (f"{user.get('first_name', '')} {user.get('last_name', '')}".strip())
+        or user.get("email")
+        or "Edge Operator"
+    )
+    if user.get("email") and f"({user.get('email')})" not in suggested_by:
+        suggested_by = f"{suggested_by} ({user.get('email')})"
+
+    sugg_id = f"SUGG-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+
+    sugg_dict = {
+        "id": sugg_id,
+        "models": models,
+        "model_names": model_names,
+        "priority": priority,
+        "reason": reason,
+        "location": location,
+        "suggested_by": suggested_by,
+        "timestamp": ts,
+        "status": "PENDING",
+        "drone_id": drone_id,
+        "mission_id": mission_id,
+    }
+
+    # Relay to remote Ingest Server
+    sent_to_ingest = await _forward_suggestion_to_ingest(sugg_dict)
+    sugg_dict["sent_to_ingest"] = sent_to_ingest
+
+    # Persist in DB
+    async with async_session_factory() as session:
+        new_sugg = AIModelSuggestion(
+            id=sugg_id,
+            models=models,
+            model_names=model_names,
+            priority=priority,
+            reason=reason,
+            location=location,
+            suggested_by=suggested_by,
+            timestamp=ts,
+            status="PENDING",
+            drone_id=drone_id,
+            mission_id=mission_id,
+        )
+        session.add(new_sugg)
+        await session.commit()
+
+    # Log to audit trail
+    try:
+        await write_audit_v2(
+            actor=user,
+            action="SUGGEST_AI_MODELS",
+            action_type="create",
+            category="analytics",
+            severity="info",
+            target=sugg_id,
+            target_type="ai_model_suggestion",
+            target_id=sugg_id,
+            target_name=", ".join(model_names),
+            details=f"Models suggested: {', '.join(model_names)} at {location}. Priority: {priority}",
+            source_module="edge",
+            request=request,
+        )
+    except Exception as audit_err:
+        logger.warning(f"Audit log failed for model suggestion: {audit_err}")
+
+    # Broadcast to WebSocket clients (Ingest / GPU Dashboard)
+    await hub.broadcast({
+        "type": "model_suggestion",
+        "suggestion": sugg_dict,
+        "models": models,
+        "model_names": model_names,
+        "priority": priority,
+        "location": location,
+        "suggested_by": suggested_by,
+        "timestamp": ts,
+    })
+
+    return {"status": "ok", "suggestion": sugg_dict}
+
+
+@router.post("/analytics/suggestions/{suggestion_id}/status")
+async def update_suggestion_status(
+    suggestion_id: str,
+    payload: dict,
+    user: dict = Depends(get_current_user),
+    request: Request = None,
+):
+    """Update suggestion status to ACKNOWLEDGED or DEPLOYED_TO_GPU."""
+    from database import async_session_factory
+    from models import AIModelSuggestion
+    from sqlalchemy import update
+    from services.websocket_hub import hub
+
+    new_status = payload.get("status", "ACKNOWLEDGED").upper()
+    if new_status not in ("PENDING", "ACKNOWLEDGED", "DEPLOYED_TO_GPU"):
+        new_status = "ACKNOWLEDGED"
+
+    async with async_session_factory() as session:
+        res = await session.execute(
+            update(AIModelSuggestion)
+            .where(AIModelSuggestion.id == suggestion_id)
+            .values(status=new_status)
+        )
+        if res.rowcount == 0:
+            raise HTTPException(404, "Model suggestion not found")
+        await session.commit()
+
+    await hub.broadcast({
+        "type": "model_suggestion_status",
+        "suggestion_id": suggestion_id,
+        "status": new_status,
+    })
+
+    return {"status": "ok", "suggestion_id": suggestion_id, "new_status": new_status}
+
+

@@ -753,6 +753,7 @@ class PipelineManager:
 
             end_time_str = datetime.datetime.utcnow().isoformat() + "Z"
             frames_processed = self.source._frame_index if self.source else 0
+            frames_selected = self.frames_selected
             mission_id = self.active_mission.get("mission_id", "") if self.active_mission else ""
             video_source_type = self.active_mission.get("video_source_type", "") if self.active_mission else ""
             video_source_path = self.active_mission.get("video_source", "") if self.active_mission else ""
@@ -816,12 +817,13 @@ class PipelineManager:
             self._bypass_frame_counter = 0
             self.geofence = None
 
-            log.info("mission_ended", mission_id=mission_id, frames_processed=frames_processed)
+            log.info("mission_ended", mission_id=mission_id, frames_processed=frames_processed, frames_selected=frames_selected)
             return {
                 "status": "ended",
                 "mission_id": mission_id,
                 "end_time": end_time_str,
                 "frames_processed": frames_processed,
+                "frames_selected": frames_selected,
             }
 
     def get_mission_history(self) -> list:

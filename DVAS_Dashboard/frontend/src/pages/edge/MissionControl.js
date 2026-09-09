@@ -250,7 +250,9 @@ export default function MissionControl() {
               drone_id: data.drone_id,
               operator_name: form.operator,
               location: form.location,
-              started_at: data.start_time
+              started_at: data.start_time,
+              video_source: data.video_source || finalVideoSource || form.video_source,
+              video_source_type: form.video_source_type || 'rtmp',
             })
           });
         } catch (backendErr) {
@@ -277,11 +279,18 @@ export default function MissionControl() {
             : m
         ));
         
-        // Update backend database
+        // Update backend database with final frames and stream info
         if (activeMission?.id) {
           try {
             await authFetch(`/api/missions/${activeMission.id}/end`, {
               method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                frames_processed: data.frames_processed || 0,
+                frames_sent: data.frames_processed || 0,
+                frames_ingested: data.frames_selected !== undefined ? data.frames_selected : (data.frames_processed || 0),
+                video_source: activeMission.videoSource || null
+              })
             });
           } catch (backendErr) {
             console.error("Failed to mark mission as ended in backend:", backendErr);
