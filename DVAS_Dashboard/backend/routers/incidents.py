@@ -79,6 +79,23 @@ async def create_incident(
     mission_id = payload.get("mission_id")
     drone_id = payload.get("drone_id")
 
+    # If mission_id is not passed, resolve from active mission in database
+    if not mission_id:
+        try:
+            from models import Mission
+            from sqlalchemy import select
+            async with async_session_factory() as session:
+                active_m = await session.execute(
+                    select(Mission).where(Mission.status == "active").order_by(Mission.started_at.desc()).limit(1)
+                )
+                m_row = active_m.scalar_one_or_none()
+                if m_row:
+                    mission_id = m_row.mission_id
+                    if not drone_id:
+                        drone_id = m_row.drone_id
+        except Exception as err:
+            logger.debug(f"Could not auto-detect active mission for incident: {err}")
+
     # Created By: operator name / email from auth
     created_by = (
         user.get("name")
@@ -91,9 +108,12 @@ async def create_incident(
 
     incident_id = f"INC-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
 
+    display_title = f"{mission_id + ': ' if mission_id else ''}{title}"
+
     incident_record = {
         "id": incident_id,
         "title": title,
+        "display_title": display_title,
         "description": description,
         "severity": severity,
         "category": category,
@@ -151,11 +171,14 @@ async def create_incident(
     ws_incident = {
         "type": "incident",
         "incident": incident_record,
-        "title": title,
+        "title": display_title,
+        "message": display_title,
         "severity": severity,
         "location": location,
         "created_by": created_by,
         "timestamp": timestamp,
+        "mission_id": mission_id,
+        "drone_id": drone_id,
     }
     await hub.broadcast(ws_incident)
 
@@ -168,10 +191,11 @@ async def create_incident(
         "type": "alert",
         "alert": {
             "id": incident_id,
-            "title": f"Incident: {title}",
-            "type": title,
+            "title": display_title,
+            "type": display_title,
             "severity": alert_severity,
             "drone_id": drone_id or "EDGE-STATION",
+            "mission_id": mission_id,
             "zone": location,
             "ts": timestamp,
         }

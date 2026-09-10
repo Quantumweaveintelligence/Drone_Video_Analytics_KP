@@ -1015,9 +1015,25 @@ async def create_model_suggestion(
     priority = payload.get("priority", "normal").lower()
     reason = payload.get("reason", "").strip()
     location = payload.get("location") or payload.get("place") or "Edge Ground Station"
-    ts = payload.get("timestamp") or datetime.now(timezone.utc).isoformat()
     drone_id = payload.get("drone_id")
     mission_id = payload.get("mission_id")
+
+    # If mission_id is not passed, resolve from active mission in database
+    if not mission_id:
+        try:
+            from models import Mission
+            from sqlalchemy import select
+            async with async_session_factory() as session:
+                active_m = await session.execute(
+                    select(Mission).where(Mission.status == "active").order_by(Mission.started_at.desc()).limit(1)
+                )
+                m_row = active_m.scalar_one_or_none()
+                if m_row:
+                    mission_id = m_row.mission_id
+                    if not drone_id:
+                        drone_id = m_row.drone_id
+        except Exception as err:
+            logger.debug(f"Could not auto-detect active mission for suggestion: {err}")
 
     suggested_by = (
         user.get("name")
@@ -1029,6 +1045,11 @@ async def create_model_suggestion(
         suggested_by = f"{suggested_by} ({user.get('email')})"
 
     sugg_id = f"SUGG-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+
+    # Format: "<MISSION ID>: Suggests <AI Model name>"
+    models_str = ", ".join(model_names) if model_names else "AI Models"
+    mission_tag = mission_id or (drone_id if drone_id else "Edge Mission")
+    display_title = f"{mission_tag}: Suggests {models_str}"
 
     sugg_dict = {
         "id": sugg_id,
@@ -1042,6 +1063,7 @@ async def create_model_suggestion(
         "status": "PENDING",
         "drone_id": drone_id,
         "mission_id": mission_id,
+        "display_title": display_title,
     }
 
     # Relay to remote Ingest Server
@@ -1085,10 +1107,14 @@ async def create_model_suggestion(
     except Exception as audit_err:
         logger.warning(f"Audit log failed for model suggestion: {audit_err}")
 
-    # Broadcast to WebSocket clients (Ingest / GPU Dashboard)
+    # Broadcast to WebSocket clients (Ingest / Command / GPU Dashboard)
     await hub.broadcast({
         "type": "model_suggestion",
         "suggestion": sugg_dict,
+        "title": display_title,
+        "message": display_title,
+        "mission_id": mission_id,
+        "drone_id": drone_id,
         "models": models,
         "model_names": model_names,
         "priority": priority,

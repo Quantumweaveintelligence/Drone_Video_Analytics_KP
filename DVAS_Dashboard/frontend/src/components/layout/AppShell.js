@@ -9,7 +9,7 @@ import {
   Shield, Map as MapIcon, Gauge, ShieldCheck, LogOut, Send as Drone,
   Sun, Moon, Bell, PanelLeftClose, PanelLeftOpen, Activity,
   Languages, AlertTriangle, ChevronDown, LayoutDashboard, Target,
-  Video, Compass, Clock, Scan, Image, Archive, Server, ClipboardList, Settings
+  Video, Compass, Clock, Scan, Image, Archive, Server, ClipboardList, Settings, Cpu
 } from "lucide-react";
 
 const NAV = {
@@ -111,26 +111,177 @@ function NotificationBell() {
   const { user } = useAuth();
   const { t } = useI18n();
   const nav = useNavigate();
-  const [alerts, setAlerts] = useState([]);
+  const [notifications, setNotifications] = useState([]);
   const [unread, setUnread] = useState(0);
   const [open, setOpen] = useState(false);
   const [flash, setFlash] = useState(false);
+  const [filter, setFilter] = useState("all");
   const rootRef = useRef(null);
 
+  // Load initial notifications from alerts, incidents, and model suggestions
+  const loadNotifications = async () => {
+    if (!user || user.role === "drone_operator") return;
+    try {
+      const [alertsRes, incsRes, suggsRes] = await Promise.allSettled([
+        api.get("/alerts"),
+        api.get("/incidents"),
+        api.get("/analytics/suggestions"),
+      ]);
+
+      const items = [];
+
+      // 1. AI Model Suggestions: Format "<MISSION ID>: Suggests <AI Model name>"
+      if (suggsRes.status === "fulfilled" && Array.isArray(suggsRes.value.data)) {
+        suggsRes.value.data.forEach((s) => {
+          const modelList = (s.model_names && s.model_names.length > 0)
+            ? s.model_names.join(", ")
+            : (s.models || []).map(m => m.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())).join(", ") || "AI Model";
+          const missionPrefix = s.mission_id || "Mission";
+          items.push({
+            id: s.id,
+            type: "model_suggestion",
+            title: `${missionPrefix}: Suggests ${modelList}`,
+            subtitle: `${s.suggested_by || "Edge Operator"} · ${s.location || "Ground Station"}`,
+            ts: s.timestamp || s.created_at,
+            severity: s.priority === "critical" ? "critical" : s.priority === "high" ? "warning" : "info",
+            badge: "AI SUGGESTION",
+            badgeClass: "bg-sky-500/10 text-sky-400 border-sky-500/30",
+            icon: "cpu",
+          });
+        });
+      }
+
+      // 2. Edge Station Incidents
+      if (incsRes.status === "fulfilled" && Array.isArray(incsRes.value.data)) {
+        incsRes.value.data.forEach((inc) => {
+          const missionPrefix = inc.mission_id ? `${inc.mission_id}: ` : inc.drone_id ? `${inc.drone_id}: ` : "";
+          items.push({
+            id: inc.id,
+            type: "incident",
+            title: `${missionPrefix}${inc.title}`,
+            subtitle: `${inc.created_by || "Edge Operator"} · ${inc.location || "Ground Station"}`,
+            ts: inc.timestamp,
+            severity: inc.severity === "CRITICAL" ? "critical" : inc.severity === "HIGH" ? "warning" : "info",
+            badge: inc.severity || "INCIDENT",
+            badgeClass: inc.severity === "CRITICAL" ? "bg-red-500/10 text-red-400 border-red-500/30" : "bg-amber-500/10 text-amber-400 border-amber-500/30",
+            icon: "incident",
+          });
+        });
+      }
+
+      // 3. Vision Detection Alerts
+      if (alertsRes.status === "fulfilled" && Array.isArray(alertsRes.value.data)) {
+        alertsRes.value.data.forEach((a) => {
+          const inScope =
+            user.role === "system_administrator" ||
+            user.role === "senior_officer" ||
+            ((user.mission_scope || []).includes(a.mission_id));
+          if (!inScope) return;
+          const missionPrefix = a.mission_id ? `${a.mission_id}: ` : "";
+          const alertName = a.type ? a.type.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase()) : (a.title || "Detection Alert");
+          items.push({
+            id: a.id,
+            type: "alert",
+            title: `${missionPrefix}${alertName}`,
+            subtitle: `${a.drone_id || "DRN"} · ${a.zone || "Zone"}`,
+            ts: a.ts,
+            severity: a.severity === "critical" ? "critical" : "warning",
+            badge: "DETECTION",
+            badgeClass: a.severity === "critical" ? "bg-red-500/10 text-red-400 border-red-500/30" : "bg-purple-500/10 text-purple-400 border-purple-500/30",
+            icon: "alert",
+          });
+        });
+      }
+
+      // Sort newest first
+      items.sort((a, b) => new Date(b.ts || 0).getTime() - new Date(a.ts || 0).getTime());
+      setNotifications(items.slice(0, 50));
+    } catch (e) {
+      console.warn("Failed to fetch initial notifications:", e);
+    }
+  };
+
+  useEffect(() => {
+    loadNotifications();
+  }, [user]);
+
+  // Real-time WebSocket listener
   useDvasSocket((msg) => {
-    if (msg.type !== "alert" || !msg.alert) return;
-    if (!user) return;
-    const a = msg.alert;
-    // Admin & SR see all alerts; CRO sees only alerts within their assigned mission scope
-    const inScope =
-      user.role === "system_administrator" ||
-      user.role === "senior_officer" ||
-      ((user.mission_scope || []).includes(a.mission_id));
-    if (!inScope) return;
-    setAlerts((prev) => [a, ...prev].slice(0, 20));
-    setUnread((c) => c + 1);
-    setFlash(true);
-    setTimeout(() => setFlash(false), 1200);
+    if (!user || user.role === "drone_operator") return;
+
+    // A. AI Model Suggestion: format "<MISSION ID>: Suggests <AI Model name>"
+    if (msg.type === "model_suggestion") {
+      const s = msg.suggestion || msg;
+      const modelList = (msg.model_names && msg.model_names.length > 0)
+        ? msg.model_names.join(", ")
+        : (s.model_names && s.model_names.length > 0)
+        ? s.model_names.join(", ")
+        : (s.models || []).map(m => m.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())).join(", ") || "AI Model";
+      const missionPrefix = msg.mission_id || s.mission_id || "Mission";
+      const newNotif = {
+        id: s.id || `sugg-${Date.now()}`,
+        type: "model_suggestion",
+        title: `${missionPrefix}: Suggests ${modelList}`,
+        subtitle: `${s.suggested_by || msg.suggested_by || "Edge Operator"} · ${s.location || msg.location || "Ground Station"}`,
+        ts: s.timestamp || msg.timestamp || new Date().toISOString(),
+        severity: (s.priority || msg.priority) === "critical" ? "critical" : (s.priority || msg.priority) === "high" ? "warning" : "info",
+        badge: "AI SUGGESTION",
+        badgeClass: "bg-sky-500/10 text-sky-400 border-sky-500/30",
+        icon: "cpu",
+      };
+      setNotifications((prev) => [newNotif, ...prev.filter(x => x.id !== newNotif.id)].slice(0, 50));
+      setUnread((c) => c + 1);
+      setFlash(true);
+      setTimeout(() => setFlash(false), 1200);
+    }
+
+    // B. Edge Incident
+    else if (msg.type === "incident" && msg.incident) {
+      const inc = msg.incident;
+      const missionPrefix = inc.mission_id ? `${inc.mission_id}: ` : inc.drone_id ? `${inc.drone_id}: ` : "";
+      const newNotif = {
+        id: inc.id || `inc-${Date.now()}`,
+        type: "incident",
+        title: `${missionPrefix}${inc.title}`,
+        subtitle: `${inc.created_by || "Edge Operator"} · ${inc.location || "Ground Station"}`,
+        ts: inc.timestamp || new Date().toISOString(),
+        severity: inc.severity === "CRITICAL" ? "critical" : inc.severity === "HIGH" ? "warning" : "info",
+        badge: inc.severity || "INCIDENT",
+        badgeClass: inc.severity === "CRITICAL" ? "bg-red-500/10 text-red-400 border-red-500/30" : "bg-amber-500/10 text-amber-400 border-amber-500/30",
+        icon: "incident",
+      };
+      setNotifications((prev) => [newNotif, ...prev.filter(x => x.id !== newNotif.id)].slice(0, 50));
+      setUnread((c) => c + 1);
+      setFlash(true);
+      setTimeout(() => setFlash(false), 1200);
+    }
+
+    // C. Standard Vision Detection Alert
+    else if (msg.type === "alert" && msg.alert) {
+      const a = msg.alert;
+      const inScope =
+        user.role === "system_administrator" ||
+        user.role === "senior_officer" ||
+        ((user.mission_scope || []).includes(a.mission_id));
+      if (!inScope) return;
+      const missionPrefix = a.mission_id ? `${a.mission_id}: ` : "";
+      const alertName = a.type ? a.type.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase()) : (a.title || "Detection Alert");
+      const newNotif = {
+        id: a.id || `alert-${Date.now()}`,
+        type: "alert",
+        title: `${missionPrefix}${alertName}`,
+        subtitle: `${a.drone_id || "DRN"} · ${a.zone || "Zone"}`,
+        ts: a.ts || new Date().toISOString(),
+        severity: a.severity === "critical" ? "critical" : "warning",
+        badge: "DETECTION",
+        badgeClass: a.severity === "critical" ? "bg-red-500/10 text-red-400 border-red-500/30" : "bg-purple-500/10 text-purple-400 border-purple-500/30",
+        icon: "alert",
+      };
+      setNotifications((prev) => [newNotif, ...prev.filter(x => x.id !== newNotif.id)].slice(0, 50));
+      setUnread((c) => c + 1);
+      setFlash(true);
+      setTimeout(() => setFlash(false), 1200);
+    }
   });
 
   useEffect(() => {
@@ -158,78 +309,160 @@ function NotificationBell() {
     }
   };
 
-  const preview = alerts.slice(0, 5);
+  const filtered = notifications.filter((n) => {
+    if (filter === "all") return true;
+    if (filter === "suggestions") return n.type === "model_suggestion";
+    if (filter === "incidents") return n.type === "incident";
+    if (filter === "alerts") return n.type === "alert";
+    return true;
+  });
+
+  const preview = filtered.slice(0, 15);
 
   return (
     <div className="relative" ref={rootRef}>
       <button
         data-testid="notification-bell"
         onClick={() => { setOpen((o) => !o); if (!open) setUnread(0); }}
-        title={`${unread} unread`}
+        title={`${unread} unread alerts & model suggestions`}
         className="relative h-9 w-9 rounded-lg flex items-center justify-center transition-colors hover:bg-[color:var(--dvas-elev)]"
         style={{ color: "var(--dvas-text-muted)" }}
       >
-        <Bell size={16} className={flash ? "dvas-live-dot" : ""} />
+        <Bell size={16} className={flash ? "dvas-live-dot text-amber-400" : ""} />
         {unread > 0 && (
           <span
             data-testid="notification-count"
-            className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full dvas-live-dot"
-            style={{ background: "var(--dvas-blue)" }}
-          />
+            className="absolute top-1 right-1 px-1 min-w-[14px] h-[14px] rounded-full text-[9px] font-bold font-mono flex items-center justify-center bg-amber-500 text-black shadow-sm animate-pulse"
+          >
+            {unread > 9 ? "9+" : unread}
+          </span>
         )}
       </button>
 
       {open && (
         <div
           data-testid="notification-drawer"
-          className="absolute right-0 top-11 z-50 w-80 dvas-fade-in overflow-hidden"
+          className="absolute right-0 top-11 z-50 w-96 dvas-fade-in overflow-hidden shadow-2xl rounded-xl border border-slate-700/80 bg-slate-900"
           style={{
-            background: "var(--dvas-surface)",
-            border: "1px solid var(--dvas-border)",
-            borderRadius: "var(--dvas-radius)",
-            boxShadow: "var(--dvas-shadow-lg)",
+            boxShadow: "0 10px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5)",
           }}
         >
+          {/* Header */}
           <div
-            className="px-4 py-3 flex items-center gap-2 text-sm font-semibold"
-            style={{ borderBottom: "1px solid var(--dvas-border)" }}
+            className="px-4 py-3 flex items-center justify-between border-b border-slate-800 bg-slate-950/60"
           >
-            <Bell size={14} style={{ color: "var(--dvas-warn)" }} />
-            {t("topbar.notifications")}
-            <span className="ml-auto text-[10px] font-medium mono" style={{ color: "var(--dvas-text-dim)" }}>
-              {preview.length}/{alerts.length}
-            </span>
+            <div className="flex items-center gap-2 text-sm font-semibold text-slate-100">
+              <Bell size={15} className="text-amber-400" />
+              <span>Command Dispatch & Alerts</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] font-medium font-mono text-slate-400">
+                {notifications.length} Total
+              </span>
+              {unread > 0 && (
+                <button
+                  onClick={() => setUnread(0)}
+                  className="text-[10px] text-sky-400 hover:text-sky-300 transition-colors"
+                >
+                  Mark read
+                </button>
+              )}
+            </div>
           </div>
 
+          {/* Quick Filter Tabs */}
+          <div className="flex items-center gap-1 px-3 py-1.5 bg-slate-950/40 border-b border-slate-800/80 text-[11px] overflow-x-auto">
+            <button
+              onClick={() => setFilter("all")}
+              className={`px-2 py-0.5 rounded transition-colors ${
+                filter === "all" ? "bg-slate-700 text-white font-medium" : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              All ({notifications.length})
+            </button>
+            <button
+              onClick={() => setFilter("suggestions")}
+              className={`px-2 py-0.5 rounded transition-colors flex items-center gap-1 ${
+                filter === "suggestions" ? "bg-sky-600/30 text-sky-300 border border-sky-500/40 font-medium" : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Cpu size={11} className="text-sky-400" />
+              Suggestions ({notifications.filter(n => n.type === "model_suggestion").length})
+            </button>
+            <button
+              onClick={() => setFilter("incidents")}
+              className={`px-2 py-0.5 rounded transition-colors flex items-center gap-1 ${
+                filter === "incidents" ? "bg-amber-600/30 text-amber-300 border border-amber-500/40 font-medium" : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <AlertTriangle size={11} className="text-amber-400" />
+              Incidents ({notifications.filter(n => n.type === "incident").length})
+            </button>
+            <button
+              onClick={() => setFilter("alerts")}
+              className={`px-2 py-0.5 rounded transition-colors ${
+                filter === "alerts" ? "bg-purple-600/30 text-purple-300 border border-purple-500/40 font-medium" : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              Alerts ({notifications.filter(n => n.type === "alert").length})
+            </button>
+          </div>
+
+          {/* Notifications List */}
           {preview.length === 0 ? (
             <div
               data-testid="notification-empty"
-              className="px-4 py-8 text-center text-xs"
-              style={{ color: "var(--dvas-text-dim)" }}
+              className="px-4 py-10 text-center text-xs text-slate-500"
             >
-              {t("topbar.noAlerts")}
+              No incoming messages or alerts in this category.
             </div>
           ) : (
-            <ul className="max-h-72 overflow-auto">
-              {preview.map((a, i) => (
+            <ul className="max-h-80 overflow-y-auto divide-y divide-slate-800/60">
+              {preview.map((item, i) => (
                 <li
-                  key={`${a.id || i}-${a.ts}`}
+                  key={`${item.id || i}-${item.ts}`}
                   data-testid={`notif-item-${i}`}
-                  className="px-4 py-3 flex items-start gap-2.5 text-xs hover:bg-[color:var(--dvas-elev)] transition-colors"
-                  style={{ borderBottom: "1px solid var(--dvas-border)" }}
+                  className="px-4 py-2.5 flex items-start gap-2.5 text-xs hover:bg-slate-800/40 transition-colors"
                 >
-                  <AlertTriangle size={14} style={{
-                    color: a.severity === "critical" ? "var(--dvas-crit)"
-                         : a.severity === "warning" ? "var(--dvas-warn)"
-                         : "var(--dvas-blue)",
-                    marginTop: 2,
-                  }} />
+                  {/* Icon */}
+                  <div className="mt-0.5 shrink-0">
+                    {item.icon === "cpu" ? (
+                      <div className="w-6 h-6 rounded-md bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400">
+                        <Cpu size={13} />
+                      </div>
+                    ) : item.icon === "incident" ? (
+                      <div className={`w-6 h-6 rounded-md flex items-center justify-center ${
+                        item.severity === "critical"
+                          ? "bg-red-500/10 border border-red-500/40 text-red-400"
+                          : "bg-amber-500/10 border border-amber-500/40 text-amber-400"
+                      }`}>
+                        <AlertTriangle size={13} />
+                      </div>
+                    ) : (
+                      <div className="w-6 h-6 rounded-md bg-purple-500/10 border border-purple-500/30 flex items-center justify-center text-purple-400">
+                        <AlertTriangle size={13} />
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Content */}
                   <div className="flex-1 min-w-0">
-                    <div className="font-medium truncate" style={{ color: "var(--dvas-text)" }}>
-                      {a.type || a.title || "alert"}
+                    <div className="flex items-center justify-between gap-1 mb-0.5">
+                      <span className={`text-[9px] font-mono px-1.5 py-0.2 rounded border font-semibold ${item.badgeClass}`}>
+                        {item.badge}
+                      </span>
+                      <span className="mono text-[10px] text-slate-500 shrink-0">
+                        {item.ts ? new Date(item.ts).toLocaleTimeString("en-GB") : ""}
+                      </span>
                     </div>
-                    <div className="mono text-[10px] mt-0.5" style={{ color: "var(--dvas-text-dim)" }}>
-                      {a.drone_id || "—"} · {a.zone || ""} · {new Date(a.ts).toLocaleTimeString()}
+
+                    {/* Exact format: <MISSION ID>: Suggests <AI Model name> */}
+                    <div className="font-semibold text-slate-100 text-[12px] leading-snug break-words">
+                      {item.title}
+                    </div>
+
+                    <div className="mono text-[10px] text-slate-400 mt-0.5 truncate">
+                      {item.subtitle}
                     </div>
                   </div>
                 </li>
@@ -237,13 +470,13 @@ function NotificationBell() {
             </ul>
           )}
 
+          {/* Footer */}
           <button
             data-testid="notification-viewall"
             onClick={jumpToAlerts}
-            className="w-full px-4 py-3 text-xs font-semibold flex items-center justify-center gap-1.5 hover:bg-[color:var(--dvas-elev)] transition-colors"
-            style={{ borderTop: "1px solid var(--dvas-border)", color: "var(--dvas-blue)" }}
+            className="w-full px-4 py-2.5 text-xs font-semibold flex items-center justify-center gap-1.5 bg-slate-950/80 hover:bg-slate-800 text-sky-400 border-t border-slate-800 transition-colors"
           >
-            {t("topbar.viewAllAlerts")} →
+            View All in Command Center →
           </button>
         </div>
       )}

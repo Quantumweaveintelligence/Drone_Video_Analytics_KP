@@ -211,6 +211,9 @@ export default function Incidents() {
   const [modelReason, setModelReason] = useState("");
   const [recentSuggestions, setRecentSuggestions] = useState([]);
 
+  // Active mission state for payload metadata
+  const [activeMission, setActiveMission] = useState(null);
+
   // Load incidents & suggestions on mount
   const loadData = async () => {
     try {
@@ -238,6 +241,37 @@ export default function Incidents() {
 
   useEffect(() => {
     loadData();
+
+    // Fetch active mission ID from edge or localStorage
+    const fetchActiveMission = async () => {
+      try {
+        const resp = await api.get("/edge/mission/active").catch(() => null);
+        if (resp?.data && (resp.data.mission_id || resp.data.id)) {
+          setActiveMission({
+            mission_id: resp.data.mission_id || resp.data.id,
+            drone_id: resp.data.drone_id || resp.data.drone || "DRN-001",
+          });
+          return;
+        }
+      } catch (e) {}
+
+      try {
+        const saved = localStorage.getItem("dvas_mission_log");
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            const active = parsed.find(m => m.status === "active") || parsed[0];
+            if (active) {
+              setActiveMission({
+                mission_id: active.id || active.mission_id,
+                drone_id: active.drone || active.drone_id || "DRN-001",
+              });
+            }
+          }
+        }
+      } catch (e) {}
+    };
+    fetchActiveMission();
   }, []);
 
   // Real-time socket subscription
@@ -276,6 +310,8 @@ export default function Incidents() {
         category: incidentPayload.category,
         location: incidentPayload.location?.trim() || "Edge Ground Station",
         timestamp: incidentPayload.timestamp || new Date().toISOString(),
+        mission_id: activeMission?.mission_id || undefined,
+        drone_id: activeMission?.drone_id || undefined,
       };
 
       const { data } = await api.post("/incidents", payload);
@@ -365,6 +401,8 @@ export default function Incidents() {
         location: modelLocation.trim() || form.location.trim() || "Edge Ground Station",
         reason: modelReason.trim(),
         timestamp: new Date().toISOString(),
+        mission_id: activeMission?.mission_id || undefined,
+        drone_id: activeMission?.drone_id || undefined,
       };
 
       const { data } = await api.post("/analytics/suggestions", payload);

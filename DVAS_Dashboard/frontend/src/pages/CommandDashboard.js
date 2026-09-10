@@ -325,6 +325,9 @@ export default function CommandDashboard() {
   const [kpis, setKpis] = useState({});
   const [drones, setDrones] = useState([]);
   const [alerts, setAlerts] = useState([]);
+  const [incidents, setIncidents] = useState([]);
+  const [suggestions, setSuggestions] = useState([]);
+  const [alertsSubTab, setAlertsSubTab] = useState("all");
   const [evidence, setEvidence] = useState([]);
   const [missions, setMissions] = useState([]);
   const [exports, setExports] = useState([]);
@@ -352,7 +355,7 @@ export default function CommandDashboard() {
 
   const load = async () => {
     try {
-      const [k, dR, aR, eR, mR, xR, cR, rptR] = await Promise.all([
+      const [k, dR, aR, eR, mR, xR, cR, rptR, incR, sugR] = await Promise.all([
         api.get("/command/kpis"),
         api.get("/drones"),
         api.get("/alerts"),
@@ -362,8 +365,12 @@ export default function CommandDashboard() {
         api.get("/exports").catch(() => ({ data: [] })),
         api.get("/analytics/crowd"),
         api.get("/reports").catch(() => ({ data: [] })),
+        api.get("/incidents").catch(() => ({ data: [] })),
+        api.get("/analytics/suggestions").catch(() => ({ data: [] })),
       ]);
       setKpis(k.data); setDrones(dR.data); setAlerts(aR.data);
+      if (incR?.data && Array.isArray(incR.data)) setIncidents(incR.data);
+      if (sugR?.data && Array.isArray(sugR.data)) setSuggestions(sugR.data);
       const eData = Array.isArray(eR.data) ? eR.data : (eR.data.items || []);
       setEvidence(eData);
       setEvidenceTotal(eR.data.total || eData.length);
@@ -394,11 +401,35 @@ export default function CommandDashboard() {
         user.role === "senior_officer" ||
         ((user.mission_scope || []).includes(a.mission_id));
       if (inScope) setAlerts((prev) => [a, ...prev].slice(0, 200));
+    } else if (msg.type === "model_suggestion") {
+      const s = msg.suggestion || msg;
+      setSuggestions((prev) => [s, ...prev.filter(x => x.id !== s.id)]);
+    } else if (msg.type === "incident" && msg.incident) {
+      const inc = msg.incident;
+      setIncidents((prev) => [inc, ...prev.filter(x => x.id !== inc.id)]);
+    } else if (msg.type === "incident_ack") {
+      setIncidents((prev) => prev.map(x => x.id === msg.incident_id ? { ...x, status: "ACKNOWLEDGED" } : x));
+    } else if (msg.type === "model_suggestion_status") {
+      setSuggestions((prev) => prev.map(x => x.id === msg.suggestion_id ? { ...x, status: msg.status } : x));
     }
   });
 
   const ackAlert = async (id) => {
     try { await api.post(`/alerts/${id}/ack`); load(); } catch (e) {}
+  };
+
+  const ackIncident = async (id) => {
+    try {
+      await api.post(`/incidents/${id}/ack`);
+      setIncidents((prev) => prev.map(x => x.id === id ? { ...x, status: "ACKNOWLEDGED" } : x));
+    } catch (e) {}
+  };
+
+  const ackSuggestion = async (id) => {
+    try {
+      await api.post(`/analytics/suggestions/${id}/status`, { status: "ACKNOWLEDGED" });
+      setSuggestions((prev) => prev.map(x => x.id === id ? { ...x, status: "ACKNOWLEDGED" } : x));
+    } catch (e) {}
   };
 
   const requestExport = async () => {
@@ -568,35 +599,237 @@ export default function CommandDashboard() {
       )}
 
 
-      {tab === "alerts" && (
-        <div className="rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
-          <div className="p-3 flex items-center gap-2 text-sm font-semibold" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text)" }}><Bell size={16} className="text-amber-500" weight="duotone" /> {t("cmd.page.alerts")}</div>
-          <ul className="divide-y max-h-[560px] overflow-auto" style={{ borderColor: "var(--dvas-border)" }}>
-            {alerts.length === 0 && <li className="p-6 text-center text-slate-500 text-xs">{t("cmd.noAlertsInScope")}</li>}
-            {alerts.map(a => (
-              <li key={a.id} data-testid={`alert-${a.id}`} className="p-3 hover:bg-[color:var(--dvas-elev)] transition-colors">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className="mono text-[10px] px-1.5 py-0.5 border border-red-500/50 bg-red-500/10 text-red-400 uppercase">{a.type.replace("_", " ")}</span>
-                  <span className="mono text-[10px] text-slate-400">conf {a.confidence}</span>
-                  <span className="mono text-[10px] text-slate-500">· {a.zone}</span>
-                  <span className="mono text-[10px] text-slate-500">· {a.drone_id}</span>
-                  <span className="mono text-[10px] text-slate-500 ml-auto">{new Date(a.ts).toLocaleString()}</span>
-                </div>
-                <div className="mt-1.5 flex items-center gap-2">
-                  {a.acknowledged_by ? (
-                    <span className="text-[11px] text-emerald-400 flex items-center gap-1"><CheckCircle size={12} /> acked by {a.acknowledged_by}</span>
-                  ) : (
-                    // CRO (former CRO + field_supervisor) and SR (former supervisory_officer) can ACK
-                    ["control_room_officer","senior_officer"].includes(user.role) && (
-                      <button data-testid={`ack-${a.id}`} onClick={() => ackAlert(a.id)} className="text-[11px] px-2 py-1 border border-slate-700 hover:border-sky-500">Acknowledge</button>
-                    )
-                  )}
-                </div>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
+      {tab === "alerts" && (() => {
+        // Normalize suggestions
+        const normalizedSuggestions = suggestions.map((s) => {
+          const modelList = (s.model_names && s.model_names.length > 0)
+            ? s.model_names.join(", ")
+            : (s.models || []).map(m => m.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())).join(", ") || "AI Model";
+          const missionPrefix = s.mission_id || "Mission";
+          return {
+            id: s.id,
+            category: "suggestion",
+            title: `${missionPrefix}: Suggests ${modelList}`,
+            subtitle: `${s.suggested_by || "Edge Operator"} · ${s.location || "Ground Station"}`,
+            ts: s.timestamp || s.created_at,
+            severity: s.priority === "critical" ? "critical" : s.priority === "high" ? "warning" : "info",
+            badge: "AI SUGGESTION",
+            badgeClass: "bg-sky-500/10 text-sky-400 border-sky-500/30",
+            status: s.status || "PENDING",
+            raw: s,
+          };
+        });
+
+        // Normalize incidents
+        const normalizedIncidents = incidents.map((inc) => {
+          const missionPrefix = inc.mission_id ? `${inc.mission_id}: ` : inc.drone_id ? `${inc.drone_id}: ` : "";
+          return {
+            id: inc.id,
+            category: "incident",
+            title: `${missionPrefix}${inc.title}`,
+            subtitle: `${inc.created_by || "Edge Operator"} · ${inc.location || "Ground Station"}`,
+            ts: inc.timestamp,
+            severity: inc.severity === "CRITICAL" ? "critical" : inc.severity === "HIGH" ? "warning" : "info",
+            badge: inc.severity || "INCIDENT",
+            badgeClass: inc.severity === "CRITICAL" ? "bg-red-500/10 text-red-400 border-red-500/30" : "bg-amber-500/10 text-amber-400 border-amber-500/30",
+            status: inc.status || "OPEN",
+            raw: inc,
+          };
+        });
+
+        // Normalize vision alerts
+        const normalizedAlerts = alerts.map((a) => {
+          const missionPrefix = a.mission_id ? `${a.mission_id}: ` : "";
+          const alertName = a.type ? a.type.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase()) : (a.title || "Detection Alert");
+          return {
+            id: a.id,
+            category: "vision",
+            title: `${missionPrefix}${alertName}`,
+            subtitle: `${a.drone_id || "DRN"} · ${a.zone || "Zone"} · conf ${a.confidence || "0.9"}`,
+            ts: a.ts,
+            severity: a.severity === "critical" ? "critical" : "warning",
+            badge: "DETECTION",
+            badgeClass: a.severity === "critical" ? "bg-red-500/10 text-red-400 border-red-500/30" : "bg-purple-500/10 text-purple-400 border-purple-500/30",
+            status: a.acknowledged_by ? "ACKNOWLEDGED" : "OPEN",
+            acknowledged_by: a.acknowledged_by,
+            raw: a,
+          };
+        });
+
+        const allItems = [...normalizedSuggestions, ...normalizedIncidents, ...normalizedAlerts]
+          .sort((a, b) => new Date(b.ts || 0).getTime() - new Date(a.ts || 0).getTime());
+
+        const displayItems = allItems.filter((item) => {
+          if (alertsSubTab === "all") return true;
+          if (alertsSubTab === "suggestions") return item.category === "suggestion";
+          if (alertsSubTab === "incidents") return item.category === "incident";
+          if (alertsSubTab === "vision") return item.category === "vision";
+          return true;
+        });
+
+        return (
+          <div className="rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
+            {/* Header with Sub-tabs */}
+            <div className="p-3 flex items-center justify-between flex-wrap gap-2" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text)" }}>
+              <div className="flex items-center gap-2 text-sm font-semibold">
+                <Bell size={16} className="text-amber-500" weight="duotone" />
+                <span>Command Center Dispatch & Alerts</span>
+                <span className="mono text-[10px] text-slate-500 ml-2">({displayItems.length} items)</span>
+              </div>
+
+              {/* Sub-tab Filter Pills */}
+              <div className="flex items-center gap-1 bg-slate-900/80 p-1 rounded-lg border border-slate-800 text-xs">
+                <button
+                  onClick={() => setAlertsSubTab("all")}
+                  className={`px-2.5 py-1 rounded transition-colors ${
+                    alertsSubTab === "all" ? "bg-slate-700 text-white font-medium" : "text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  All ({allItems.length})
+                </button>
+                <button
+                  onClick={() => setAlertsSubTab("suggestions")}
+                  className={`px-2.5 py-1 rounded transition-colors flex items-center gap-1 ${
+                    alertsSubTab === "suggestions" ? "bg-sky-600/30 text-sky-300 border border-sky-500/40 font-medium" : "text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  <Cpu size={12} className="text-sky-400" />
+                  AI Suggestions ({normalizedSuggestions.length})
+                </button>
+                <button
+                  onClick={() => setAlertsSubTab("incidents")}
+                  className={`px-2.5 py-1 rounded transition-colors flex items-center gap-1 ${
+                    alertsSubTab === "incidents" ? "bg-amber-600/30 text-amber-300 border border-amber-500/40 font-medium" : "text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  <Warning size={12} className="text-amber-400" />
+                  Incidents ({normalizedIncidents.length})
+                </button>
+                <button
+                  onClick={() => setAlertsSubTab("vision")}
+                  className={`px-2.5 py-1 rounded transition-colors flex items-center gap-1 ${
+                    alertsSubTab === "vision" ? "bg-purple-600/30 text-purple-300 border border-purple-500/40 font-medium" : "text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  Vision Alerts ({normalizedAlerts.length})
+                </button>
+              </div>
+            </div>
+
+            {/* List */}
+            <ul className="divide-y max-h-[600px] overflow-auto" style={{ borderColor: "var(--dvas-border)" }}>
+              {displayItems.length === 0 && (
+                <li className="p-8 text-center text-slate-500 text-xs">
+                  No alerts or messages in this category.
+                </li>
+              )}
+              {displayItems.map((item) => (
+                <li key={`${item.category}-${item.id}`} className="p-3.5 hover:bg-[color:var(--dvas-elev)] transition-colors">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-start gap-2.5 min-w-0">
+                      {/* Icon */}
+                      <div className="mt-0.5 shrink-0">
+                        {item.category === "suggestion" ? (
+                          <div className="w-7 h-7 rounded-md bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400">
+                            <Cpu size={14} />
+                          </div>
+                        ) : item.category === "incident" ? (
+                          <div className={`w-7 h-7 rounded-md flex items-center justify-center ${
+                            item.severity === "critical"
+                              ? "bg-red-500/10 border border-red-500/40 text-red-400"
+                              : "bg-amber-500/10 border border-amber-500/40 text-amber-400"
+                          }`}>
+                            <Warning size={14} />
+                          </div>
+                        ) : (
+                          <div className="w-7 h-7 rounded-md bg-purple-500/10 border border-purple-500/30 flex items-center justify-center text-purple-400">
+                            <Warning size={14} />
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Text */}
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap mb-1">
+                          <span className={`mono text-[10px] px-1.5 py-0.5 rounded border font-semibold ${item.badgeClass}`}>
+                            {item.badge}
+                          </span>
+                          <span className="mono text-[10px] text-slate-500">
+                            {item.ts ? new Date(item.ts).toLocaleString() : ""}
+                          </span>
+                        </div>
+
+                        {/* Exact format: <MISSION ID>: Suggests <AI Model name> */}
+                        <div className="text-sm font-semibold text-slate-100 leading-snug">
+                          {item.title}
+                        </div>
+
+                        <div className="mono text-[11px] text-slate-400 mt-1">
+                          {item.subtitle}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Actions / Status */}
+                    <div className="shrink-0 flex items-center gap-2 pt-1">
+                      {item.category === "suggestion" && (
+                        item.status === "ACKNOWLEDGED" ? (
+                          <span className="text-[11px] text-emerald-400 flex items-center gap-1 font-mono">
+                            <CheckCircle size={12} /> Acknowledged
+                          </span>
+                        ) : (
+                          ["control_room_officer", "senior_officer"].includes(user.role) && (
+                            <button
+                              onClick={() => ackSuggestion(item.id)}
+                              className="text-[11px] px-2.5 py-1 rounded border border-sky-600/60 text-sky-300 hover:bg-sky-500/20 transition-colors"
+                            >
+                              Acknowledge
+                            </button>
+                          )
+                        )
+                      )}
+
+                      {item.category === "incident" && (
+                        item.status === "ACKNOWLEDGED" ? (
+                          <span className="text-[11px] text-emerald-400 flex items-center gap-1 font-mono">
+                            <CheckCircle size={12} /> Acknowledged
+                          </span>
+                        ) : (
+                          ["control_room_officer", "senior_officer"].includes(user.role) && (
+                            <button
+                              onClick={() => ackIncident(item.id)}
+                              className="text-[11px] px-2.5 py-1 rounded border border-amber-600/60 text-amber-300 hover:bg-amber-500/20 transition-colors"
+                            >
+                              Acknowledge
+                            </button>
+                          )
+                        )
+                      )}
+
+                      {item.category === "vision" && (
+                        item.acknowledged_by ? (
+                          <span className="text-[11px] text-emerald-400 flex items-center gap-1 font-mono">
+                            <CheckCircle size={12} /> acked by {item.acknowledged_by}
+                          </span>
+                        ) : (
+                          ["control_room_officer", "senior_officer"].includes(user.role) && (
+                            <button
+                              onClick={() => ackAlert(item.id)}
+                              className="text-[11px] px-2.5 py-1 rounded border border-slate-700 hover:border-sky-500 text-slate-300 transition-colors"
+                            >
+                              Acknowledge
+                            </button>
+                          )
+                        )
+                      )}
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        );
+      })()}
 
       {tab === "evidence" && (
           <div className="space-y-4">
