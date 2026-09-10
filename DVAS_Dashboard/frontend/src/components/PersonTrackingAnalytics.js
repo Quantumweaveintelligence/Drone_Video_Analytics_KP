@@ -141,7 +141,7 @@ function Panel({ title, icon: Icon, iconClass = 'text-sky-400', children, right,
    ────────────────────────────────────────────────────────────── */
 const FRAME_INTERVAL = 800;
 
-function AnnotatedPersonFeedViewer({ activeDrone, setActiveDrone, drones, streamRunning, onStartStream, onStopStream, modelActive, startingStream, activeMissionId }) {
+function AnnotatedPersonFeedViewer({ activeDrone, setActiveDrone, drones, streamRunning, onStartStream, onStopStream, modelActive, startingStream, activeMissionId, onNavigateTab }) {
   const hasDrone = !!activeDrone;
   const [fps, setFps] = useState(0);
   const fpsRef = useRef({ count: 0, ts: Date.now() });
@@ -249,11 +249,25 @@ function AnnotatedPersonFeedViewer({ activeDrone, setActiveDrone, drones, stream
           </div>
         )}
         {!modelActive && !streamRunning && (
-          <span className="mono text-[10px] px-2.5 py-1 rounded-lg"
-            style={{ color: '#64748b', background: 'var(--dvas-surface-2)', border: '1px solid var(--dvas-border)' }}>
-            <Cpu size={10} className="inline mr-1 -mt-0.5" />
+          <button
+            onClick={() => onNavigateTab ? onNavigateTab("models") : onStartStream()}
+            className="mono text-[10px] px-2.5 py-1 rounded-lg transition-all hover:bg-slate-700/60 cursor-pointer flex items-center"
+            style={{ color: '#94a3b8', background: 'var(--dvas-surface-2)', border: '1px solid var(--dvas-border)' }}
+            title="Configure and enable Person Detection in Detection Models"
+          >
+            <Cpu size={10} className="inline mr-1 -mt-0.5 text-sky-400" />
             Enable in Detection Models
-          </span>
+          </button>
+        )}
+        {onNavigateTab && (
+          <button
+            onClick={() => onNavigateTab("models")}
+            className="flex items-center gap-1 px-2.5 py-1 rounded-lg mono text-[10px] font-bold text-slate-400 hover:text-sky-300 hover:bg-slate-800 transition-colors"
+            title="Open Detection Models Configuration"
+            style={{ border: '1px solid var(--dvas-border)' }}
+          >
+            <Cpu size={10} /> Models
+          </button>
         )}
       </div>
 
@@ -1472,7 +1486,7 @@ function DeduplicationSection({ missions, dedupProgress, onDeduplicate, dedupDat
 /* ───────────────────────────────────────────────────────────────
    MAIN EXPORT
    ────────────────────────────────────────────────────────────── */
-export default function PersonTrackingAnalytics({ drones }) {
+export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
   const [activeDrone, setActiveDrone] = useState(null);
 
   useEffect(() => {
@@ -1544,6 +1558,11 @@ export default function PersonTrackingAnalytics({ drones }) {
     setStartingStream(true);
     try {
       await api.get('/analytics/person/stream/start');
+      try {
+        await api.post('/models/sync-worker', { service: 'person', action: 'start' });
+      } catch (e) {
+        console.warn('Sync worker failed:', e);
+      }
     } catch (err) {
       console.error('Failed to start person stream:', err);
     } finally {
@@ -1554,6 +1573,11 @@ export default function PersonTrackingAnalytics({ drones }) {
   const handleStopStream = useCallback(async () => {
     try {
       await api.get('/analytics/person/stream/stop');
+      try {
+        await api.post('/models/sync-worker', { service: 'person', action: 'stop' });
+      } catch (e) {
+        console.warn('Sync worker failed:', e);
+      }
     } catch (err) {
       console.error('Failed to stop person stream:', err);
     }
@@ -1603,6 +1627,7 @@ export default function PersonTrackingAnalytics({ drones }) {
         modelActive={modelActive}
         startingStream={startingStream}
         activeMissionId={activeMissionId}
+        onNavigateTab={onNavigateTab}
       />
 
       {/* KPI STRIP */}

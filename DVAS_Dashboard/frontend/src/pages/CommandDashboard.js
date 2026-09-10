@@ -781,12 +781,20 @@ export default function CommandDashboard() {
                           </span>
                         ) : (
                           ["control_room_officer", "senior_officer"].includes(user.role) && (
-                            <button
-                              onClick={() => ackSuggestion(item.id)}
-                              className="text-[11px] px-2.5 py-1 rounded border border-sky-600/60 text-sky-300 hover:bg-sky-500/20 transition-colors"
-                            >
-                              Acknowledge
-                            </button>
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                onClick={() => setTab("models")}
+                                className="text-[11px] px-2 py-1 rounded border border-indigo-600/60 text-indigo-300 hover:bg-indigo-500/20 transition-colors flex items-center gap-1"
+                              >
+                                <Cpu size={10} /> Configure in Models
+                              </button>
+                              <button
+                                onClick={() => ackSuggestion(item.id)}
+                                className="text-[11px] px-2.5 py-1 rounded border border-sky-600/60 text-sky-300 hover:bg-sky-500/20 transition-colors"
+                              >
+                                Acknowledge
+                              </button>
+                            </div>
                           )
                         )
                       )}
@@ -925,19 +933,19 @@ export default function CommandDashboard() {
       )}
 
       {tab === "crowd" && (
-        <CrowdAnalytics crowdSeries={crowd} drones={drones} />
+        <CrowdAnalytics crowdSeries={crowd} drones={drones} onNavigateTab={setTab} />
       )}
 
       {tab === "traffic" && (
-        <TrafficAnalytics drones={drones} />
+        <TrafficAnalytics drones={drones} onNavigateTab={setTab} />
       )}
 
       {tab === "person" && (
-        <PersonTrackingAnalytics drones={drones} />
+        <PersonTrackingAnalytics drones={drones} onNavigateTab={setTab} />
       )}
 
       {tab === "intrusion" && (
-        <IntrusionAnalytics activeDrone={selectedDrone} drones={mergedDrones || drones} missions={missions} user={user} />
+        <IntrusionAnalytics activeDrone={selectedDrone} drones={mergedDrones || drones} missions={missions} user={user} onNavigateTab={setTab} />
       )}
 
       {tab === "models" && <ModelsPage user={user} t={t} />}
@@ -1033,6 +1041,7 @@ export default function CommandDashboard() {
           drones={drones}
           alerts={alerts}
           connected={connected}
+          onNavigateTab={setTab}
         />
       )}
 
@@ -1371,7 +1380,8 @@ function ModelsPage({ user, t }) {
     setSaving(true); setMsg({ text: "", ok: true }); setActions(null);
     try {
       const { data } = await api.post("/models", { active: selected });
-      setCfg(c => ({ ...c, ...data }));
+      setCfg(data);
+      setSelected(data.active);
       setActions(data.stream_actions || null);
 
       // Build human-readable summary
@@ -1401,7 +1411,8 @@ function ModelsPage({ user, t }) {
   const gpuTone = gpuUsed > 90 ? "text-red-400" : gpuUsed > 70 ? "text-amber-400" : "text-emerald-400";
   const dirty   = JSON.stringify([...selected].sort()) !== JSON.stringify([...cfg.active].sort());
   const streamStatus = cfg.stream_status || {};
-  const runningCount = Object.values(streamStatus).filter(Boolean).length;
+  const uniqueServices = ["crowd", "person", "vehicle", "plate", "intrusion"];
+  const runningCount = uniqueServices.filter(k => streamStatus[k]).length;
 
   // Action badge colour helper
   const actionColour = (v) => {

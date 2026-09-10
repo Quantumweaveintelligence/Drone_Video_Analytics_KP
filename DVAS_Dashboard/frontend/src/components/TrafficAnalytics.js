@@ -11,7 +11,7 @@ import {
   Car, AlertTriangle, Activity, MapPin, 
   BarChart2, Zap, Clock, Maximize2, Radio, Target, History, RefreshCw, X,
   Hash, Gauge, ShieldAlert, CheckCircle2, Camera, Search, Download, Archive, ChevronLeft, ChevronRight, Folder,
-  Plus, Trash2
+  Plus, Trash2, Cpu
 } from 'lucide-react';
 
 import { useJpegPoller } from '../hooks/useJpegPoller';
@@ -1444,7 +1444,7 @@ function MissionHistory() {
     </div>
   );
 }
-export default function TrafficAnalytics() {
+export default function TrafficAnalytics({ drones, onNavigateTab }) {
   const { streams, loading: dronesLoading } = useActiveStreams();
   const activeDrones = streams.map(s => ({
     drone_id: s.drone_id,
@@ -1494,32 +1494,7 @@ export default function TrafficAnalytics() {
   const { data: alerts }                          = usePoll('/analytics/alerts/theft', POLL_ALERTS);
   const { data: watchlist }                       = usePoll('/analytics/watchlist', POLL_WATCHLIST);
 
-  // Respect the Detection Models page config: only start streams for
-  // models the user has explicitly enabled (persisted in the DB via POST /api/models).
-  // If the model config cannot be fetched (e.g. user is a drone_operator
-  // who has no access to /models), fall back to polling health only.
-  useEffect(() => {
-    const syncStreams = async () => {
-      // Ensure vehicle and ANPR streams are started when visiting Traffic & ANPR page
-      try {
-        await Promise.allSettled([
-          api.get('/analytics/vehicle/stream/start'),
-          api.get('/analytics/anpr/stream/start'),
-        ]);
-      } catch { /* ignore network/permission errors */ }
-
-      try {
-        const { data: cfg } = await api.get('/models');
-        const active = cfg?.active || [];
-        const starts = [];
-        if (active.includes('vehicle')) starts.push(api.get('/analytics/vehicle/stream/start'));
-        if (active.includes('plate'))   starts.push(api.get('/analytics/anpr/stream/start'));
-        if (starts.length) await Promise.allSettled(starts);
-      } catch { /* /models unreachable or user lacks permission — do nothing */ }
-    };
-    syncStreams();
-  }, []);
-
+  // Poll health of vehicle and ANPR stream workers
   useEffect(() => {
     const check = async () => {
       try {
@@ -1544,6 +1519,11 @@ export default function TrafficAnalytics() {
     try {
       await api.get(endpoint);
       setServiceStatus(prev => ({ ...prev, [service]: !isRunning }));
+      try {
+        await api.post('/models/sync-worker', { service, action: isRunning ? 'stop' : 'start' });
+      } catch (e) {
+        console.warn('Sync worker failed:', e);
+      }
     } catch (e) {
       console.error(`Failed to toggle ${service} worker`, e);
     }
@@ -1640,6 +1620,16 @@ export default function TrafficAnalytics() {
                 </button>
               );
             })}
+            {onNavigateTab && (
+              <button
+                onClick={() => onNavigateTab("models")}
+                className="mono text-[9px] px-2.5 py-1 rounded-full flex items-center gap-1 transition-all cursor-pointer text-slate-400 hover:text-sky-300 hover:bg-slate-800"
+                style={{ border: '1px solid var(--dvas-border)' }}
+                title="Configure models in Detection Models"
+              >
+                <Cpu size={10} /> Detection Models
+              </button>
+            )}
           </div>
         </div>
         {(() => {

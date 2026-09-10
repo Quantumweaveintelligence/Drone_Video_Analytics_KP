@@ -43,7 +43,7 @@ import { useJpegPoller } from '@/hooks/useJpegPoller';
 
 
 /* ─── Main IntrusionAnalytics Component ───────────────────────────── */
-export default function IntrusionAnalytics({ activeDrone: initialDrone, drones = [], missions: initialMissions = [], user = {} }) {
+export default function IntrusionAnalytics({ activeDrone: initialDrone, drones = [], missions: initialMissions = [], user = {}, onNavigateTab }) {
   const { streams, streamMap } = useActiveStreams();
 
   // Helper to detect legacy mock/placeholder drone or mission IDs
@@ -308,6 +308,11 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
     try {
       await api.get('/analytics/intrusion/stream/start');
       mutateHealth();
+      try {
+        await api.post('/models/sync-worker', { service: 'intrusion', action: 'start' });
+      } catch (e) {
+        console.warn('Sync worker failed:', e);
+      }
     } catch (err) {
       console.error('Failed to start intrusion stream:', err);
     } finally {
@@ -320,6 +325,11 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
     try {
       await api.get('/analytics/intrusion/stream/stop');
       mutateHealth();
+      try {
+        await api.post('/models/sync-worker', { service: 'intrusion', action: 'stop' });
+      } catch (e) {
+        console.warn('Sync worker failed:', e);
+      }
     } catch (err) {
       console.error('Failed to stop intrusion stream:', err);
     } finally {
@@ -711,6 +721,17 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
             >
               <Play className="w-3.5 h-3.5 fill-current" />
               <span>Start Stream</span>
+            </button>
+          )}
+
+          {onNavigateTab && (
+            <button
+              onClick={() => onNavigateTab("models")}
+              className="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-300 border border-slate-700 hover:text-sky-300 hover:border-sky-500 hover:bg-slate-800 flex items-center gap-1.5 transition-all cursor-pointer"
+              title="Configure models in Detection Models"
+            >
+              <Cpu className="w-3.5 h-3.5 text-sky-400" />
+              <span>Detection Models</span>
             </button>
           )}
         </div>

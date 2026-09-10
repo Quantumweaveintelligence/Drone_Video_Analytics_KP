@@ -1227,7 +1227,7 @@ function EventTimeline({ events, onPlay }) {
 /* ─────────────────────────────────────────────
    GLOBAL HEADER BAR (inside multidrone view)
    ───────────────────────────────────────────── */
-function GlobalHeader({ drones, alerts, connected }) {
+function GlobalHeader({ drones, alerts, connected, onNavigateTab }) {
   const online = drones.filter((d) => d.status === "live").length;
   const activeMissions = [...new Set(drones.map((d) => d.mission_id))].length;
   const sysAlerts = alerts?.length ?? 1010;
@@ -1333,6 +1333,26 @@ function GlobalHeader({ drones, alerts, connected }) {
             </div>
           </div>
         ))}
+
+        {onNavigateTab && (
+          <button
+            onClick={() => onNavigateTab("models")}
+            className="flex items-center gap-2 px-3 py-1.5 rounded-lg shrink-0 transition-all hover:bg-teal-500/10 cursor-pointer text-left"
+            style={{
+              background: "rgba(20,184,166,0.08)",
+              border: "1px solid rgba(20,184,166,0.3)",
+            }}
+            title="Configure Detection Models"
+          >
+            <Cpu size={12} className="text-teal-400" />
+            <div>
+              <div className="mono text-[11px] font-bold text-teal-400 flex items-center gap-1">
+                Models <ChevronRight size={10} />
+              </div>
+              <div className="mono text-[8px]" style={{ color: "var(--dvas-text-dim)" }}>GPU Cluster</div>
+            </div>
+          </button>
+        )}
       </div>
     </div>
   );
@@ -1341,7 +1361,7 @@ function GlobalHeader({ drones, alerts, connected }) {
 /* ─────────────────────────────────────────────
    MAIN EXPORT
    ───────────────────────────────────────────── */
-export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts, connected }) {
+export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts, connected, onNavigateTab }) {
   // Use active ingest streams to discover real drones and enrich with live metadata
   const { mergeWithDrones, streams } = useActiveStreams();
 
@@ -1412,7 +1432,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
       style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }}
     >
       {/* ── 1. Global Header ── */}
-      <GlobalHeader drones={drones} alerts={liveAlerts} connected={connected} />
+      <GlobalHeader drones={drones} alerts={liveAlerts} connected={connected} onNavigateTab={onNavigateTab} />
 
       {/* ── 2. Drone Cards Grid (tiled CSS grid format) ── */}
       <div className="flex-1 overflow-y-auto dvas-scrollbar min-h-[60vh] xl:min-h-[500px]">

@@ -1,3 +1,4 @@
+import asyncio
 import random
 import logging
 from datetime import datetime, timezone, timedelta
@@ -21,6 +22,14 @@ from schemas.models import ModelUpdateIn
 
 logger = logging.getLogger("dvas")
 router = APIRouter(prefix="/api", tags=["Infrastructure & Models"])
+
+CLUSTER_SCOPE = "cluster"
+
+
+class WorkerSyncIn(BaseModel):
+    service: str
+    action: str
+
 
 
 @router.get("/infra/health")
@@ -112,99 +121,121 @@ def _build_service_map():
     }
 
 
+async def _fetch_single_status(client: httpx.AsyncClient, key: str, url: str) -> tuple:
+    try:
+        r = await client.get(url, timeout=5.0)
+        data = r.json() if r.status_code == 200 else {}
+        return key, bool(data.get("stream_running", False))
+    except Exception:
+        return key, False
+
+
 async def _get_service_stream_status() -> dict:
     """
-    Query each analytics service health endpoint and return
-    {model_key: stream_running bool} for all 4 services.
+    Query each analytics service health endpoint concurrently and return
+    {model_key: stream_running bool} for all 5 services.
     face shares person-analyzer status.
     """
     urls = {
-        "crowd":   f"{CROWD_URL}/health",
-        "person":  f"{PERSON_URL}/health",
-        "vehicle": f"{VEHICLE_URL}/health",
-        "plate":   f"{ANPR_URL}/health",
+        "crowd":     f"{CROWD_URL}/health",
+        "person":    f"{PERSON_URL}/health",
+        "vehicle":   f"{VEHICLE_URL}/health",
+        "plate":     f"{ANPR_URL}/health",
         "intrusion": f"{INTRUSION_URL}/health",
     }
     status = {}
-    async with httpx.AsyncClient(timeout=4.0) as client:
-        for key, url in urls.items():
-            try:
-                r = await client.get(url)
-                data = r.json() if r.status_code == 200 else {}
-                status[key] = bool(data.get("stream_running", False))
-            except Exception:
-                status[key] = False
+    async with httpx.AsyncClient() as client:
+        tasks = [_fetch_single_status(client, key, url) for key, url in urls.items()]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in results:
+            if isinstance(res, tuple):
+                status[res[0]] = res[1]
     status["face"] = status.get("person", False)  # face shares person-analyzer
     return status
 
 
+async def _apply_single_change(client: httpx.AsyncClient, svc_key: str, base_url: str, should_run: bool, is_running: bool) -> tuple:
+    if should_run and not is_running:
+        try:
+            r = await client.get(f"{base_url}/stream/start", timeout=8.0)
+            return svc_key, ("started" if r.status_code == 200 else f"start_failed({r.status_code})")
+        except Exception as e:
+            return svc_key, f"start_error({e})"
+    elif not should_run and is_running:
+        try:
+            r = await client.get(f"{base_url}/stream/stop", timeout=8.0)
+            return svc_key, ("stopped" if r.status_code == 200 else f"stop_failed({r.status_code})")
+        except Exception as e:
+            return svc_key, f"stop_error({e})"
+    else:
+        return svc_key, ("already_running" if is_running else "already_stopped")
+
+
 async def _apply_stream_changes(requested_active: list) -> dict:
     """
-    Start/stop analytics stream loops based on the requested active model list.
+    Start/stop analytics stream loops concurrently based on the requested active model list.
     Returns dict of {model_key: action_taken} e.g. {"crowd": "started", "plate": "already_stopped"}
     """
-    # Unique services to act on (face→person, plate→anpr, deduplicate)
-    service_keys = {"crowd", "person", "vehicle", "plate", "intrusion"}
-    # face uses person-analyzer — if face OR person is active, person runs
     effective_active = set(requested_active)
     if "face" in effective_active:
         effective_active.add("person")
 
     current_status = await _get_service_stream_status()
-    results = {}
-
     smap = {
-        "crowd":   CROWD_URL,
-        "person":  PERSON_URL,
-        "vehicle": VEHICLE_URL,
-        "plate":   ANPR_URL,
+        "crowd":     CROWD_URL,
+        "person":    PERSON_URL,
+        "vehicle":   VEHICLE_URL,
+        "plate":     ANPR_URL,
         "intrusion": INTRUSION_URL,
     }
 
-    async with httpx.AsyncClient(timeout=8.0) as client:
-        for svc_key, base_url in smap.items():
-            should_run = svc_key in effective_active
-            is_running  = current_status.get(svc_key, False)
-
-            if should_run and not is_running:
-                try:
-                    r = await client.get(f"{base_url}/stream/start")
-                    results[svc_key] = "started" if r.status_code == 200 else f"start_failed({r.status_code})"
-                except Exception as e:
-                    results[svc_key] = f"start_error({e})"
-            elif not should_run and is_running:
-                try:
-                    r = await client.get(f"{base_url}/stream/stop")
-                    results[svc_key] = "stopped" if r.status_code == 200 else f"stop_failed({r.status_code})"
-                except Exception as e:
-                    results[svc_key] = f"stop_error({e})"
-            else:
-                results[svc_key] = "already_running" if is_running else "already_stopped"
-
+    results = {}
+    async with httpx.AsyncClient() as client:
+        tasks = [
+            _apply_single_change(
+                client, svc_key, base_url,
+                svc_key in effective_active,
+                current_status.get(svc_key, False)
+            )
+            for svc_key, base_url in smap.items()
+        ]
+        change_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in change_results:
+            if isinstance(res, tuple):
+                results[res[0]] = res[1]
+            elif isinstance(res, Exception):
+                logger.error("Error applying stream change: %s", res)
     return results
 
 
-async def _get_model_config(scope: str):
+async def _get_model_config(scope: str = CLUSTER_SCOPE):
     async with async_session_factory() as session:
         result = await session.execute(
             select(ModelConfig).where(ModelConfig.scope == scope)
         )
         obj = result.scalar_one_or_none()
         if not obj:
-            active = [m["key"] for m in AVAILABLE_MODELS if m["default"]]
+            # Fallback: check if State HQ or another scope had configuration
+            fallback = await session.execute(
+                select(ModelConfig).order_by(ModelConfig.updated_at.desc())
+            )
+            fb_obj = fallback.scalars().first()
+            if fb_obj and fb_obj.active:
+                active = fb_obj.active
+            else:
+                active = [m["key"] for m in AVAILABLE_MODELS if m["default"]]
             return {"scope": scope, "active": active, "updated_at": None, "updated_by": None}
         return _row_to_dict(obj)
 
 
 @router.get("/models")
 async def list_models(user: dict = Depends(get_current_user)):
-    if user["role"] not in ("control_room_officer", "senior_officer"):
+    if user["role"] not in ("control_room_officer", "senior_officer", "system_administrator"):
         raise HTTPException(403, "Not permitted")
-    scope = user.get("jurisdiction") or "State HQ"
-    cfg = await _get_model_config(scope)
+    cfg = await _get_model_config(CLUSTER_SCOPE)
     gpu_total = sum(m["gpu_pct"] for m in AVAILABLE_MODELS if m["key"] in cfg["active"])
 
-    # Fetch real stream_running status from each analytics service
+    # Fetch real stream_running status from each analytics service in parallel
     stream_status = await _get_service_stream_status()
 
     # Annotate each model with its real running state
@@ -219,8 +250,8 @@ async def list_models(user: dict = Depends(get_current_user)):
     return {
         "available": available_with_status,
         "active": cfg["active"],
-        "stream_status": stream_status,   # {"crowd": True, "person": False, ...}
-        "scope": scope,
+        "stream_status": stream_status,
+        "scope": CLUSTER_SCOPE,
         "gpu_total_pct": gpu_total,
         "updated_at": cfg.get("updated_at"),
         "updated_by": cfg.get("updated_by"),
@@ -231,28 +262,25 @@ async def list_models(user: dict = Depends(get_current_user)):
 @router.post("/models")
 async def update_models(
     body: ModelUpdateIn,
-    # CRO (former field_supervisor) + Senior Officer (former supervisory_officer) can update models
-    user: dict = Depends(require_roles("control_room_officer", "senior_officer")),
+    user: dict = Depends(require_roles("control_room_officer", "senior_officer", "system_administrator")),
     request: Request = None,
 ):
     valid_keys = {m["key"] for m in AVAILABLE_MODELS}
     invalid = [k for k in body.active if k not in valid_keys]
     if invalid:
         raise HTTPException(400, f"Unknown model keys: {invalid}")
-    scope = user.get("jurisdiction") or "State HQ"
     now_iso = datetime.now(timezone.utc).isoformat()
     old_active = []
     async with async_session_factory() as session:
         existing = await session.execute(
-            select(ModelConfig).where(ModelConfig.scope == scope)
+            select(ModelConfig).where(ModelConfig.scope == CLUSTER_SCOPE)
         )
         existing_obj = existing.scalar_one_or_none()
         if existing_obj and existing_obj.active:
             old_active = existing_obj.active
-        # Upsert: try update, if no row affected, insert
         result = await session.execute(
             update(ModelConfig)
-            .where(ModelConfig.scope == scope)
+            .where(ModelConfig.scope == CLUSTER_SCOPE)
             .values(
                 active=body.active,
                 updated_at=now_iso,
@@ -261,18 +289,19 @@ async def update_models(
         )
         if result.rowcount == 0:
             session.add(ModelConfig(
-                scope=scope,
+                scope=CLUSTER_SCOPE,
                 active=body.active,
                 updated_at=now_iso,
                 updated_by=user["email"],
             ))
         await session.commit()
+
     await write_audit_v2(
         actor=user,
         action="model_config_update",
-        target=scope,
+        target=CLUSTER_SCOPE,
         target_type="configuration",
-        target_name=f"Model Config ({scope})",
+        target_name=f"Model Config ({CLUSTER_SCOPE})",
         details=f"active={','.join(body.active)}",
         before_values={"active": old_active},
         after_values={"active": body.active},
@@ -280,18 +309,69 @@ async def update_models(
         request=request,
     )
 
-    # Actually start/stop the analytics stream loops based on what was toggled
+    # Concurrently start/stop the analytics stream loops based on what was toggled
     stream_results = await _apply_stream_changes(body.active)
     logger.info("model_deploy", extra={"stream_results": stream_results, "active": body.active, "by": user["email"]})
 
-    updated_cfg = await _get_model_config(scope)
+    updated_cfg = await _get_model_config(CLUSTER_SCOPE)
     stream_status = await _get_service_stream_status()
+    gpu_total = sum(m["gpu_pct"] for m in AVAILABLE_MODELS if m["key"] in updated_cfg["active"])
+
+    available_with_status = [
+        {
+            **m,
+            "stream_running": stream_status.get(m["key"], False),
+        }
+        for m in AVAILABLE_MODELS
+    ]
+
     return {
         **updated_cfg,
+        "available": available_with_status,
         "stream_status": stream_status,
-        "stream_actions": stream_results,   # what was started/stopped/unchanged
+        "stream_actions": stream_results,
+        "gpu_total_pct": gpu_total,
         "deploy_ok": True,
+        "read_only": False,
     }
+
+
+@router.post("/models/sync-worker")
+async def sync_worker_state(
+    body: WorkerSyncIn,
+    user: dict = Depends(require_roles("control_room_officer", "senior_officer", "system_administrator")),
+):
+    """Synchronize an individual worker start/stop from an analytics page with ModelConfig."""
+    key = body.service
+    if key == "anpr":
+        key = "plate"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    async with async_session_factory() as session:
+        existing = await session.execute(
+            select(ModelConfig).where(ModelConfig.scope == CLUSTER_SCOPE)
+        )
+        existing_obj = existing.scalar_one_or_none()
+        current_active = list(existing_obj.active) if existing_obj and existing_obj.active else [m["key"] for m in AVAILABLE_MODELS if m["default"]]
+
+        if body.action == "start" and key not in current_active:
+            current_active.append(key)
+        elif body.action == "stop" and key in current_active:
+            current_active = [k for k in current_active if k != key]
+
+        result = await session.execute(
+            update(ModelConfig)
+            .where(ModelConfig.scope == CLUSTER_SCOPE)
+            .values(active=current_active, updated_at=now_iso, updated_by=user["email"])
+        )
+        if result.rowcount == 0:
+            session.add(ModelConfig(
+                scope=CLUSTER_SCOPE,
+                active=current_active,
+                updated_at=now_iso,
+                updated_by=user["email"],
+            ))
+        await session.commit()
+    return {"ok": True, "active": current_active}
 
 
 @router.get("/infra/overview")

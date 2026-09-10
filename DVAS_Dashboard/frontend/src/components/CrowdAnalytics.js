@@ -204,6 +204,7 @@ function LiveFeedSection({
   onStopStream,
   startingStream,
   onFrameCount,
+  onNavigateTab,
 }) {
   const hasDrone = !!activeDrone;
   const modelLabel = MODEL_OPTIONS.find(m => m.value === activeModel)?.label || 'CSRNet Part A';
@@ -325,6 +326,17 @@ function LiveFeedSection({
               <Square size={9} /> Stop Worker
             </button>
           </div>
+        )}
+
+        {onNavigateTab && (
+          <button
+            onClick={() => onNavigateTab("models")}
+            className="mono text-[10px] px-2.5 py-1.5 rounded-lg flex items-center gap-1 transition-all text-slate-400 hover:text-sky-300 hover:bg-slate-800 ml-2"
+            style={{ border: '1px solid var(--dvas-border)' }}
+            title="Configure models in Detection Models"
+          >
+            <Cpu size={11} /> Detection Models
+          </button>
         )}
       </div>
 
@@ -740,7 +752,7 @@ function MissionExport({ hasData, activeModel }) {
 /* ───────────────────────────────────────────────────────────────
    MAIN EXPORT
    ────────────────────────────────────────────────────────────── */
-export default function CrowdAnalytics({ crowdSeries, drones }) {
+export default function CrowdAnalytics({ crowdSeries, drones, onNavigateTab }) {
   const { streams } = useActiveStreams();
   const [activeDrone, setActiveDrone] = useState(null);
   const [activeMissionId, setActiveMissionId] = useState(null);
@@ -895,6 +907,11 @@ export default function CrowdAnalytics({ crowdSeries, drones }) {
       setRecentCounts([]);
       setPeakCount(0);
       setPeakTimestamp(null);
+      try {
+        await api.post('/models/sync-worker', { service: 'crowd', action: 'start' });
+      } catch (e) {
+        console.warn('Sync worker failed:', e);
+      }
     } catch (err) {
       console.error('Failed to start stream:', err);
     } finally {
@@ -907,6 +924,11 @@ export default function CrowdAnalytics({ crowdSeries, drones }) {
     try {
       await api.get('/analytics/crowd/stream/stop');
       setStreamRunning(false);
+      try {
+        await api.post('/models/sync-worker', { service: 'crowd', action: 'stop' });
+      } catch (e) {
+        console.warn('Sync worker failed:', e);
+      }
     } catch (err) {
       console.error('Failed to stop stream:', err);
     }
@@ -957,6 +979,7 @@ export default function CrowdAnalytics({ crowdSeries, drones }) {
         onStopStream={handleStopStream}
         startingStream={startingStream}
         onFrameCount={handleFrameCount}
+        onNavigateTab={onNavigateTab}
       />
 
       {/* KPI STRIP */}
