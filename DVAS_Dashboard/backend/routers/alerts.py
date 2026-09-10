@@ -16,6 +16,7 @@ from audit_service import write_audit_v2
 from schemas.exports import ExportRequestIn, ExportDecisionIn
 from schemas.evidence import LegalHoldIn, LegalHoldReleaseIn, DirectExportIn
 from services.pdf_service import _make_65b_pdf
+from core.analytics_client import _get_minio_client
 
 logger = logging.getLogger("dvas")
 router = APIRouter(prefix="/api", tags=["Alerts, Evidence & Exports"])
@@ -387,12 +388,10 @@ async def request_export(
 
 @router.post("/exports/{export_id}/decision")
 async def decide_export(
-    export_id: str, body: ExportDecisionIn, user: dict = Depends(get_current_user),
+    export_id: str, body: ExportDecisionIn,
+    user: dict = Depends(require_roles("senior_officer")),
     request: Request = None,
 ):
-    # Senior Officer inherits full export approve/reject authority (former supervisory_officer)
-    if user["role"] != "senior_officer":
-        raise HTTPException(403, "Only Senior Officer may approve/reject exports")
     async with async_session_factory() as session:
         result = await session.execute(
             select(Export).where(Export.id == export_id)
@@ -434,10 +433,17 @@ async def download_65b_bundle(export_id: str, request: Request, token: str = "")
         try:
             options = {"verify_aud": False}
             payload = jwt.decode(token, get_jwks(), algorithms=["RS256"], options=options)
+            # Extract real role from JWT claims instead of hardcoding
+            realm_roles = payload.get("realm_access", {}).get("roles", [])
+            role = "control_room_officer"  # default
+            for r in ("senior_officer", "system_administrator", "control_room_officer", "drone_operator"):
+                if r in realm_roles:
+                    role = r
+                    break
             user = {
                 "id": payload.get("sub"),
                 "email": payload.get("email", ""),
-                "role": "control_room_officer", # Assuming higher role for exports
+                "role": role,
             }
         except jwt.JWTError:
             raise HTTPException(401, "Invalid token")
@@ -482,16 +488,39 @@ async def download_65b_bundle(export_id: str, request: Request, token: str = "")
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr(f"{exp['id']}_certificate_65B.pdf", pdf_bytes)
         z.writestr("metadata.json", json.dumps(metadata, indent=2, default=str))
-        z.writestr(
-            "video_url.txt",
-            f"Original clip URL (secure, time-limited):\n{ev['video_url']}\n\n"
-            "Actual video file bytes are streamed from the DVAS evidence vault under "
-            "separate signed session and are not embedded in this bundle for size reasons.",
-        )
+        # Include real evidence images from MinIO instead of fake video_url.txt
+        minio_client = _get_minio_client()
+        image_count = 0
+        for key_field, bucket_fallback, filename in [
+            ("primary_image_key", ev.get("image_bucket", "dvas-faces"), "evidence_image_1.jpg"),
+            ("thumbnail", ev.get("image_bucket", "dvas-faces"), "evidence_thumbnail.jpg"),
+            ("secondary_image_key", "dvas-plates", "evidence_image_2.jpg"),
+        ]:
+            img_key = ev.get(key_field, "")
+            if not img_key or img_key.startswith("http"):
+                continue
+            bucket = bucket_fallback or "dvas-faces"
+            if minio_client:
+                try:
+                    resp_obj = minio_client.get_object(bucket, img_key)
+                    img_data = resp_obj.read()
+                    resp_obj.close()
+                    resp_obj.release_conn()
+                    z.writestr(filename, img_data)
+                    image_count += 1
+                except Exception:
+                    pass
+        if image_count == 0:
+            z.writestr(
+                "evidence_note.txt",
+                "No image evidence available for this event.\n"
+                "The event was recorded without visual capture, or the image has expired from storage.\n",
+            )
         z.writestr(
             "README.txt",
             f"DVAS Section 65B Evidence Bundle\nExport {exp['id']}\nEvidence {ev['id']}\n"
-            f"Approved by {exp.get('decision_by', '-')} on {exp.get('decision_at', '-')}\n",
+            f"Approved by {exp.get('decision_by', '-')} on {exp.get('decision_at', '-')}\n"
+            f"Evidence images included: {image_count}\n",
         )
     buf.seek(0)
     await write_audit_v2(

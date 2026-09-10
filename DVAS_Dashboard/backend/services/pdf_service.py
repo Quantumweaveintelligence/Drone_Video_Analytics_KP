@@ -133,7 +133,7 @@ def _make_65b_pdf(evidence: dict, export: dict, decision_by: str) -> bytes:
         "operating properly; and (c) the information contained in the electronic record reproduces "
         "information fed into the computer in the ordinary course of the said activities.\n\n"
         "Chain of custody is maintained by the DVAS audit log (tamper-evident, hash-chained). "
-        "This bundle contains: (1) the confirmed-event video clip, (2) event metadata JSON, "
+        "This bundle contains: (1) the confirmed-event image evidence, (2) event metadata JSON, "
         "(3) this Section 65B(4) certificate.",
     )
     pdf.ln(4)
@@ -162,8 +162,8 @@ def _format_officer_info(user: dict):
         "system_administrator": "System Administrator"
     }
     role_label = role_labels.get(role, role.replace("_", " ").title()) if role else "Senior Officer"
-    email = user.get("email") or "dvas@keralapolice.gov.in"
-    jurisdiction = user.get("jurisdiction") or "State HQ"
+    email = user.get("email") or "—"
+    jurisdiction = user.get("jurisdiction") or "—"
     return name, role_label, email, jurisdiction
 
 
@@ -300,9 +300,9 @@ def _make_daily_incident_pdf(user: dict, alerts: list, evidence_items: list, mis
         for m in missions[:10]:
             name = m.get("name", m.get("mission_id", ""))[:25]
             mid = m.get("mission_id", "")[:18]
-            op = (m.get("operator_name") or "Ravi Menon")[:18]
-            did = (m.get("drone_id") or "DRN-001")[:18]
-            zone = (m.get("zone") or m.get("status") or "Patrol")[:15]
+            op = (m.get("operator_name") or "—")[:18]
+            did = (m.get("drone_id") or "—")[:18]
+            zone = (m.get("zone") or m.get("status") or "—")[:15]
             pdf.cell(55, 6, _s(name), border=1)
             pdf.cell(35, 6, _s(mid), border=1)
             pdf.cell(35, 6, _s(op), border=1)
@@ -367,10 +367,10 @@ def _make_weekly_response_pdf(user: dict, alerts: list, missions: list, week_sta
     total_alerts = len(alerts)
     total_ack = sum(1 for a in alerts if a.get('acknowledged_at'))
     ack_rate = (total_ack / total_alerts * 100) if total_alerts else 100.0
-    mean_rt = sum(response_times) / len(response_times) if response_times else 24.5
-    median_rt = sorted(response_times)[len(response_times)//2] if response_times else 18.0
+    mean_rt = sum(response_times) / len(response_times) if response_times else 0.0
+    median_rt = sorted(response_times)[len(response_times)//2] if response_times else 0.0
     sla_compliant = sum(1 for rt in response_times if rt <= 60)
-    sla_pct = (sla_compliant / len(response_times) * 100) if response_times else 94.2
+    sla_pct = (sla_compliant / len(response_times) * 100) if response_times else 0.0
     
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 7, "Executive SLA & Dispatch Metrics", ln=1)
@@ -415,9 +415,9 @@ def _make_weekly_response_pdf(user: dict, alerts: list, missions: list, week_sta
         pdf.cell(190, 6, "No daily log available for the requested period.", border=1, ln=1)
     else:
         for d, st in sorted(daily.items())[:7]:
-            avg_rt = sum(st["rts"])/len(st["rts"]) if st["rts"] else 22.0
+            avg_rt = sum(st["rts"])/len(st["rts"]) if st["rts"] else 0.0
             sla_cnt = sum(1 for r in st["rts"] if r <= 60)
-            c_sla = (sla_cnt / len(st["rts"]) * 100) if st["rts"] else 95.0
+            c_sla = (sla_cnt / len(st["rts"]) * 100) if st["rts"] else 0.0
             pdf.cell(45, 6, _s(d), border=1)
             pdf.cell(35, 6, _s(str(st["count"])), border=1)
             pdf.cell(35, 6, _s(str(st["ack"])), border=1)
@@ -436,9 +436,9 @@ def _make_weekly_response_pdf(user: dict, alerts: list, missions: list, week_sta
     
     op_summary = {}
     for m in missions:
-        op = m.get("operator_name") or "Ravi Menon"
+        op = m.get("operator_name") or "—"
         if op not in op_summary:
-            op_summary[op] = {"missions": 0, "jur": m.get("jurisdiction") or "Thiruvananthapuram", "hours": 0.0}
+            op_summary[op] = {"missions": 0, "jur": m.get("jurisdiction") or "—", "hours": 0.0}
         op_summary[op]["missions"] += 1
         if m.get("started_at") and m.get("ended_at"):
             try:
@@ -446,9 +446,9 @@ def _make_weekly_response_pdf(user: dict, alerts: list, missions: list, week_sta
                 e = datetime.fromisoformat(m["ended_at"].replace("Z", "+00:00"))
                 op_summary[op]["hours"] += max(0.5, (e - s).total_seconds() / 3600)
             except Exception:
-                op_summary[op]["hours"] += 2.0
+                op_summary[op]["hours"] += 0.0
         else:
-            op_summary[op]["hours"] += 2.5
+            op_summary[op]["hours"] += 0.0
             
     pdf.set_font("Helvetica", "", 8)
     for op, st in sorted(op_summary.items(), key=lambda x: x[1]["hours"], reverse=True)[:8]:
@@ -482,15 +482,15 @@ def _make_drone_utilisation_pdf(user: dict, missions: list, drones: list, period
         drone_stats[did] = {
             "count": 0,
             "hours": 0.0,
-            "operator": d.get("operator_name") or "Ravi Menon",
-            "jurisdiction": d.get("jurisdiction") or "Thiruvananthapuram",
-            "battery": d.get("battery_pct", 92),
+            "operator": d.get("operator_name") or "—",
+            "jurisdiction": d.get("jurisdiction") or "—",
+            "battery": d.get("battery_pct", 0),
             "status": d.get("status", "Active").capitalize()
         }
         
     for m in missions:
         did = m.get("drone_id")
-        h = 2.0
+        h = 0.0
         if m.get("started_at") and m.get("ended_at"):
             try:
                 s = datetime.fromisoformat(m["started_at"].replace("Z", "+00:00"))
@@ -584,7 +584,7 @@ def _make_mission_aar_pdf(user: dict, mission: dict, alerts: list, evidence_item
     pdf.set_font("Helvetica", "", 9)
     
     # Calculate duration
-    dur_str = "4h 30m"
+    dur_str = "—"
     if mission.get("started_at") and mission.get("ended_at"):
         try:
             s = datetime.fromisoformat(mission["started_at"].replace("Z", "+00:00"))
@@ -596,14 +596,14 @@ def _make_mission_aar_pdf(user: dict, mission: dict, alerts: list, evidence_item
     elif alerts:
         dur_str = "Continuous Surveillance (Active Sortie)"
 
-    op_name = mission.get("operator_name") or "Ravi Menon"
+    op_name = mission.get("operator_name") or "—"
     if op_name in ("System Recovered", "", None):
-        op_name = "Ravi Menon"
-    supervisor_name = mission.get("supervisor") or "Deepa Krishnan"
-    drone_id = mission.get("drone_id") or "DRN-001"
-    zone = mission.get("zone") or "Command Patrol Sector"
+        op_name = "—"
+    supervisor_name = mission.get("supervisor") or "—"
+    drone_id = mission.get("drone_id") or "—"
+    zone = mission.get("zone") or "—"
     jurisdiction = mission.get("jurisdiction") or jur
-    objective = mission.get("objective") or "Aerial surveillance, crowd density control, perimeter security, and real-time anomaly detection."
+    objective = mission.get("objective") or "—"
     
     def kv_box(k, v, w1=45, w2=145):
         pdf.set_font("Helvetica", "B", 8)
@@ -619,7 +619,7 @@ def _make_mission_aar_pdf(user: dict, mission: dict, alerts: list, evidence_item
     kv_box("Airframe Deployed", drone_id)
     kv_box("Operational Zone", zone)
     kv_box("District Jurisdiction", jurisdiction)
-    kv_box("Mission Timeline", f"Start: {mission.get('started_at', '2026-09-09 08:00 UTC')} | End: {mission.get('ended_at', '2026-09-09 17:30 UTC')}")
+    kv_box("Mission Timeline", f"Start: {mission.get('started_at', '—')} | End: {mission.get('ended_at', '—')}")
     kv_box("Sortie Duration", dur_str)
     kv_box("Strategic Objective", objective)
     pdf.ln(3)
@@ -637,7 +637,8 @@ def _make_mission_aar_pdf(user: dict, mission: dict, alerts: list, evidence_item
     pdf.cell(col_w[0], 6, _s(f"Total Alerts Logged: {total_alerts}"), border=1)
     pdf.cell(col_w[1], 6, _s(f"Acknowledged Rate: {ack_rate:.1f}%"), border=1)
     pdf.cell(col_w[2], 6, _s(f"Evidence Vault Clips: {len(evidence_items)}"), border=1)
-    pdf.cell(col_w[3], 6, _s("Compliance SLA: 100%"), border=1, ln=1)
+    sla = f"{(ack_alerts/total_alerts*100):.0f}%" if total_alerts else "N/A"
+    pdf.cell(col_w[3], 6, _s(f"Compliance SLA: {sla}"), border=1, ln=1)
     pdf.ln(4)
     
     # Incident Log
@@ -658,7 +659,7 @@ def _make_mission_aar_pdf(user: dict, mission: dict, alerts: list, evidence_item
             ts = str(a.get("ts", ""))[:19]
             typ = str(a.get("type", a.get("event_type", "anomaly"))).replace("_", " ").title()[:20]
             az = str(a.get("zone", a.get("zone_id", zone)))[:20]
-            conf = f"{float(a.get('confidence', 0.92)):.2f}"
+            conf = f"{float(a.get('confidence', 0)):.2f}"
             status = "Verified & Closed" if a.get("acknowledged_at") else "Under Investigation"
             pdf.cell(40, 6, _s(ts), border=1)
             pdf.cell(45, 6, _s(typ), border=1)
@@ -679,17 +680,12 @@ def _make_mission_aar_pdf(user: dict, mission: dict, alerts: list, evidence_item
     
     pdf.set_font("Helvetica", "", 8)
     if not evidence_items:
-        # Fallback rows from mission if no direct link
-        pdf.cell(45, 6, _s(f"EVI-{mid[:8]}"), border=1)
-        pdf.cell(50, 6, "Perimeter Breach Video Clip", border=1)
-        pdf.cell(30, 6, "24s (1080p)", border=1)
-        pdf.cell(35, 6, "Active Retention", border=1)
-        pdf.cell(30, 6, "2026-12-09", border=1, ln=1)
+        pdf.cell(190, 6, "No evidence items recorded for this mission", border=1, ln=1)
     else:
         for ev in evidence_items[:8]:
             eid = ev.get("id", "EVI-UNKNOWN")
             et = str(ev.get("event_type", "evidence")).replace("_", " ").title()[:22]
-            dur = f"{ev.get('duration_s', 20)}s"
+            dur = f"{ev.get('duration_s', 0)}s"
             hold = "LEGAL HOLD" if ev.get("legal_hold") else "Standard Retention"
             ret = str(ev.get("retention_until", "90 Days"))[:10]
             pdf.cell(45, 6, _s(eid), border=1)
@@ -703,7 +699,7 @@ def _make_mission_aar_pdf(user: dict, mission: dict, alerts: list, evidence_item
     pdf.set_font("Helvetica", "B", 9)
     pdf.cell(0, 5, "Official Verification & Chain of Custody Sign-Off", ln=1)
     pdf.set_font("Helvetica", "", 8)
-    pdf.multi_cell(0, 4, "I hereby verify that this After-Action Report and all associated electronic telemetry, video recordings, and analytical alerts were generated in accordance with official Kerala Police standard operating procedures. The chain of custody has been cryptographically preserved.")
+    pdf.multi_cell(0, 4, "I hereby verify that this After-Action Report and all associated electronic telemetry, image evidence, and analytical alerts were generated in accordance with official Kerala Police standard operating procedures. The chain of custody has been cryptographically preserved.")
     pdf.ln(8)
     
     pdf.cell(90, 5, "________________________________________", ln=0)

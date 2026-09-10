@@ -90,68 +90,7 @@ function toProxiedUrl(objectKeyOrUrl, bucket = "dvas-faces") {
    HELPERS
    ───────────────────────────────────────────── */
 
-const MOCK_EVENTS = [
-  {
-    id: "evt-001",
-    ts: new Date(Date.now() - 4 * 60000).toISOString(),
-    drone_id: "DRN-002",
-    mission_id: "M-104",
-    event_type: "Perimeter Breach",
-    confidence: 94,
-    zone: "Sector-7 North",
-    severity: "critical",
-  },
-  {
-    id: "evt-002",
-    ts: new Date(Date.now() - 11 * 60000).toISOString(),
-    drone_id: "DRN-001",
-    mission_id: "M-102",
-    event_type: "Crowd Surge",
-    confidence: 88,
-    zone: "Statue Junction",
-    severity: "warning",
-  },
-  {
-    id: "evt-003",
-    ts: new Date(Date.now() - 23 * 60000).toISOString(),
-    drone_id: "DRN-002",
-    mission_id: "M-104",
-    event_type: "Suspicious Object",
-    confidence: 77,
-    zone: "Secretariat Rd",
-    severity: "warning",
-  },
-  {
-    id: "evt-004",
-    ts: new Date(Date.now() - 38 * 60000).toISOString(),
-    drone_id: "DRN-001",
-    mission_id: "M-102",
-    event_type: "Vehicle Violation",
-    confidence: 91,
-    zone: "MG Road",
-    severity: "info",
-  },
-  {
-    id: "evt-005",
-    ts: new Date(Date.now() - 61 * 60000).toISOString(),
-    drone_id: "DRN-003",
-    mission_id: "M-106",
-    event_type: "Loitering Detected",
-    confidence: 82,
-    zone: "East Fort",
-    severity: "info",
-  },
-  {
-    id: "evt-006",
-    ts: new Date(Date.now() - 78 * 60000).toISOString(),
-    drone_id: "DRN-002",
-    mission_id: "M-104",
-    event_type: "Intrusion Detection",
-    confidence: 96,
-    zone: "VJT Hall",
-    severity: "critical",
-  },
-];
+const MOCK_EVENTS = []; // Removed — no mock events; live alerts only
 
 const MOCK_DRONES = [];
 
@@ -690,7 +629,7 @@ function BiometricsGalleryModal({ galleryType, onClose, effectiveDroneId }) {
                           className="w-full h-full object-cover"
                           onError={(e) => {
                             e.target.onerror = null;
-                            e.target.src = "https://images.unsplash.com/photo-1511367461989-f85a21fda167?auto=format&fit=crop&w=300&h=400&q=80";
+                            e.target.style.display = 'none'; e.target.parentElement.classList.add('bg-slate-800'); e.target.insertAdjacentHTML('afterend', '<div class="flex items-center justify-center w-full h-full text-slate-600 text-xs">No image</div>');
                           }}
                         />
                       ) : (
@@ -1433,7 +1372,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
         zone: a.zone || "—",
         severity: a.severity || "info",
       }))
-    : MOCK_EVENTS;
+    : [];
 
   const [selectedDroneId, setSelectedDroneId] = useState(null);
   const [playingEvent, setPlayingEvent] = useState(null);

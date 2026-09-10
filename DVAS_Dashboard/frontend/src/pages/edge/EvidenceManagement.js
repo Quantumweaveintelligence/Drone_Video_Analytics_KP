@@ -37,24 +37,9 @@ export default function EvidenceManagement() {
     ? evidence.filter(e => e.mission_id === selectedMission)
     : evidence;
 
-  const handleExtraction = () => {
-    if (isExtracting) return;
-    setIsExtracting(true);
-    setProgress(0);
-    const interval = setInterval(() => {
-      setProgress(p => {
-        if (p >= 100) {
-          clearInterval(interval);
-          setTimeout(() => {
-            setIsExtracting(false);
-            setProgress(0);
-            loadData(); // Refresh to pick up any new evidence
-          }, 500);
-          return 100;
-        }
-        return p + 20;
-      });
-    }, 200);
+  const handleExtraction = (evidenceId) => {
+    // Evidence extraction requires edge rolling-buffer pipeline (not yet implemented)
+    console.info('Evidence clip extraction not available — system captures image crops only');
   };
 
   const totalPackages = filteredEvidence.length;
@@ -195,12 +180,12 @@ export default function EvidenceManagement() {
                         </span>
                       </td>
                       <td className="px-4 py-4 text-right">
-                        {item.video_url ? (
-                          <a href={item.video_url} target="_blank" rel="noreferrer" className="inline-flex items-center justify-center p-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 text-emerald-400 rounded transition-colors" title="View Evidence">
+                        {(item.primary_image_key || item.thumbnail) ? (
+                          <a href={item.thumbnail?.startsWith('http') ? item.thumbnail : `/api/minio/image?bucket=${encodeURIComponent(item.image_bucket || 'dvas-faces')}&key=${encodeURIComponent(item.primary_image_key || item.thumbnail)}`} target="_blank" rel="noreferrer" className="inline-flex items-center justify-center p-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 text-emerald-400 rounded transition-colors" title="View Evidence Image">
                             <Download size={14} />
                           </a>
                         ) : (
-                          <button disabled className="inline-flex items-center justify-center p-1.5 bg-slate-800 text-slate-600 rounded cursor-not-allowed" title="No video available">
+                          <button disabled className="inline-flex items-center justify-center p-1.5 bg-slate-800 text-slate-600 rounded cursor-not-allowed" title="No image available">
                             <Download size={14} />
                           </button>
                         )}

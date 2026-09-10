@@ -238,16 +238,6 @@ async def seed_data():
                 acknowledged_at=None,
             ))
 
-        sample_videos = [
-            "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
-            "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
-            "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
-        ]
-        thumbs = [
-            "https://images.unsplash.com/photo-1612043743114-d19a560b70eb?w=400",
-            "https://images.unsplash.com/photo-1580509742642-84c9d4bd97a4?w=400",
-            "https://images.unsplash.com/photo-1541704328070-20b8a213b12d?w=400",
-        ]
         evidence_items = []
         for i in range(14):
             drone = random.choice(drones[:3])
@@ -259,9 +249,11 @@ async def seed_data():
                 "drone_id": drone["id"],
                 "event_type": random.choice(alert_types),
                 "confidence": round(random.uniform(0.80, 0.99), 2),
-                "duration_s": random.randint(12, 46),
-                "video_url": random.choice(sample_videos),
-                "thumbnail": random.choice(thumbs),
+                "duration_s": 0,
+                "primary_image_key": "",
+                "secondary_image_key": "",
+                "image_bucket": "",
+                "thumbnail": "",
                 "ts": (now - timedelta(hours=random.randint(0, 96))).isoformat(),
                 "legal_hold": random.random() < 0.15,
                 "retention_until": (

@@ -42,15 +42,9 @@ async def _generate_report_task(report_id: str, report_type: str, params: dict, 
                 target_date = params.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
                 alerts_res = await session.execute(select(Alert).where(Alert.ts.like(f"{target_date}%")))
                 alerts = [_row_to_dict(a) for a in alerts_res.scalars().all()]
-                if not alerts:
-                    fb_res = await session.execute(select(Alert).order_by(desc(Alert.ts)).limit(25))
-                    alerts = [_row_to_dict(a) for a in fb_res.scalars().all()]
                 
                 ev_res = await session.execute(select(Evidence).where(Evidence.ts.like(f"{target_date}%")))
                 evidence = [_row_to_dict(e) for e in ev_res.scalars().all()]
-                if not evidence:
-                    fb_ev = await session.execute(select(Evidence).order_by(desc(Evidence.ts)).limit(15))
-                    evidence = [_row_to_dict(e) for e in fb_ev.scalars().all()]
                 
                 miss_res = await session.execute(select(Mission))
                 missions = [_row_to_dict(m) for m in miss_res.scalars().all()]
@@ -78,10 +72,13 @@ async def _generate_report_task(report_id: str, report_type: str, params: dict, 
                 pdf_bytes = _make_drone_utilisation_pdf(user, missions, drones, period_days)
                 
             elif report_type == "mission_after_action":
+                from sqlalchemy import text
                 mission_id = params.get("mission_id")
                 miss_res = await session.execute(select(Mission).where(Mission.mission_id == mission_id))
                 mission_obj = miss_res.scalar_one_or_none()
-                mission = _row_to_dict(mission_obj) if mission_obj else {"mission_id": mission_id, "name": mission_id}
+                if not mission_obj:
+                    raise ValueError("Mission not found")
+                mission = _row_to_dict(mission_obj)
                 
                 alerts_res = await session.execute(select(Alert).where(Alert.mission_id == mission_id))
                 alerts = [_row_to_dict(a) for a in alerts_res.scalars().all()]
@@ -156,16 +153,21 @@ async def generate_report(
     report_id = f"RPT-{uuid.uuid4().hex[:8]}"
     now_str = datetime.now(timezone.utc).isoformat()
     
+    # Merge any extra fields provided at top-level into params
+    effective_params = dict(body.params or {})
+    if hasattr(body, "__pydantic_extra__") and body.__pydantic_extra__:
+        effective_params.update(body.__pydantic_extra__)
+    
     title = f"{body.report_type.replace('_', ' ').title()}"
     async with async_session_factory() as session:
-        if body.report_type == "mission_after_action" and body.params.get("mission_id"):
-            m_res = await session.execute(select(Mission.name).where(Mission.mission_id == body.params["mission_id"]))
+        if body.report_type == "mission_after_action" and effective_params.get("mission_id"):
+            m_res = await session.execute(select(Mission.name).where(Mission.mission_id == effective_params["mission_id"]))
             m_row = m_res.first()
             if m_row and m_row[0]:
-                title = f"Mission After-Action: {m_row[0]} ({body.params['mission_id']})"
+                title = f"Mission After-Action: {m_row[0]} ({effective_params['mission_id']})"
             else:
-                title = f"Mission After-Action: {body.params['mission_id']}"
-        elif body.params:
+                title = f"Mission After-Action: {effective_params['mission_id']}"
+        elif effective_params:
             p_vals = list(body.params.values())
             if p_vals:
                 title += f" - {p_vals[0]}"
@@ -183,7 +185,7 @@ async def generate_report(
         session.add(new_rep)
         await session.commit()
         
-    asyncio.create_task(_generate_report_task(report_id, body.report_type, body.params, user))
+    asyncio.create_task(_generate_report_task(report_id, body.report_type, effective_params, user))
     
     await write_audit_v2(
         actor=user,
@@ -281,3 +283,97 @@ async def download_report(report_id: str, request: Request, token: str = ""):
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{report_id}.pdf"'}
     )
+
+
+@router.get("/reports/{report_type}/preview-data")
+async def preview_report_data(
+    report_type: str,
+    request: Request,
+    user: dict = Depends(require_roles("senior_officer", "system_administrator"))
+):
+    params = dict(request.query_params)
+    try:
+        async with async_session_factory() as session:
+            u_res = await session.execute(select(User).where(User.email == user.get("email", "")))
+            u_obj = u_res.scalar_one_or_none()
+            if u_obj:
+                user["name"] = u_obj.name or user.get("name", "")
+                user["role"] = u_obj.role or user.get("role", "")
+                user["jurisdiction"] = u_obj.jurisdiction or user.get("jurisdiction", "")
+
+            if report_type == "daily_incident":
+                target_date = params.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+                alerts_res = await session.execute(select(Alert).where(Alert.ts.like(f"{target_date}%")))
+                alerts = [_row_to_dict(a) for a in alerts_res.scalars().all()]
+                ev_res = await session.execute(select(Evidence).where(Evidence.ts.like(f"{target_date}%")))
+                evidence = [_row_to_dict(e) for e in ev_res.scalars().all()]
+                miss_res = await session.execute(select(Mission))
+                missions = [_row_to_dict(m) for m in miss_res.scalars().all()]
+                return {
+                    "user": user,
+                    "alerts": alerts,
+                    "evidence_items": evidence,
+                    "missions": missions,
+                    "target_date": target_date
+                }
+                
+            elif report_type == "weekly_response":
+                week_start = params.get("week_start", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+                alerts_res = await session.execute(select(Alert).order_by(desc(Alert.ts)).limit(500))
+                alerts = [_row_to_dict(a) for a in alerts_res.scalars().all()]
+                miss_res = await session.execute(select(Mission))
+                missions = [_row_to_dict(m) for m in miss_res.scalars().all()]
+                return {
+                    "user": user,
+                    "alerts": alerts,
+                    "missions": missions,
+                    "week_start_date": week_start
+                }
+                
+            elif report_type == "drone_utilisation":
+                period_days = int(params.get("period_days", 30))
+                miss_res = await session.execute(select(Mission))
+                missions = [_row_to_dict(m) for m in miss_res.scalars().all()]
+                drone_res = await session.execute(select(Drone))
+                drones = [_row_to_dict(d) for d in drone_res.scalars().all()]
+                return {
+                    "user": user,
+                    "missions": missions,
+                    "drones": drones,
+                    "period_days": period_days
+                }
+                
+            elif report_type == "mission_after_action":
+                from sqlalchemy import text
+                mission_id = params.get("mission_id")
+                miss_res = await session.execute(select(Mission).where(Mission.mission_id == mission_id))
+                mission_obj = miss_res.scalar_one_or_none()
+                if not mission_obj:
+                    raise HTTPException(404, "Mission not found")
+                mission = _row_to_dict(mission_obj)
+                
+                alerts_res = await session.execute(select(Alert).where(Alert.mission_id == mission_id))
+                alerts = [_row_to_dict(a) for a in alerts_res.scalars().all()]
+                if not alerts and mission.get("drone_id"):
+                    al_dr = await session.execute(select(Alert).where(Alert.drone_id == mission.get("drone_id")))
+                    alerts = [_row_to_dict(a) for a in al_dr.scalars().all()]
+                
+                ev_res = await session.execute(select(Evidence).where(Evidence.mission_id == mission_id))
+                evidence = [_row_to_dict(e) for e in ev_res.scalars().all()]
+                if not evidence and mission.get("drone_id"):
+                    ev_dr = await session.execute(select(Evidence).where(Evidence.drone_id == mission.get("drone_id")))
+                    evidence = [_row_to_dict(e) for e in ev_dr.scalars().all()]
+                return {
+                    "user": user,
+                    "mission": mission,
+                    "alerts": alerts,
+                    "evidence_items": evidence
+                }
+            else:
+                raise HTTPException(400, "Unknown report type")
+                
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Preview generation failed: {exc}")
+        raise HTTPException(500, str(exc))

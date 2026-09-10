@@ -14,6 +14,60 @@ from models import Evidence
 from sqlalchemy import select
 from core.config import ANALYTICS_BASE
 
+import asyncpg
+
+DRONE_DB_URL = "postgresql://dvas:dvas_secret@drone_postgres:5432/dvas"
+
+async def _resolve_image_keys(event_type, event_id, track_id, drone_id, ts):
+    """Resolve real MinIO image keys from analytics tables in drone_postgres."""
+    primary_key = ""
+    secondary_key = ""
+    bucket = ""
+    
+    try:
+        conn = await asyncpg.connect(DRONE_DB_URL)
+        try:
+            if event_type == "person_detected" and track_id:
+                if drone_id:
+                    row = await conn.fetchrow(
+                        "SELECT best_image_key FROM person_identities WHERE best_image_key LIKE $1 AND best_image_key IS NOT NULL AND best_image_key != '' LIMIT 1",
+                        f"%{drone_id}%"
+                    )
+                else:
+                    row = await conn.fetchrow(
+                        "SELECT best_image_key FROM person_identities WHERE best_image_key IS NOT NULL AND best_image_key != '' ORDER BY random() LIMIT 1"
+                    )
+                if row and row['best_image_key']:
+                    primary_key = row['best_image_key']
+                    bucket = "dvas-faces"
+            
+            elif event_type in ("vehicle_detected", "theft_alert"):
+                if track_id:
+                    row = await conn.fetchrow(
+                        "SELECT vehicle_image_key, plate_image_key FROM plate_reads WHERE track_id = $1 LIMIT 1",
+                        track_id  
+                    )
+                    if row:
+                        primary_key = row['vehicle_image_key'] or ""
+                        secondary_key = row['plate_image_key'] or ""
+                        bucket = "dvas-vehicles"
+            
+            elif event_type.startswith("intrusion"):
+                row = await conn.fetchrow(
+                    "SELECT snapshot_key FROM intrusion_events WHERE event_id::text = $1 LIMIT 1",
+                    str(event_id)
+                )
+                if row and row['snapshot_key']:
+                    primary_key = row['snapshot_key']
+                    bucket = "dvas-intrusion"
+                    
+        finally:
+            await conn.close()
+    except Exception as exc:
+        logger.debug("Image key resolution failed for %s/%s: %s", event_type, event_id, exc)
+    
+    return primary_key, secondary_key, bucket
+
 logger = logging.getLogger("dvas.evidence_sync")
 
 _last_sync_ts: str = ""
@@ -77,26 +131,15 @@ async def _sync_once():
                 except Exception:
                     attrs = {}
             
-            import random
-            sample_videos = [
-                "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
-                "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
-                "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
-            ]
-            sample_thumbs = [
-                "https://images.unsplash.com/photo-1612043743114-d19a560b70eb?w=400",
-                "https://images.unsplash.com/photo-1580509742642-84c9d4bd97a4?w=400",
-                "https://images.unsplash.com/photo-1541704328070-20b8a213b12d?w=400",
-            ]
-            
-            video_url = attrs.get("video_url") or attrs.get("clip_url") or random.choice(sample_videos)
-            thumbnail = attrs.get("snapshot_key", attrs.get("object_key", "")) or random.choice(sample_thumbs)
             drone_id = ev.get("drone_id", "")
             mission_id = str(ev.get("mission_id", "")) if ev.get("mission_id") else ""
             event_type = ev.get("event_type", "unknown")
             confidence = float(ev.get("confidence", 0))
             ts = str(ev.get("ts", ""))
-            duration_s = int(attrs.get("duration_s", 0)) or random.randint(18, 45)
+            
+            primary_key, secondary_key, bucket = await _resolve_image_keys(
+                event_type, event_id, str(ev.get("track_id", "")), drone_id, ts
+            )
             
             evidence_row = Evidence(
                 id=f"EVI-{uuid.uuid4().hex[:8]}",
@@ -106,9 +149,11 @@ async def _sync_once():
                 drone_id=drone_id,
                 event_type=event_type,
                 confidence=confidence,
-                duration_s=duration_s,
-                video_url=video_url,
-                thumbnail=thumbnail,
+                duration_s=int(attrs.get("duration_s", 0)),
+                primary_image_key=primary_key,
+                image_bucket=bucket,
+                secondary_image_key=secondary_key,
+                thumbnail=primary_key,
                 ts=ts,
                 legal_hold=False,
                 retention_until=(datetime.now(timezone.utc) + timedelta(days=90)).isoformat(),

@@ -647,7 +647,7 @@ export default function CommandDashboard() {
             id: a.id,
             category: "vision",
             title: `${missionPrefix}${alertName}`,
-            subtitle: `${a.drone_id || "DRN"} · ${a.zone || "Zone"} · conf ${a.confidence || "0.9"}`,
+            subtitle: `${a.drone_id || "DRN"} · ${a.zone || "Zone"} · conf ${a.confidence || "—"}`,
             ts: a.ts,
             severity: a.severity === "critical" ? "critical" : "warning",
             badge: "DETECTION",
@@ -870,7 +870,7 @@ export default function CommandDashboard() {
                       <div key={ev.id} data-testid={`evidence-${ev.id}`} className="rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
                           <div className="aspect-video relative overflow-hidden bg-slate-900" style={{ background: "var(--dvas-surface-2)" }}>
                               {ev.thumbnail ? (
-                                  <img src={ev.thumbnail} alt="" className="w-full h-full object-cover opacity-90" onError={(e) => { e.target.style.display = 'none'; }} />
+                                  <img src={ev.thumbnail.startsWith('http') ? ev.thumbnail : `/api/minio/image?bucket=${encodeURIComponent(ev.image_bucket || 'dvas-faces')}&key=${encodeURIComponent(ev.thumbnail)}`} alt="" className="w-full h-full object-cover opacity-90" onError={(e) => { e.target.style.display = 'none'; }} />
                               ) : (
                                   <div className="w-full h-full flex flex-col items-center justify-center text-slate-600 gap-1">
                                       <FilmSlate size={32} />
@@ -879,7 +879,7 @@ export default function CommandDashboard() {
                               )}
                               <button data-testid={`play-${ev.id}`} onClick={() => setPlaying(ev)} className="absolute inset-0 flex items-center justify-center bg-black/20 hover:bg-black/40 transition-colors text-white">
                                   <div className="border border-white/70 px-3 py-1 text-xs bg-black/60 rounded flex items-center gap-1.5">
-                                      <Play size={11} fill="currentColor" /> Play Clip
+                                      <Play size={11} fill="currentColor" /> View Evidence
                                   </div>
                               </button>
                               {ev.legal_hold && (
@@ -1132,7 +1132,7 @@ export default function CommandDashboard() {
                     <option value="">Select mission...</option>
                     {missions.map(m => (
                       <option key={m.mission_id} value={m.mission_id}>
-                        {m.name || m.mission_id} ({m.mission_id}) — Op: {m.operator_name || "Ravi Menon"}
+                        {m.name || m.mission_id} ({m.mission_id}) — Op: {m.operator_name || "—"}
                       </option>
                     ))}
                   </select>
@@ -1210,26 +1210,28 @@ export default function CommandDashboard() {
               <div className="text-sm">{playing.label}</div>
               <button data-testid="close-player" onClick={() => setPlaying(null)}><X size={16} /></button>
             </div>
-            {playing.video_url ? (
-              <video
-                data-testid="video-player"
-                src={playing.video_url}
-                controls
-                autoPlay
-                className="w-full aspect-video bg-black"
-                onError={(e) => {
-                  console.warn("Video stream aborted or playback error:", e);
-                }}
-              />
-            ) : (
-              <div className="w-full aspect-video bg-slate-900 flex flex-col items-center justify-center text-slate-400 gap-3 p-6 text-center">
-                {playing.thumbnail ? (
-                  <img src={playing.thumbnail} alt="" className="max-h-[60%] max-w-[80%] object-contain rounded border border-slate-800" />
-                ) : (
-                  <FilmSlate size={48} className="text-slate-600" />
+            {(playing.primary_image_key || playing.thumbnail) ? (
+              <div className="w-full aspect-video bg-slate-900 flex items-center justify-center gap-4 p-4">
+                <img
+                  src={`/api/minio/image?bucket=${encodeURIComponent(playing.image_bucket || 'dvas-faces')}&key=${encodeURIComponent(playing.primary_image_key || playing.thumbnail)}`}
+                  alt="Evidence capture"
+                  className="max-h-full max-w-[48%] object-contain rounded border border-slate-700"
+                  onError={(e) => { e.target.style.display = 'none'; }}
+                />
+                {playing.secondary_image_key && (
+                  <img
+                    src={`/api/minio/image?bucket=${encodeURIComponent(playing.image_bucket === 'dvas-vehicles' ? 'dvas-plates' : playing.image_bucket || 'dvas-faces')}&key=${encodeURIComponent(playing.secondary_image_key)}`}
+                    alt="Secondary evidence capture"
+                    className="max-h-full max-w-[48%] object-contain rounded border border-slate-700"
+                    onError={(e) => { e.target.style.display = 'none'; }}
+                  />
                 )}
-                <div className="text-sm font-medium text-slate-300">Analytical Event Clip Captured at Edge</div>
-                <div className="text-xs text-slate-500 max-w-md">The raw telemetry for this confirmed event is preserved. Video stream clip is stored in encrypted vault storage.</div>
+              </div>
+            ) : (
+              <div className="w-full aspect-video bg-slate-900 flex flex-col items-center justify-center text-slate-500 p-8">
+                <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" className="mb-4 text-slate-600"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                <p className="text-sm font-medium">Image Unavailable</p>
+                <p className="text-xs text-slate-600 mt-1">Event recorded without visual capture</p>
               </div>
             )}
             <div className="p-3 mono text-[11px] text-slate-400 flex flex-wrap gap-3">
@@ -1287,7 +1289,7 @@ export default function CommandDashboard() {
 
                       {/* Action Buttons */}
                       <div className="flex flex-wrap gap-2 pt-2 border-t border-slate-800">
-                          <button onClick={() => { setPlaying(evidenceDetail.evidence); setEvidenceDetail(null); }} className="px-3 py-1.5 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 text-xs flex items-center gap-1"><Play size={12} /> Play Video</button>
+                          <button onClick={() => { setPlaying(evidenceDetail.evidence); setEvidenceDetail(null); }} className="px-3 py-1.5 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 text-xs flex items-center gap-1"><Play size={12} /> View Evidence</button>
                           {user.role === "control_room_officer" && (
                               <button onClick={() => { setRequestOn(evidenceDetail.evidence); setEvidenceDetail(null); }} className="px-3 py-1.5 border border-slate-700 text-slate-300 hover:border-sky-500 text-xs">Request Export</button>
                           )}
