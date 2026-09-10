@@ -209,34 +209,8 @@ async def seed_data():
         for d in drones:
             session.add(Drone(**d))
 
-        alert_types = [
-            "crowd_surge",
-            "vehicle_anomaly",
-            "perimeter_intrusion",
-            "unattended_object",
-            "wrong_way",
-        ]
-        zones = [
-            "Attukal Temple",
-            "Marine Drive",
-            "Padmanabhaswamy",
-            "Statue Jn",
-            "East Fort",
-        ]
-        for i in range(28):
-            drone = random.choice(drones[:3])
-            session.add(Alert(
-                id=f"A-{1000 + i}",
-                mission_id=drone["mission_id"],
-                jurisdiction=drone["jurisdiction"],
-                drone_id=drone["id"],
-                type=random.choice(alert_types),
-                confidence=round(random.uniform(0.72, 0.98), 2),
-                zone=random.choice(zones),
-                ts=(now - timedelta(minutes=random.randint(1, 720))).isoformat(),
-                acknowledged_by=None,
-                acknowledged_at=None,
-            ))
+        # NOTE: Seed alerts removed — alerts table now only holds real
+        # operator-submitted incidents and AI model suggestions.
 
         evidence_items = []
         for i in range(14):

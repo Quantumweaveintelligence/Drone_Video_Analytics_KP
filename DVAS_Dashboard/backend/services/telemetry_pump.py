@@ -218,29 +218,8 @@ async def _telemetry_pump():
                     }
                 )
 
-            # occasionally inject a new alert for active missions
-            active_mission_drones = [d for d in updates if d.get("mission_id")]
-            if random.random() < 0.28 and active_mission_drones:
-                d = random.choice(active_mission_drones)
-                a = {
-                    "id": f"A-{uuid.uuid4().hex[:8].upper()}",
-                    "mission_id": d.get("mission_id"),
-                    "jurisdiction": d.get("jurisdiction"),
-                    "drone_id": d.get("id"),
-                    "type": random.choice(alert_types),
-                    "confidence": round(random.uniform(0.72, 0.98), 2),
-                    "zone": random.choice(zones),
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "acknowledged_by": None,
-                    "acknowledged_at": None,
-                }
-                try:
-                    async with async_session_factory() as session:
-                        session.add(Alert(**a))
-                        await session.commit()
-                    await hub.broadcast({"type": "alert", "alert": a})
-                except Exception as e:
-                    logger.debug(f"telemetry pump alert generation error: {e}")
+            # NOTE: Fake alert injection removed — only real operator-submitted
+            # incidents and AI model suggestions should appear in the alerts table.
         except Exception as e:
             logger.warning(f"telemetry pump: {e}")
 
