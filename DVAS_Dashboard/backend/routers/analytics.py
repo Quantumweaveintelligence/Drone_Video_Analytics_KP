@@ -1015,6 +1015,7 @@ async def create_model_suggestion(
     priority = payload.get("priority", "normal").lower()
     reason = payload.get("reason", "").strip()
     location = payload.get("location") or payload.get("place") or "Edge Ground Station"
+    ts = payload.get("timestamp") or datetime.now(timezone.utc).isoformat()
     drone_id = payload.get("drone_id")
     mission_id = payload.get("mission_id")
 

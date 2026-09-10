@@ -146,6 +146,7 @@ function NotificationBell() {
             severity: s.priority === "critical" ? "critical" : s.priority === "high" ? "warning" : "info",
             badge: "AI SUGGESTION",
             badgeClass: "bg-sky-500/10 text-sky-400 border-sky-500/30",
+            status: s.status || "PENDING",
             icon: "cpu",
           });
         });
@@ -164,6 +165,7 @@ function NotificationBell() {
             severity: inc.severity === "CRITICAL" ? "critical" : inc.severity === "HIGH" ? "warning" : "info",
             badge: inc.severity || "INCIDENT",
             badgeClass: inc.severity === "CRITICAL" ? "bg-red-500/10 text-red-400 border-red-500/30" : "bg-amber-500/10 text-amber-400 border-amber-500/30",
+            status: inc.status || "OPEN",
             icon: "incident",
           });
         });
@@ -188,6 +190,7 @@ function NotificationBell() {
             severity: a.severity === "critical" ? "critical" : "warning",
             badge: "DETECTION",
             badgeClass: a.severity === "critical" ? "bg-red-500/10 text-red-400 border-red-500/30" : "bg-purple-500/10 text-purple-400 border-purple-500/30",
+            status: a.acknowledged_by ? "ACKNOWLEDGED" : "OPEN",
             icon: "alert",
           });
         });
@@ -196,6 +199,10 @@ function NotificationBell() {
       // Sort newest first
       items.sort((a, b) => new Date(b.ts || 0).getTime() - new Date(a.ts || 0).getTime());
       setNotifications(items.slice(0, 50));
+
+      // Calculate unacknowledged count for badge
+      const pendingCount = items.filter(x => x.status !== "ACKNOWLEDGED").length;
+      setUnread(pendingCount);
     } catch (e) {
       console.warn("Failed to fetch initial notifications:", e);
     }
@@ -203,6 +210,8 @@ function NotificationBell() {
 
   useEffect(() => {
     loadNotifications();
+    const interval = setInterval(loadNotifications, 5000);
+    return () => clearInterval(interval);
   }, [user]);
 
   // Real-time WebSocket listener

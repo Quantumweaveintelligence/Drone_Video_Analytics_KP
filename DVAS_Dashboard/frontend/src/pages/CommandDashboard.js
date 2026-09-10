@@ -379,7 +379,7 @@ export default function CommandDashboard() {
     } catch (e) { console.error(e); }
   };
 
-  useEffect(() => { load(); const t = setInterval(load, 15000); return () => clearInterval(t); }, []);
+  useEffect(() => { load(); const t = setInterval(load, 5000); return () => clearInterval(t); }, []);
 
   // WebSocket live updates
   const { connected } = useDvasSocket((msg) => {

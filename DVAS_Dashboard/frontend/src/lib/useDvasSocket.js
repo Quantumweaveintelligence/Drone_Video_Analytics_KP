@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { API, api } from "@/lib/api";
+import { API, api, getAuthToken } from "@/lib/api";
 
 /**
  * Live WebSocket connection to /api/ws.
@@ -25,6 +25,11 @@ export function useDvasSocket(onMessage) {
         url = apiPath.startsWith("http")
           ? `${apiPath.replace(/^http/, "ws")}/ws`
           : `${protocol}//${host}${apiPath.startsWith("/") ? "" : "/"}${apiPath}/ws`;
+
+        const token = getAuthToken();
+        if (token) {
+          url += (url.includes("?") ? "&" : "?") + `token=${encodeURIComponent(token)}`;
+        }
       } catch (e) {
         console.warn("Failed to construct WebSocket URL:", e);
         return;
