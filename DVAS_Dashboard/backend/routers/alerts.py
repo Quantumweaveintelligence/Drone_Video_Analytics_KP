@@ -6,14 +6,15 @@ import logging
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func, or_
 from jose import jwt
 
 from database import async_session_factory
 from models import Alert, Evidence, Export
-from core.security import get_current_user, get_jwks, scope_filter_for, _apply_scope_to_query, _row_to_dict
+from core.security import get_current_user, get_jwks, scope_filter_for, _apply_scope_to_query, _row_to_dict, require_roles
 from audit_service import write_audit_v2
 from schemas.exports import ExportRequestIn, ExportDecisionIn
+from schemas.evidence import LegalHoldIn, LegalHoldReleaseIn, DirectExportIn
 from services.pdf_service import _make_65b_pdf
 
 logger = logging.getLogger("dvas")
@@ -70,7 +71,18 @@ async def ack_alert(
 
 
 @router.get("/evidence")
-async def list_evidence(user: dict = Depends(get_current_user)):
+async def list_evidence(
+    drone_id: str = "",
+    mission_id: str = "",
+    event_type: str = "",
+    from_ts: str = "",
+    to_ts: str = "",
+    legal_hold_only: bool = False,
+    search: str = "",
+    limit: int = 200,
+    offset: int = 0,
+    user: dict = Depends(get_current_user)
+):
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     f = scope_filter_for(user)
@@ -81,9 +93,184 @@ async def list_evidence(user: dict = Depends(get_current_user)):
         stmt = _apply_scope_to_query(stmt, Evidence, f)
         if stmt is None:
             raise HTTPException(403, "Not permitted")
-        stmt = stmt.order_by(Evidence.ts.desc()).limit(200)
+        
+        if drone_id:
+            stmt = stmt.where(Evidence.drone_id == drone_id)
+        if mission_id:
+            stmt = stmt.where(Evidence.mission_id == mission_id)
+        if event_type:
+            stmt = stmt.where(Evidence.event_type == event_type)
+        if from_ts:
+            stmt = stmt.where(Evidence.ts >= from_ts)
+        if to_ts:
+            stmt = stmt.where(Evidence.ts <= to_ts)
+        if legal_hold_only:
+            stmt = stmt.where(Evidence.legal_hold == True)
+        if search:
+            stmt = stmt.where(Evidence.label.ilike(f"%{search}%"))
+        
+        count_stmt = select(func.count()).select_from(stmt.subquery())
+        total = await session.scalar(count_stmt)
+        
+        stmt = stmt.order_by(Evidence.ts.desc()).offset(offset).limit(limit)
         result = await session.execute(stmt)
-        return [_row_to_dict(r) for r in result.scalars().all()]
+        
+        return {
+            "items": [_row_to_dict(r) for r in result.scalars().all()],
+            "total": total
+        }
+
+
+@router.get("/evidence/{evidence_id}")
+async def get_evidence(evidence_id: str, user: dict = Depends(get_current_user)):
+    if user["role"] not in ("control_room_officer", "senior_officer"):
+        raise HTTPException(403, "Not permitted")
+    async with async_session_factory() as session:
+        result = await session.execute(select(Evidence).where(Evidence.id == evidence_id))
+        ev_obj = result.scalar_one_or_none()
+        if not ev_obj:
+            raise HTTPException(404, "Evidence not found")
+        ev = _row_to_dict(ev_obj)
+        
+        exports_result = await session.execute(select(Export).where(Export.evidence_id == evidence_id))
+        exports = [_row_to_dict(r) for r in exports_result.scalars().all()]
+        
+        return {"evidence": ev, "exports": exports}
+
+
+@router.post("/evidence/{evidence_id}/legal-hold")
+async def set_legal_hold(
+    evidence_id: str,
+    body: LegalHoldIn,
+    user: dict = Depends(require_roles("senior_officer")),
+    request: Request = None
+):
+    async with async_session_factory() as session:
+        result = await session.execute(select(Evidence).where(Evidence.id == evidence_id))
+        ev_obj = result.scalar_one_or_none()
+        if not ev_obj:
+            raise HTTPException(404, "Evidence not found")
+        if ev_obj.legal_hold:
+            raise HTTPException(400, "Evidence already on legal hold")
+            
+        now_str = datetime.now(timezone.utc).isoformat()
+        await session.execute(
+            update(Evidence)
+            .where(Evidence.id == evidence_id)
+            .values(
+                legal_hold=True,
+                legal_hold_reason=body.reason,
+                legal_hold_by=user["email"],
+                legal_hold_at=now_str
+            )
+        )
+        await session.commit()
+        
+    await write_audit_v2(
+        actor=user,
+        action="evidence_legal_hold",
+        target=evidence_id,
+        target_type="evidence",
+        target_id=evidence_id,
+        details=body.reason,
+        before_values={"legal_hold": False},
+        after_values={"legal_hold": True, "reason": body.reason},
+        compliance_tags=["LEGAL_HOLD"],
+        source_endpoint="POST /api/evidence/{id}/legal-hold",
+        request=request
+    )
+    return {"ok": True}
+
+
+@router.delete("/evidence/{evidence_id}/legal-hold")
+async def release_legal_hold(
+    evidence_id: str,
+    body: LegalHoldReleaseIn,
+    user: dict = Depends(require_roles("senior_officer")),
+    request: Request = None
+):
+    async with async_session_factory() as session:
+        result = await session.execute(select(Evidence).where(Evidence.id == evidence_id))
+        ev_obj = result.scalar_one_or_none()
+        if not ev_obj:
+            raise HTTPException(404, "Evidence not found")
+        if not ev_obj.legal_hold:
+            raise HTTPException(400, "Evidence not on legal hold")
+            
+        prev_reason = ev_obj.legal_hold_reason
+        await session.execute(
+            update(Evidence)
+            .where(Evidence.id == evidence_id)
+            .values(
+                legal_hold=False,
+                legal_hold_reason=None,
+                legal_hold_by=None,
+                legal_hold_at=None
+            )
+        )
+        await session.commit()
+        
+    await write_audit_v2(
+        actor=user,
+        action="evidence_legal_hold_release",
+        target=evidence_id,
+        target_type="evidence",
+        target_id=evidence_id,
+        details=body.reason,
+        before_values={"legal_hold": True, "reason": prev_reason},
+        after_values={"legal_hold": False},
+        compliance_tags=["LEGAL_HOLD"],
+        source_endpoint="DELETE /api/evidence/{id}/legal-hold",
+        request=request
+    )
+    return {"ok": True}
+
+
+@router.post("/evidence/{evidence_id}/direct-export")
+async def direct_export(
+    evidence_id: str,
+    body: DirectExportIn,
+    user: dict = Depends(require_roles("senior_officer")),
+    request: Request = None
+):
+    async with async_session_factory() as session:
+        result = await session.execute(select(Evidence).where(Evidence.id == evidence_id))
+        ev_obj = result.scalar_one_or_none()
+        if not ev_obj:
+            raise HTTPException(404, "Evidence not found")
+        ev = _row_to_dict(ev_obj)
+        
+        now_str = datetime.now(timezone.utc).isoformat()
+        exp_id = str(uuid.uuid4())
+        doc = {
+            "id": exp_id,
+            "evidence_id": evidence_id,
+            "evidence_label": ev.get("label", ""),
+            "jurisdiction": ev.get("jurisdiction", ""),
+            "requested_by": user["email"],
+            "requested_at": now_str,
+            "justification": body.justification,
+            "status": "approved",
+            "decision_by": user["email"],
+            "decision_at": now_str,
+            "decision_comment": "Direct export by Senior Officer"
+        }
+        session.add(Export(**doc))
+        await session.commit()
+        
+    await write_audit_v2(
+        actor=user,
+        action="direct_export",
+        target=evidence_id,
+        target_type="evidence",
+        target_id=evidence_id,
+        details=body.justification,
+        before_values={},
+        after_values=doc,
+        source_endpoint="POST /api/evidence/{id}/direct-export",
+        request=request
+    )
+    return doc
 
 
 @router.get("/exports")

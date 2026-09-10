@@ -752,7 +752,9 @@ export default function CrowdAnalytics({ crowdSeries, drones }) {
   // Dynamic drone list from active streams or fallback to props
   const droneList = streams?.length > 0
     ? streams.map(s => ({ id: s.drone_id, ...s }))
-    : (drones?.length > 0 ? drones : []);
+    : (drones?.length > 0
+        ? drones.filter(d => (d.status === 'live' || d.status === 'draining') && !/^DRN-00[1-5]$/i.test(d.id || d.drone_id))
+        : []);
 
   // Auto-select first active drone once discovered
   useEffect(() => {

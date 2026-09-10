@@ -18,7 +18,7 @@ import {
   Cpu, ShieldCheck, User as UserIcon, Users as UsersIcon, Car, Hash,
   UserSearch, RefreshCw, Play, Square, CheckCircle2,
   Activity, Battery, BatteryLow, BatteryMedium, BatteryFull,
-  Wifi, WifiOff, Clock, Radio, Shield,
+  Wifi, WifiOff, Clock, Radio, Shield, FileText,
 } from "lucide-react";
 import { useJpegPoller } from "@/hooks/useJpegPoller";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, BarChart, Bar } from "recharts";
@@ -334,13 +334,25 @@ export default function CommandDashboard() {
   const [justification, setJustification] = useState("");
   const [selectedDrone, setSelectedDrone] = useState(null);
 
+  const [evidenceFilters, setEvidenceFilters] = useState({ drone_id: "", mission_id: "", event_type: "", from_ts: "", to_ts: "", legal_hold_only: false, search: "" });
+  const [evidenceTotal, setEvidenceTotal] = useState(0);
+  const [evidenceDetail, setEvidenceDetail] = useState(null); // for detail modal
+  const [reports, setReports] = useState([]);
+  const [generatingReport, setGeneratingReport] = useState(null); // report_id being generated
+  const [reportParams, setReportParams] = useState({
+    daily_incident: { date: new Date().toISOString().split("T")[0] },
+    weekly_response: { week_start: new Date(Date.now() - 6 * 86400000).toISOString().split("T")[0] },
+    drone_utilisation: { period_days: 30 },
+    mission_after_action: { mission_id: "" },
+  });
+
   const { mergeWithDrones } = useActiveStreams();
   const mergedDrones = mergeWithDrones(drones);
   const liveMissionsCount = mergedDrones.filter((d) => ["live", "draining"].includes(d.status) && Boolean(d.mission_id)).length;
 
   const load = async () => {
     try {
-      const [k, dR, aR, eR, mR, xR, cR] = await Promise.all([
+      const [k, dR, aR, eR, mR, xR, cR, rptR] = await Promise.all([
         api.get("/command/kpis"),
         api.get("/drones"),
         api.get("/alerts"),
@@ -349,9 +361,14 @@ export default function CommandDashboard() {
         // CRO now has access to their own export requests
         api.get("/exports").catch(() => ({ data: [] })),
         api.get("/analytics/crowd"),
+        api.get("/reports").catch(() => ({ data: [] })),
       ]);
-      setKpis(k.data); setDrones(dR.data); setAlerts(aR.data); setEvidence(eR.data);
+      setKpis(k.data); setDrones(dR.data); setAlerts(aR.data);
+      const eData = Array.isArray(eR.data) ? eR.data : (eR.data.items || []);
+      setEvidence(eData);
+      setEvidenceTotal(eR.data.total || eData.length);
       setMissions(mR.data); setExports(xR.data); setCrowd(cR.data.series || []);
+      setReports(rptR.data || []);
     } catch (e) { console.error(e); }
   };
 
@@ -397,6 +414,72 @@ export default function CommandDashboard() {
       await api.post(`/exports/${id}/decision`, { decision, comment: `${decision} by ${user.email}` });
       load();
     } catch (e) { alert(e.response?.data?.detail || "failed"); }
+  };
+
+  const loadFilteredEvidence = async (filters) => {
+      try {
+          const params = new URLSearchParams();
+          Object.entries(filters).forEach(([k, v]) => {
+              if (v !== "" && v !== false) params.set(k, v);
+          });
+          const res = await api.get(`/evidence?${params.toString()}`);
+          const data = res.data;
+          setEvidence(Array.isArray(data) ? data : (data.items || []));
+          setEvidenceTotal(data.total || 0);
+      } catch (e) { console.error(e); }
+  };
+
+  const toggleLegalHold = async (ev) => {
+      try {
+          if (ev.legal_hold) {
+              await api.delete(`/evidence/${ev.id}/legal-hold`, { data: { reason: "Released by Senior Officer" } });
+          } else {
+              const reason = prompt("Enter legal hold reason:");
+              if (!reason) return;
+              await api.post(`/evidence/${ev.id}/legal-hold`, { reason });
+          }
+          load();
+      } catch (e) { alert(e.response?.data?.detail || "Failed"); }
+  };
+
+  const directExport = async (ev) => {
+      const justification = prompt("Enter justification for direct export:");
+      if (!justification) return;
+      try {
+          await api.post(`/evidence/${ev.id}/direct-export`, { justification });
+          load();
+      } catch (e) { alert(e.response?.data?.detail || "Failed"); }
+  };
+
+  const generateMissionReport = async (missionId) => {
+      try {
+          setGeneratingReport(missionId);
+          await api.post("/reports/generate", { report_type: "mission_after_action", params: { mission_id: missionId } });
+          load();
+          setTimeout(() => setGeneratingReport(null), 3000);
+      } catch (e) { alert(e.response?.data?.detail || "Failed"); setGeneratingReport(null); }
+  };
+
+  const openEvidenceDetail = async (evidenceId) => {
+      try {
+          const res = await api.get(`/evidence/${evidenceId}`);
+          setEvidenceDetail(res.data);
+      } catch (e) { alert(e.response?.data?.detail || "Failed"); }
+  };
+
+  const generateReport = async (reportType) => {
+      try {
+          setGeneratingReport(reportType);
+          const params = reportParams[reportType] || {};
+          await api.post("/reports/generate", { report_type: reportType, params });
+          load();
+          setTimeout(() => setGeneratingReport(null), 3000);
+      } catch (e) { alert(e.response?.data?.detail || "Failed"); setGeneratingReport(null); }
+  };
+
+  const downloadReport = (reportId) => {
+      const token = localStorage.getItem("dvas_token") || "";
+      window.open(`${API}/reports/${reportId}/download?token=${encodeURIComponent(token)}`, "_blank");
   };
 
   return (
@@ -516,32 +599,94 @@ export default function CommandDashboard() {
       )}
 
       {tab === "evidence" && (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {evidence.map(ev => (
-            <div key={ev.id} data-testid={`evidence-${ev.id}`} className="rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
-              <div className="aspect-video relative overflow-hidden" style={{ background: "var(--dvas-surface-2)" }}>
-                <img src={ev.thumbnail} alt="" className="w-full h-full object-cover opacity-90" />
-                <button data-testid={`play-${ev.id}`} onClick={() => setPlaying(ev)} className="absolute inset-0 flex items-center justify-center bg-black/10 hover:bg-black/5 transition-colors text-white">
-                  <div className="border border-white/70 px-3 py-1 text-xs bg-black/40 rounded">▶ Play</div>
-                </button>
-                {ev.legal_hold && (
-                  <span className="absolute top-2 left-2 mono text-[10px] px-1.5 py-0.5 border border-red-500/50 bg-white/90 text-red-500 uppercase flex items-center gap-1 shadow-sm rounded-sm"><FolderLock size={10} /> hold</span>
-                )}
+          <div className="space-y-4">
+              {/* Search & Filter Bar */}
+              <div className="rounded-xl p-4 space-y-3" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
+                  <div className="flex items-center gap-2 text-sm font-semibold" style={{ color: "var(--dvas-text)" }}>
+                      <FilmSlate size={16} className="text-sky-500" /> Evidence Vault
+                      <span className="ml-auto mono text-[10px] text-slate-500">{evidenceTotal} items</span>
+                  </div>
+                  <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2">
+                      <select value={evidenceFilters.drone_id} onChange={e => { const f = {...evidenceFilters, drone_id: e.target.value}; setEvidenceFilters(f); loadFilteredEvidence(f); }} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200">
+                          <option value="">All Drones</option>
+                          {[...new Set(drones.map(d => d.id))].map(id => <option key={id} value={id}>{id}</option>)}
+                      </select>
+                      <select value={evidenceFilters.mission_id} onChange={e => { const f = {...evidenceFilters, mission_id: e.target.value}; setEvidenceFilters(f); loadFilteredEvidence(f); }} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200">
+                          <option value="">All Missions</option>
+                          {missions.map(m => <option key={m.mission_id} value={m.mission_id}>{m.mission_id}</option>)}
+                      </select>
+                      <select value={evidenceFilters.event_type} onChange={e => { const f = {...evidenceFilters, event_type: e.target.value}; setEvidenceFilters(f); loadFilteredEvidence(f); }} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200">
+                          <option value="">All Types</option>
+                          {["crowd_surge","vehicle_anomaly","perimeter_intrusion","unattended_object","wrong_way","crowd_threshold","theft_alert","intrusion_alert","vehicle_detected"].map(t => <option key={t} value={t}>{t.replace(/_/g, ' ')}</option>)}
+                      </select>
+                      <input type="date" value={evidenceFilters.from_ts?.split('T')[0] || ""} onChange={e => { const f = {...evidenceFilters, from_ts: e.target.value ? e.target.value + "T00:00:00" : ""}; setEvidenceFilters(f); loadFilteredEvidence(f); }} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200" placeholder="From" />
+                      <input type="date" value={evidenceFilters.to_ts?.split('T')[0] || ""} onChange={e => { const f = {...evidenceFilters, to_ts: e.target.value ? e.target.value + "T23:59:59" : ""}; setEvidenceFilters(f); loadFilteredEvidence(f); }} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200" placeholder="To" />
+                      <label className="flex items-center gap-1 text-[10px] text-amber-400 cursor-pointer">
+                          <input type="checkbox" checked={evidenceFilters.legal_hold_only} onChange={e => { const f = {...evidenceFilters, legal_hold_only: e.target.checked}; setEvidenceFilters(f); loadFilteredEvidence(f); }} className="accent-amber-500" />
+                          Legal Hold Only
+                      </label>
+                      <input type="text" value={evidenceFilters.search} onChange={e => { const f = {...evidenceFilters, search: e.target.value}; setEvidenceFilters(f); }} onKeyDown={e => { if (e.key === "Enter") loadFilteredEvidence(evidenceFilters); }} placeholder="Search label..." className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200 placeholder-slate-500" />
+                  </div>
               </div>
-              <div className="p-3">
-                <div className="text-xs font-medium">{ev.label}</div>
-                <div className="mono text-[10px] text-slate-500 mt-1 flex flex-wrap gap-2">
-                  <span>{ev.event_type}</span><span>·</span><span>conf {ev.confidence}</span><span>·</span><span>{ev.duration_s}s</span>
-                </div>
-                <div className="mono text-[10px] text-slate-500">{new Date(ev.ts).toLocaleString()}</div>
-                {/* CRO (former field_supervisor) can request exports for active-mission evidence */}
-                {user.role === "control_room_officer" && (
-                  <button data-testid={`request-${ev.id}`} onClick={() => setRequestOn(ev)} className="mt-2 w-full text-xs border border-slate-700 hover:border-sky-500 py-1.5">Request Export</button>
-                )}
+
+              {/* Evidence Cards Grid */}
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {evidence.map(ev => (
+                      <div key={ev.id} data-testid={`evidence-${ev.id}`} className="rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
+                          <div className="aspect-video relative overflow-hidden bg-slate-900" style={{ background: "var(--dvas-surface-2)" }}>
+                              {ev.thumbnail ? (
+                                  <img src={ev.thumbnail} alt="" className="w-full h-full object-cover opacity-90" onError={(e) => { e.target.style.display = 'none'; }} />
+                              ) : (
+                                  <div className="w-full h-full flex flex-col items-center justify-center text-slate-600 gap-1">
+                                      <FilmSlate size={32} />
+                                      <span className="mono text-[10px] text-slate-500">{ev.event_type}</span>
+                                  </div>
+                              )}
+                              <button data-testid={`play-${ev.id}`} onClick={() => setPlaying(ev)} className="absolute inset-0 flex items-center justify-center bg-black/20 hover:bg-black/40 transition-colors text-white">
+                                  <div className="border border-white/70 px-3 py-1 text-xs bg-black/60 rounded flex items-center gap-1.5">
+                                      <Play size={11} fill="currentColor" /> Play Clip
+                                  </div>
+                              </button>
+                              {ev.legal_hold && (
+                                  <span className="absolute top-2 left-2 mono text-[10px] px-1.5 py-0.5 border border-red-500/50 bg-white/90 text-red-500 uppercase flex items-center gap-1 shadow-sm rounded-sm"><FolderLock size={10} /> hold</span>
+                              )}
+                              <button onClick={() => openEvidenceDetail(ev.id)} className="absolute top-2 right-2 mono text-[10px] px-1.5 py-0.5 border border-slate-400/50 bg-black/60 text-slate-200 hover:bg-black/80 rounded-sm">Details</button>
+                          </div>
+                          <div className="p-3">
+                              <div className="text-xs font-medium" style={{ color: "var(--dvas-text)" }}>{ev.label}</div>
+                              <div className="mono text-[10px] text-slate-500 mt-1 flex flex-wrap gap-2">
+                                  <span>{ev.event_type}</span><span>·</span><span>conf {ev.confidence}</span><span>·</span><span>{ev.duration_s}s</span>
+                              </div>
+                              <div className="mono text-[10px] text-slate-500">{new Date(ev.ts).toLocaleString()}</div>
+                              <div className="mono text-[10px] text-slate-500">{ev.drone_id} · {ev.mission_id}</div>
+                              <div className="mt-2 flex flex-wrap gap-1">
+                                  {/* CRO: Request Export */}
+                                  {user.role === "control_room_officer" && (
+                                      <button data-testid={`request-${ev.id}`} onClick={() => setRequestOn(ev)} className="text-[10px] px-2 py-1 border border-slate-700 hover:border-sky-500 text-slate-300">Request Export</button>
+                                  )}
+                                  {/* SR: Direct Export */}
+                                  {user.role === "senior_officer" && (
+                                      <button onClick={() => directExport(ev)} className="text-[10px] px-2 py-1 border border-emerald-600/60 text-emerald-300 hover:bg-emerald-500/10">Direct Export</button>
+                                  )}
+                                  {/* SR: Legal Hold Toggle */}
+                                  {user.role === "senior_officer" && (
+                                      <button onClick={() => toggleLegalHold(ev)} className={`text-[10px] px-2 py-1 border ${ev.legal_hold ? 'border-red-500/60 text-red-300 hover:bg-red-500/10' : 'border-amber-500/60 text-amber-300 hover:bg-amber-500/10'}`}>
+                                          <FolderLock size={10} className="inline mr-1" />{ev.legal_hold ? 'Release Hold' : 'Legal Hold'}
+                                      </button>
+                                  )}
+                                  {/* Generate Mission AAR Report */}
+                                  {ev.mission_id && (
+                                      <button onClick={() => generateMissionReport(ev.mission_id)} disabled={generatingReport === ev.mission_id} className="text-[10px] px-2 py-1 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 disabled:opacity-40 flex items-center gap-1">
+                                          {generatingReport === ev.mission_id ? <><RefreshCw size={10} className="animate-spin" /> Generating...</> : <><Download size={10} /> AAR Report</>}
+                                      </button>
+                                  )}
+                              </div>
+                          </div>
+                      </div>
+                  ))}
               </div>
-            </div>
-          ))}
-        </div>
+              {evidence.length === 0 && <div className="text-center text-slate-500 py-12 text-sm">No evidence items match the current filters</div>}
+          </div>
       )}
 
       {tab === "crowd" && (
@@ -563,52 +708,88 @@ export default function CommandDashboard() {
       {tab === "models" && <ModelsPage user={user} t={t} />}
 
       {tab === "exports" && (
-        <div className="rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
-          <div className="p-3 text-sm flex items-center gap-2 font-semibold" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text)" }}>
-            <ArrowSquareOut size={16} className="text-sky-500" weight="duotone" /> Evidence Export Requests
+        <div className="space-y-4">
+          {/* Section 1: Evidence Export Requests */}
+          <div className="rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
+            <div className="p-3 text-sm flex items-center gap-2 font-semibold" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text)" }}>
+              <ArrowSquareOut size={16} className="text-sky-500" /> Evidence Export Requests
+              <span className="ml-auto mono text-[10px] text-slate-500">{exports.length} requests</span>
+            </div>
+            <table className="w-full text-xs">
+              <thead style={{ background: "var(--dvas-surface-2)" }}>
+                <tr>{["ID","Evidence","Requester","Justification","Status","Actions"].map(h => <th key={h} className="text-left px-3 py-2 dvas-label" style={{ fontSize: 10, borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text-dim)" }}>{h}</th>)}</tr>
+              </thead>
+              <tbody className="mono">
+                {exports.length === 0 && <tr><td colSpan={6} className="px-3 py-6 text-center text-slate-500">No export requests in scope</td></tr>}
+                {exports.map(x => (
+                  <tr key={x.id} data-testid={`export-${x.id}`} className="hover:bg-slate-800/40">
+                    <td className="px-3 py-2 border-b border-slate-800/60">{x.id}</td>
+                    <td className="px-3 py-2 border-b border-slate-800/60 text-slate-100">{x.evidence_label}</td>
+                    <td className="px-3 py-2 border-b border-slate-800/60">{x.requested_by}</td>
+                    <td className="px-3 py-2 border-b border-slate-800/60 text-slate-400 max-w-[280px]">{x.justification}</td>
+                    <td className="px-3 py-2 border-b border-slate-800/60">
+                      <span className={`px-1.5 py-0.5 border text-[10px] ${
+                        x.status === "pending" ? "text-amber-400 border-amber-500/40 bg-amber-500/10"
+                        : x.status === "approved" ? "text-emerald-400 border-emerald-500/40 bg-emerald-500/10"
+                        : "text-red-400 border-red-500/40 bg-red-500/10"
+                      }`}>{x.status}</span>
+                    </td>
+                    <td className="px-3 py-2 border-b border-slate-800/60">
+                      {user.role === "senior_officer" && x.status === "pending" && (
+                        <div className="flex gap-1">
+                          <button data-testid={`approve-${x.id}`} onClick={() => decide(x.id, "approved")} className="px-2 py-1 border border-emerald-600/60 text-emerald-300 hover:bg-emerald-500/10">Approve</button>
+                          <button data-testid={`reject-${x.id}`} onClick={() => decide(x.id, "rejected")} className="px-2 py-1 border border-red-600/60 text-red-300 hover:bg-red-500/10">Reject</button>
+                        </div>
+                      )}
+                      {x.status === "approved" && ["control_room_officer","senior_officer"].includes(user.role) && (
+                        <a
+                          data-testid={`bundle-${x.id}`}
+                          href={`${API}/exports/${x.id}/bundle?token=${encodeURIComponent(localStorage.getItem("dvas_token") || "")}`}
+                          className="px-2 py-1 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 inline-flex items-center gap-1"
+                        >
+                          <ArrowSquareOut size={12} /> 65B Bundle
+                        </a>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
-          <table className="w-full text-xs">
-            <thead style={{ background: "var(--dvas-surface-2)" }}>
-              <tr>{["ID","Evidence","Requester","Justification","Status","Actions"].map(h => <th key={h} className="text-left px-3 py-2 dvas-label" style={{ fontSize: 10, borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text-dim)" }}>{h}</th>)}</tr>
-            </thead>
-            <tbody className="mono">
-              {exports.length === 0 && <tr><td colSpan={6} className="px-3 py-6 text-center text-slate-500">No export requests in scope</td></tr>}
-              {exports.map(x => (
-                <tr key={x.id} data-testid={`export-${x.id}`} className="hover:bg-slate-800/40">
-                  <td className="px-3 py-2 border-b border-slate-800/60">{x.id}</td>
-                  <td className="px-3 py-2 border-b border-slate-800/60 text-slate-100">{x.evidence_label}</td>
-                  <td className="px-3 py-2 border-b border-slate-800/60">{x.requested_by}</td>
-                  <td className="px-3 py-2 border-b border-slate-800/60 text-slate-400 max-w-[280px]">{x.justification}</td>
-                  <td className="px-3 py-2 border-b border-slate-800/60">
-                    <span className={`px-1.5 py-0.5 border text-[10px] ${
-                      x.status === "pending" ? "text-amber-400 border-amber-500/40 bg-amber-500/10"
-                      : x.status === "approved" ? "text-emerald-400 border-emerald-500/40 bg-emerald-500/10"
-                      : "text-red-400 border-red-500/40 bg-red-500/10"
-                    }`}>{x.status}</span>
-                  </td>
-                  <td className="px-3 py-2 border-b border-slate-800/60">
-                    {/* SR (former supervisory_officer) approves/rejects pending exports */}
-                    {user.role === "senior_officer" && x.status === "pending" && (
-                      <div className="flex gap-1">
-                        <button data-testid={`approve-${x.id}`} onClick={() => decide(x.id, "approved")} className="px-2 py-1 border border-emerald-600/60 text-emerald-300 hover:bg-emerald-500/10">Approve</button>
-                        <button data-testid={`reject-${x.id}`} onClick={() => decide(x.id, "rejected")} className="px-2 py-1 border border-red-600/60 text-red-300 hover:bg-red-500/10">Reject</button>
-                      </div>
-                    )}
-                    {/* CRO who submitted (own request) or SR (full jurisdiction access) can download bundle */}
-                    {x.status === "approved" && ["control_room_officer","senior_officer"].includes(user.role) && (
-                      <a
-                        data-testid={`bundle-${x.id}`}
-                        href={`${API}/exports/${x.id}/bundle?token=${encodeURIComponent(localStorage.getItem("dvas_token") || "")}`}
-                        className="px-2 py-1 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 inline-flex items-center gap-1"
-                      >
-                        <ArrowSquareOut size={12} /> 65B Bundle
-                      </a>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+
+          {/* Section 2: Generated Reports Downloads */}
+          <div className="rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
+            <div className="p-3 text-sm flex items-center gap-2 font-semibold" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text)" }}>
+              <FileText size={16} className="text-emerald-500" /> Report Downloads
+              <span className="ml-auto mono text-[10px] text-slate-500">{(reports || []).filter(r => r.status === "ready").length} ready</span>
+            </div>
+            <table className="w-full text-xs">
+              <thead style={{ background: "var(--dvas-surface-2)" }}>
+                <tr>{["ID","Type","Title","Generated","Size","Download"].map(h => <th key={h} className="text-left px-3 py-2 dvas-label" style={{ fontSize: 10, borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text-dim)" }}>{h}</th>)}</tr>
+              </thead>
+              <tbody className="mono">
+                {(reports || []).filter(r => r.status === "ready").length === 0 && <tr><td colSpan={6} className="px-3 py-6 text-center text-slate-500">No reports available for download — generate reports from the Reports tab</td></tr>}
+                {(reports || []).filter(r => r.status === "ready").map(r => (
+                  <tr key={r.id} className="hover:bg-slate-800/40">
+                    <td className="px-3 py-2 border-b border-slate-800/60 text-slate-300">{r.id}</td>
+                    <td className="px-3 py-2 border-b border-slate-800/60 text-slate-400">{(r.report_type || "").replace(/_/g, " ")}</td>
+                    <td className="px-3 py-2 border-b border-slate-800/60 text-slate-200 max-w-[200px] truncate">{r.title}</td>
+                    <td className="px-3 py-2 border-b border-slate-800/60 text-slate-500">{r.generated_at ? new Date(r.generated_at).toLocaleString() : "—"}</td>
+                    <td className="px-3 py-2 border-b border-slate-800/60 text-slate-500">{r.file_size_bytes ? `${(r.file_size_bytes / 1024).toFixed(1)} KB` : "—"}</td>
+                    <td className="px-3 py-2 border-b border-slate-800/60">
+                      {user.role === "senior_officer" ? (
+                        <button onClick={() => downloadReport(r.id)} className="px-2 py-1 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 flex items-center gap-1 text-[10px]">
+                          <Download size={10} /> Download PDF
+                        </button>
+                      ) : (
+                        <span className="text-[10px] text-slate-500 italic">SR Only</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 
@@ -632,16 +813,155 @@ export default function CommandDashboard() {
       )}
 
       {tab === "reports" && (
-        <div className="border border-slate-800 bg-slate-900 p-4">
-          <div className="dvas-label mb-3">On-demand Reports</div>
-          <ul className="space-y-2 text-xs">
-            {["Daily incident summary","Weekly response-time report","Drone utilisation (30d)","Mission after-action report"].map(r=>(
-              <li key={r} data-testid={`report-${r}`} className="flex items-center justify-between border border-slate-800 p-3">
-                <div><div className="text-slate-100">{r}</div><div className="mono text-[10px] text-slate-500">Watermarked · {user.email} · {new Date().toLocaleDateString()}</div></div>
-                <button onClick={() => { const w=window.open("","_blank"); if(w){w.document.write(`<pre style='font:12px monospace;padding:24px'>${r}\nGenerated for: ${user.email}\nGenerated at: ${new Date().toISOString()}\nJurisdiction: ${user.jurisdiction}\n\n(Placeholder report body — actual data pipeline pending)</pre>`);}}} className="px-3 py-1.5 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 flex items-center gap-1"><Download size={11}/> Generate</button>
-              </li>
-            ))}
-          </ul>
+        <div className="space-y-4">
+          {/* ── Report Type Cards (SR only) ── */}
+          {user.role !== "senior_officer" && (
+            <div className="rounded-xl p-4" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
+              <div className="flex items-center gap-2 text-sm text-amber-400 mb-2"><Shield size={16} /> Report generation is restricted to Senior Officers</div>
+              <div className="text-xs text-slate-400">Only Senior Officers can generate and download reports directly. Contact your Senior Officer to request a report.</div>
+            </div>
+          )}
+          {user.role === "senior_officer" && (
+          <div className="rounded-xl p-4" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
+            <div className="flex items-center gap-2 text-sm font-semibold mb-4" style={{ color: "var(--dvas-text)" }}>
+              <FileText size={16} className="text-sky-500" /> On-Demand Report Generator
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+
+              {/* Daily Incident Summary */}
+              <div className="border border-slate-800 rounded-lg p-4 space-y-3" style={{ background: "var(--dvas-surface-2)" }}>
+                <div className="flex items-center gap-2">
+                  <Bell size={14} className="text-amber-400" />
+                  <span className="text-sm font-medium text-slate-100">Daily Incident Summary</span>
+                </div>
+                <div className="mono text-[10px] text-slate-500">All alerts, evidence items, and active missions for a specific date. Includes acknowledgement rates and type breakdown.</div>
+                <div className="flex items-center gap-2">
+                  <label className="text-[10px] text-slate-400">Date:</label>
+                  <input type="date" value={reportParams.daily_incident.date} onChange={e => setReportParams(p => ({...p, daily_incident: { date: e.target.value }}))} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1 rounded text-slate-200" />
+                </div>
+                <div className="flex items-center justify-between">
+                  <div className="mono text-[10px] text-slate-500">Watermarked · {user.email}</div>
+                  <button onClick={() => generateReport("daily_incident")} disabled={generatingReport === "daily_incident"} className="px-3 py-1.5 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 text-xs flex items-center gap-1 disabled:opacity-40">
+                    {generatingReport === "daily_incident" ? <><RefreshCw size={11} className="animate-spin" /> Generating...</> : <><Download size={11} /> Generate</>}
+                  </button>
+                </div>
+              </div>
+
+              {/* Weekly Response-Time Report */}
+              <div className="border border-slate-800 rounded-lg p-4 space-y-3" style={{ background: "var(--dvas-surface-2)" }}>
+                <div className="flex items-center gap-2">
+                  <Clock size={14} className="text-sky-400" />
+                  <span className="text-sm font-medium text-slate-100">Weekly Response-Time Report</span>
+                </div>
+                <div className="mono text-[10px] text-slate-500">Alert-to-acknowledgement response times, daily breakdown, per-type analysis, and mission hours for a 7-day period.</div>
+                <div className="flex items-center gap-2">
+                  <label className="text-[10px] text-slate-400">Week start:</label>
+                  <input type="date" value={reportParams.weekly_response.week_start} onChange={e => setReportParams(p => ({...p, weekly_response: { week_start: e.target.value }}))} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1 rounded text-slate-200" />
+                </div>
+                <div className="flex items-center justify-between">
+                  <div className="mono text-[10px] text-slate-500">Watermarked · {user.email}</div>
+                  <button onClick={() => generateReport("weekly_response")} disabled={generatingReport === "weekly_response"} className="px-3 py-1.5 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 text-xs flex items-center gap-1 disabled:opacity-40">
+                    {generatingReport === "weekly_response" ? <><RefreshCw size={11} className="animate-spin" /> Generating...</> : <><Download size={11} /> Generate</>}
+                  </button>
+                </div>
+              </div>
+
+              {/* Drone Utilisation (30d) */}
+              <div className="border border-slate-800 rounded-lg p-4 space-y-3" style={{ background: "var(--dvas-surface-2)" }}>
+                <div className="flex items-center gap-2">
+                  <Activity size={14} className="text-emerald-400" />
+                  <span className="text-sm font-medium text-slate-100">Drone Utilisation (30-Day)</span>
+                </div>
+                <div className="mono text-[10px] text-slate-500">Fleet summary, per-drone mission counts and hours, average mission duration, and top operators ranked by flight time.</div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] text-slate-400 italic">Period: last 30 days (automatic)</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <div className="mono text-[10px] text-slate-500">Watermarked · {user.email}</div>
+                  <button onClick={() => generateReport("drone_utilisation")} disabled={generatingReport === "drone_utilisation"} className="px-3 py-1.5 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 text-xs flex items-center gap-1 disabled:opacity-40">
+                    {generatingReport === "drone_utilisation" ? <><RefreshCw size={11} className="animate-spin" /> Generating...</> : <><Download size={11} /> Generate</>}
+                  </button>
+                </div>
+              </div>
+
+              {/* Mission After-Action Report */}
+              <div className="border border-slate-800 rounded-lg p-4 space-y-3" style={{ background: "var(--dvas-surface-2)" }}>
+                <div className="flex items-center gap-2">
+                  <Shield size={14} className="text-red-400" />
+                  <span className="text-sm font-medium text-slate-100">Mission After-Action Report</span>
+                </div>
+                <div className="mono text-[10px] text-slate-500">Full mission debrief: objective, timeline, all alerts, evidence captured, acknowledgement rates, and duration analysis.</div>
+                <div className="flex items-center gap-2">
+                  <label className="text-[10px] text-slate-400">Mission:</label>
+                  <select value={reportParams.mission_after_action.mission_id} onChange={e => setReportParams(p => ({...p, mission_after_action: { mission_id: e.target.value }}))} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1 rounded text-slate-200 flex-1">
+                    <option value="">Select mission...</option>
+                    {missions.map(m => (
+                      <option key={m.mission_id} value={m.mission_id}>
+                        {m.name || m.mission_id} ({m.mission_id}) — Op: {m.operator_name || "Ravi Menon"}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="flex items-center justify-between">
+                  <div className="mono text-[10px] text-slate-500">Watermarked · {user.email}</div>
+                  <button onClick={() => generateReport("mission_after_action")} disabled={generatingReport === "mission_after_action" || !reportParams.mission_after_action.mission_id} className="px-3 py-1.5 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 text-xs flex items-center gap-1 disabled:opacity-40">
+                    {generatingReport === "mission_after_action" ? <><RefreshCw size={11} className="animate-spin" /> Generating...</> : <><Download size={11} /> Generate</>}
+                  </button>
+                </div>
+              </div>
+
+            </div>
+          </div>
+          )}
+
+          {/* ── Generated Reports Table ── */}
+          <div className="rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
+            <div className="p-3 text-sm flex items-center gap-2 font-semibold" style={{ borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text)" }}>
+              <FileText size={16} className="text-emerald-500" /> Generated Reports
+              <span className="ml-auto mono text-[10px] text-slate-500">{reports.length} reports</span>
+            </div>
+            <table className="w-full text-xs">
+              <thead style={{ background: "var(--dvas-surface-2)" }}>
+                <tr>{["ID", "Type", "Title", "Status", "Generated", "Size", "Actions"].map(h => <th key={h} className="text-left px-3 py-2 dvas-label" style={{ fontSize: 10, borderBottom: "1px solid var(--dvas-border)", color: "var(--dvas-text-dim)" }}>{h}</th>)}</tr>
+              </thead>
+              <tbody className="mono">
+                {reports.length === 0 && <tr><td colSpan={7} className="px-3 py-6 text-center text-slate-500">No reports generated yet — use the cards above to generate your first report</td></tr>}
+                {(Array.isArray(reports) ? reports : []).map(r => (
+                  <tr key={r.id} className="hover:bg-slate-800/40">
+                    <td className="px-3 py-2 border-b border-slate-800/60 text-slate-300">{r.id}</td>
+                    <td className="px-3 py-2 border-b border-slate-800/60 text-slate-400">{(r.report_type || "").replace(/_/g, " ")}</td>
+                    <td className="px-3 py-2 border-b border-slate-800/60 text-slate-200 max-w-[200px] truncate">{r.title}</td>
+                    <td className="px-3 py-2 border-b border-slate-800/60">
+                      <span className={`px-1.5 py-0.5 border text-[10px] ${
+                        r.status === "generating" ? "text-amber-400 border-amber-500/40 bg-amber-500/10" :
+                        r.status === "ready" ? "text-emerald-400 border-emerald-500/40 bg-emerald-500/10" :
+                        "text-red-400 border-red-500/40 bg-red-500/10"
+                      }`}>
+                        {r.status === "generating" && <RefreshCw size={9} className="inline animate-spin mr-1" />}
+                        {r.status === "ready" && <CheckCircle size={9} className="inline mr-1" />}
+                        {r.status}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2 border-b border-slate-800/60 text-slate-500">{r.generated_at ? new Date(r.generated_at).toLocaleString() : "—"}</td>
+                    <td className="px-3 py-2 border-b border-slate-800/60 text-slate-500">{r.file_size_bytes ? `${(r.file_size_bytes / 1024).toFixed(1)} KB` : "—"}</td>
+                    <td className="px-3 py-2 border-b border-slate-800/60">
+                      {r.status === "ready" && user.role === "senior_officer" && (
+                        <button onClick={() => downloadReport(r.id)} className="px-2 py-1 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 flex items-center gap-1 text-[10px]">
+                          <Download size={10} /> Download PDF
+                        </button>
+                      )}
+                      {r.status === "ready" && user.role !== "senior_officer" && (
+                        <span className="text-[10px] text-slate-500 italic">SR Only</span>
+                      )}
+                      {r.status === "failed" && (
+                        <span className="text-[10px] text-red-400" title={r.error_message || ""}>Failed — hover for details</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 
@@ -655,7 +975,28 @@ export default function CommandDashboard() {
               <div className="text-sm">{playing.label}</div>
               <button data-testid="close-player" onClick={() => setPlaying(null)}><X size={16} /></button>
             </div>
-            <video data-testid="video-player" src={playing.video_url} controls autoPlay className="w-full aspect-video bg-black" />
+            {playing.video_url ? (
+              <video
+                data-testid="video-player"
+                src={playing.video_url}
+                controls
+                autoPlay
+                className="w-full aspect-video bg-black"
+                onError={(e) => {
+                  console.warn("Video stream aborted or playback error:", e);
+                }}
+              />
+            ) : (
+              <div className="w-full aspect-video bg-slate-900 flex flex-col items-center justify-center text-slate-400 gap-3 p-6 text-center">
+                {playing.thumbnail ? (
+                  <img src={playing.thumbnail} alt="" className="max-h-[60%] max-w-[80%] object-contain rounded border border-slate-800" />
+                ) : (
+                  <FilmSlate size={48} className="text-slate-600" />
+                )}
+                <div className="text-sm font-medium text-slate-300">Analytical Event Clip Captured at Edge</div>
+                <div className="text-xs text-slate-500 max-w-md">The raw telemetry for this confirmed event is preserved. Video stream clip is stored in encrypted vault storage.</div>
+              </div>
+            )}
             <div className="p-3 mono text-[11px] text-slate-400 flex flex-wrap gap-3">
               <span>{playing.event_type}</span><span>conf {playing.confidence}</span>
               <span>duration {playing.duration_s}s</span><span>mission {playing.mission_id}</span>
@@ -663,6 +1004,65 @@ export default function CommandDashboard() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Evidence Detail Modal */}
+      {evidenceDetail && (
+          <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-6" onClick={() => setEvidenceDetail(null)}>
+              <div className="border border-slate-700 bg-slate-950 max-w-3xl w-full max-h-[85vh] overflow-y-auto rounded-xl" onClick={e => e.stopPropagation()}>
+                  <div className="p-4 border-b border-slate-800 flex items-center justify-between">
+                      <div className="text-sm font-semibold" style={{ color: "var(--dvas-text)" }}>Evidence Detail — {evidenceDetail.evidence?.id}</div>
+                      <button onClick={() => setEvidenceDetail(null)}><X size={16} /></button>
+                  </div>
+                  <div className="p-4 space-y-4">
+                      {/* Metadata Grid */}
+                      <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-xs">
+                          {[["Label", evidenceDetail.evidence?.label], ["Event Type", evidenceDetail.evidence?.event_type], ["Drone", evidenceDetail.evidence?.drone_id], ["Mission", evidenceDetail.evidence?.mission_id], ["Confidence", evidenceDetail.evidence?.confidence], ["Duration", `${evidenceDetail.evidence?.duration_s}s`], ["Jurisdiction", evidenceDetail.evidence?.jurisdiction], ["Captured", evidenceDetail.evidence?.ts ? new Date(evidenceDetail.evidence.ts).toLocaleString() : "-"], ["Legal Hold", evidenceDetail.evidence?.legal_hold ? `Yes — ${evidenceDetail.evidence.legal_hold_reason || ''}` : "No"], ["Retention Until", evidenceDetail.evidence?.retention_until ? new Date(evidenceDetail.evidence.retention_until).toLocaleDateString() : "-"]].map(([k, v]) => (
+                              <div key={k}><span className="dvas-label text-[10px]">{k}</span><div className="mono text-slate-200 mt-0.5">{v || "—"}</div></div>
+                          ))}
+                      </div>
+
+                      {/* Legal Hold Info */}
+                      {evidenceDetail.evidence?.legal_hold && (
+                          <div className="border border-red-500/30 bg-red-500/5 rounded p-3 text-xs">
+                              <div className="text-red-400 font-semibold flex items-center gap-1"><FolderLock size={12} /> Legal Hold Active</div>
+                              <div className="text-slate-400 mt-1">Reason: {evidenceDetail.evidence.legal_hold_reason}</div>
+                              <div className="text-slate-500 mt-0.5">Placed by: {evidenceDetail.evidence.legal_hold_by} on {evidenceDetail.evidence.legal_hold_at ? new Date(evidenceDetail.evidence.legal_hold_at).toLocaleString() : "-"}</div>
+                          </div>
+                      )}
+
+                      {/* Associated Exports */}
+                      {evidenceDetail.exports?.length > 0 && (
+                          <div>
+                              <div className="dvas-label text-[10px] mb-2">Associated Exports</div>
+                              <div className="space-y-1">
+                                  {evidenceDetail.exports.map(x => (
+                                      <div key={x.id} className="flex items-center justify-between text-xs border border-slate-800 rounded p-2">
+                                          <div className="mono text-slate-300">{x.id}</div>
+                                          <div className="text-slate-400">{x.requested_by}</div>
+                                          <span className={`px-1.5 py-0.5 border text-[10px] ${x.status === "pending" ? "text-amber-400 border-amber-500/40" : x.status === "approved" ? "text-emerald-400 border-emerald-500/40" : "text-red-400 border-red-500/40"}`}>{x.status}</span>
+                                          {x.status === "approved" && (
+                                              <a href={`${API}/exports/${x.id}/bundle?token=${encodeURIComponent(localStorage.getItem("dvas_token") || "")}`} className="text-sky-400 hover:text-sky-300 text-[10px]">Download 65B Bundle</a>
+                                          )}
+                                      </div>
+                                  ))}
+                              </div>
+                          </div>
+                      )}
+
+                      {/* Action Buttons */}
+                      <div className="flex flex-wrap gap-2 pt-2 border-t border-slate-800">
+                          <button onClick={() => { setPlaying(evidenceDetail.evidence); setEvidenceDetail(null); }} className="px-3 py-1.5 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 text-xs flex items-center gap-1"><Play size={12} /> Play Video</button>
+                          {user.role === "control_room_officer" && (
+                              <button onClick={() => { setRequestOn(evidenceDetail.evidence); setEvidenceDetail(null); }} className="px-3 py-1.5 border border-slate-700 text-slate-300 hover:border-sky-500 text-xs">Request Export</button>
+                          )}
+                          {user.role === "senior_officer" && (
+                              <button onClick={() => { directExport(evidenceDetail.evidence); setEvidenceDetail(null); }} className="px-3 py-1.5 border border-emerald-600/60 text-emerald-300 hover:bg-emerald-500/10 text-xs">Direct Export</button>
+                          )}
+                      </div>
+                  </div>
+              </div>
+          </div>
       )}
 
       {/* Export request modal */}

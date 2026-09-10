@@ -3,7 +3,7 @@ import json
 import hashlib
 from datetime import datetime, timezone
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, and_
 
 from database import async_session_factory
 from models import Mission, Drone, Alert, Evidence, Export
@@ -35,14 +35,19 @@ async def list_drones(user: dict = Depends(get_current_user)):
             stmt = _apply_scope_to_query(stmt, Drone, f)
             if stmt is None:
                 raise HTTPException(403, "Not permitted")
-            # Exclude dead ephemeral test drones (offline with no active mission)
+            # Exclude dead ephemeral test drones (offline with no active mission) and legacy mock drones
             if user["role"] in ["senior_officer", "control_room_officer"]:
-                active_missions_subq = select(Mission.mission_id).where(Mission.status == "active")
+                active_missions_subq = select(Mission.mission_id).where(
+                    Mission.status == "active",
+                    ~Mission.mission_id.like("M-10%")
+                )
                 stmt = stmt.where(
-                    or_(
-                        Drone.status.in_(["live", "degraded"]),
-                        Drone.mission_id.in_(active_missions_subq),
-                        ~Drone.id.like("DRN-MSN-%")
+                    and_(
+                        ~Drone.id.in_(["DRN-001", "DRN-002", "DRN-003", "DRN-004", "DRN-005"]),
+                        or_(
+                            Drone.status.in_(["live", "degraded", "draining"]),
+                            Drone.mission_id.in_(active_missions_subq)
+                        )
                     )
                 )
         stmt = stmt.limit(200)
@@ -115,7 +120,7 @@ async def list_missions(user: dict = Depends(get_current_user)):
     async with async_session_factory() as session:
         # All roles (drone_operator, senior_officer, control_room_officer, system_administrator)
         # can view missions — filtered by jurisdiction if set for control_room_officer
-        stmt = select(Mission)
+        stmt = select(Mission).where(~Mission.mission_id.like("M-10%"))
         if user.get("role") == "control_room_officer":
             jur = user.get("jurisdiction")
             if jur:

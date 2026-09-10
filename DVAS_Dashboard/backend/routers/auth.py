@@ -80,21 +80,24 @@ async def login(body: LoginIn, response: Response, request: Request):
                     from database import async_session_factory
                     from models import User
                     from sqlalchemy import select
+                    name_val = payload.get("name") or payload.get("preferred_username", "")
                     async with async_session_factory() as session:
-                        res = await session.execute(select(User.jurisdiction, User.mission_scope).where(User.email == email))
+                        res = await session.execute(select(User.name, User.jurisdiction, User.mission_scope).where(User.email == email))
                         row = res.first()
                         if row:
-                            if not jurisdiction_val and row[0]:
-                                jurisdiction_val = row[0]
-                            if not mission_scope_val and row[1]:
-                                mission_scope_val = row[1]
+                            if row[0]:
+                                name_val = row[0]
+                            if not jurisdiction_val and row[1]:
+                                jurisdiction_val = row[1]
+                            if not mission_scope_val and row[2]:
+                                mission_scope_val = row[2]
                 except Exception as e:
                     logger.debug(f"Could not hydrate user attributes from DB: {e}")
 
             user_dict = {
                 "id": payload.get("sub"),
                 "email": payload.get("email", email),
-                "name": payload.get("name") or payload.get("preferred_username", ""),
+                "name": name_val if 'name_val' in locals() else (payload.get("name") or payload.get("preferred_username", "")),
                 "role": user_role,
                 "jurisdiction": jurisdiction_val,
                 "mission_scope": mission_scope_val,

@@ -10,6 +10,7 @@ from sqlalchemy import (
     Boolean,
     Float,
     Integer,
+    BigInteger,
     Text,
     DateTime,
     ForeignKey,
@@ -169,6 +170,12 @@ class Evidence(Base):
     ts = Column(String, index=True)
     legal_hold = Column(Boolean, default=False)
     retention_until = Column(String)
+    # Phase 10: Legal hold details
+    legal_hold_reason = Column(Text, nullable=True)
+    legal_hold_by = Column(String, nullable=True)
+    legal_hold_at = Column(String, nullable=True)
+    # Phase 10: Analytics confirmed-event dedup key
+    source_event_id = Column(String, nullable=True, unique=True, index=True)
 
 
 class Export(Base):
@@ -227,4 +234,41 @@ class AIModelSuggestion(Base):
     status = Column(String, default="PENDING")   # PENDING, ACKNOWLEDGED, DEPLOYED_TO_GPU
     drone_id = Column(String, nullable=True)
     mission_id = Column(String, nullable=True)
+
+
+class Report(Base):
+    """Generated on-demand report metadata.
+
+    PDF bytes are stored in MinIO bucket ``dvas-evidence``
+    under key ``reports/{id}.pdf``.
+    """
+    __tablename__ = "reports"
+
+    id = Column(String, primary_key=True)
+    report_type = Column(String, nullable=False)      # daily_incident | weekly_response | drone_utilisation | mission_after_action
+    title = Column(String, nullable=False)
+    requested_by = Column(String, nullable=False)
+    requested_at = Column(String, nullable=False)
+    jurisdiction = Column(String)
+    status = Column(String, default="generating")     # generating | ready | failed
+    params = Column(JSONB, default=dict)              # date range, mission_id, etc.
+    file_key = Column(String, nullable=True)          # MinIO object key
+    file_size_bytes = Column(BigInteger, nullable=True)
+    generated_at = Column(String, nullable=True)
+    error_message = Column(Text, nullable=True)
+    watermark_text = Column(String, nullable=True)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(String, primary_key=True)
+    email = Column(String, unique=True, nullable=False, index=True)
+    name = Column(String, nullable=False)
+    role = Column(String, nullable=False)
+    jurisdiction = Column(String, nullable=True)
+    mission_scope = Column(JSONB, default=list)
+    password_hash = Column(String, nullable=False)
+    suspended = Column(Boolean, default=False)
+    created_at = Column(String, nullable=True)
 

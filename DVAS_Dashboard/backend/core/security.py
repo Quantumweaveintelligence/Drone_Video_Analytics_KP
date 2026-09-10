@@ -44,13 +44,14 @@ ROLE_MAP = {
 }
 
 async def get_current_user(request: Request) -> dict:
-    token = request.cookies.get("dvas_access_token")
-    if not token:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
+    token = None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
     if not token:
         token = request.query_params.get("token")
+    if not token:
+        token = request.cookies.get("dvas_access_token")
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
@@ -79,26 +80,33 @@ async def get_current_user(request: Request) -> dict:
             mission_scope_val = [mission_scope_val]
 
         email_val = payload.get("email", "")
-        if (not jurisdiction_val or not mission_scope_val) and email_val:
+        name_val = payload.get("name") or payload.get("preferred_username", "")
+        if email_val:
             try:
                 from database import async_session_factory
                 from models import User
                 from sqlalchemy import select
                 async with async_session_factory() as session:
-                    res = await session.execute(select(User.jurisdiction, User.mission_scope).where(User.email == email_val))
+                    res = await session.execute(
+                        select(User.name, User.jurisdiction, User.mission_scope, User.role).where(User.email == email_val)
+                    )
                     row = res.first()
                     if row:
-                        if not jurisdiction_val and row[0]:
-                            jurisdiction_val = row[0]
-                        if not mission_scope_val and row[1]:
-                            mission_scope_val = row[1]
+                        if row[0]:
+                            name_val = row[0]
+                        if not jurisdiction_val and row[1]:
+                            jurisdiction_val = row[1]
+                        if not mission_scope_val and row[2]:
+                            mission_scope_val = row[2]
+                        if row[3]:
+                            user_role = row[3]
             except Exception as e:
                 logger.debug(f"Could not hydrate user attributes from DB: {e}")
 
         return {
             "id": payload.get("sub"),
-            "email": payload.get("email", ""),
-            "name": payload.get("name") or payload.get("preferred_username", ""),
+            "email": payload.get("email", email_val),
+            "name": name_val,
             "role": user_role,
             "jurisdiction": jurisdiction_val,
             "mission_scope": mission_scope_val,

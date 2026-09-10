@@ -132,9 +132,9 @@ function AnnotatedPersonFeedViewer({ activeDrone, setActiveDrone, drones, stream
   const { streams } = useActiveStreams();
   const droneList = streams?.length > 0
     ? streams.map(s => ({ id: s.drone_id, ...s }))
-    : drones?.length > 0
-      ? drones
-      : [{ id: 'DRN-001' }, { id: 'DRN-002' }, { id: 'DRN-003' }, { id: 'DRN-004' }];
+    : (drones?.length > 0
+        ? drones.filter(d => (d.status === 'live' || d.status === 'draining') && !/^DRN-00[1-5]$/i.test(d.id || d.drone_id))
+        : []);
 
   const rawUrl = hasDrone
     ? `/api/ingest-server/frame/${encodeURIComponent(activeDrone)}/latest?drone_id=${encodeURIComponent(activeDrone)}`

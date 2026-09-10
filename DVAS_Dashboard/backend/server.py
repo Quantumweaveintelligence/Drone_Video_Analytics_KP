@@ -24,9 +24,10 @@ from models import Base
 from services.seed_service import seed_data
 from services.telemetry_pump import start_telemetry_pump
 from services.audit_sync import start_audit_sync_service
+from services.evidence_sync import start_evidence_sync
 from ingest_proxy import ingest_api
 
-from routers import auth, drones, alerts, audit, analytics, edge, infra, ws, incidents
+from routers import auth, drones, alerts, audit, analytics, edge, infra, ws, incidents, reports
 
 # ---------- App ----------
 logging.basicConfig(level=logging.INFO)
@@ -62,6 +63,10 @@ async def _start_pump():
 async def _start_sync():
     start_audit_sync_service()
 
+@app.on_event("startup")
+async def _start_evidence_sync():
+    start_evidence_sync()
+
 # ---------- Root ----------
 @app.get("/api/")
 async def root():
@@ -78,6 +83,7 @@ app.include_router(infra.router)
 app.include_router(ws.router)
 app.include_router(ingest_api)
 app.include_router(incidents.router)
+app.include_router(reports.router)
 
 # ---------- CORS ----------
 cors_origins = [o.strip() for o in CORS_ORIGINS if o.strip() and o.strip() != "*"]

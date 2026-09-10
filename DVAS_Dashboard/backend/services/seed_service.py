@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import select, delete, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from database import engine, async_session_factory
-from models import Base, AuditLog, Mission, Drone, Alert, Evidence, Export
+from models import Base, AuditLog, Mission, Drone, Alert, Evidence, Export, Report
 from audit_service import _audit_hash
 
 logger = logging.getLogger(__name__)
@@ -108,7 +108,7 @@ async def seed_data():
             {
                 "mission_id": "M-101",
                 "name": "Attukal Pongala Crowd Watch",
-                "status": "active",
+                "status": "completed",
                 "drone_id": "DRN-001",
                 "operator_name": "Ravi Menon",
                 "jurisdiction": "Thiruvananthapuram",
@@ -121,7 +121,7 @@ async def seed_data():
             {
                 "mission_id": "M-102",
                 "name": "Kochi Marine Drive Traffic",
-                "status": "active",
+                "status": "completed",
                 "drone_id": "DRN-002",
                 "operator_name": "K. Suresh",
                 "jurisdiction": "Thiruvananthapuram",
@@ -153,9 +153,9 @@ async def seed_data():
                 "id": "DRN-001",
                 "operator_id": op_id,
                 "operator_name": "Ravi Menon",
-                "mission_id": "M-101",
+                "mission_id": None,
                 "jurisdiction": "Thiruvananthapuram",
-                "status": "live",
+                "status": "offline",
                 "lat": 8.5241,
                 "lng": 76.9366,
                 "altitude_m": 90,
@@ -167,9 +167,9 @@ async def seed_data():
                 "id": "DRN-002",
                 "operator_id": "op-2",
                 "operator_name": "K. Suresh",
-                "mission_id": "M-102",
+                "mission_id": None,
                 "jurisdiction": "Thiruvananthapuram",
-                "status": "live",
+                "status": "offline",
                 "lat": 9.9673,
                 "lng": 76.2810,
                 "altitude_m": 120,
@@ -181,9 +181,9 @@ async def seed_data():
                 "id": "DRN-003",
                 "operator_id": "op-3",
                 "operator_name": "A. Thomas",
-                "mission_id": "M-101",
+                "mission_id": None,
                 "jurisdiction": "Thiruvananthapuram",
-                "status": "degraded",
+                "status": "offline",
                 "lat": 8.5300,
                 "lng": 76.9500,
                 "altitude_m": 60,
@@ -195,9 +195,9 @@ async def seed_data():
                 "id": "DRN-004",
                 "operator_id": op_id,
                 "operator_name": "P. Kurian",
-                "mission_id": "M-101",
+                "mission_id": None,
                 "jurisdiction": "Thiruvananthapuram",
-                "status": "live",
+                "status": "offline",
                 "lat": 8.5350,
                 "lng": 76.8861,
                 "altitude_m": 85,
@@ -295,6 +295,30 @@ async def seed_data():
                 decision_at=None,
                 decision_comment=None,
             ))
+
+        # ── Seed reports ──
+        report_types = [
+            ("daily_incident", "Daily Incident Summary", "ready"),
+            ("weekly_response", "Weekly Response-Time Report", "generating"),
+            ("drone_utilisation", "Drone Utilisation (30d)", "ready"),
+        ]
+        for i, (rtype, title, status) in enumerate(report_types):
+            r_dict = {
+                "id": f"RPT-{4000 + i}",
+                "report_type": rtype,
+                "title": f"{title} — {(now - timedelta(days=i)).strftime('%Y-%m-%d')}",
+                "requested_by": "control@dvas.kp",
+                "requested_at": (now - timedelta(hours=random.randint(1, 48))).isoformat(),
+                "jurisdiction": "Thiruvananthapuram",
+                "status": status,
+                "params": {"date": (now - timedelta(days=i)).strftime("%Y-%m-%d")},
+                "file_key": f"reports/RPT-{4000 + i}.pdf" if status == "ready" else None,
+                "file_size_bytes": random.randint(40000, 120000) if status == "ready" else None,
+                "generated_at": (now - timedelta(hours=random.randint(0, 12))).isoformat() if status == "ready" else None,
+                "error_message": None,
+                "watermark_text": f"CONFIDENTIAL — Generated for: control@dvas.kp",
+            }
+            session.add(Report(**r_dict))
 
         await session.commit()
         await _seed_audit_chain(session, user_ids_by_email, now=now)

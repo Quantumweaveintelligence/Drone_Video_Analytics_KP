@@ -46,7 +46,15 @@ import { useJpegPoller } from '@/hooks/useJpegPoller';
 export default function IntrusionAnalytics({ activeDrone: initialDrone, drones = [], missions: initialMissions = [], user = {} }) {
   const { streams, streamMap } = useActiveStreams();
 
-  // Dynamic drone list from active streams or backend drones (no hardcoding)
+  // Helper to detect legacy mock/placeholder drone or mission IDs
+  const isLegacyMock = (id, mId) => {
+    if (!id) return true;
+    if (/^DRN-00[1-5]$/i.test(id)) return true;
+    if (mId && /^M-10[1-9]$/i.test(mId)) return true;
+    return false;
+  };
+
+  // Dynamic drone list from active streams or live backend drones (no hardcoding / no offline mock drones)
   const droneList = useMemo(() => {
     const list = [];
     const seen = new Set();
@@ -56,6 +64,10 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
       streams.forEach(s => {
         const id = s.drone_id || s.id;
         if (id && !seen.has(id)) {
+          // Exclude legacy mock drones (DRN-001..005 / M-101..) unless they are genuinely streaming live
+          if (isLegacyMock(id, s.mission_id) && s.status !== 'live' && (s.frames_received || s.frame_count || 0) === 0) {
+            return;
+          }
           seen.add(id);
           list.push({
             id,
@@ -63,7 +75,7 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
             name: s.name || id,
             mission_id: s.mission_id || null,
             status: s.status || 'live',
-            isLive: true,
+            isLive: s.status === 'live' || s.status === 'degraded',
             frames_received: s.frames_received || s.frame_count || 0,
             messages_ready: s.messages_ready ?? 0,
             consumer_lag: s.consumer_lag || null,
@@ -72,24 +84,31 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
       });
     }
 
-    // 2. Add drones from DB/props
+    // 2. Add drones from DB/props ONLY if actively streaming or draining (exclude offline mock drones)
     if (drones && drones.length > 0) {
       drones.forEach(d => {
         const id = d.drone_id || d.id;
         if (id && !seen.has(id)) {
-          seen.add(id);
-          const isLive = d.status === 'live' || (d.frame_count || 0) > 0 || (d.messages_ready || 0) > 0;
-          list.push({
-            id,
-            drone_id: id,
-            name: d.name || d.label || id,
-            mission_id: d.mission_id || null,
-            status: d.status || 'offline',
-            isLive,
-            frames_received: d.frames_received || d.frame_count || 0,
-            messages_ready: d.messages_ready ?? 0,
-            consumer_lag: d.consumer_lag || null,
-          });
+          // Exclude legacy mock drones (DRN-001..005 / M-101..) unless genuinely live
+          if (isLegacyMock(id, d.mission_id) && d.status !== 'live' && (d.frame_count || 0) === 0 && (d.messages_ready || 0) === 0) {
+            return;
+          }
+          const isLive = d.status === 'live' || d.status === 'degraded';
+          const isDraining = d.status === 'draining' || (d.messages_ready ?? 0) > 0;
+          if (isLive || isDraining || (d.frame_count || 0) > 0) {
+            seen.add(id);
+            list.push({
+              id,
+              drone_id: id,
+              name: d.name || d.label || id,
+              mission_id: d.mission_id || null,
+              status: d.status || (isLive ? 'live' : 'draining'),
+              isLive,
+              frames_received: d.frames_received || d.frame_count || 0,
+              messages_ready: d.messages_ready ?? 0,
+              consumer_lag: d.consumer_lag || null,
+            });
+          }
         }
       });
     }
@@ -101,10 +120,13 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
 
   // Auto-select first live drone or first available drone
   useEffect(() => {
-    if (droneList.length === 0) return;
+    if (droneList.length === 0) {
+      setSelectedDrone(null);
+      return;
+    }
     setSelectedDrone(prev => {
       if (prev && droneList.some(d => d.id === prev)) return prev;
-      const live = droneList.find(d => d.isLive || d.status === 'live' || d.mission_id);
+      const live = droneList.find(d => d.isLive || d.status === 'live' || d.status === 'draining');
       return (live || droneList[0])?.id || null;
     });
   }, [droneList]);
@@ -327,13 +349,13 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
 
         const discovered = new Set();
 
-        // 1. From /api/missions
+        // 1. From /api/missions (exclude legacy mock missions like M-101..M-103)
         if (missionsRes.status === 'fulfilled' && missionsRes.value?.data) {
           const mData = missionsRes.value.data;
           const mArray = Array.isArray(mData) ? mData : (Array.isArray(mData?.missions) ? mData.missions : []);
           mArray.forEach(m => {
             const mId = typeof m === 'string' ? m : (m.mission_id || m.id || m.name);
-            if (mId) discovered.add(mId);
+            if (mId && !/^M-10[1-9]$/i.test(mId)) discovered.add(mId);
           });
         }
 
@@ -341,15 +363,15 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
         if (Array.isArray(initialMissions)) {
           initialMissions.forEach(m => {
             const mId = typeof m === 'string' ? m : (m.mission_id || m.id || m.name);
-            if (mId) discovered.add(mId);
+            if (mId && !/^M-10[1-9]$/i.test(mId)) discovered.add(mId);
           });
         }
 
         // 3. From active streams / active mission
-        if (activeMissionId) discovered.add(activeMissionId);
+        if (activeMissionId && !/^M-10[1-9]$/i.test(activeMissionId)) discovered.add(activeMissionId);
         if (streams && streams.length > 0) {
           streams.forEach(s => {
-            if (s.mission_id) discovered.add(s.mission_id);
+            if (s.mission_id && !/^M-10[1-9]$/i.test(s.mission_id)) discovered.add(s.mission_id);
           });
         }
 
@@ -358,7 +380,7 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
           const eData = eventsRes.value.data;
           const eArray = Array.isArray(eData) ? eData : (Array.isArray(eData?.events) ? eData.events : []);
           eArray.forEach(e => {
-            if (e.mission_id) discovered.add(e.mission_id);
+            if (e.mission_id && !/^M-10[1-9]$/i.test(e.mission_id)) discovered.add(e.mission_id);
           });
         }
 

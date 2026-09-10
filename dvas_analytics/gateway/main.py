@@ -211,6 +211,59 @@ async def dashboard_live():
     }
 
 
+@app.get("/events/confirmed")
+async def list_confirmed_events(
+    since: str = "",
+    drone_id: str = "",
+    limit: int = 100,
+):
+    """List recent confirmed events for evidence sync pipeline."""
+    pool = await get_pool()
+    
+    query = "SELECT event_id::text, mission_id::text, drone_id, event_type, confidence, ts, latitude, longitude, attributes::text, status, created_at FROM confirmed_events"
+    params = []
+    conditions = []
+    
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            since_dt = datetime.now(timezone.utc)
+        conditions.append(f"ts >= ${len(params) + 1}::timestamptz")
+        params.append(since_dt)
+    if drone_id:
+        conditions.append(f"drone_id = ${len(params) + 1}")
+        params.append(drone_id)
+    
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    
+    query += f" ORDER BY ts DESC LIMIT ${len(params) + 1}"
+    params.append(limit)
+    
+    rows = await pool.fetch(query, *params)
+    
+    events = []
+    for r in rows:
+        d = dict(r)
+        # Convert non-serializable types
+        for k, v in d.items():
+            if hasattr(v, 'isoformat'):
+                d[k] = v.isoformat()
+            elif isinstance(v, (bytes, memoryview)):
+                d[k] = str(v)
+        # Parse attributes JSON string back to dict if present
+        if d.get('attributes') and isinstance(d['attributes'], str):
+            try:
+                import json
+                d['attributes'] = json.loads(d['attributes'])
+            except Exception:
+                pass
+        events.append(d)
+    
+    return {"events": events, "count": len(events)}
+
+
 # ── SSE Event Stream ─────────────────────────────────────────────────────────
 
 @app.get("/events/stream", dependencies=[Depends(verify_service_key)])
