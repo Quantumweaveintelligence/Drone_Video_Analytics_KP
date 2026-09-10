@@ -28,6 +28,7 @@ import {
   VideoOff, RefreshCw, Wifi, WifiOff, UserCheck,
   Fingerprint, Clock, Copy, Database, Play, Square, Cpu,
   Zap, Power, ChevronLeft, ChevronRight, Shield,
+  Search, X, Maximize2, Download, Calendar, ExternalLink,
 } from 'lucide-react';
 import {
   useAnalyticsFetch,
@@ -59,6 +60,23 @@ function fmtAge(isoTs) {
   if (s < 60)   return `${s}s ago`;
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
   return `${Math.floor(s / 3600)}h ago`;
+}
+
+function fmtIST(isoTs) {
+  if (!isoTs) return '—';
+  try {
+    const d = new Date(isoTs);
+    return d.toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      day: '2-digit',
+      month: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true,
+    });
+  } catch {
+    return isoTs;
+  }
 }
 
 /**
@@ -587,66 +605,245 @@ function DetectionChart({ sseWindow }) {
 }
 
 /* ───────────────────────────────────────────────────────────────
-   SECTION 5a — Gallery Mission Filter Bar
+   SECTION 5a — Searchable Mission Filter Bar
    ────────────────────────────────────────────────────────────── */
-function GalleryMissionFilter({ missions, selected, onSelect, activeMissionId }) {
+function formatMissionDate(missionId, rawTs) {
+  if (rawTs) return fmtIST(rawTs);
+  if (!missionId) return '—';
+  const match = missionId.match(/MSN-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})/);
+  if (match) {
+    const [, y, m, d, hh, mm] = match;
+    try {
+      const dt = new Date(`${y}-${m}-${d}T${hh}:${mm}:00Z`);
+      return fmtIST(dt.toISOString());
+    } catch {
+      return `${y}-${m}-${d} ${hh}:${mm}`;
+    }
+  }
+  return '—';
+}
+
+function SearchableMissionFilter({ missions, selected, onSelect, activeMissionId, type = 'person' }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const dropdownRef = useRef(null);
+
   const missionList = Array.isArray(missions) ? missions : [];
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    function handleClickOutside(e) {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target)) {
+        setIsOpen(false);
+      }
+    }
+    if (isOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [isOpen]);
+
+  const filteredMissions = missionList.filter(m => {
+    if (!searchQuery) return true;
+    const q = searchQuery.toLowerCase().trim();
+    const idMatch = (m.mission_id || '').toLowerCase().includes(q);
+    const dateRawMatch = (m.first_seen || m.last_seen || '').toLowerCase().includes(q);
+    const dateParsed = formatMissionDate(m.mission_id, m.first_seen || m.last_seen).toLowerCase();
+    return idMatch || dateRawMatch || dateParsed.includes(q);
+  });
+
   const hasCurrentMission = activeMissionId && activeMissionId !== selected;
+  const isPerson = type === 'person';
+  const accentColor = isPerson ? '#38bdf8' : '#fbbf24';
+  const accentBg = isPerson ? 'rgba(56,189,248,0.1)' : 'rgba(251,191,36,0.1)';
+  const accentBorder = isPerson ? 'rgba(56,189,248,0.3)' : 'rgba(251,191,36,0.3)';
 
   return (
     <div className="flex items-center gap-2 flex-wrap mb-3">
-      <select
-        value={selected}
-        onChange={(e) => onSelect(e.target.value)}
-        className="mono text-[11px] px-2 py-1.5 rounded-lg"
-        style={{
-          background: 'var(--dvas-surface-2)',
-          color: 'var(--dvas-text)',
-          border: '1px solid var(--dvas-border)',
-          outline: 'none',
-          minWidth: 140,
-        }}>
-        <option value="">All Missions</option>
-        {missionList.map(m => (
-          <option key={m.mission_id} value={m.mission_id}>
-            {m.mission_id} ({m.total_faces} faces)
-          </option>
-        ))}
-      </select>
+      {/* Searchable Combobox Input */}
+      <div className="relative" ref={dropdownRef} style={{ minWidth: 260 }}>
+        <div
+          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg cursor-pointer transition-all"
+          style={{
+            background: 'var(--dvas-surface-2)',
+            border: `1px solid ${isOpen ? accentColor : 'var(--dvas-border)'}`,
+            color: 'var(--dvas-text)',
+          }}
+          onClick={() => setIsOpen(!isOpen)}
+        >
+          <Search size={13} style={{ color: isOpen ? accentColor : 'var(--dvas-text-dim)' }} />
+          <input
+            type="text"
+            className="bg-transparent border-none outline-none mono text-[11px] w-full"
+            style={{ color: 'var(--dvas-text)' }}
+            placeholder={selected ? selected : "Search / Select Mission..."}
+            value={isOpen ? searchQuery : (selected ? selected : '')}
+            onChange={(e) => {
+              setSearchQuery(e.target.value);
+              if (!isOpen) setIsOpen(true);
+            }}
+            onFocus={() => {
+              setIsOpen(true);
+              setSearchQuery('');
+            }}
+            onClick={(e) => e.stopPropagation()}
+          />
+          {selected ? (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onSelect('');
+                setSearchQuery('');
+                setIsOpen(false);
+              }}
+              className="hover:text-red-400 p-0.5 text-slate-400"
+              title="Clear Mission Filter"
+            >
+              <X size={12} />
+            </button>
+          ) : (
+            <span className="mono text-[9px] text-slate-500 select-none">▼</span>
+          )}
+        </div>
 
+        {/* Dropdown Menu */}
+        {isOpen && (
+          <div
+            className="absolute top-full left-0 mt-1 w-80 max-h-64 overflow-y-auto rounded-lg shadow-2xl z-50 py-1"
+            style={{
+              background: 'var(--dvas-surface)',
+              border: '1px solid var(--dvas-border)',
+              boxShadow: '0 10px 30px -5px rgba(0,0,0,0.8)',
+            }}
+          >
+            {/* Option: All Missions */}
+            <div
+              className="px-3 py-2 cursor-pointer transition-colors flex items-center justify-between border-b hover:bg-slate-800/60"
+              style={{
+                borderBottomColor: 'var(--dvas-border)',
+                background: !selected ? accentBg : 'transparent',
+              }}
+              onClick={() => {
+                onSelect('');
+                setIsOpen(false);
+              }}
+            >
+              <span className="mono text-[11px] font-semibold" style={{ color: !selected ? accentColor : 'var(--dvas-text)' }}>
+                All Missions (Entire History)
+              </span>
+              <span className="mono text-[10px]" style={{ color: 'var(--dvas-text-dim)' }}>
+                {missionList.length} missions
+              </span>
+            </div>
+
+            {filteredMissions.length === 0 ? (
+              <div className="p-3 mono text-xs text-slate-500 text-center">
+                No matching missions found
+              </div>
+            ) : (
+              filteredMissions.map((m) => {
+                const isItemActive = selected === m.mission_id;
+                const count = isPerson ? (m.total_persons ?? 0) : (m.total_faces ?? 0);
+                const countLabel = isPerson ? `${count} persons` : `${count} faces`;
+                const dateDisplay = formatMissionDate(m.mission_id, m.first_seen || m.last_seen);
+
+                return (
+                  <div
+                    key={m.mission_id}
+                    className="px-3 py-2 cursor-pointer transition-colors border-b last:border-b-0 hover:bg-slate-800/60"
+                    style={{
+                      borderBottomColor: 'rgba(51,65,85,0.3)',
+                      background: isItemActive ? accentBg : 'transparent',
+                    }}
+                    onClick={() => {
+                      onSelect(m.mission_id);
+                      setIsOpen(false);
+                    }}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span
+                        className="mono text-[11px] font-bold truncate"
+                        style={{ color: isItemActive ? accentColor : 'var(--dvas-text)' }}
+                      >
+                        {m.mission_id}
+                      </span>
+                      <span
+                        className="mono text-[9px] font-semibold px-1.5 py-0.5 rounded flex-shrink-0"
+                        style={{
+                          background: count > 0 ? (isPerson ? 'rgba(56,189,248,0.15)' : 'rgba(251,191,36,0.15)') : 'rgba(100,116,139,0.15)',
+                          color: count > 0 ? accentColor : '#64748b',
+                          border: `1px solid ${count > 0 ? accentBorder : 'rgba(100,116,139,0.2)'}`,
+                        }}
+                      >
+                        {countLabel}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between text-[10px] text-slate-400 mt-0.5">
+                      <span className="mono flex items-center gap-1">
+                        <Calendar size={10} className="text-slate-500" />
+                        {dateDisplay}
+                      </span>
+                      {m.is_deduplicated && (
+                        <span className="mono text-[8px] text-emerald-400">deduped</span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Quick Action: Current Live Mission */}
       {hasCurrentMission && (
-        <button onClick={() => onSelect(activeMissionId)}
-          className="flex items-center gap-1 px-2 py-1 rounded-lg mono text-[10px] font-semibold transition-all"
-          style={{ background: 'rgba(45,212,191,0.1)', color: '#2dd4bf', border: '1px solid rgba(45,212,191,0.25)' }}>
-          <Radio size={9} /> Current Mission
+        <button
+          onClick={() => onSelect(activeMissionId)}
+          className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg mono text-[10px] font-semibold transition-all shadow-sm"
+          style={{
+            background: 'rgba(45,212,191,0.12)',
+            color: '#2dd4bf',
+            border: '1px solid rgba(45,212,191,0.3)',
+          }}
+          title={`Filter to current mission: ${activeMissionId}`}
+        >
+          <Radio size={10} className="animate-pulse" /> Current Mission
         </button>
       )}
 
+      {/* Active Filter Pill with Clear */}
       {selected && (
-        <button onClick={() => onSelect('')}
-          className="mono text-[10px] px-1.5 py-0.5 rounded transition-all"
-          style={{ background: 'rgba(248,113,113,0.08)', color: '#f87171', border: '1px solid rgba(248,113,113,0.2)' }}>
-          ✕ Clear
-        </button>
-      )}
-      {selected && (
-        <span className="mono text-[10px]" style={{ color: 'var(--dvas-text-dim)' }}>
-          Filtered: {selected}
-        </span>
+        <div
+          className="flex items-center gap-1.5 px-2 py-1 rounded-lg mono text-[10px] font-semibold"
+          style={{
+            background: accentBg,
+            color: accentColor,
+            border: `1px solid ${accentBorder}`,
+          }}
+        >
+          <span className="truncate max-w-[160px]">{selected}</span>
+          <button
+            onClick={() => onSelect('')}
+            className="hover:text-red-400 transition-colors p-0.5 rounded"
+            title="Clear mission filter"
+          >
+            <X size={11} />
+          </button>
+        </div>
       )}
     </div>
   );
 }
 
 /* ───────────────────────────────────────────────────────────────
-   SECTION 5b — Gallery Card (extracted so useState is called at top level)
+   SECTION 5b — Gallery Card
    ────────────────────────────────────────────────────────────── */
-function GalleryCard({ item, i, isSelected, isAnySelected, onSelect, isPersonGallery, bucket }) {
+function GalleryCard({ item, i, onOpenModal, isPersonGallery, bucket }) {
   const [imgError, setImgError] = useState(false);
-  const itemId   = item.identity_id || item.id || i;
+  const itemId = item.identity_id || item.id || i;
 
-  // For person gallery: prefer person body crop (dvas-evidence bucket)
-  // For face gallery: use face crop (dvas-faces bucket)
   const personObjKey = item.best_person_image_key;
   const faceObjKey   = item.best_image_key || item.object_key;
   const faceRawUrl   = item.best_image_url || item.image_url || item.presigned_url || item.url;
@@ -654,14 +851,12 @@ function GalleryCard({ item, i, isSelected, isAnySelected, onSelect, isPersonGal
 
   let imgUrl;
   if (isPersonGallery) {
-    // Strictly use person body crop from dvas-faces bucket (persons/ prefix)
     imgUrl = personObjKey
       ? toProxiedUrl(personObjKey, 'dvas-faces')
       : personRawUrl
       ? toProxiedUrl(personRawUrl, 'dvas-faces')
       : null;
   } else {
-    // Face gallery uses face crop from dvas-faces bucket
     imgUrl = faceObjKey
       ? toProxiedUrl(faceObjKey, bucket)
       : toProxiedUrl(faceRawUrl, bucket);
@@ -672,34 +867,33 @@ function GalleryCard({ item, i, isSelected, isAnySelected, onSelect, isPersonGal
   const msnId     = item.mission_id || '';
   const lastSeen  = item.last_seen || item.created_at || item.ts;
   const count     = item.embedding_count || 1;
+  const accentColor = isPersonGallery ? '#38bdf8' : '#fbbf24';
 
   return (
     <div
       key={itemId}
-      onClick={onSelect}
-      className="flex flex-col rounded-xl overflow-hidden cursor-pointer transition-all duration-300"
+      onClick={() => onOpenModal(item)}
+      className="group relative flex flex-col rounded-xl overflow-hidden cursor-pointer transition-all duration-200 hover:-translate-y-1 hover:shadow-lg"
       style={{
         background: 'rgba(15,23,42,0.9)',
-        border: `1px solid ${isSelected ? (isPersonGallery ? '#38bdf8' : '#fbbf24') : 'rgba(51,65,85,0.8)'}`,
-        transform: isSelected ? 'scale(1.05)' : 'scale(1)',
-        zIndex: isSelected ? 10 : 1,
-        filter: (isAnySelected && !isSelected) ? 'blur(2px) opacity(0.35) grayscale(40%)' : 'none',
-        boxShadow: isSelected
-          ? isPersonGallery ? '0 8px 24px -4px rgba(56,189,248,0.3)' : '0 8px 24px -4px rgba(251,191,36,0.3)'
-          : '0 1px 4px rgba(0,0,0,0.4)',
+        border: '1px solid rgba(51,65,85,0.8)',
+        boxShadow: '0 1px 4px rgba(0,0,0,0.4)',
       }}>
       {/* Header */}
       <div className="flex items-center justify-between px-2 py-1"
         style={{ background: 'rgba(30,41,59,0.8)', borderBottom: '1px solid rgba(51,65,85,0.5)' }}>
-        <span className="font-mono font-bold text-[9px]" style={{ color: isPersonGallery ? '#38bdf8' : '#fbbf24' }}>
+        <span className="font-mono font-bold text-[9px]" style={{ color: accentColor }}>
           {clusterId}
         </span>
-        {count > 1 && (
-          <span className="font-mono font-bold text-[8px] px-1 py-0.5 rounded"
-            style={{ background: 'rgba(167,139,250,0.15)', color: '#a78bfa', border: '1px solid rgba(167,139,250,0.2)' }}>
-            ×{count}
-          </span>
-        )}
+        <div className="flex items-center gap-1">
+          {count > 1 && (
+            <span className="font-mono font-bold text-[8px] px-1 py-0.5 rounded"
+              style={{ background: 'rgba(167,139,250,0.15)', color: '#a78bfa', border: '1px solid rgba(167,139,250,0.2)' }}>
+              ×{count}
+            </span>
+          )}
+          <Maximize2 size={10} className="text-slate-400 opacity-0 group-hover:opacity-100 transition-opacity" />
+        </div>
       </div>
 
       {/* Image (blurred bg + sharp fg) */}
@@ -712,7 +906,7 @@ function GalleryCard({ item, i, isSelected, isAnySelected, onSelect, isPersonGal
               style={{ filter: 'blur(14px) brightness(0.4)', transform: 'scale(1.15)' }}
               onError={() => setImgError(true)} />
             <img src={imgUrl} alt={clusterId}
-              className="absolute inset-0 w-full h-full object-contain block"
+              className="absolute inset-0 w-full h-full object-contain block transition-transform duration-200 group-hover:scale-105"
               onError={() => setImgError(true)} />
           </>
         ) : (
@@ -727,27 +921,247 @@ function GalleryCard({ item, i, isSelected, isAnySelected, onSelect, isPersonGal
 
       {/* Caption */}
       <div className="px-2 py-1.5 flex flex-col gap-0.5" style={{ background: 'rgba(15,23,42,0.85)' }}>
-        {drone   && <span className="mono text-[9px] font-semibold" style={{ color: '#94a3b8' }}>{drone}</span>}
+        {drone   && <span className="mono text-[9px] font-semibold truncate" style={{ color: '#94a3b8' }}>{drone}</span>}
         {msnId   && <span className="mono text-[8px] truncate" style={{ color: '#64748b' }}>{msnId}</span>}
-        <span className="mono text-[9px]" style={{ color: '#475569' }}>{fmtAge(lastSeen)}</span>
+        <div className="flex items-center justify-between mt-0.5">
+          <span className="mono text-[9px]" style={{ color: '#475569' }}>{fmtAge(lastSeen)}</span>
+          <span className="mono text-[8px] text-slate-500 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-0.5">
+            <Maximize2 size={8} /> zoom
+          </span>
+        </div>
       </div>
     </div>
   );
 }
 
 /* ───────────────────────────────────────────────────────────────
-   SECTION 5c — Image Gallery wrapper
+   SECTION 5c — Full-Resolution Preview Modal
    ────────────────────────────────────────────────────────────── */
-function ImageGallery({ items, loading, label = 'Items', bucket = 'dvas-faces', isPersonGallery = false }) {
-  const [page, setPage] = useState(0);
-  const [selectedId, setSelectedId] = useState(null);
-  const perPage = 12;
-  const arr = Array.isArray(items) ? items : [];
-  const pages = Math.ceil(arr.length / perPage);
-  const shown = arr.slice(page * perPage, page * perPage + perPage);
-  const isAnySelected = selectedId !== null;
+function GalleryPreviewModal({ item, isPersonGallery, bucket, onClose }) {
+  const [copiedKey, setCopiedKey] = useState(false);
+  const [copiedMsn, setCopiedMsn] = useState(false);
 
-  if (loading && arr.length === 0) {
+  // Close on ESC
+  useEffect(() => {
+    function handleKeyDown(e) {
+      if (e.key === 'Escape') onClose();
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
+
+  if (!item) return null;
+
+  const personObjKey = item.best_person_image_key;
+  const faceObjKey   = item.best_image_key || item.object_key;
+  const faceRawUrl   = item.best_image_url || item.image_url || item.presigned_url || item.url;
+  const personRawUrl = item.best_person_image_url;
+
+  let imgUrl;
+  let objectKey;
+  if (isPersonGallery) {
+    objectKey = personObjKey;
+    imgUrl = personObjKey
+      ? toProxiedUrl(personObjKey, 'dvas-faces')
+      : personRawUrl
+      ? toProxiedUrl(personRawUrl, 'dvas-faces')
+      : null;
+  } else {
+    objectKey = faceObjKey;
+    imgUrl = faceObjKey
+      ? toProxiedUrl(faceObjKey, bucket)
+      : toProxiedUrl(faceRawUrl, bucket);
+  }
+
+  const clusterLabel = item.cluster_id != null ? `Cluster #${item.cluster_id}` : `Identity #${item.identity_id || item.id || '—'}`;
+  const drone = item.drone_id || '—';
+  const msnId = item.mission_id || '—';
+  const timestamp = item.last_seen || item.created_at || item.ts;
+  const count = item.embedding_count || 1;
+  const accentColor = isPersonGallery ? '#38bdf8' : '#fbbf24';
+
+  const copyToClipboard = (text, type) => {
+    navigator.clipboard.writeText(text);
+    if (type === 'key') {
+      setCopiedKey(true);
+      setTimeout(() => setCopiedKey(false), 2000);
+    } else {
+      setCopiedMsn(true);
+      setTimeout(() => setCopiedMsn(false), 2000);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="relative w-full max-w-xl rounded-2xl overflow-hidden shadow-2xl flex flex-col"
+        style={{
+          background: 'var(--dvas-surface)',
+          border: `1px solid var(--dvas-border)`,
+          maxHeight: '90vh',
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Modal Header */}
+        <div
+          className="flex items-center justify-between px-4 py-3 border-b"
+          style={{
+            background: 'var(--dvas-surface-2)',
+            borderBottomColor: 'var(--dvas-border)',
+          }}
+        >
+          <div className="flex items-center gap-2">
+            {isPersonGallery ? <Users size={18} style={{ color: accentColor }} /> : <Fingerprint size={18} style={{ color: accentColor }} />}
+            <span className="mono font-bold text-sm" style={{ color: accentColor }}>
+              {clusterLabel}
+            </span>
+            {count > 1 && (
+              <span
+                className="font-mono font-bold text-xs px-2 py-0.5 rounded"
+                style={{ background: 'rgba(167,139,250,0.18)', color: '#a78bfa', border: '1px solid rgba(167,139,250,0.3)' }}
+              >
+                ×{count} sightings
+              </span>
+            )}
+          </div>
+          <button
+            onClick={onClose}
+            className="p-1 rounded-lg hover:bg-slate-700/50 text-slate-400 hover:text-white transition-colors"
+          >
+            <X size={18} />
+          </button>
+        </div>
+
+        {/* Modal Body: Image Preview */}
+        <div className="relative bg-black flex items-center justify-center p-2 min-h-[300px] max-h-[55vh] overflow-hidden">
+          {imgUrl ? (
+            <img
+              src={imgUrl}
+              alt={clusterLabel}
+              className="max-h-[50vh] w-auto max-w-full object-contain rounded"
+            />
+          ) : (
+            <div className="flex flex-col items-center justify-center py-16 text-slate-600 gap-2">
+              <VideoOff size={32} />
+              <span className="mono text-xs">No image available</span>
+            </div>
+          )}
+        </div>
+
+        {/* Modal Footer / Metadata */}
+        <div className="p-4 flex flex-col gap-2.5 overflow-y-auto" style={{ background: 'var(--dvas-surface)' }}>
+          <div className="grid grid-cols-2 gap-3 text-xs">
+            <div>
+              <span className="mono text-[10px] text-slate-400 block mb-0.5">Mission ID</span>
+              <div className="flex items-center gap-1.5">
+                <span className="mono font-semibold text-[11px] truncate text-slate-200" title={msnId}>
+                  {msnId}
+                </span>
+                {msnId !== '—' && (
+                  <button
+                    onClick={() => copyToClipboard(msnId, 'msn')}
+                    className="text-slate-500 hover:text-slate-300 transition-colors"
+                    title="Copy Mission ID"
+                  >
+                    <Copy size={11} />
+                  </button>
+                )}
+                {copiedMsn && <span className="mono text-[9px] text-emerald-400">Copied!</span>}
+              </div>
+            </div>
+
+            <div>
+              <span className="mono text-[10px] text-slate-400 block mb-0.5">Drone ID</span>
+              <span className="mono font-semibold text-[11px] text-slate-200">{drone}</span>
+            </div>
+
+            <div>
+              <span className="mono text-[10px] text-slate-400 block mb-0.5">Recorded Time (IST)</span>
+              <span className="mono text-[11px] text-slate-200">{fmtIST(timestamp)}</span>
+              <span className="mono text-[9px] text-slate-500 ml-1">({fmtAge(timestamp)})</span>
+            </div>
+
+            <div>
+              <span className="mono text-[10px] text-slate-400 block mb-0.5">MinIO Storage</span>
+              <div className="flex items-center gap-1.5">
+                <span className="mono text-[10px] truncate text-slate-300 max-w-[150px]" title={objectKey || '—'}>
+                  {objectKey ? objectKey.split('/').pop() : '—'}
+                </span>
+                {objectKey && (
+                  <button
+                    onClick={() => copyToClipboard(objectKey, 'key')}
+                    className="text-slate-500 hover:text-slate-300 transition-colors"
+                    title="Copy object key"
+                  >
+                    <Copy size={11} />
+                  </button>
+                )}
+                {copiedKey && <span className="mono text-[9px] text-emerald-400">Copied!</span>}
+              </div>
+            </div>
+          </div>
+
+          {/* Action Row */}
+          <div className="flex items-center justify-between pt-2 border-t border-slate-800">
+            <span className="mono text-[10px] text-slate-500">
+              {isPersonGallery ? 'Whole-body person crop' : 'Face detection crop'} · MinIO
+            </span>
+            {imgUrl && (
+              <a
+                href={imgUrl}
+                target="_blank"
+                rel="noreferrer"
+                download
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg mono text-xs font-semibold transition-all hover:brightness-110"
+                style={{
+                  background: isPersonGallery ? 'rgba(56,189,248,0.2)' : 'rgba(251,191,36,0.2)',
+                  color: accentColor,
+                  border: `1px solid ${isPersonGallery ? 'rgba(56,189,248,0.4)' : 'rgba(251,191,36,0.4)'}`,
+                }}
+              >
+                <Download size={12} /> Open / Download High-Res
+              </a>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ───────────────────────────────────────────────────────────────
+   SECTION 5d — Image Gallery wrapper
+   ────────────────────────────────────────────────────────────── */
+function ImageGallery({ items, loading, label = 'Items', bucket = 'dvas-faces', isPersonGallery = false, selectedMission = '' }) {
+  const [page, setPage] = useState(0);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [previewItem, setPreviewItem] = useState(null);
+  const perPage = 12;
+
+  const rawArr = Array.isArray(items) ? items : [];
+
+  // Reset page to 0 when items length, selected mission, or search term changes
+  useEffect(() => {
+    setPage(0);
+  }, [rawArr.length, selectedMission, searchTerm]);
+
+  // Client-side search within loaded items
+  const filtered = rawArr.filter((item, idx) => {
+    if (!searchTerm) return true;
+    const q = searchTerm.toLowerCase().trim();
+    const cluster = item.cluster_id != null ? `cl-${item.cluster_id} ${item.cluster_id}` : `id-${idx + 1}`;
+    const drone = (item.drone_id || '').toLowerCase();
+    const msn = (item.mission_id || '').toLowerCase();
+    return cluster.toLowerCase().includes(q) || drone.includes(q) || msn.includes(q);
+  });
+
+  const pages = Math.ceil(filtered.length / perPage);
+  const shown = filtered.slice(page * perPage, page * perPage + perPage);
+
+  if (loading && rawArr.length === 0) {
     return (
       <div className="flex items-center justify-center py-12 gap-2">
         <RefreshCw size={16} className="text-slate-500 animate-spin" />
@@ -756,13 +1170,15 @@ function ImageGallery({ items, loading, label = 'Items', bucket = 'dvas-faces', 
     );
   }
 
-  if (!loading && arr.length === 0) {
+  if (!loading && rawArr.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-12 gap-3">
         <Eye size={36} className="text-slate-600 opacity-40" />
-        <span className="mono text-xs text-slate-500">No {label.toLowerCase()} yet</span>
+        <span className="mono text-xs text-slate-500">No {label.toLowerCase()} found</span>
         <span className="mono text-[10px] text-slate-600">
-          Images stored in MinIO will appear here after detection
+          {selectedMission
+            ? `No detections recorded for mission ${selectedMission}`
+            : 'Images stored in MinIO will appear here after detection'}
         </span>
       </div>
     );
@@ -770,30 +1186,68 @@ function ImageGallery({ items, loading, label = 'Items', bucket = 'dvas-faces', 
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))' }}>
-        {shown.map((item, i) => {
-          const itemId = item.identity_id || item.id || i;
-          const isSelected = selectedId === String(itemId);
-          return (
-            <GalleryCard
-              key={itemId}
-              item={item}
-              i={i}
-              isSelected={isSelected}
-              isAnySelected={isAnySelected}
-              onSelect={() => setSelectedId(isSelected ? null : String(itemId))}
-              isPersonGallery={isPersonGallery}
-              bucket={bucket}
-            />
-          );
-        })}
+      {/* Sub-bar: In-Gallery Search & Counts */}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="relative flex-1" style={{ maxWidth: 260 }}>
+          <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-500" />
+          <input
+            type="text"
+            placeholder={`Filter ${label.toLowerCase()} (cluster / drone)...`}
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            className="w-full pl-7 pr-7 py-1 rounded-lg mono text-[11px] outline-none transition-all"
+            style={{
+              background: 'var(--dvas-surface-2)',
+              border: '1px solid var(--dvas-border)',
+              color: 'var(--dvas-text)',
+            }}
+          />
+          {searchTerm && (
+            <button
+              onClick={() => setSearchTerm('')}
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300"
+            >
+              <X size={12} />
+            </button>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <span className="mono text-[10px]" style={{ color: 'var(--dvas-text-dim)' }}>
+            Showing {filtered.length} of {rawArr.length} {isPersonGallery ? 'identities' : 'faces'}
+          </span>
+        </div>
       </div>
+
+      {/* Grid of Cards */}
+      {filtered.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-8 gap-2">
+          <Search size={24} className="text-slate-600 opacity-40" />
+          <span className="mono text-xs text-slate-500">No matches for "{searchTerm}"</span>
+        </div>
+      ) : (
+        <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))' }}>
+          {shown.map((item, i) => {
+            const itemId = item.identity_id || item.id || i;
+            return (
+              <GalleryCard
+                key={itemId}
+                item={item}
+                i={page * perPage + i}
+                onOpenModal={setPreviewItem}
+                isPersonGallery={isPersonGallery}
+                bucket={bucket}
+              />
+            );
+          })}
+        </div>
+      )}
 
       {/* Pagination */}
       {pages > 1 && (
         <div className="flex items-center justify-between pt-1">
           <span className="mono text-[10px]" style={{ color: 'var(--dvas-text-dim)' }}>
-            {page * perPage + 1}–{Math.min((page + 1) * perPage, arr.length)} of {arr.length}
+            {page * perPage + 1}–{Math.min((page + 1) * perPage, filtered.length)} of {filtered.length}
           </span>
           <div className="flex gap-1 items-center">
             <button onClick={() => setPage(p => Math.max(0, p - 1))} disabled={page === 0}
@@ -805,9 +1259,9 @@ function ImageGallery({ items, loading, label = 'Items', bucket = 'dvas-faces', 
               <button key={i} onClick={() => setPage(i)}
                 className="w-6 h-6 rounded text-[10px] mono font-bold transition-colors"
                 style={{
-                  background: i === page ? 'rgba(56,189,248,0.15)' : 'var(--dvas-surface-2)',
-                  color: i === page ? '#38bdf8' : 'var(--dvas-text-muted)',
-                  border: `1px solid ${i === page ? 'rgba(56,189,248,0.3)' : 'var(--dvas-border)'}`,
+                  background: i === page ? (isPersonGallery ? 'rgba(56,189,248,0.15)' : 'rgba(251,191,36,0.15)') : 'var(--dvas-surface-2)',
+                  color: i === page ? (isPersonGallery ? '#38bdf8' : '#fbbf24') : 'var(--dvas-text-muted)',
+                  border: `1px solid ${i === page ? (isPersonGallery ? 'rgba(56,189,248,0.3)' : 'rgba(251,191,36,0.3)') : 'var(--dvas-border)'}`,
                 }}>{i + 1}</button>
             ))}
             <button onClick={() => setPage(p => Math.min(pages - 1, p + 1))} disabled={page >= pages - 1}
@@ -817,6 +1271,16 @@ function ImageGallery({ items, loading, label = 'Items', bucket = 'dvas-faces', 
             </button>
           </div>
         </div>
+      )}
+
+      {/* Full-resolution preview modal */}
+      {previewItem && (
+        <GalleryPreviewModal
+          item={previewItem}
+          isPersonGallery={isPersonGallery}
+          bucket={bucket}
+          onClose={() => setPreviewItem(null)}
+        />
       )}
     </div>
   );
@@ -1020,11 +1484,12 @@ export default function PersonTrackingAnalytics({ drones }) {
     }
   }, [drones]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const [reidLoading,          setReidLoading]          = useState(false);
-  const [sseWindow,            setSseWindow]            = useState([]);
-  const [startingStream,       setStartingStream]       = useState(false);
-  const [liveFaceCount,        setLiveFaceCount]        = useState(0);
-  const [galleryMissionFilter, setGalleryMissionFilter] = useState('');
+  const [reidLoading,         setReidLoading]         = useState(false);
+  const [sseWindow,           setSseWindow]           = useState([]);
+  const [startingStream,      setStartingStream]      = useState(false);
+  const [liveFaceCount,       setLiveFaceCount]       = useState(0);
+  const [personMissionFilter, setPersonMissionFilter] = useState('');
+  const [faceMissionFilter,   setFaceMissionFilter]   = useState('');
 
   // Health
   const { data: healthData } = useAnalyticsFetch('/analytics/person/health', 5000);
@@ -1044,8 +1509,8 @@ export default function PersonTrackingAnalytics({ drones }) {
   // Data hooks
   const { data: tracksData,     loading: tracksLoading }   = usePersonTracks(activeDrone || '', 5000);
   const { data: dedupData }                                 = usePersonDedup(15000);
-  const { data: identitiesData, loading: identLoading }    = usePersonIdentities(activeDrone || '', 10000, galleryMissionFilter);
-  const { data: facesData,      loading: facesLoading }    = useFacesGallery(activeDrone || '', 10000, galleryMissionFilter);
+  const { data: identitiesData, loading: identLoading }    = usePersonIdentities(activeDrone || '', 10000, personMissionFilter);
+  const { data: facesData,      loading: facesLoading }    = useFacesGallery(activeDrone || '', 10000, faceMissionFilter);
   const { data: countData }                                 = usePersonCount(activeDrone || '', 5000);
   const { data: liveData,       loading: liveLoading }     = usePersonLive(activeDrone || '', 3000);
 
@@ -1186,14 +1651,15 @@ export default function PersonTrackingAnalytics({ drones }) {
         badge={identities.length > 0 ? `${identities.length} identities` : null}
         right={
           <span className="mono text-[10px]" style={{ color: 'var(--dvas-text-dim)' }}>
-            {galleryMissionFilter ? 'Mission filtered' : 'Deduplicated'} · MinIO
+            {personMissionFilter ? `Mission: ${personMissionFilter}` : 'Deduplicated'} · MinIO
           </span>
         }>
-        <GalleryMissionFilter
+        <SearchableMissionFilter
           missions={missionDedupData?.missions}
-          selected={galleryMissionFilter}
-          onSelect={setGalleryMissionFilter}
+          selected={personMissionFilter}
+          onSelect={setPersonMissionFilter}
           activeMissionId={activeMissionId}
+          type="person"
         />
         <ImageGallery
           items={identities}
@@ -1201,6 +1667,7 @@ export default function PersonTrackingAnalytics({ drones }) {
           label="Detected Persons"
           bucket="dvas-faces"
           isPersonGallery={true}
+          selectedMission={personMissionFilter}
         />
       </Panel>
 
@@ -1212,14 +1679,15 @@ export default function PersonTrackingAnalytics({ drones }) {
         badge={faces.length > 0 ? `${faces.length} faces` : null}
         right={
           <span className="mono text-[10px]" style={{ color: 'var(--dvas-text-dim)' }}>
-            {galleryMissionFilter ? 'Mission filtered' : 'Face crops'} · MinIO
+            {faceMissionFilter ? `Mission: ${faceMissionFilter}` : 'Face crops'} · MinIO
           </span>
         }>
-        <GalleryMissionFilter
+        <SearchableMissionFilter
           missions={missionDedupData?.missions}
-          selected={galleryMissionFilter}
-          onSelect={setGalleryMissionFilter}
+          selected={faceMissionFilter}
+          onSelect={setFaceMissionFilter}
           activeMissionId={activeMissionId}
+          type="face"
         />
         <ImageGallery
           items={faces}
@@ -1227,6 +1695,7 @@ export default function PersonTrackingAnalytics({ drones }) {
           label="Detected Faces"
           bucket="dvas-faces"
           isPersonGallery={false}
+          selectedMission={faceMissionFilter}
         />
       </Panel>
 

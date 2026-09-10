@@ -844,7 +844,7 @@ async def missions_dedup_status():
         is_deduped = (dedup_status == "complete") or (clustered > 0 and clustered >= total * 0.8)
         missions_map[mid] = {
             "mission_id": mid,
-            "total_faces": total, # For UI compatibility
+            "total_faces": 0,
             "total_persons": total,
             "duplicates": m.get("duplicates", 0),
             "is_deduplicated": is_deduped,
@@ -856,14 +856,16 @@ async def missions_dedup_status():
         }
     for m in face_missions:
         mid = m["mission_id"]
-        if mid not in missions_map:
-            total = m.get("total_faces", 0)
+        total_f = m.get("total_faces", 0)
+        if mid in missions_map:
+            missions_map[mid]["total_faces"] = total_f
+        else:
             clustered = m.get("clustered", 0)
             dedup_status = m.get("dedup_status")
-            is_deduped = (dedup_status == "complete") or (clustered > 0 and clustered >= total * 0.8)
+            is_deduped = (dedup_status == "complete") or (clustered > 0 and clustered >= total_f * 0.8)
             missions_map[mid] = {
                 "mission_id": mid,
-                "total_faces": total,
+                "total_faces": total_f,
                 "total_persons": 0,
                 "duplicates": m.get("duplicates", 0),
                 "is_deduplicated": is_deduped,
@@ -973,29 +975,32 @@ async def person_count():
 
 
 @app.get("/faces/gallery")
-async def face_gallery(limit: int = 50, drone_id: str = "", mission_id: str = ""):
-    """Face thumbnail gallery — one best face per Re-ID cluster, filterable by mission."""
+async def face_gallery(limit: int = 60, drone_id: str = "", mission_id: str = ""):
+    """Face thumbnail gallery — deduplicated face crops, filterable by mission."""
     pool = await get_pool()
     conditions = ["is_duplicate = false", "object_key IS NOT NULL"]
     params = []
     idx = 1
-    if drone_id:
-        conditions.append(f"drone_id = ${idx}")
-        params.append(drone_id)
-        idx += 1
     if mission_id:
         conditions.append(f"mission_id = ${idx}")
         params.append(mission_id)
         idx += 1
-    params.append(limit)
+    elif drone_id:
+        conditions.append(f"drone_id = ${idx}")
+        params.append(drone_id)
+        idx += 1
+    params.append(min(limit, 200))
     where = " AND ".join(conditions)
     rows = await pool.fetch(
         f"""
-        SELECT DISTINCT ON (cluster_id)
-            id::text, cluster_id, object_key, drone_id, mission_id, created_at
+        SELECT 
+            id::text, cluster_id, object_key, drone_id, mission_id, created_at,
+            (SELECT COUNT(*) FROM face_embeddings f2 
+             WHERE (f2.cluster_id = face_embeddings.cluster_id AND face_embeddings.cluster_id IS NOT NULL)
+                OR f2.id = face_embeddings.id) AS embedding_count
         FROM face_embeddings
         WHERE {where}
-        ORDER BY cluster_id, created_at DESC
+        ORDER BY created_at DESC
         LIMIT ${idx}
         """,
         *params,

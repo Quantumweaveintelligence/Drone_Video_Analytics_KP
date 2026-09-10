@@ -165,16 +165,22 @@ export function usePersonDedup(intervalMs = 15000) {
 }
 
 export function usePersonIdentities(droneId = '', intervalMs = 10000, missionId = '') {
-  let path = '/analytics/person/identities?limit=50';
-  if (droneId) path += `&drone_id=${droneId}`;
-  if (missionId) path += `&mission_id=${missionId}`;
+  let path = '/analytics/person/identities?limit=60';
+  if (missionId) {
+    path += `&mission_id=${encodeURIComponent(missionId)}`;
+  } else if (droneId) {
+    path += `&drone_id=${encodeURIComponent(droneId)}`;
+  }
   return useAnalyticsFetch(path, intervalMs);
 }
 
 export function useFacesGallery(droneId = '', intervalMs = 10000, missionId = '') {
   let path = '/analytics/person/gallery?limit=60';
-  if (droneId) path += `&drone_id=${droneId}`;
-  if (missionId) path += `&mission_id=${missionId}`;
+  if (missionId) {
+    path += `&mission_id=${encodeURIComponent(missionId)}`;
+  } else if (droneId) {
+    path += `&drone_id=${encodeURIComponent(droneId)}`;
+  }
   return useAnalyticsFetch(path, intervalMs);
 }
 

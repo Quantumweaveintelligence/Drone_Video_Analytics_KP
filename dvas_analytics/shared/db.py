@@ -891,8 +891,12 @@ async def upsert_person_identity(
 ) -> str:
     pool = await get_pool()
     row = await pool.fetchrow(
-        "SELECT identity_id::text FROM person_identities WHERE cluster_id=$1 LIMIT 1",
-        cluster_id,
+        """
+        SELECT identity_id::text FROM person_identities 
+        WHERE COALESCE(mission_id, '') = COALESCE($1, '') AND cluster_id = $2 
+        LIMIT 1
+        """,
+        mission_id, cluster_id,
     )
     if row:
         await pool.execute(
@@ -901,11 +905,11 @@ async def upsert_person_identity(
             SET best_image_key=COALESCE($1, best_image_key),
                 best_person_image_key=COALESCE($2, best_person_image_key),
                 embedding_count=$3,
-                mission_id=COALESCE($4, mission_id),
+                drone_id=COALESCE($4, drone_id),
                 last_seen=now()
-            WHERE cluster_id=$5
+            WHERE COALESCE(mission_id, '') = COALESCE($5, '') AND cluster_id = $6
             """,
-            best_image_key, best_person_image_key, embedding_count, mission_id, cluster_id,
+            best_image_key, best_person_image_key, embedding_count, drone_id, mission_id, cluster_id,
         )
         return row["identity_id"]
     return await write_person_identity(
@@ -923,13 +927,13 @@ async def get_person_identities(
     conditions = []
     params = []
     idx = 1
-    if drone_id:
-        conditions.append(f"drone_id = ${idx}")
-        params.append(drone_id)
-        idx += 1
     if mission_id:
         conditions.append(f"mission_id = ${idx}")
         params.append(mission_id)
+        idx += 1
+    elif drone_id:
+        conditions.append(f"drone_id = ${idx}")
+        params.append(drone_id)
         idx += 1
     params.append(limit)
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
@@ -937,7 +941,38 @@ async def get_person_identities(
         f"SELECT * FROM person_identities {where} ORDER BY last_seen DESC LIMIT ${idx}",
         *params,
     )
-    return [dict(r) for r in rows]
+    results = [dict(r) for r in rows]
+
+    # If querying by mission_id and person_identities has fewer rows or is missing,
+    # fall back to person_embeddings directly to guarantee 100% data visibility
+    if mission_id and len(results) == 0:
+        emb_rows = await pool.fetch(
+            """
+            SELECT 
+                p.id::text AS identity_id,
+                COALESCE(p.cluster_id, 0) AS cluster_id,
+                NULL AS best_image_key,
+                p.object_key AS best_person_image_key,
+                p.drone_id,
+                p.mission_id,
+                COALESCE((
+                    SELECT COUNT(*) FROM person_embeddings p2 
+                    WHERE p2.mission_id = p.mission_id 
+                      AND p2.cluster_id = p.cluster_id 
+                      AND p.cluster_id IS NOT NULL
+                ), 1) AS embedding_count,
+                p.created_at AS last_seen,
+                p.created_at
+            FROM person_embeddings p
+            WHERE p.mission_id = $1 AND p.is_duplicate = false AND p.object_key IS NOT NULL
+            ORDER BY p.created_at DESC
+            LIMIT $2
+            """,
+            mission_id, limit,
+        )
+        results = [dict(r) for r in emb_rows]
+
+    return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
