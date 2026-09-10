@@ -399,6 +399,8 @@ export default function CommandDashboard() {
       // SR receives all alerts; CRO receives only mission-scoped alerts
       const inScope =
         user.role === "senior_officer" ||
+        user.role === "control_room_officer" ||
+        user.role === "system_administrator" ||
         ((user.mission_scope || []).includes(a.mission_id));
       if (inScope) setAlerts((prev) => [a, ...prev].slice(0, 200));
     } else if (msg.type === "model_suggestion") {

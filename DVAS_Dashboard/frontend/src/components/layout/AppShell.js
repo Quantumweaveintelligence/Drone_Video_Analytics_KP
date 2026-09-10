@@ -120,7 +120,7 @@ function NotificationBell() {
 
   // Load initial notifications from alerts, incidents, and model suggestions
   const loadNotifications = async () => {
-    if (!user || user.role === "drone_operator") return;
+    if (!user) return;
     try {
       const [alertsRes, incsRes, suggsRes] = await Promise.allSettled([
         api.get("/alerts"),
@@ -177,6 +177,8 @@ function NotificationBell() {
           const inScope =
             user.role === "system_administrator" ||
             user.role === "senior_officer" ||
+            user.role === "control_room_officer" ||
+            user.role === "drone_operator" ||
             ((user.mission_scope || []).includes(a.mission_id));
           if (!inScope) return;
           const missionPrefix = a.mission_id ? `${a.mission_id}: ` : "";
@@ -216,7 +218,7 @@ function NotificationBell() {
 
   // Real-time WebSocket listener
   useDvasSocket((msg) => {
-    if (!user || user.role === "drone_operator") return;
+    if (!user) return;
 
     // A. AI Model Suggestion: format "<MISSION ID>: Suggests <AI Model name>"
     if (msg.type === "model_suggestion") {
@@ -271,6 +273,8 @@ function NotificationBell() {
       const inScope =
         user.role === "system_administrator" ||
         user.role === "senior_officer" ||
+        user.role === "control_room_officer" ||
+        user.role === "drone_operator" ||
         ((user.mission_scope || []).includes(a.mission_id));
       if (!inScope) return;
       const missionPrefix = a.mission_id ? `${a.mission_id}: ` : "";
@@ -302,7 +306,7 @@ function NotificationBell() {
     return () => document.removeEventListener("mousedown", onDoc);
   }, [open]);
 
-  if (!user || user.role === "drone_operator") return null;
+  if (!user) return null;
 
   const jumpToAlerts = () => {
     setOpen(false);
@@ -311,11 +315,37 @@ function NotificationBell() {
       nav("/ingest");
       try { localStorage.setItem("dvas_ingest_tab", "alerts"); } catch (e) {}
       window.dispatchEvent(new CustomEvent("dvas:ingest-tab", { detail: "alerts" }));
+    } else if (user?.role === "drone_operator") {
+      nav("/edge/incidents");
     } else {
       nav("/command");
       try { localStorage.setItem("dvas_cmd_tab", "alerts"); } catch (e) { /* noop */ }
       window.dispatchEvent(new CustomEvent("dvas:cmd-tab", { detail: "alerts" }));
     }
+  };
+
+  const handleItemClick = (item) => {
+    setOpen(false);
+    setUnread(0);
+    if (user?.role === "drone_operator") {
+      nav("/edge/incidents");
+      return;
+    }
+    if (user?.role === "system_administrator") {
+      if (item.type === "model_suggestion") {
+        nav("/ingest");
+        try { localStorage.setItem("dvas_ingest_tab", "gpu"); } catch (e) {}
+        window.dispatchEvent(new CustomEvent("dvas:ingest-tab", { detail: "gpu" }));
+      } else {
+        nav("/ingest");
+        try { localStorage.setItem("dvas_ingest_tab", "alerts"); } catch (e) {}
+        window.dispatchEvent(new CustomEvent("dvas:ingest-tab", { detail: "alerts" }));
+      }
+      return;
+    }
+    nav("/command");
+    try { localStorage.setItem("dvas_cmd_tab", "alerts"); } catch (e) {}
+    window.dispatchEvent(new CustomEvent("dvas:cmd-tab", { detail: "alerts" }));
   };
 
   const filtered = notifications.filter((n) => {
@@ -431,7 +461,8 @@ function NotificationBell() {
                 <li
                   key={`${item.id || i}-${item.ts}`}
                   data-testid={`notif-item-${i}`}
-                  className="px-4 py-2.5 flex items-start gap-2.5 text-xs hover:bg-slate-800/40 transition-colors"
+                  onClick={() => handleItemClick(item)}
+                  className="px-4 py-2.5 flex items-start gap-2.5 text-xs hover:bg-slate-800/60 cursor-pointer transition-colors"
                 >
                   {/* Icon */}
                   <div className="mt-0.5 shrink-0">
@@ -485,7 +516,7 @@ function NotificationBell() {
             onClick={jumpToAlerts}
             className="w-full px-4 py-2.5 text-xs font-semibold flex items-center justify-center gap-1.5 bg-slate-950/80 hover:bg-slate-800 text-sky-400 border-t border-slate-800 transition-colors"
           >
-            View All in Command Center →
+            {user?.role === "drone_operator" ? "View in Edge Incidents →" : "View All in Alerts & Dispatch →"}
           </button>
         </div>
       )}

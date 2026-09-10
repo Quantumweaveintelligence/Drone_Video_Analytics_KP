@@ -1087,6 +1087,21 @@ async def create_model_suggestion(
             mission_id=mission_id,
         )
         session.add(new_sugg)
+
+        from models import Alert
+        new_alert = Alert(
+            id=sugg_id,
+            mission_id=mission_id or "EDGE",
+            jurisdiction=user.get("jurisdiction") or "Thiruvananthapuram",
+            drone_id=drone_id or "EDGE-STATION",
+            type=display_title,
+            confidence=1.0,
+            zone=location,
+            ts=ts,
+            acknowledged_by=None,
+            acknowledged_at=None,
+        )
+        session.add(new_alert)
         await session.commit()
 
     # Log to audit trail
@@ -1124,6 +1139,21 @@ async def create_model_suggestion(
         "timestamp": ts,
     })
 
+    # Also broadcast standard alert event so NotificationBell captures it
+    await hub.broadcast({
+        "type": "alert",
+        "alert": {
+            "id": sugg_id,
+            "title": display_title,
+            "type": display_title,
+            "severity": "warning" if priority in ("critical", "high") else "info",
+            "drone_id": drone_id or "EDGE-STATION",
+            "mission_id": mission_id or "EDGE",
+            "zone": location,
+            "ts": ts,
+        }
+    })
+
     return {"status": "ok", "suggestion": sugg_dict}
 
 
@@ -1152,6 +1182,16 @@ async def update_suggestion_status(
         )
         if res.rowcount == 0:
             raise HTTPException(404, "Model suggestion not found")
+
+        from models import Alert
+        await session.execute(
+            update(Alert)
+            .where(Alert.id == suggestion_id)
+            .values(
+                acknowledged_by=user.get("email") or user.get("name") or "Operator",
+                acknowledged_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
         await session.commit()
 
     await hub.broadcast({

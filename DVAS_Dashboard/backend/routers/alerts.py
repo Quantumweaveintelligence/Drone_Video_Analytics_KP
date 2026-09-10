@@ -23,17 +23,29 @@ router = APIRouter(prefix="/api", tags=["Alerts, Evidence & Exports"])
 
 @router.get("/alerts")
 async def list_alerts(user: dict = Depends(get_current_user)):
-    if user["role"] == "drone_operator":
-        raise HTTPException(403, "Not permitted")
-    f = scope_filter_for(user)
-    if "__deny__" in f:
-        raise HTTPException(403, "Not permitted")
+    role = user.get("role")
     async with async_session_factory() as session:
-        stmt = select(Alert)
-        stmt = _apply_scope_to_query(stmt, Alert, f)
-        if stmt is None:
+        if role in ("system_administrator", "senior_officer"):
+            stmt = select(Alert).order_by(Alert.ts.desc()).limit(200)
+        elif role == "control_room_officer":
+            f = scope_filter_for(user)
+            if "__deny__" in f:
+                stmt = select(Alert).order_by(Alert.ts.desc()).limit(200)
+            else:
+                jur = f.get("jurisdiction")
+                if jur:
+                    stmt = select(Alert).where(or_(
+                        Alert.jurisdiction == jur,
+                        Alert.jurisdiction == "Kerala",
+                        Alert.jurisdiction == "State HQ",
+                        Alert.jurisdiction.is_(None)
+                    )).order_by(Alert.ts.desc()).limit(200)
+                else:
+                    stmt = select(Alert).order_by(Alert.ts.desc()).limit(200)
+        elif role == "drone_operator":
+            stmt = select(Alert).order_by(Alert.ts.desc()).limit(100)
+        else:
             raise HTTPException(403, "Not permitted")
-        stmt = stmt.order_by(Alert.ts.desc()).limit(200)
         result = await session.execute(stmt)
         return [_row_to_dict(r) for r in result.scalars().all()]
 
@@ -42,28 +54,68 @@ async def list_alerts(user: dict = Depends(get_current_user)):
 async def ack_alert(
     alert_id: str, user: dict = Depends(get_current_user), request: Request = None
 ):
-    # CRO: inherits field_supervisor ack capability; SR: inherits supervisory_officer ack capability
-    if user["role"] not in ("control_room_officer", "senior_officer"):
+    # CRO, SR, and sysadmin can acknowledge alerts
+    if user["role"] not in ("control_room_officer", "senior_officer", "system_administrator"):
         raise HTTPException(403, "Not permitted")
     async with async_session_factory() as session:
         result = await session.execute(
             update(Alert)
             .where(Alert.id == alert_id)
             .values(
-                acknowledged_by=user["email"],
+                acknowledged_by=user.get("email") or user.get("name") or "Operator",
                 acknowledged_at=datetime.now(timezone.utc).isoformat(),
             )
         )
         if result.rowcount == 0:
             raise HTTPException(404, "Alert not found")
+
+        # Also sync Incident if matching
+        try:
+            from models import Incident
+            await session.execute(
+                update(Incident)
+                .where(Incident.id == alert_id)
+                .values(status="ACKNOWLEDGED")
+            )
+        except Exception:
+            pass
+
+        # Also sync AIModelSuggestion if matching
+        try:
+            from models import AIModelSuggestion
+            await session.execute(
+                update(AIModelSuggestion)
+                .where(AIModelSuggestion.id == alert_id)
+                .values(status="ACKNOWLEDGED")
+            )
+        except Exception:
+            pass
+
         await session.commit()
+
+    # Broadcast websocket acknowledgments so all live dashboards update
+    try:
+        from services.websocket_hub import hub
+        await hub.broadcast({
+            "type": "incident_ack",
+            "incident_id": alert_id,
+            "status": "ACKNOWLEDGED",
+        })
+        await hub.broadcast({
+            "type": "model_suggestion_status",
+            "suggestion_id": alert_id,
+            "status": "ACKNOWLEDGED",
+        })
+    except Exception as ws_err:
+        logger.debug(f"Could not broadcast ack: {ws_err}")
+
     await write_audit_v2(
         actor=user, action="alert_ack",
         target=alert_id, target_type="alert",
         target_id=alert_id,
         details="acknowledged",
         before_values={"acknowledged_by": None},
-        after_values={"acknowledged_by": user["email"]},
+        after_values={"acknowledged_by": user.get("email") or user.get("name")},
         source_endpoint="POST /api/alerts/{id}/ack",
         request=request,
     )

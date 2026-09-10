@@ -14,7 +14,7 @@ from sqlalchemy import select, update, desc
 import httpx
 
 from database import async_session_factory
-from models import Incident
+from models import Incident, Alert
 from core.security import get_current_user, _row_to_dict
 from audit_service import write_audit_v2
 from services.websocket_hub import hub
@@ -129,7 +129,7 @@ async def create_incident(
     sent_to_ingest = await _forward_incident_to_ingest(incident_record)
     incident_record["sent_to_ingest"] = sent_to_ingest
 
-    # Persist to database
+    # Persist to database (both Incident and Alert tables)
     async with async_session_factory() as session:
         new_inc = Incident(
             id=incident_id,
@@ -146,6 +146,20 @@ async def create_incident(
             sent_to_ingest=sent_to_ingest,
         )
         session.add(new_inc)
+
+        new_alert = Alert(
+            id=incident_id,
+            mission_id=mission_id or "EDGE",
+            jurisdiction=user.get("jurisdiction") or "Thiruvananthapuram",
+            drone_id=drone_id or "EDGE-STATION",
+            type=display_title,
+            confidence=1.0,
+            zone=location,
+            ts=timestamp,
+            acknowledged_by=None,
+            acknowledged_at=None,
+        )
+        session.add(new_alert)
         await session.commit()
 
     # Log to audit trail
@@ -224,6 +238,16 @@ async def acknowledge_incident(
         )
         if result.rowcount == 0:
             raise HTTPException(404, "Incident not found")
+
+        # Also update corresponding Alert record
+        await session.execute(
+            update(Alert)
+            .where(Alert.id == incident_id)
+            .values(
+                acknowledged_by=user.get("email") or user.get("name") or "Operator",
+                acknowledged_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
         await session.commit()
 
     try:
