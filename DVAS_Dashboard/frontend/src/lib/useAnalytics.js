@@ -237,6 +237,13 @@ export function useVehicleByColour(intervalMs = 30000) {
 }
 
 // ── ANPR / Plate hooks ─────────────────────────────────────────────────────
+export function usePlatesLive(droneId = '', intervalMs = 3000, limit = 25) {
+  const path = droneId
+    ? `/analytics/plates/live?drone_id=${encodeURIComponent(droneId)}&limit=${limit}`
+    : `/analytics/plates/live?limit=${limit}`;
+  return useAnalyticsFetch(path, intervalMs);
+}
+
 export function usePlatesRecent(droneId = '', intervalMs = 5000) {
   const path = droneId
     ? `/analytics/plates/recent?drone_id=${droneId}&limit=50`
@@ -266,6 +273,10 @@ export function useTheftAlerts(intervalMs = 10000) {
 
 export function useAnalyticsHealth(intervalMs = 15000) {
   return useAnalyticsFetch('/analytics/health', intervalMs);
+}
+
+export function useModelsStatus(intervalMs = 10000) {
+  return useAnalyticsFetch('/analytics/models/status', intervalMs);
 }
 
 // ── Intrusion Detection hooks ──────────────────────────────────────────────

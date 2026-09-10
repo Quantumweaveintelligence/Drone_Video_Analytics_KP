@@ -48,6 +48,39 @@ import {
 
 import { useActiveStreams } from "@/hooks/useActiveStreams";
 import { useJpegPoller } from "@/hooks/useJpegPoller";
+import {
+  useCrowdReadings,
+  usePersonCount,
+  usePersonIdentities,
+  useFacesGallery,
+  usePersonLive,
+  useVehicleTracks,
+  useVehicleStats,
+  usePlatesLive,
+  usePlatesRecent,
+  useWatchlist,
+  useTheftAlerts,
+  useModelsStatus,
+} from "@/lib/useAnalytics";
+
+function toProxiedUrl(objectKeyOrUrl, bucket = "dvas-faces") {
+  if (!objectKeyOrUrl) return null;
+  if (objectKeyOrUrl.startsWith("data:image")) return objectKeyOrUrl;
+  if (objectKeyOrUrl.startsWith("/api/minio/")) return objectKeyOrUrl;
+  if (objectKeyOrUrl.startsWith("/api/infra/proxy-image")) return objectKeyOrUrl;
+  if (objectKeyOrUrl.startsWith("http://minio") || objectKeyOrUrl.startsWith("http://localhost") || objectKeyOrUrl.startsWith("http://127.0.0.1")) {
+    try {
+      const u = new URL(objectKeyOrUrl);
+      const parts = u.pathname.split("/").filter(Boolean);
+      if (parts.length >= 2) {
+        const b = parts[0];
+        const k = parts.slice(1).join("/");
+        return `/api/minio/image?bucket=${encodeURIComponent(b)}&key=${encodeURIComponent(k)}`;
+      }
+    } catch (_) {}
+  }
+  return `/api/minio/image?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(objectKeyOrUrl)}`;
+}
 
 /* ─────────────────────────────────────────────
    STATIC / FALLBACK DATA
@@ -567,49 +600,238 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge }) {
 /* ─────────────────────────────────────────────
    ANALYTICS ROW  (4 panels, full-width horizontal)
    ───────────────────────────────────────────── */
-function AnalyticsRow({ selectedDrone, drones, onOpenGallery }) {
+/* ─────────────────────────────────────────────
+   BIOMETRICS GALLERY MODAL (Real Persons & Faces)
+   ───────────────────────────────────────────── */
+function BiometricsGalleryModal({ galleryType, onClose, effectiveDroneId }) {
+  const { data: identitiesData, loading: idLoading } = usePersonIdentities(effectiveDroneId, 10000);
+  const { data: facesData, loading: facesLoading } = useFacesGallery(effectiveDroneId, 10000);
+  const { data: personLive, loading: liveLoading } = usePersonLive(effectiveDroneId, 3000);
+
+  const isPersons = galleryType === "persons";
+  const loading = isPersons ? (idLoading && liveLoading) : facesLoading;
+
+  const rawList = isPersons
+    ? (identitiesData?.identities || identitiesData?.clusters || personLive?.persons || [])
+    : (facesData?.faces || facesData?.gallery || []);
+
+  const items = useMemo(() => {
+    if (!Array.isArray(rawList)) return [];
+    return rawList;
+  }, [rawList]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 md:p-8"
+      style={{ background: "rgba(0,0,0,0.85)", backdropFilter: "blur(6px)" }}
+      onClick={onClose}
+    >
+      <div
+        className="relative w-full max-w-5xl max-h-[90vh] rounded-2xl flex flex-col overflow-hidden"
+        style={{
+          background: "var(--dvas-surface)",
+          border: "1px solid rgba(236,72,153,0.3)",
+          boxShadow: "0 0 0 1px rgba(236,72,153,0.1), 0 24px 64px rgba(0,0,0,0.6)",
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Modal header */}
+        <div className="px-5 py-4 flex items-center justify-between" style={{ borderBottom: "1px solid var(--dvas-border)" }}>
+          <div className="flex items-center gap-3">
+            <Users size={18} className="text-pink-400" />
+            <div>
+              <h2 className="text-sm font-bold text-pink-300 tracking-wide uppercase flex items-center gap-2">
+                Live {isPersons ? "Person Identities" : "Faces"} Gallery
+                <span className="mono text-[10px] px-1.5 py-0.5 rounded bg-pink-500/20 text-pink-300 border border-pink-500/40">
+                  {effectiveDroneId ? `Drone: ${effectiveDroneId}` : "Fleet Stream"}
+                </span>
+              </h2>
+              <div className="mono text-[10px] text-slate-400 mt-0.5">
+                {items.length} {isPersons ? "identities tracked" : "faces cataloged"} · MinIO / Valkey Re-ID
+              </div>
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="w-8 h-8 rounded-lg flex items-center justify-center transition-colors hover:bg-slate-800 border border-slate-700 text-slate-300 hover:text-white"
+          >
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* Gallery Grid */}
+        <div className="flex-1 overflow-y-auto p-5 dvas-scrollbar min-h-[300px]">
+          {loading && items.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-20 text-slate-500">
+              <RefreshCw size={24} className="animate-spin text-pink-400 mb-2" />
+              <span className="mono text-xs">Retrieving biometric captures from server…</span>
+            </div>
+          ) : items.length > 0 ? (
+            <div className={`grid gap-4 ${isPersons ? "grid-cols-2 sm:grid-cols-3 lg:grid-cols-5" : "grid-cols-3 sm:grid-cols-4 lg:grid-cols-6"}`}>
+              {items.map((item, i) => {
+                const imgUrl = item.crop64
+                  ? `data:image/jpeg;base64,${item.crop64}`
+                  : toProxiedUrl(item.crop_url || item.image_url || item.face_image_url || item.key, isPersons ? "dvas-faces" : "dvas-faces");
+                const tag = item.person_id || item.track_id || item.face_id || (isPersons ? `PERS-${i + 1}` : `FACE-${i + 1}`);
+                const ts = item.detected_at || item.last_seen || item.created_at || item.timestamp;
+                const droneTag = item.drone_id || effectiveDroneId || "DRN";
+                const conf = typeof item.confidence === "number" ? Math.round(item.confidence * 100) : null;
+
+                return (
+                  <div
+                    key={item.id || item.track_id || i}
+                    className="flex flex-col rounded-lg overflow-hidden border border-slate-700/60 bg-slate-900/50 transition-transform hover:scale-105 cursor-pointer hover:border-pink-500/50"
+                  >
+                    <div className={`relative ${isPersons ? "aspect-[3/4]" : "aspect-square"} bg-slate-950`}>
+                      {imgUrl ? (
+                        <img
+                          src={imgUrl}
+                          alt={tag}
+                          className="w-full h-full object-cover"
+                          onError={(e) => {
+                            e.target.onerror = null;
+                            e.target.src = "https://images.unsplash.com/photo-1511367461989-f85a21fda167?auto=format&fit=crop&w=300&h=400&q=80";
+                          }}
+                        />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center text-slate-600">
+                          <UserIcon size={32} />
+                        </div>
+                      )}
+                      <div className="absolute inset-0 border border-pink-500/20 mix-blend-overlay pointer-events-none" />
+                      {conf !== null && (
+                        <span className="absolute top-1 right-1 mono text-[8px] font-bold px-1 rounded bg-black/70 text-emerald-400">
+                          {conf}%
+                        </span>
+                      )}
+                    </div>
+                    <div className="p-2 border-t border-slate-700/60 flex flex-col gap-1">
+                      <div className="mono font-bold text-[10px] text-slate-200 truncate">{tag}</div>
+                      <div className="flex justify-between items-center text-[8px] mono text-slate-400">
+                        <span>{ts ? fmtAge(ts) : "Live track"}</span>
+                        <span className="px-1 bg-slate-800 text-teal-400 rounded truncate max-w-[65px]">{droneTag}</span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="flex flex-col items-center justify-center py-24 text-center text-slate-500">
+              <Users size={36} className="text-pink-400/40 mb-3 animate-pulse" />
+              <div className="mono text-sm font-semibold text-slate-300">
+                No {isPersons ? "Person Identities" : "Face Detections"} Logged Yet
+              </div>
+              <div className="mono text-xs text-slate-500 mt-1 max-w-sm">
+                Biometrics tracking service is scanning active stream <span className="text-pink-300">{effectiveDroneId || "fleet feeds"}</span>. Captures will appear here as subjects enter camera frame.
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   ANALYTICS ROW (End-to-End Live Processing Feeds)
+   ───────────────────────────────────────────── */
+function AnalyticsRow({ selectedDrone, drones, onOpenGallery, effectiveDroneId: passedDroneId }) {
   const [stolenSearch, setStolenSearch] = useState("");
   const drone = drones.find((d) => d.id === selectedDrone) || drones[0];
-  const ana = drone?.last_analytics || {};
+  const effectiveDroneId = passedDroneId || drone?.id || "";
+  const isSelected = !!selectedDrone;
 
+  // 1. Human & Crowd Analytics Live Hooks
+  const { data: crowdData } = useCrowdReadings(effectiveDroneId, 4000);
+  const { data: personCount } = usePersonCount(effectiveDroneId, 4000);
+  const crowdAnnotatedUrl = effectiveDroneId
+    ? `${API}/analytics/crowd/annotated?drone_id=${encodeURIComponent(effectiveDroneId)}`
+    : "";
+  const { blobUrl: crowdHeatmapUrl, hasFrame: hasCrowdHeatmap } = useJpegPoller(
+    crowdAnnotatedUrl,
+    1000,
+    !!effectiveDroneId
+  );
+
+  const crowdCount = (typeof crowdData?.count === "number")
+    ? crowdData.count
+    : (Array.isArray(crowdData?.readings) && crowdData.readings.length > 0)
+    ? (crowdData.readings[0]?.count ?? 0)
+    : (drone?.last_analytics?.crowd_count ?? 0);
+
+  const densityLevel = crowdCount >= 150 ? "Critical" : crowdCount >= 75 ? "High" : crowdCount >= 25 ? "Medium" : "Low";
   const densityColor = {
-    High: "text-red-400", Medium: "text-amber-400", Low: "text-emerald-400",
-  }[ana.crowd_density] || "text-slate-400";
+    Critical: "text-red-500",
+    High: "text-orange-400",
+    Medium: "text-amber-400",
+    Low: "text-emerald-400",
+  }[densityLevel] || "text-slate-400";
 
+  const activePersons = personCount?.active_tracks ?? personCount?.total_persons ?? (drone?.last_analytics?.crowd_count ?? 0);
+  const densityPct = Math.min(100, Math.max(12, Math.round((crowdCount / 150) * 100)));
+
+  // 2. Vehicle Metrics Live Hooks
+  const { data: vehicleTracks } = useVehicleTracks(effectiveDroneId, 5000);
+  const { data: vehicleStats } = useVehicleStats(15000);
+  const liveVehicleList = Array.isArray(vehicleTracks?.tracks) ? vehicleTracks.tracks : [];
+  const carsCount = vehicleStats?.cars ?? (liveVehicleList.filter(t => (t.class_name || t.type || "").toLowerCase().includes("car")).length || (drone?.last_analytics?.cars ?? 0));
+  const twoWheelersCount = vehicleStats?.two_wheelers ?? (liveVehicleList.filter(t => ["motorcycle", "bicycle", "2-wheeler", "scooter"].some(k => (t.class_name || t.type || "").toLowerCase().includes(k))).length || (drone?.last_analytics?.two_wheelers ?? 0));
+  const totalVehicles = carsCount + twoWheelersCount + (vehicleStats?.heavy ?? 0);
+  const trafficState = totalVehicles > 60 ? "Congested" : totalVehicles > 20 ? "Moderate" : "Clear";
   const trafficColor = {
-    Congested: "text-red-400", Moderate: "text-amber-400", Clear: "text-emerald-400",
-  }[ana.traffic_state] || "text-slate-400";
+    Congested: "text-red-400",
+    Moderate: "text-amber-400",
+    Clear: "text-emerald-400",
+  }[trafficState] || "text-slate-400";
 
-  const gpuStats = [
-    { label: "Person Det.", pct: 87, color: "#14b8a6" },
-    { label: "Vehicle Det.", pct: 72, color: "#818cf8" },
-    { label: "Face Recog.", pct: 64, color: "#f59e0b" },
-    { label: "ANPR",        pct: 55, color: "#34d399" },
+  // 3. GPU Pipeline Load & Model Status
+  const { data: modelsStatus } = useModelsStatus(10000);
+  const engineRoster = [
+    { key: "person", label: "Person Det.", pct: 87, color: "#14b8a6" },
+    { key: "vehicle", label: "Vehicle Det.", pct: 72, color: "#818cf8" },
+    { key: "crowd", label: "CSRNet Crowd", pct: 64, color: "#f59e0b" },
+    { key: "anpr", label: "Live ANPR", pct: 55, color: "#34d399" },
   ];
 
-  const safetyItems = [
-    { label: "Intrusion Detection", active: drone?.id === "DRN-002", severity: "critical" },
-    { label: "Suspicious Object",   active: drone?.id === "DRN-002", severity: "warning"  },
-    { label: "Perimeter Breach",    active: drone?.id === "DRN-002", severity: "critical" },
-  ];
+  // 4. Live ANPR Feed Hooks
+  const { data: platesLive } = usePlatesLive(effectiveDroneId, 3000);
+  const { data: platesRecent } = usePlatesRecent(effectiveDroneId, 6000);
+  const livePlates = useMemo(() => {
+    const liveItems = Array.isArray(platesLive?.plates) ? platesLive.plates : [];
+    if (liveItems.length > 0) return liveItems;
+    return Array.isArray(platesRecent?.plates) ? platesRecent.plates : [];
+  }, [platesLive, platesRecent]);
 
-  /* ANPR Data Mock */
-  const anprData = [
-    { plate: "KL-01-BK-9090", type: "Car", time: "12s ago", match: false },
-    { plate: "KL-22-C-4512", type: "Two-Wheeler", time: "1m ago", match: false },
-    { plate: "KL-01-CJ-1234", type: "Car", time: "2m ago", match: true }, // STOLEN MATCH
-    { plate: "KL-05-AB-7777", type: "Heavy", time: "5m ago", match: false },
-    { plate: "KL-01-CD-9999", type: "Car", time: "8m ago", match: false },
-  ];
-  
-  const matchedPlate = anprData.find(v => v.plate.toLowerCase() === stolenSearch.toLowerCase() && v.match);
-  const hasStolenMatch = !!matchedPlate;
+  // 5. Stolen Vehicle Match & Watchlist Hooks
+  const { data: watchlistData } = useWatchlist(15000);
+  const { data: theftData } = useTheftAlerts(5000);
+  const watchlist = Array.isArray(watchlistData?.watchlist) ? watchlistData.watchlist : [];
+  const theftAlerts = Array.isArray(theftData?.alerts) ? theftData.alerts : [];
+
+  const searchUpper = stolenSearch.trim().toUpperCase();
+  const searchMatch = searchUpper ? watchlist.find(w => (w.plate_text || "").toUpperCase() === searchUpper) : null;
+  const liveHit = livePlates.find(p => {
+    const text = (p.plate_text || p.plate || "").toUpperCase();
+    return text && watchlist.some(w => (w.plate_text || "").toUpperCase() === text);
+  });
+  const liveHitWatchlist = liveHit ? watchlist.find(w => (w.plate_text || "").toUpperCase() === (liveHit.plate_text || liveHit.plate || "").toUpperCase()) : null;
+  const topTheftAlert = theftAlerts[0] || null;
+
+  const matchedRecord = searchMatch || liveHitWatchlist || (topTheftAlert ? {
+    plate_text: topTheftAlert.plate_text,
+    vehicle_type: topTheftAlert.vehicle_type || "Vehicle",
+    reason: topTheftAlert.notes || "Flagged in Stolen Vehicle Database",
+    added_at: topTheftAlert.detected_at,
+  } : null);
+
+  const hasStolenMatch = !!matchedRecord;
 
   /* shared panel shell */
-  const Panel = ({ children, borderColor = "var(--dvas-border)", className = "" }) => (
+  const Panel = ({ children, borderColor = "var(--dvas-border)", className = "", style = {} }) => (
     <div
       className={`rounded-lg p-3 flex flex-col gap-2 ${className}`}
-      style={{ background: "var(--dvas-surface)", border: `1px solid ${borderColor}` }}
+      style={{ background: "var(--dvas-surface)", border: `1px solid ${borderColor}`, ...style }}
     >
       {children}
     </div>
@@ -628,7 +850,7 @@ function AnalyticsRow({ selectedDrone, drones, onOpenGallery }) {
   const MetricRow = ({ label, value, valueClass }) => (
     <div className="flex items-center justify-between">
       <span className="mono text-[11px]" style={{ color: "var(--dvas-text-muted)" }}>{label}</span>
-      <span className={`mono font-semibold text-sm ${valueClass || 'text-[#2D3748]'}`}>{value ?? "—"}</span>
+      <span className={`mono font-semibold text-sm ${valueClass || "text-[#2D3748]"}`}>{value ?? "—"}</span>
     </div>
   );
 
@@ -640,169 +862,292 @@ function AnalyticsRow({ selectedDrone, drones, onOpenGallery }) {
   );
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8 gap-3">
-
-      {/* ── A: Human & Crowd ── */}
-      <Panel className="col-span-1">
-        <SectionHead
-          icon={<Users size={13} className="text-sky-400" />}
-          label="Human & Crowd Analytics"
-        />
-
-        {/* heatmap */}
-        <div className="relative w-full rounded overflow-hidden" style={{ height: 52, border: "1px solid var(--dvas-border)" }}>
-          <div className="absolute inset-0" style={{ background: "var(--dvas-surface-2)" }} />
-          <div className="absolute inset-0" style={{
-            background: "radial-gradient(ellipse 80% 60% at 35% 55%, rgba(239,68,68,0.50) 0%, rgba(245,158,11,0.30) 45%, rgba(20,184,166,0.12) 75%, transparent 100%)",
-            opacity: { High: 0.9, Medium: 0.55, Low: 0.2 }[ana.crowd_density] ?? 0.5,
-          }} />
-          <div className="absolute inset-0" style={{
-            backgroundImage: "linear-gradient(rgba(20,184,166,0.07) 1px,transparent 1px),linear-gradient(90deg,rgba(20,184,166,0.07) 1px,transparent 1px)",
-            backgroundSize: "12px 12px",
-          }} />
-          <span className="absolute bottom-0.5 right-1.5 mono text-teal-500 text-[9px]">DENSITY MAP</span>
+    <div className="flex flex-col gap-2">
+      {/* Scope Indicator Bar */}
+      <div className="flex items-center justify-between px-3 py-1 rounded border border-slate-700/40 bg-slate-900/60 mono text-[10px]">
+        <div className="flex items-center gap-2">
+          <span className="text-slate-400 font-medium">ANALYTICS STREAM:</span>
+          {isSelected ? (
+            <span className="px-1.5 py-0.5 rounded bg-teal-500/20 text-teal-300 font-bold border border-teal-500/40 flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-teal-400 animate-pulse" />
+              Targeted: {effectiveDroneId}
+            </span>
+          ) : (
+            <span className="px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 font-medium border border-sky-500/40 flex items-center gap-1">
+              <Radio size={10} className="text-sky-400" />
+              Primary Stream: {effectiveDroneId || "Awaiting Stream"}
+            </span>
+          )}
         </div>
+        <div className="flex items-center gap-3 text-slate-400">
+          <span className="flex items-center gap-1">
+            <Activity size={11} className="text-emerald-400" /> Live Ingest Sync
+          </span>
+          <span className="text-slate-500">·</span>
+          <span>Thiruvananthapuram Sector</span>
+        </div>
+      </div>
 
-        <MetricRow label="Crowd Density"  value={ana.crowd_density}  valueClass={densityColor} />
-        <MetricRow label="Active Persons" value={ana.crowd_count} />
-        <Bar
-          pct={ana.crowd_density === "High" ? 88 : ana.crowd_density === "Medium" ? 55 : 22}
-          color={
-            ana.crowd_density === "High"   ? "linear-gradient(90deg,#ef4444,#f87171)" :
-            ana.crowd_density === "Medium" ? "linear-gradient(90deg,#f59e0b,#fbbf24)" :
-                                             "linear-gradient(90deg,#10b981,#34d399)"
-          }
-        />
-      </Panel>
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8 gap-3">
+        {/* ── A: Human & Crowd Analytics ── */}
+        <Panel className="col-span-1">
+          <SectionHead
+            icon={<Users size={13} className="text-sky-400" />}
+            label="Human & Crowd Analytics"
+          />
 
-      {/* ── B: Vehicle Metrics ── */}
-      <Panel className="col-span-1">
-        <SectionHead
-          icon={<Car size={13} className="text-violet-400" />}
-          label="Vehicle Metrics"
-        />
-
-        {[
-          { label: "Cars",         count: ana.cars         ?? 0, max: 200, color: "#818cf8" },
-          { label: "Two-Wheelers", count: ana.two_wheelers ?? 0, max: 100, color: "#c084fc" },
-        ].map(({ label, count, max, color }) => (
-          <div key={label} className="flex flex-col gap-1">
-            <div className="flex justify-between items-center">
-              <span className="mono text-slate-500 text-xs">{label}</span>
-              <span className="mono font-bold text-sm text-slate-100">{count}</span>
-            </div>
-            <Bar pct={Math.min(100, (count / max) * 100)} color={color} />
+          {/* CSRNet Heatmap Display */}
+          <div className="relative w-full rounded overflow-hidden" style={{ height: 58, border: "1px solid var(--dvas-border)", background: "#060e1a" }}>
+            {hasCrowdHeatmap && crowdHeatmapUrl ? (
+              <img
+                src={crowdHeatmapUrl}
+                alt="CSRNet Heatmap"
+                className="w-full h-full object-cover opacity-90"
+              />
+            ) : (
+              <div className="absolute inset-0 flex flex-col items-center justify-center">
+                <div className="absolute inset-0" style={{
+                  background: "radial-gradient(ellipse 80% 60% at 35% 55%, rgba(239,68,68,0.40) 0%, rgba(245,158,11,0.25) 45%, rgba(20,184,166,0.10) 75%, transparent 100%)",
+                  opacity: { High: 0.9, Medium: 0.55, Low: 0.2 }[densityLevel] ?? 0.5,
+                }} />
+                <div className="absolute inset-0" style={{
+                  backgroundImage: "linear-gradient(rgba(20,184,166,0.07) 1px,transparent 1px),linear-gradient(90deg,rgba(20,184,166,0.07) 1px,transparent 1px)",
+                  backgroundSize: "12px 12px",
+                }} />
+              </div>
+            )}
+            <span className="absolute bottom-0.5 right-1.5 mono text-teal-400 text-[9px] font-bold px-1 bg-black/70 rounded">
+              CSRNet · {densityLevel.toUpperCase()}
+            </span>
           </div>
-        ))}
 
-        <MetricRow label="Traffic State" value={ana.traffic_state} valueClass={trafficColor} />
-      </Panel>
+          <MetricRow label="Crowd Density" value={densityLevel} valueClass={densityColor} />
+          <MetricRow label="Active Persons" value={activePersons} />
+          <Bar
+            pct={densityPct}
+            color={
+              densityLevel === "Critical" || densityLevel === "High"
+                ? "linear-gradient(90deg,#ef4444,#f87171)"
+                : densityLevel === "Medium"
+                ? "linear-gradient(90deg,#f59e0b,#fbbf24)"
+                : "linear-gradient(90deg,#10b981,#34d399)"
+            }
+          />
+        </Panel>
 
-      {/* ── C: GPU Pipeline Load ── */}
-      <Panel className="col-span-1">
-        <SectionHead
-          icon={<BarChart2 size={13} className="text-teal-400" />}
-          label="GPU Pipeline Load"
-          right="Processing Batch"
-        />
+        {/* ── B: Vehicle Metrics ── */}
+        <Panel className="col-span-1">
+          <SectionHead
+            icon={<Car size={13} className="text-violet-400" />}
+            label="Vehicle Metrics"
+          />
 
-        <div className="flex flex-col gap-2 mt-1">
-          {gpuStats.map(({ label, pct, color }) => (
+          {[
+            { label: "Cars", count: carsCount, max: 150, color: "#818cf8" },
+            { label: "Two-Wheelers", count: twoWheelersCount, max: 80, color: "#c084fc" },
+          ].map(({ label, count, max, color }) => (
             <div key={label} className="flex flex-col gap-1">
               <div className="flex justify-between items-center">
-                <span className="mono text-[11px]" style={{ color: "var(--dvas-text-muted)" }}>{label}</span>
-                <span className="mono font-semibold text-sm" style={{ color: "var(--dvas-text)" }}>{pct}%</span>
+                <span className="mono text-slate-500 text-xs">{label}</span>
+                <span className="mono font-bold text-sm text-slate-100">{count}</span>
               </div>
-              <Bar pct={pct} color={color === "#14b8a6" ? "var(--dvas-cyan)" : color} />
+              <Bar pct={Math.min(100, (count / max) * 100)} color={color} />
             </div>
           ))}
-        </div>
-      </Panel>
 
-      {/* ── D: Live ANPR Feed ── */}
-      <Panel className="col-span-1">
-        <SectionHead icon={<Camera size={13} className="text-blue-400" />} label="Live ANPR Feed" right="Scanning" />
-        <div className="flex flex-col gap-1.5 overflow-y-auto max-h-[160px] pr-1 dvas-scrollbar">
-          {anprData.map((v, i) => (
-             <div key={i} className="flex justify-between items-center px-2 py-1.5 rounded" style={{background: v.match ? "var(--dvas-crit-bg)" : "var(--dvas-surface-2)"}}>
-                <div>
-                   <div className={`mono font-semibold text-[11px] ${v.match ? 'text-red-500' : ''}`} style={{ color: v.match ? 'var(--dvas-crit)' : 'var(--dvas-text)' }}>{v.plate}</div>
-                   <div className="mono text-[9px]" style={{ color: "var(--dvas-text-dim)" }}>{v.type}</div>
-                </div>
-                <div className="mono text-[9px]" style={{ color: "var(--dvas-text-dim)" }}>{v.time}</div>
-             </div>
-          ))}
-        </div>
-      </Panel>
+          <MetricRow label="Traffic State" value={trafficState} valueClass={trafficColor} />
+        </Panel>
 
-      {/* ── E: Subject Tracking & Biometrics ── */}
-      <Panel className="col-span-1 md:col-span-2 xl:col-span-2">
-        <SectionHead icon={<UserIcon size={13} className="text-pink-400" />} label="Subject Tracking & Biometrics" />
-        <div className="flex gap-2 items-center mb-2 mt-1 px-1">
-           <div className="flex-1 flex flex-col items-center p-2 rounded" style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border)" }}>
-             <div className="mono text-[9px] mb-1" style={{ color: "var(--dvas-text-muted)" }}>PERSONS DETECTED</div>
-             <div className="mono font-semibold text-base" style={{ color: "var(--dvas-text)" }}>1,240</div>
-           </div>
-           <div className="flex-1 flex flex-col items-center p-2 rounded" style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border)" }}>
-             <div className="mono text-[9px] mb-1" style={{ color: "var(--dvas-text-muted)" }}>FACES CAPTURED</div>
-             <div className="mono font-semibold text-base" style={{ color: "var(--dvas-text)" }}>842</div>
-           </div>
-        </div>
-        <div className="flex gap-2 mt-auto">
-          <button onClick={() => onOpenGallery('persons')} className="flex-1 py-1.5 text-[10px] font-semibold mono rounded transition-colors" style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border-strong)", color: "var(--dvas-text-muted)" }}>
-            VIEW PERSONS
-          </button>
-          <button onClick={() => onOpenGallery('faces')} className="flex-1 py-1.5 text-[10px] font-semibold mono rounded transition-colors" style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border-strong)", color: "var(--dvas-text-muted)" }}>
-            VIEW FACES
-          </button>
-        </div>
-      </Panel>
+        {/* ── C: GPU Pipeline Load ── */}
+        <Panel className="col-span-1">
+          <SectionHead
+            icon={<BarChart2 size={13} className="text-teal-400" />}
+            label="GPU Pipeline Load"
+            right="Active Batch"
+          />
 
-      {/* ── F: Stolen Vehicle Match ── */}
-      <Panel 
-        borderColor={hasStolenMatch ? "var(--dvas-crit)" : "var(--dvas-border)"} 
-        className={`col-span-1 md:col-span-2 xl:col-span-2`}
-        style={hasStolenMatch ? { background: "var(--dvas-crit-bg)" } : {}}
-      >
-        <div className="flex items-center justify-between pb-1" style={{ borderBottom: "1px solid var(--dvas-border)" }}>
-           <div className="flex items-center gap-1.5">
-             <ShieldAlert size={14} className={hasStolenMatch ? "text-red-500" : ""} style={{ color: hasStolenMatch ? "var(--dvas-crit)" : "var(--dvas-text-dim)" }} />
-             <span className="text-xs font-semibold" style={{ color: "var(--dvas-text)" }}>Stolen Vehicle Match</span>
-           </div>
-           <input 
-             type="text" 
-             placeholder="Enter Plate #..." 
-             value={stolenSearch}
-             onChange={(e) => setStolenSearch(e.target.value)}
-             className="mono text-[10px] px-2 py-1 rounded w-28 focus:outline-none transition-colors uppercase"
-             style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border-strong)", color: "var(--dvas-text)" }}
-           />
-        </div>
-        
-        {hasStolenMatch ? (
-           <div className="flex items-stretch gap-2 mt-1 h-full min-h-[140px]">
-              <div className="flex-1 flex flex-col items-center justify-center rounded p-2 relative" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-crit)" }}>
-                  <img src="https://images.unsplash.com/photo-1533473359331-0135ef1b58bf?auto=format&fit=crop&q=80&w=200&h=150" alt="DB Photo" className="w-full h-24 object-cover rounded mb-1 opacity-90" />
-                  <span className="mono text-[9px] tracking-wider" style={{ color: "var(--dvas-crit)" }}>REGISTRY DATABASE</span>
-                  <div className="absolute top-3 left-3 text-white mono font-bold text-[8px] px-1.5 py-0.5 rounded shadow-sm" style={{ background: "var(--dvas-crit)" }}>{matchedPlate.plate}</div>
-              </div>
-              <div className="flex-1 flex flex-col items-center justify-center rounded p-2 relative" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-cyan)" }}>
-                  <img src="https://images.unsplash.com/photo-1512428818580-08e13291eb81?auto=format&fit=crop&q=80&w=200&h=150" alt="Live Photo" className="w-full h-24 object-cover rounded mb-1" style={{ borderColor: "var(--dvas-cyan)" }} />
-                  <span className="mono text-[9px] tracking-wider" style={{ color: "var(--dvas-cyan)" }}>LIVE CAPTURE · DRN-001</span>
-                  <div className="absolute inset-0 m-2 flex items-center justify-center pointer-events-none">
-                     <div className="w-12 h-12 border-2 rounded-sm" style={{ borderColor: "var(--dvas-crit)", opacity: 0.8 }}></div>
+          <div className="flex flex-col gap-2 mt-1">
+            {engineRoster.map(({ key, label, pct, color }) => {
+              const svcHealth = modelsStatus?.[key];
+              const isRunning = svcHealth?.stream_running === true || svcHealth?.status === "ok";
+              return (
+                <div key={label} className="flex flex-col gap-1">
+                  <div className="flex justify-between items-center">
+                    <span className="mono text-[11px] flex items-center gap-1" style={{ color: "var(--dvas-text-muted)" }}>
+                      <span className={`w-1.5 h-1.5 rounded-full ${isRunning ? "bg-emerald-400" : "bg-amber-400/80"}`} />
+                      {label}
+                    </span>
+                    <span className="mono font-semibold text-xs" style={{ color: "var(--dvas-text)" }}>
+                      {isRunning ? `${pct}%` : "STANDBY"}
+                    </span>
                   </div>
-              </div>
-           </div>
-        ) : (
-           <div className="flex flex-col items-center justify-center h-full min-h-[140px] text-slate-500">
-               <ShieldCheck size={28} className="mb-2 opacity-40 text-teal-500" />
-               <span className="mono text-[10px] tracking-widest text-slate-400">NO ACTIVE MATCHES</span>
-               <span className="mono text-[9px] opacity-70 mt-1">Search or monitor live feed</span>
-           </div>
-        )}
-      </Panel>
+                  <Bar pct={isRunning ? pct : 15} color={color === "#14b8a6" ? "var(--dvas-cyan)" : color} />
+                </div>
+              );
+            })}
+          </div>
+        </Panel>
 
+        {/* ── D: Live ANPR Feed ── */}
+        <Panel className="col-span-1">
+          <SectionHead icon={<Camera size={13} className="text-blue-400" />} label="Live ANPR Feed" right="Scanning" />
+          <div className="flex flex-col gap-1.5 overflow-y-auto max-h-[160px] pr-1 dvas-scrollbar">
+            {livePlates.length > 0 ? (
+              livePlates.slice(0, 15).map((v, i) => {
+                const pText = v.plate_text || v.plate || "—";
+                const isMatch = v.is_watchlist || v.is_stolen || v.match;
+                const vType = v.vehicle_type || v.type || "Vehicle";
+                const timeLabel = fmtAge(v.detected_at || v.created_at || v.timestamp);
+                return (
+                  <div
+                    key={v.id || i}
+                    onClick={() => setStolenSearch(pText)}
+                    className="flex justify-between items-center px-2 py-1.5 rounded cursor-pointer transition-all hover:bg-slate-800"
+                    style={{ background: isMatch ? "var(--dvas-crit-bg)" : "var(--dvas-surface-2)" }}
+                    title="Click to inspect in Stolen Vehicle Match"
+                  >
+                    <div>
+                      <div className={`mono font-semibold text-[11px] ${isMatch ? "text-red-500 font-bold" : ""}`} style={{ color: isMatch ? "var(--dvas-crit)" : "var(--dvas-text)" }}>
+                        {pText}
+                      </div>
+                      <div className="mono text-[9px]" style={{ color: "var(--dvas-text-dim)" }}>{vType}</div>
+                    </div>
+                    <div className="text-right">
+                      <div className="mono text-[9px]" style={{ color: "var(--dvas-text-dim)" }}>{timeLabel}</div>
+                      {isMatch && <span className="mono text-[8px] font-bold text-red-400 uppercase">WANTED</span>}
+                    </div>
+                  </div>
+                );
+              })
+            ) : (
+              <div className="flex flex-col items-center justify-center py-6 text-center text-slate-500">
+                <Camera size={20} className="mb-1 opacity-40 text-blue-400 animate-pulse" />
+                <span className="mono text-[10px]">Scanning active feed…</span>
+                <span className="mono text-[8px] text-slate-600 mt-0.5">Awaiting plate optical recognition</span>
+              </div>
+            )}
+          </div>
+        </Panel>
+
+        {/* ── E: Subject Tracking & Biometrics ── */}
+        <Panel className="col-span-1 md:col-span-2 xl:col-span-2">
+          <SectionHead icon={<UserIcon size={13} className="text-pink-400" />} label="Subject Tracking & Biometrics" />
+          <div className="flex gap-2 items-center mb-2 mt-1 px-1">
+            <div className="flex-1 flex flex-col items-center p-2 rounded" style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border)" }}>
+              <div className="mono text-[9px] mb-1" style={{ color: "var(--dvas-text-muted)" }}>PERSONS DETECTED</div>
+              <div className="mono font-semibold text-base" style={{ color: "var(--dvas-text)" }}>
+                {personCount?.total_persons ?? personCount?.active_tracks ?? (effectiveDroneId ? "0" : "—")}
+              </div>
+            </div>
+            <div className="flex-1 flex flex-col items-center p-2 rounded" style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border)" }}>
+              <div className="mono text-[9px] mb-1" style={{ color: "var(--dvas-text-muted)" }}>FACES CAPTURED</div>
+              <div className="mono font-semibold text-base" style={{ color: "var(--dvas-text)" }}>
+                {personCount?.total_faces ?? personCount?.faces_captured ?? (effectiveDroneId ? "0" : "—")}
+              </div>
+            </div>
+          </div>
+          <div className="flex gap-2 mt-auto">
+            <button
+              onClick={() => onOpenGallery("persons")}
+              className="flex-1 py-1.5 text-[10px] font-semibold mono rounded transition-colors hover:bg-pink-950/40 hover:border-pink-500/50"
+              style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border-strong)", color: "var(--dvas-text-muted)" }}
+            >
+              VIEW PERSONS
+            </button>
+            <button
+              onClick={() => onOpenGallery("faces")}
+              className="flex-1 py-1.5 text-[10px] font-semibold mono rounded transition-colors hover:bg-pink-950/40 hover:border-pink-500/50"
+              style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border-strong)", color: "var(--dvas-text-muted)" }}
+            >
+              VIEW FACES
+            </button>
+          </div>
+        </Panel>
+
+        {/* ── F: Stolen Vehicle Match ── */}
+        <Panel
+          borderColor={hasStolenMatch ? "var(--dvas-crit)" : "var(--dvas-border)"}
+          className="col-span-1 md:col-span-2 xl:col-span-2"
+          style={hasStolenMatch ? { background: "var(--dvas-crit-bg)" } : {}}
+        >
+          <div className="flex items-center justify-between pb-1" style={{ borderBottom: "1px solid var(--dvas-border)" }}>
+            <div className="flex items-center gap-1.5">
+              <ShieldAlert size={14} className={hasStolenMatch ? "text-red-500" : ""} style={{ color: hasStolenMatch ? "var(--dvas-crit)" : "var(--dvas-text-dim)" }} />
+              <span className="text-xs font-semibold" style={{ color: "var(--dvas-text)" }}>Stolen Vehicle Match</span>
+            </div>
+            <input
+              type="text"
+              placeholder="Enter Plate #..."
+              value={stolenSearch}
+              onChange={(e) => setStolenSearch(e.target.value)}
+              className="mono text-[10px] px-2 py-1 rounded w-28 focus:outline-none transition-colors uppercase"
+              style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border-strong)", color: "var(--dvas-text)" }}
+            />
+          </div>
+
+          {hasStolenMatch && matchedRecord ? (
+            <div className="flex items-stretch gap-2 mt-1 h-full min-h-[140px]">
+              {/* Left: Registry File */}
+              <div className="flex-1 flex flex-col justify-between rounded p-2 relative" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-crit)" }}>
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="mono text-[8px] tracking-wider text-red-400 font-bold">POLICE REGISTRY</span>
+                    <span className="mono text-[7px] px-1 bg-red-950 text-red-300 border border-red-800 rounded">WANTED</span>
+                  </div>
+                  <div className="mono font-bold text-sm text-red-300 mb-1">{matchedRecord.plate_text}</div>
+                  <div className="mono text-[10px] text-slate-300 mb-0.5">{matchedRecord.vehicle_type || "Motor Vehicle"}</div>
+                  <div className="mono text-[9px] text-slate-400 line-clamp-2">{matchedRecord.reason || "Reported stolen in jurisdiction"}</div>
+                </div>
+                <div className="mono text-[8px] text-slate-500 border-t border-slate-800 pt-1 mt-1">
+                  Alert: {matchedRecord.added_at ? fmtAge(matchedRecord.added_at) : "Active Hotlist"}
+                </div>
+              </div>
+
+              {/* Right: Live Drone Capture */}
+              <div className="flex-1 flex flex-col items-center justify-center rounded p-2 relative overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-cyan)" }}>
+                {liveHit?.plate_image_url || topTheftAlert?.vehicle_image_url ? (
+                  <img
+                    src={toProxiedUrl(liveHit?.plate_image_url || topTheftAlert?.vehicle_image_url, "dvas-plates")}
+                    alt="Live Capture"
+                    className="w-full h-24 object-cover rounded mb-1"
+                  />
+                ) : liveHit?.image_b64 ? (
+                  <img
+                    src={`data:image/jpeg;base64,${liveHit.image_b64}`}
+                    alt="Live Capture"
+                    className="w-full h-24 object-cover rounded mb-1"
+                  />
+                ) : effectiveDroneId ? (
+                  <img
+                    src={`${API}/ingest-server/frame/${encodeURIComponent(effectiveDroneId)}/latest`}
+                    alt="Live Drone Feed"
+                    className="w-full h-24 object-cover rounded mb-1 opacity-80"
+                    onError={(e) => { e.target.style.display = "none"; }}
+                  />
+                ) : (
+                  <div className="w-full h-24 flex items-center justify-center bg-slate-900 rounded mb-1">
+                    <Camera size={24} className="text-slate-600" />
+                  </div>
+                )}
+                <span className="mono text-[9px] tracking-wider" style={{ color: "var(--dvas-cyan)" }}>
+                  LIVE · {effectiveDroneId || "DRONE FEED"}
+                </span>
+                <div className="absolute inset-0 m-2 flex items-center justify-center pointer-events-none">
+                  <div className="w-12 h-12 border-2 rounded-sm" style={{ borderColor: "var(--dvas-crit)", opacity: 0.8 }}></div>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col items-center justify-center h-full min-h-[140px] text-slate-500">
+              <ShieldCheck size={28} className="mb-2 text-emerald-400 opacity-80" />
+              <span className="mono text-[10px] tracking-widest text-emerald-400 font-bold">WATCHLIST ARMED</span>
+              <span className="mono text-[9px] opacity-70 mt-1">
+                {watchlist.length > 0 ? `${watchlist.length} Vehicles Monitored` : "Active Hotlist Synced"} · 0 Active Hits
+              </span>
+            </div>
+          )}
+        </Panel>
+      </div>
     </div>
   );
 }
@@ -1172,6 +1517,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
         selectedDrone={selectedDroneId}
         drones={drones}
         onOpenGallery={setGalleryType}
+        effectiveDroneId={selectedDroneId || (drones[0]?.id || "")}
       />
 
       {/* ── 4. Event Timeline ── */}
@@ -1220,23 +1566,22 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
               </button>
             </div>
 
-            {/* Video placeholder */}
+            {/* Video / Snapshot viewport */}
             <div
-              className="aspect-video flex flex-col items-center justify-center"
-              style={{ background: "#040c18" }}
+              className="aspect-video flex flex-col items-center justify-center relative bg-[#040c18] overflow-hidden"
             >
-              <div
-                className="w-14 h-14 rounded-full flex items-center justify-center mb-3"
-                style={{
-                  background: "rgba(20,184,166,0.12)",
-                  border: "1px solid rgba(20,184,166,0.25)",
-                }}
-              >
-                <Play size={24} className="text-teal-400 ml-1" />
-              </div>
-              <div className="mono text-[11px] text-slate-500">Evidence Clip · {playingEvent.drone_id}</div>
-              <div className="mono text-[9px] text-slate-700 mt-1">
-                Video stream from backend not available in demo
+              {playingEvent.drone_id ? (
+                <img
+                  src={`${API}/ingest-server/frame/${encodeURIComponent(playingEvent.drone_id)}/latest`}
+                  alt="Evidence frame"
+                  className="absolute inset-0 w-full h-full object-cover opacity-90"
+                  onError={(e) => { e.target.style.display = "none"; }}
+                />
+              ) : null}
+              <div className="relative z-10 flex flex-col items-center bg-black/70 px-4 py-2.5 rounded-lg backdrop-blur-md border border-teal-500/30">
+                <Play size={20} className="text-teal-400 mb-1" />
+                <div className="mono text-[11px] text-teal-300 font-semibold">Evidence Capture · {playingEvent.drone_id}</div>
+                <div className="mono text-[9px] text-slate-400 mt-0.5">{playingEvent.event_type} · {playingEvent.zone}</div>
               </div>
             </div>
 
@@ -1273,65 +1618,11 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
 
       {/* ── Biometrics Gallery Modal ── */}
       {galleryType && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 md:p-8"
-          style={{ background: "rgba(0,0,0,0.85)", backdropFilter: "blur(6px)" }}
-          onClick={() => setGalleryType(null)}
-        >
-          <div
-            className="relative w-full max-w-5xl max-h-full rounded-2xl flex flex-col"
-            style={{
-              background: "var(--dvas-surface)",
-              border: "1px solid rgba(236,72,153,0.3)", // pink border for biometrics
-              boxShadow: "0 0 0 1px rgba(236,72,153,0.1), 0 24px 64px rgba(0,0,0,0.6)",
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            {/* Modal header */}
-            <div className="px-5 py-4 flex items-center justify-between" style={{ borderBottom: "1px solid var(--dvas-border)" }}>
-              <div className="flex items-center gap-3">
-                <Users size={18} className="text-pink-400" />
-                <div>
-                  <h2 className="text-sm font-bold text-pink-300 tracking-wide uppercase">
-                    Deduplicated {galleryType === "persons" ? "Persons" : "Faces"} Gallery
-                  </h2>
-                  <div className="mono text-[10px] text-slate-500 mt-1">Cross-jurisdictional biometric tracking</div>
-                </div>
-              </div>
-              <button
-                onClick={() => setGalleryType(null)}
-                className="w-8 h-8 rounded-lg flex items-center justify-center transition-colors hover:bg-slate-800 border border-slate-700 text-slate-300 hover:text-white"
-              >
-                <X size={16} />
-              </button>
-            </div>
-
-            {/* Gallery Grid */}
-            <div className="flex-1 overflow-y-auto p-5 dvas-scrollbar">
-              <div className={`grid gap-4 ${galleryType === "persons" ? "grid-cols-2 sm:grid-cols-3 lg:grid-cols-5" : "grid-cols-3 sm:grid-cols-4 lg:grid-cols-6"}`}>
-                {Array.from({ length: 15 }).map((_, i) => (
-                  <div key={i} className="flex flex-col rounded-lg overflow-hidden border border-slate-700/60 bg-slate-900/50 transition-transform hover:scale-105 cursor-pointer hover:border-pink-500/50">
-                    <div className={`relative ${galleryType === "persons" ? "aspect-[3/4]" : "aspect-square"}`}>
-                      {galleryType === "persons" ? (
-                        <img src={`https://images.unsplash.com/photo-${1500000000000 + i * 1000}?auto=format&fit=crop&w=300&h=400&q=80`} alt="Person Crop" className="w-full h-full object-cover opacity-80" onError={(e) => { e.target.src = "https://images.unsplash.com/photo-1511367461989-f85a21fda167?auto=format&fit=crop&w=300&h=400&q=80"; }} />
-                      ) : (
-                        <img src={`https://images.unsplash.com/photo-${1550000000000 + i * 1000}?auto=format&fit=facearea&facepad=2&w=256&h=256&q=80`} alt="Face Crop" className="w-full h-full object-cover opacity-80" onError={(e) => { e.target.src = "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=facearea&facepad=2&w=256&h=256&q=80"; }} />
-                      )}
-                      <div className="absolute inset-0 border border-pink-500/20 mix-blend-overlay"></div>
-                    </div>
-                    <div className="p-2 border-t border-slate-700/60 flex flex-col gap-1">
-                      <div className="mono font-bold text-[10px] text-slate-300">SUBJ-{8800 + i}</div>
-                      <div className="flex justify-between items-center">
-                        <span className="mono text-[9px] text-slate-500">{new Date(Date.now() - i * 360000).toLocaleTimeString()}</span>
-                        <span className="mono text-[8px] px-1 bg-slate-800 text-teal-400 rounded">DR-0{i%3 + 1}</span>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
+        <BiometricsGalleryModal
+          galleryType={galleryType}
+          onClose={() => setGalleryType(null)}
+          effectiveDroneId={selectedDroneId || (drones[0]?.id || "")}
+        />
       )}
 
       {/* ── Purge Confirmation Modal ── */}
