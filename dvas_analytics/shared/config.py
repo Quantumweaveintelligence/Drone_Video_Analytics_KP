@@ -88,6 +88,18 @@ class Config:
     LOG_LEVEL: str  = os.getenv("LOG_LEVEL", "INFO")
     LOG_JSON:  bool = os.getenv("LOG_JSON", "true").lower() == "true"
 
+    # ── Face Recognition (ArcFace) ────────────────────────────────────────
+    ARCFACE_MODEL_PATH:       str   = os.getenv("ARCFACE_MODEL_PATH", "/analytics/person/models/arcface_r100.onnx")
+    ARCFACE_MATCH_THRESHOLD:  float = float(os.getenv("ARCFACE_MATCH_THRESHOLD", "0.55"))
+    ARCFACE_QUALITY_MIN_BLUR: float = float(os.getenv("ARCFACE_QUALITY_MIN_BLUR", "50.0"))
+    ARCFACE_QUALITY_MIN_SIZE: int   = int(os.getenv("ARCFACE_QUALITY_MIN_SIZE", "30"))
+    ARCFACE_ALERT_COOLDOWN_S: int   = int(os.getenv("ARCFACE_ALERT_COOLDOWN_S", "30"))
+    ARCFACE_ENABLED:          bool  = os.getenv("ARCFACE_ENABLED", "true").lower() == "true"
+    FACE_ENHANCE_ENABLED:     bool  = os.getenv("FACE_ENHANCE_ENABLED", "true").lower() == "true"
+
+    # MinIO bucket for watchlist reference images
+    BUCKET_WATCHLIST:  str = os.getenv("BUCKET_WATCHLIST", "dvas-watchlist")
+
 
 cfg = Config()
 

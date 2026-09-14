@@ -61,6 +61,7 @@ _SERVICES = {
 _ANALYTICS_STREAMS = [
     "analytics:crowd:results",
     "analytics:person:results",
+    "analytics:person_alert:results",
     "analytics:vehicle:results",
     "analytics:anpr:results",
     "analytics:intrusion:results",

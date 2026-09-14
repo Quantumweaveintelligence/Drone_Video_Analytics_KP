@@ -29,16 +29,40 @@ import {
   Fingerprint, Clock, Copy, Database, Play, Square, Cpu,
   Zap, Power, ChevronLeft, ChevronRight, Shield,
   Search, X, Maximize2, Download, Calendar, ExternalLink,
+  Plus, Trash2, SlidersHorizontal, Check, FileCheck,
+  Bell, Volume2, VolumeX, ShieldAlert,
 } from 'lucide-react';
 import {
   useAnalyticsFetch,
   usePersonTracks, usePersonDedup, usePersonIdentities,
   useFacesGallery, usePersonCount, usePersonLive, useAnalyticsSSE,
   usePersonDedupProgress, usePersonMissionDedup,
+  usePersonWatchlist, usePersonWatchlistAlerts, usePersonAnnotationConfig,
 } from '../lib/useAnalytics';
 import { useActiveStreams } from '../hooks/useActiveStreams';
 import { useJpegPoller } from '../hooks/useJpegPoller';
 import { api } from '../lib/api';
+
+function playAlertChime() {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(880, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(440, ctx.currentTime + 0.35);
+    gain.gain.setValueAtTime(0.25, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.35);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.35);
+  } catch (e) {
+    // Autoplay restrictions
+  }
+}
 
 /* ───────────────────────────────────────────────────────────────
    HELPERS
@@ -141,15 +165,16 @@ function Panel({ title, icon: Icon, iconClass = 'text-sky-400', children, right,
    ────────────────────────────────────────────────────────────── */
 const FRAME_INTERVAL = 800;
 
-function AnnotatedPersonFeedViewer({ activeDrone, setActiveDrone, drones, streamRunning, onStartStream, onStopStream, modelActive, startingStream, activeMissionId, onNavigateTab }) {
+function AnnotatedPersonFeedViewer({ activeDrone, setActiveDrone, drones, streamRunning, onStartStream, onStopStream, modelActive, startingStream, activeMissionId, onNavigateTab, annotationConfig, onToggleAnnotation }) {
   const hasDrone = !!activeDrone;
   const [fps, setFps] = useState(0);
   const fpsRef = useRef({ count: 0, ts: Date.now() });
   const prevAnnotatedRef = useRef(null);
 
   const { streams } = useActiveStreams();
-  const droneList = streams?.length > 0
-    ? streams.map(s => ({ id: s.drone_id, ...s }))
+  const liveStreams = streams?.filter(s => s.status === 'live' || s.status === 'draining' || s.online);
+  const droneList = liveStreams?.length > 0
+    ? liveStreams.map(s => ({ id: s.drone_id, ...s }))
     : (drones?.length > 0
         ? drones.filter(d => (d.status === 'live' || d.status === 'draining') && !/^DRN-00[1-5]$/i.test(d.id || d.drone_id))
         : []);
@@ -298,6 +323,43 @@ function AnnotatedPersonFeedViewer({ activeDrone, setActiveDrone, drones, stream
         return null;
       })()}
 
+      {/* Tactical Annotation Toggle Bar */}
+      <div className="px-4 py-2 flex items-center gap-2 flex-wrap"
+        style={{ borderBottom: '1px solid var(--dvas-border)', background: 'var(--dvas-surface-2)' }}>
+        <div className="flex items-center gap-1.5 mr-1">
+          <SlidersHorizontal size={11} className="text-sky-400" />
+          <span className="mono text-[9px] font-bold text-slate-400 tracking-wider uppercase">HUD OVERLAYS</span>
+        </div>
+        {[
+          { key: 'person_boxes',     label: 'Persons',      icon: Users,         desc: 'YOLO Person Bounding Boxes' },
+          { key: 'face_boxes',       label: 'Faces',        icon: Eye,           desc: 'YOLO Face Bounding Boxes' },
+          { key: 'track_ids',        label: 'Track IDs',    icon: UserCheck,     desc: 'Unique Tracker IDs' },
+          { key: 'confidence',       label: 'Confidence',   icon: Zap,           desc: 'Detection & Match Confidence %' },
+          { key: 'watchlist_alerts', label: 'Watchlist',    icon: Shield,        desc: 'Tactical Watchlist Crosshairs & Brackets' },
+          { key: 'alert_labels',    label: 'Alert Labels', icon: AlertTriangle, desc: 'Subject Category & FIR Labels' },
+          { key: 'trajectory',      label: 'Trajectories', icon: Activity,      desc: 'Movement Path Vectors' },
+        ].map(({ key, label, icon: Icon, desc }) => {
+          const isActive = !!annotationConfig?.[key];
+          return (
+            <button
+              key={key}
+              type="button"
+              onClick={() => onToggleAnnotation && onToggleAnnotation(key)}
+              title={desc}
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded mono text-[9px] font-bold transition-all cursor-pointer ${
+                isActive
+                  ? 'bg-sky-500/20 text-sky-300 border border-sky-500/40 shadow-sm shadow-sky-500/10'
+                  : 'bg-slate-900/60 text-slate-500 border border-slate-800 hover:border-slate-700 hover:text-slate-400'
+              }`}
+            >
+              <Icon size={10} className={isActive ? 'text-sky-400' : 'text-slate-600'} />
+              <span>{label}</span>
+              <span className={`w-1.5 h-1.5 rounded-full ml-0.5 ${isActive ? 'bg-sky-400 shadow-sm shadow-sky-400' : 'bg-slate-700'}`} />
+            </button>
+          );
+        })}
+      </div>
+
       {/* Feed viewport */}
       <div className="relative bg-black flex items-center justify-center" style={{ height: 420 }}>
         {hasAnyFeed ? (
@@ -353,7 +415,7 @@ function AnnotatedPersonFeedViewer({ activeDrone, setActiveDrone, drones, stream
 /* ───────────────────────────────────────────────────────────────
    SECTION 2 — Person KPI Strip
    ────────────────────────────────────────────────────────────── */
-function PersonKPIStrip({ tracks, dedupData, countData, sseConnected, liveFaceCount, activeMissionId }) {
+function PersonKPIStrip({ tracks, dedupData, countData, sseConnected, liveFaceCount, activeMissionId, watchlistAlertCount = 0 }) {
   const tracksArr = Array.isArray(tracks) ? tracks : [];
   const totalTracked  = countData?.active_persons ?? (tracksArr.length || 0);
   const uniquePersons = dedupData?.unique_identities || dedupData?.total_unique || 0;
@@ -365,12 +427,13 @@ function PersonKPIStrip({ tracks, dedupData, countData, sseConnected, liveFaceCo
     { label: 'Persons Tracked',    value: totalTracked,                        tone: 'text-sky-400',     icon: Users,       sub: 'Active tracks (selected drone)' },
     { label: 'Unique Identities',  value: uniquePersons,                       tone: 'text-violet-400',  icon: UserCheck,   sub: 'After Re-ID deduplication' },
     { label: 'Faces Detected',     value: facesDetected,                       tone: 'text-amber-400',   icon: Fingerprint, sub: liveFaceCount ? 'Live SSE counter' : 'Total face crops stored' },
+    { label: 'Watchlist Matches',  value: watchlistAlertCount,                 tone: watchlistAlertCount > 0 ? 'text-red-400 animate-pulse' : 'text-slate-400', icon: ShieldAlert, sub: watchlistAlertCount > 0 ? 'Active suspect alerts' : 'No active alerts' },
     { label: 'Duplicates Removed', value: duplicates,                          tone: 'text-emerald-400', icon: Copy,        sub: `${dedupRate}% dedup rate` },
     { label: 'Live Stream',        value: sseConnected ? 'ON' : 'OFF',         tone: sseConnected ? 'text-emerald-400' : 'text-slate-500', icon: Radio, sub: activeMissionId ? `MSN: ${activeMissionId}` : (sseConnected ? 'Real-time SSE active' : 'Polling mode') },
   ];
 
   return (
-    <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
       {kpis.map(({ label, value, tone, icon: Icon, sub }) => (
         <div key={label} className="rounded-xl p-4 flex flex-col gap-1"
           style={{ background: 'var(--dvas-surface)', border: '1px solid var(--dvas-border)' }}>
@@ -438,19 +501,19 @@ function ActivePersonTracks({ persons, loading }) {
               onClick={() => setSelectedId(isSelected ? null : id)}
               className="flex flex-col rounded-xl overflow-hidden cursor-pointer transition-all duration-300"
               style={{
-                background: 'rgba(15,23,42,0.9)',
-                border: `1px solid ${isSelected ? '#38bdf8' : 'rgba(51,65,85,0.8)'}`,
+                background: 'var(--dvas-surface)',
+                border: `1px solid ${isSelected ? '#38bdf8' : 'var(--dvas-border)'}`,
                 transform: isSelected ? 'scale(1.04)' : 'scale(1)',
                 zIndex: isSelected ? 10 : 1,
                 filter: (isAnySelected && !isSelected) ? 'blur(2px) opacity(0.35) grayscale(40%)' : 'none',
                 boxShadow: isSelected
                   ? '0 8px 24px -4px rgba(56,189,248,0.3)'
-                  : '0 1px 4px rgba(0,0,0,0.4)',
+                  : 'var(--dvas-shadow)',
               }}>
 
               {/* ── Card Header ── */}
               <div className="flex items-center justify-between px-2.5 py-1.5"
-                style={{ background: 'rgba(30,41,59,0.75)', borderBottom: '1px solid rgba(51,65,85,0.6)' }}>
+                style={{ background: 'var(--dvas-surface-2)', borderBottom: '1px solid var(--dvas-border)' }}>
                 <span className="font-mono font-semibold text-slate-400" style={{ fontSize: 10 }}>
                   P-{String(p.tracker_id).padStart(3, '0')}
                 </span>
@@ -510,7 +573,7 @@ function ActivePersonTracks({ persons, loading }) {
 
               {/* ── Face Crop (square 1:1) ── */}
               <div className="w-full flex flex-col"
-                style={{ background: 'rgba(15,23,42,0.97)', borderTop: '1px solid rgba(51,65,85,0.5)', padding: '6px 8px' }}>
+                style={{ background: 'var(--dvas-surface)', borderTop: '1px solid var(--dvas-border)', padding: '6px 8px' }}>
                 <div className="w-full mb-1.5">
                   <span className="font-mono font-bold uppercase text-slate-500" style={{ fontSize: 8, letterSpacing: '0.08em' }}>
                     FACE CROP
@@ -544,7 +607,7 @@ function ActivePersonTracks({ persons, loading }) {
 
               {/* ── Card Footer ── */}
               <div className="flex items-center justify-between px-2.5 py-1.5"
-                style={{ background: 'rgba(30,41,59,0.5)', borderTop: '1px solid rgba(51,65,85,0.5)' }}>
+                style={{ background: 'var(--dvas-surface-2)', borderTop: '1px solid var(--dvas-border)' }}>
                 <div className="flex items-center gap-1">
                   <Clock size={9} className="text-slate-500 opacity-60" />
                   <span className="font-mono text-[9px] text-slate-500">{fmtAge(p.last_seen)}</span>
@@ -889,13 +952,13 @@ function GalleryCard({ item, i, onOpenModal, isPersonGallery, bucket }) {
       onClick={() => onOpenModal(item)}
       className="group relative flex flex-col rounded-xl overflow-hidden cursor-pointer transition-all duration-200 hover:-translate-y-1 hover:shadow-lg"
       style={{
-        background: 'rgba(15,23,42,0.9)',
-        border: '1px solid rgba(51,65,85,0.8)',
-        boxShadow: '0 1px 4px rgba(0,0,0,0.4)',
+        background: 'var(--dvas-surface)',
+        border: '1px solid var(--dvas-border)',
+        boxShadow: 'var(--dvas-shadow)',
       }}>
       {/* Header */}
       <div className="flex items-center justify-between px-2 py-1"
-        style={{ background: 'rgba(30,41,59,0.8)', borderBottom: '1px solid rgba(51,65,85,0.5)' }}>
+        style={{ background: 'var(--dvas-surface-2)', borderBottom: '1px solid var(--dvas-border)' }}>
         <span className="font-mono font-bold text-[9px]" style={{ color: accentColor }}>
           {clusterId}
         </span>
@@ -934,7 +997,7 @@ function GalleryCard({ item, i, onOpenModal, isPersonGallery, bucket }) {
       </div>
 
       {/* Caption */}
-      <div className="px-2 py-1.5 flex flex-col gap-0.5" style={{ background: 'rgba(15,23,42,0.85)' }}>
+      <div className="px-2 py-1.5 flex flex-col gap-0.5" style={{ background: 'var(--dvas-surface)' }}>
         {drone   && <span className="mono text-[9px] font-semibold truncate" style={{ color: '#94a3b8' }}>{drone}</span>}
         {msnId   && <span className="mono text-[8px] truncate" style={{ color: '#64748b' }}>{msnId}</span>}
         <div className="flex items-center justify-between mt-0.5">
@@ -1484,19 +1547,651 @@ function DeduplicationSection({ missions, dedupProgress, onDeduplicate, dedupDat
 }
 
 /* ───────────────────────────────────────────────────────────────
+   SECTION 6 — Face Recognition Watchlist & Reverse Search Components
+   ────────────────────────────────────────────────────────────── */
+
+function WatchlistAlertCard({ alert, onConfirm, onDismiss, onOpenPreview }) {
+  const categoryColors = {
+    wanted:  { bg: 'rgba(239,68,68,0.12)', border: 'rgba(239,68,68,0.35)', text: '#ef4444', badge: 'bg-red-500/20 text-red-300 border-red-500/30' },
+    missing: { bg: 'rgba(251,146,60,0.12)', border: 'rgba(251,146,60,0.35)', text: '#fb923c', badge: 'bg-orange-500/20 text-orange-300 border-orange-500/30' },
+    vip:     { bg: 'rgba(34,197,94,0.12)',  border: 'rgba(34,197,94,0.35)',  text: '#22c55e', badge: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' },
+    poi:     { bg: 'rgba(168,85,247,0.12)', border: 'rgba(168,85,247,0.35)', text: '#a855f7', badge: 'bg-purple-500/20 text-purple-300 border-purple-500/30' },
+  };
+  const cat = (alert.category || 'wanted').toLowerCase();
+  const colors = categoryColors[cat] || categoryColors.wanted;
+  const matchPct = Math.round((alert.confidence || 0) * 100);
+
+  return (
+    <div className="rounded-xl p-3.5 flex gap-3.5 transition-all relative overflow-hidden"
+      style={{ background: colors.bg, border: `1px solid ${colors.border}` }}>
+      {/* Face crop thumbnail */}
+      <div className="w-20 h-20 rounded-lg overflow-hidden shrink-0 bg-black/60 border border-slate-700/50 relative group cursor-pointer"
+        onClick={() => onOpenPreview && onOpenPreview({
+          object_key: alert.face_crop_key,
+          image_url: alert.face_crop_url,
+          frame_crop_url: alert.frame_crop_url,
+          name: alert.name,
+          category: alert.category,
+        })}>
+        {alert.face_crop_url ? (
+          <img src={toProxiedUrl(alert.face_crop_url, 'dvas-faces')} alt={alert.name} className="w-full h-full object-cover group-hover:scale-105 transition-transform" />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center text-slate-600">
+            <Eye size={22} />
+          </div>
+        )}
+        <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+          <Maximize2 size={14} className="text-white" />
+        </div>
+      </div>
+
+      {/* Details */}
+      <div className="flex-1 min-w-0 flex flex-col justify-between">
+        <div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className={`mono text-[9px] font-bold px-1.5 py-0.5 rounded border uppercase ${colors.badge}`}>
+              {cat}
+            </span>
+            <span className="mono text-[11px] font-bold text-amber-300">
+              {matchPct}% match
+            </span>
+            {alert.is_confirmed && (
+              <span className="mono text-[9px] bg-emerald-500/20 text-emerald-300 px-1.5 py-0.5 rounded border border-emerald-500/30 flex items-center gap-1">
+                <Check size={9} /> CONFIRMED
+              </span>
+            )}
+          </div>
+          <div className="mono text-sm font-bold text-white mt-1 truncate" title={alert.name}>
+            {alert.name}
+          </div>
+          <div className="mono text-[10px] text-slate-400 mt-0.5 truncate">
+            {alert.drone_id || 'Drone'} {alert.mission_id ? `· ${alert.mission_id}` : ''} · {fmtAge(alert.detected_at)}
+          </div>
+          {alert.notes && (
+            <div className="mono text-[10px] italic mt-1 px-2 py-0.5 rounded truncate" style={{ color: 'var(--dvas-text-muted)', background: 'var(--dvas-surface-2)' }}>
+              "{alert.notes}"
+            </div>
+          )}
+        </div>
+
+        {/* Section 65B indicator */}
+        <div className="mono text-[9px] text-slate-500 flex items-center gap-1 mt-1">
+          <FileCheck size={10} className="text-emerald-400" />
+          <span>Sec 65B Evidence Logged</span>
+        </div>
+      </div>
+
+      {/* Action buttons */}
+      {!alert.is_confirmed && (
+        <div className="flex flex-col justify-center gap-2 pl-2 border-l border-slate-700/40">
+          <button
+            onClick={() => onConfirm(alert.id)}
+            title="Confirm Match (Operator Verification)"
+            className="p-2 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/35 text-emerald-400 border border-emerald-500/40 transition-all cursor-pointer"
+          >
+            <CheckCircle size={15} />
+          </button>
+          <button
+            onClick={() => onDismiss(alert.id)}
+            title="Dismiss Alert (False Positive)"
+            className="p-2 rounded-lg bg-slate-800/60 hover:bg-red-500/20 text-slate-400 hover:text-red-400 border border-slate-700 hover:border-red-500/30 transition-all cursor-pointer"
+          >
+            <X size={15} />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function WatchlistCard({ entry, onRemove }) {
+  const categoryColors = {
+    wanted:  { text: '#ef4444', badge: 'bg-red-500/20 text-red-300 border-red-500/30' },
+    missing: { text: '#fb923c', badge: 'bg-orange-500/20 text-orange-300 border-orange-500/30' },
+    vip:     { text: '#22c55e', badge: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' },
+    poi:     { text: '#a855f7', badge: 'bg-purple-500/20 text-purple-300 border-purple-500/30' },
+  };
+  const cat = (entry.category || 'wanted').toLowerCase();
+  const colors = categoryColors[cat] || categoryColors.wanted;
+
+  return (
+    <div className="rounded-xl p-3 flex flex-col justify-between gap-3 relative group"
+      style={{ background: 'var(--dvas-surface-2)', border: '1px solid var(--dvas-border)' }}>
+      <div className="flex items-start gap-3">
+        {/* Photo thumbnail */}
+        <div className="w-16 h-16 rounded-lg overflow-hidden shrink-0 bg-black/50 border border-slate-700/50">
+          {entry.reference_image_url ? (
+            <img
+              src={toProxiedUrl(entry.reference_image_url, 'dvas-watchlist')}
+              alt={entry.name}
+              className="w-full h-full object-cover"
+            />
+          ) : (
+            <div className="w-full h-full flex items-center justify-center text-slate-600">
+              <Users size={20} />
+            </div>
+          )}
+        </div>
+
+        {/* Info */}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className={`mono text-[8px] font-bold px-1.5 py-0.5 rounded border uppercase ${colors.badge}`}>
+              {cat}
+            </span>
+            {entry.embedding_count > 0 && (
+              <span className="mono text-[8px] text-sky-400 bg-sky-500/10 px-1 py-0.5 rounded">
+                {entry.embedding_count} emb
+              </span>
+            )}
+          </div>
+          <div className="mono text-xs font-bold text-white mt-1 truncate" title={entry.name}>
+            {entry.name}
+          </div>
+          {entry.case_ref && (
+            <div className="mono text-[10px] text-amber-300/80 truncate mt-0.5">
+              {entry.case_ref}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {entry.description && (
+        <div className="mono text-[10px] line-clamp-2 p-1.5 rounded" style={{ color: 'var(--dvas-text-muted)', background: 'var(--dvas-surface-2)' }}>
+          {entry.description}
+        </div>
+      )}
+
+      <div className="flex items-center justify-between pt-2 border-t border-slate-800/80">
+        <span className="mono text-[9px] text-slate-500">
+          Added {fmtAge(entry.added_at)}
+        </span>
+        <button
+          onClick={() => onRemove(entry.id, entry.name)}
+          title="Remove from Watchlist"
+          className="p-1 rounded text-slate-500 hover:text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer"
+        >
+          <Trash2 size={13} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function EnrollmentModal({ isOpen, onClose, onEnrolled }) {
+  const [name, setName] = useState('');
+  const [category, setCategory] = useState('wanted');
+  const [caseRef, setCaseRef] = useState('');
+  const [description, setDescription] = useState('');
+  const [file, setFile] = useState(null);
+  const [previewUrl, setPreviewUrl] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [errorMsg, setErrorMsg] = useState(null);
+  const fileInputRef = useRef(null);
+
+  const handleFileChange = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setFile(f);
+    setPreviewUrl(URL.createObjectURL(f));
+    setErrorMsg(null);
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!name.trim()) {
+      setErrorMsg('Subject name is required');
+      return;
+    }
+    if (!file) {
+      setErrorMsg('Reference face photograph is required');
+      return;
+    }
+
+    setSubmitting(true);
+    setErrorMsg(null);
+
+    const formData = new FormData();
+    formData.append('name', name.trim());
+    formData.append('category', category);
+    if (caseRef.trim()) formData.append('case_ref', caseRef.trim());
+    if (description.trim()) formData.append('description', description.trim());
+    formData.append('image', file);
+
+    try {
+      const res = await api.post('/analytics/person/watchlist/enroll', formData);
+      if (res.data?.status === 'enrolled') {
+        onEnrolled && onEnrolled(res.data);
+        onClose();
+      } else {
+        setErrorMsg(res.data?.detail || 'Enrollment failed');
+      }
+    } catch (err) {
+      setErrorMsg(err.response?.data?.detail || err.message || 'Failed to enroll person');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm">
+      <div className="w-full max-w-lg rounded-2xl overflow-hidden shadow-2xl flex flex-col"
+        style={{ background: 'var(--dvas-surface)', border: '1px solid var(--dvas-border)' }}>
+        {/* Header */}
+        <div className="px-5 py-4 flex items-center justify-between border-b border-slate-800">
+          <div className="flex items-center gap-2">
+            <Shield className="text-amber-400" size={18} />
+            <span className="font-bold text-white text-sm tracking-wide">Enroll Person to Face Watchlist</span>
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-white transition-colors cursor-pointer">
+            <X size={18} />
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="p-5 flex flex-col gap-4">
+          {errorMsg && (
+            <div className="p-3 rounded-lg bg-red-500/15 border border-red-500/30 text-red-300 mono text-xs flex items-center gap-2">
+              <AlertTriangle size={15} className="shrink-0 text-red-400" />
+              <span>{errorMsg}</span>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {/* Photo Upload & Preview */}
+            <div className="flex flex-col gap-2">
+              <label className="mono text-[10px] text-slate-400 font-bold uppercase tracking-wider">
+                Reference Photograph *
+              </label>
+              <div
+                onClick={() => fileInputRef.current?.click()}
+                className="w-full h-44 rounded-xl border-2 border-dashed hover:border-sky-500/60 flex flex-col items-center justify-center cursor-pointer transition-colors overflow-hidden relative group"
+                style={{ background: 'var(--dvas-surface-2)', borderColor: 'var(--dvas-border)' }}
+              >
+                {previewUrl ? (
+                  <>
+                    <img src={previewUrl} alt="Preview" className="w-full h-full object-contain" />
+                    <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center mono text-xs text-sky-300 font-bold">
+                      Change Photo
+                    </div>
+                  </>
+                ) : (
+                  <div className="text-center p-3 flex flex-col items-center gap-2 text-slate-500">
+                    <Eye size={28} className="text-slate-600" />
+                    <span className="mono text-xs font-semibold text-slate-400">Click or Drag Photo</span>
+                    <span className="mono text-[9px] text-slate-600">JPEG, PNG (Clear frontal face recommended)</span>
+                  </div>
+                )}
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/jpeg,image/png,image/jpg"
+                  onChange={handleFileChange}
+                  className="hidden"
+                />
+              </div>
+            </div>
+
+            {/* Fields */}
+            <div className="flex flex-col gap-3">
+              <div>
+                <label className="mono text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">
+                  Subject Full Name *
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={name}
+                  onChange={e => setName(e.target.value)}
+                  placeholder="e.g. Ramesh Kumar"
+                  className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 text-white mono text-xs focus:outline-none focus:border-sky-500"
+                />
+              </div>
+
+              <div>
+                <label className="mono text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">
+                  Category *
+                </label>
+                <select
+                  value={category}
+                  onChange={e => setCategory(e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 text-white mono text-xs focus:outline-none focus:border-sky-500"
+                >
+                  <option value="wanted">Wanted Suspect (Red Alert)</option>
+                  <option value="missing">Missing Person (Amber Alert)</option>
+                  <option value="vip">VIP / Protected Subject (Green)</option>
+                  <option value="poi">Person of Interest (Purple)</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="mono text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">
+                  FIR / Case Reference
+                </label>
+                <input
+                  type="text"
+                  value={caseRef}
+                  onChange={e => setCaseRef(e.target.value)}
+                  placeholder="e.g. FIR/2026/EKM/912"
+                  className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 text-white mono text-xs focus:outline-none focus:border-sky-500"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <label className="mono text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">
+              Description & Surveillance Notes
+            </label>
+            <textarea
+              rows={2}
+              value={description}
+              onChange={e => setDescription(e.target.value)}
+              placeholder="Identifying features, known associates, operating district..."
+              className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 text-white mono text-xs focus:outline-none focus:border-sky-500"
+            />
+          </div>
+
+          {/* Footer Buttons */}
+          <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={submitting}
+              className="px-4 py-2 rounded-lg mono text-xs text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={submitting}
+              className="px-5 py-2 rounded-lg mono text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 flex items-center gap-2 transition-all cursor-pointer shadow-lg shadow-amber-500/20 disabled:opacity-50"
+            >
+              {submitting ? (
+                <>
+                  <RefreshCw size={13} className="animate-spin" />
+                  <span>Extracting Biometrics…</span>
+                </>
+              ) : (
+                <>
+                  <Shield size={13} />
+                  <span>Enroll Subject</span>
+                </>
+              )}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function FaceSearchPanel({ missions, onOpenPreview }) {
+  const [queryFile, setQueryFile] = useState(null);
+  const [queryPreview, setQueryPreview] = useState(null);
+  const [selectedMission, setSelectedMission] = useState('');
+  const [threshold, setThreshold] = useState(0.40);
+  const [searching, setSearching] = useState(false);
+  const [searchResults, setSearchResults] = useState(null);
+  const [searchError, setSearchError] = useState(null);
+  const fileInputRef = useRef(null);
+
+  const handleFileChange = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setQueryFile(f);
+    setQueryPreview(URL.createObjectURL(f));
+    setSearchResults(null);
+    setSearchError(null);
+  };
+
+  const handleSearch = async (e) => {
+    if (e) e.preventDefault();
+    if (!queryFile) {
+      setSearchError('Please upload a face photo to search');
+      return;
+    }
+
+    setSearching(true);
+    setSearchError(null);
+
+    const formData = new FormData();
+    formData.append('image', queryFile);
+    if (selectedMission) formData.append('mission_id', selectedMission);
+    formData.append('threshold', threshold.toString());
+    formData.append('limit', '24');
+
+    try {
+      const res = await api.post('/analytics/person/faces/search', formData);
+      setSearchResults(res.data);
+    } catch (err) {
+      setSearchError(err.response?.data?.detail || err.message || 'Face search failed');
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-4 p-4">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+        {/* Dropzone & Controls */}
+        <div className="lg:col-span-5 flex flex-col gap-3">
+          <div
+            onClick={() => fileInputRef.current?.click()}
+            className="w-full h-44 rounded-xl border-2 border-dashed hover:border-violet-500/60 flex flex-col items-center justify-center cursor-pointer transition-colors overflow-hidden relative group"
+            style={{ background: 'var(--dvas-surface-2)', borderColor: 'var(--dvas-border)' }}
+          >
+            {queryPreview ? (
+              <>
+                <img src={queryPreview} alt="Query Face" className="w-full h-full object-contain" />
+                <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center mono text-xs text-violet-300 font-bold">
+                  Change Photo
+                </div>
+              </>
+            ) : (
+              <div className="text-center p-3 flex flex-col items-center gap-2 text-slate-500">
+                <Search size={28} className="text-violet-400/60" />
+                <span className="mono text-xs font-semibold" style={{ color: 'var(--dvas-text-muted)' }}>Upload Target Face Photo</span>
+                <span className="mono text-[9px]" style={{ color: 'var(--dvas-text-dim)' }}>Searches drone video recordings database</span>
+              </div>
+            )}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/jpeg,image/png,image/jpg"
+              onChange={handleFileChange}
+              className="hidden"
+            />
+          </div>
+
+          {/* Search Scope & Threshold Controls */}
+          <div className="flex flex-col gap-2.5 p-3 rounded-xl" style={{ background: 'var(--dvas-surface-2)', border: '1px solid var(--dvas-border)' }}>
+            <div>
+              <label className="mono text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">
+                Search Scope
+              </label>
+              <select
+                value={selectedMission}
+                onChange={e => setSelectedMission(e.target.value)}
+                className="w-full px-3 py-1.5 rounded-lg mono text-xs focus:outline-none focus:border-violet-500"
+                style={{ background: 'var(--dvas-surface)', border: '1px solid var(--dvas-border)', color: 'var(--dvas-text)' }}
+              >
+                <option value="">Universal Search (All Drone Missions)</option>
+                {missions?.map(m => {
+                  const mId = typeof m === 'string' ? m : m.mission_id;
+                  return (
+                    <option key={mId} value={mId}>
+                      Mission: {mId}
+                    </option>
+                  );
+                })}
+              </select>
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between mono text-[10px] text-slate-400 font-bold mb-1">
+                <span className="uppercase tracking-wider">Similarity Match Threshold</span>
+                <span className="text-violet-300 font-bold">{Math.round(threshold * 100)}%</span>
+              </div>
+              <input
+                type="range"
+                min="0.20"
+                max="0.80"
+                step="0.05"
+                value={threshold}
+                onChange={e => setThreshold(parseFloat(e.target.value))}
+                className="w-full accent-violet-500 cursor-pointer"
+              />
+              <div className="flex justify-between mono text-[8px] text-slate-600 mt-0.5">
+                <span>Broad (20%)</span>
+                <span>Standard (40%)</span>
+                <span>Strict (80%)</span>
+              </div>
+            </div>
+
+            <button
+              onClick={handleSearch}
+              disabled={searching || !queryFile}
+              className="w-full py-2 px-4 rounded-lg mono text-xs font-bold bg-violet-600 hover:bg-violet-500 flex items-center justify-center gap-2 transition-all cursor-pointer shadow-lg shadow-violet-600/20 disabled:opacity-40 disabled:cursor-not-allowed mt-1"
+              style={{ color: '#ffffff' }}
+            >
+              {searching ? (
+                <>
+                  <RefreshCw size={13} className="animate-spin" />
+                  <span>Searching for matches…</span>
+                </>
+              ) : (
+                <>
+                  <Search size={13} />
+                  <span>Run Reverse Biometric Search</span>
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+
+        {/* Results Grid */}
+        <div className="lg:col-span-7 flex flex-col gap-3">
+          {searchError && (
+            <div className="p-3 rounded-lg bg-red-500/15 border border-red-500/30 text-red-300 mono text-xs flex items-center gap-2">
+              <AlertTriangle size={15} className="shrink-0 text-red-400" />
+              <span>{searchError}</span>
+            </div>
+          )}
+
+          {searchResults && (
+            <div className="flex items-center justify-between p-2.5 rounded-lg" style={{ background: 'var(--dvas-surface-2)', border: '1px solid var(--dvas-border)' }}>
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                <span className="mono text-xs font-bold" style={{ color: 'var(--dvas-text)' }}>
+                  {searchResults.count} Matches Found
+                </span>
+                <span className="mono text-[10px] text-slate-400">
+                  (Scanned {searchResults.total_scanned ?? 'all'} faces across {searchResults.search_scope})
+                </span>
+              </div>
+            </div>
+          )}
+
+          {searchResults?.results?.length > 0 ? (
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 max-h-[460px] overflow-y-auto pr-1">
+              {searchResults.results.map((r, idx) => {
+                const simPct = Math.round(r.similarity * 100);
+                const scoreColor = simPct >= 70 ? 'text-emerald-400 border-emerald-500/30 bg-emerald-500/15'
+                  : simPct >= 50 ? 'text-amber-400 border-amber-500/30 bg-amber-500/15'
+                  : 'text-sky-400 border-sky-500/30 bg-sky-500/15';
+
+                return (
+                  <div key={r.id || idx}
+                    onClick={() => onOpenPreview && onOpenPreview({
+                      image_url: r.image_url,
+                      object_key: r.object_key,
+                      person_image_url: r.person_image_url,
+                      drone_id: r.drone_id,
+                      mission_id: r.mission_id,
+                      created_at: r.created_at,
+                    })}
+                    className="rounded-xl p-2.5 flex flex-col gap-2 cursor-pointer transition-all hover:border-violet-500/50 group"
+                    style={{ background: 'var(--dvas-surface-2)', border: '1px solid var(--dvas-border)' }}>
+                    <div className="w-full h-28 rounded-lg overflow-hidden relative" style={{ background: 'var(--dvas-surface-2)' }}>
+                      {r.image_url ? (
+                        <img src={toProxiedUrl(r.image_url, 'dvas-faces')} alt="Match" className="w-full h-full object-contain group-hover:scale-105 transition-transform" />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center text-slate-600">
+                          <Eye size={20} />
+                        </div>
+                      )}
+                      <div className="absolute top-1.5 right-1.5">
+                        <span className={`mono text-[9px] font-bold px-1.5 py-0.5 rounded border ${scoreColor}`}>
+                          {simPct}%
+                        </span>
+                      </div>
+                      <div className="absolute bottom-1.5 left-1.5">
+                        <span className="mono text-[8px] bg-black/80 text-violet-300 px-1.5 py-0.5 rounded uppercase">
+                          {r.matched_on || 'ArcFace'}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-col gap-0.5">
+                      <span className="mono text-[10px] font-bold text-white truncate">
+                        {r.drone_id || 'Drone'}
+                      </span>
+                      <span className="mono text-[9px] text-slate-400 truncate">
+                        {r.mission_id || 'Mission'}
+                      </span>
+                      <span className="mono text-[8px] text-slate-500">
+                        {fmtIST(r.created_at)}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : searchResults ? (
+            <div className="p-8 text-center text-slate-500 mono text-xs flex flex-col items-center gap-2">
+              <Search size={32} className="opacity-30 text-slate-600" />
+              <span>No matching faces found above {Math.round(threshold * 100)}% threshold.</span>
+              <span className="text-[10px] text-slate-600">Try lowering the threshold slider or choosing universal search scope.</span>
+            </div>
+          ) : (
+            <div className="h-64 rounded-xl border border-dashed border-slate-800 flex flex-col items-center justify-center text-slate-600 mono text-xs gap-2">
+              <Fingerprint size={36} className="opacity-30" />
+              <span>Upload a reference photo on the left to initiate search</span>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ───────────────────────────────────────────────────────────────
    MAIN EXPORT
    ────────────────────────────────────────────────────────────── */
 export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
   const [activeDrone, setActiveDrone] = useState(null);
 
+  // Active streams hook
+  const { streams: activeStreams, streamMap } = useActiveStreams();
+  const liveStreams = activeStreams?.filter(s => s.status === 'live' || s.status === 'draining' || s.online);
+  const validDrones = liveStreams?.length > 0
+    ? liveStreams.map(s => ({ id: s.drone_id, ...s }))
+    : (drones?.length > 0
+        ? drones.filter(d => (d.status === 'live' || d.status === 'draining') && !/^DRN-00[1-5]$/i.test(d.id || d.drone_id))
+        : []);
+
   useEffect(() => {
-    if (!drones || drones.length === 0) return;
-    const currentStillValid = drones.some(d => d.id === activeDrone);
-    if (!activeDrone || !currentStillValid) {
-      const onlineDrone = drones.find(d => d.status !== 'offline');
-      setActiveDrone(onlineDrone ? onlineDrone.id : drones[0].id);
+    if (!validDrones || validDrones.length === 0) {
+      setActiveDrone(null);
+      return;
     }
-  }, [drones]); // eslint-disable-line react-hooks/exhaustive-deps
+    const currentStillValid = validDrones.some(d => d.id === activeDrone);
+    if (!activeDrone || !currentStillValid) {
+      setActiveDrone(validDrones[0].id);
+    }
+  }, [validDrones, activeDrone]);
 
   const [reidLoading,         setReidLoading]         = useState(false);
   const [sseWindow,           setSseWindow]           = useState([]);
@@ -1505,19 +2200,59 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
   const [personMissionFilter, setPersonMissionFilter] = useState('');
   const [faceMissionFilter,   setFaceMissionFilter]   = useState('');
 
+  // ── Face Recognition & Watchlist State ─────────────────────────────────────
+  // Defaults: only persons, faces, track_ids, confidence enabled; others enabled by user
+  const [annotationConfig, setAnnotationConfig] = useState({
+    person_boxes:     true,
+    face_boxes:       true,
+    track_ids:        true,
+    confidence:       true,
+    watchlist_alerts: false,
+    alert_labels:     false,
+    trajectory:       false,
+  });
+  const [showEnrollModal, setShowEnrollModal] = useState(false);
+  const [previewModalItem, setPreviewModalItem] = useState(null);
+  const [alertsList, setAlertsList] = useState([]);
+  const [watchlistCategoryFilter, setWatchlistCategoryFilter] = useState('');
+
   // Health
   const { data: healthData } = useAnalyticsFetch('/analytics/person/health', 5000);
   const streamRunning  = healthData?.stream_running ?? false;
   const modelActive    = healthData?.model_loaded  ?? false;
   const activeMissions = healthData?.active_missions ?? {};
 
-  // Active mission from stream map
-  const { streams: activeStreams, streamMap } = useActiveStreams();
+  // Annotation config sync from backend
+  const { data: serverAnnotationConfig } = usePersonAnnotationConfig(10000);
+  useEffect(() => {
+    if (serverAnnotationConfig && typeof serverAnnotationConfig === 'object' && !serverAnnotationConfig.error) {
+      setAnnotationConfig(prev => ({ ...prev, ...serverAnnotationConfig }));
+    }
+  }, [serverAnnotationConfig]);
+
+  const handleToggleAnnotation = useCallback(async (key) => {
+    const updated = { ...annotationConfig, [key]: !annotationConfig[key] };
+    setAnnotationConfig(updated);
+    try {
+      await api.put('/analytics/person/annotation/config', { [key]: updated[key] });
+    } catch (err) {
+      console.error('Failed to update annotation config:', err);
+    }
+  }, [annotationConfig]);
+
+  // Active mission from stream map or health data (only for live/draining drones)
   const activeMissionId = (() => {
     if (activeDrone && streamMap.has(activeDrone)) {
-      return streamMap.get(activeDrone)?.mission_id || null;
+      const s = streamMap.get(activeDrone);
+      if (s?.status === 'live' || s?.status === 'draining' || s?.online) {
+        return s.mission_id || null;
+      }
     }
-    return activeMissions[activeDrone] || null;
+    const isLive = validDrones.some(d => d.id === activeDrone);
+    if (isLive && activeMissions[activeDrone]) {
+      return activeMissions[activeDrone];
+    }
+    return null;
   })();
 
   // Data hooks
@@ -1527,6 +2262,23 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
   const { data: facesData,      loading: facesLoading }    = useFacesGallery(activeDrone || '', 10000, faceMissionFilter);
   const { data: countData }                                 = usePersonCount(activeDrone || '', 5000);
   const { data: liveData,       loading: liveLoading }     = usePersonLive(activeDrone || '', 3000);
+
+  // Watchlist & Alerts hooks
+  const { data: watchlistData, loading: watchlistLoading, refetch: refreshWatchlist } = usePersonWatchlist(watchlistCategoryFilter, 15000);
+  const { data: alertsData } = usePersonWatchlistAlerts(activeDrone || '', 20, 5000);
+
+  useEffect(() => {
+    const arr = Array.isArray(alertsData?.alerts) ? alertsData.alerts
+      : Array.isArray(alertsData) ? alertsData : [];
+    if (arr.length > 0) {
+      setAlertsList(prev => {
+        const validItems = arr.filter(a => !a.notes || !a.notes.toLowerCase().includes('dismiss'));
+        const existingIds = new Set(prev.map(a => a.id));
+        const newItems = validItems.filter(a => !existingIds.has(a.id));
+        return [...newItems, ...prev].slice(0, 30);
+      });
+    }
+  }, [alertsData]);
 
   // Mission dedup
   const { data: dedupProgressData }  = usePersonDedupProgress(2000);
@@ -1540,8 +2292,32 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
     }
   }, []);
 
-  // SSE
+  // SSE handler with real-time watchlist match support & audio chime
   const handleSSEEvent = useCallback((evt) => {
+    if (evt?.service === 'person_alert' || evt?.data?.type === 'watchlist_match') {
+      const alertData = evt.data;
+      if (alertData) {
+        setAlertsList(prev => [
+          {
+            id: alertData.id || `alert-${Date.now()}`,
+            watchlist_id: alertData.watchlist_id,
+            name: alertData.name,
+            category: alertData.category,
+            confidence: alertData.similarity ?? alertData.confidence ?? 0.8,
+            drone_id: alertData.drone_id,
+            mission_id: alertData.mission_id,
+            tracker_id: alertData.tracker_id,
+            face_crop_url: alertData.face_crop_key ? `/api/minio/image?bucket=dvas-faces&key=${encodeURIComponent(alertData.face_crop_key)}` : null,
+            face_crop_key: alertData.face_crop_key,
+            detected_at: alertData.ts || new Date().toISOString(),
+            is_confirmed: false,
+          },
+          ...prev.filter(a => a.watchlist_id !== alertData.watchlist_id || Date.now() - new Date(a.detected_at).getTime() > 10000),
+        ].slice(0, 30));
+        playAlertChime();
+      }
+      return;
+    }
     if (evt?.service !== 'person') return;
     if (activeDrone && evt.drone_id && evt.drone_id !== activeDrone) return;
     const pCount = evt.data?.person_count ?? evt.data?.count ?? 0;
@@ -1552,6 +2328,34 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
   }, [activeDrone]);
 
   const { connected: sseConnected } = useAnalyticsSSE(handleSSEEvent);
+
+  const handleConfirmAlert = useCallback(async (alertId) => {
+    try {
+      await api.post(`/analytics/person/watchlist/alerts/${alertId}/confirm`, { notes: 'Verified by Operator' });
+      setAlertsList(prev => prev.map(a => a.id === alertId ? { ...a, is_confirmed: true, notes: 'Verified by Operator' } : a));
+    } catch (err) {
+      console.error('Failed to confirm alert:', err);
+    }
+  }, []);
+
+  const handleDismissAlert = useCallback(async (alertId) => {
+    try {
+      await api.post(`/analytics/person/watchlist/alerts/${alertId}/dismiss`, { notes: 'Dismissed by Operator' });
+      setAlertsList(prev => prev.filter(a => a.id !== alertId));
+    } catch (err) {
+      console.error('Failed to dismiss alert:', err);
+    }
+  }, []);
+
+  const handleRemoveWatchlist = useCallback(async (id, name) => {
+    if (!window.confirm(`Are you sure you want to remove "${name}" from the watchlist?`)) return;
+    try {
+      await api.delete(`/analytics/person/watchlist/${id}`);
+      refreshWatchlist && refreshWatchlist();
+    } catch (err) {
+      console.error('Failed to remove from watchlist:', err);
+    }
+  }, [refreshWatchlist]);
 
   // Stream start/stop
   const handleStartStream = useCallback(async () => {
@@ -1628,6 +2432,8 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
         startingStream={startingStream}
         activeMissionId={activeMissionId}
         onNavigateTab={onNavigateTab}
+        annotationConfig={annotationConfig}
+        onToggleAnnotation={handleToggleAnnotation}
       />
 
       {/* KPI STRIP */}
@@ -1638,7 +2444,44 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
         sseConnected={sseConnected}
         liveFaceCount={liveFaceCount}
         activeMissionId={activeMissionId}
+        watchlistAlertCount={alertsList.filter(a => !a.is_confirmed).length}
       />
+
+      {/* WATCHLIST ALERTS PANEL (Real-Time match notifications) */}
+      {alertsList?.length > 0 && (
+        <Panel
+          title="⚠️ Watchlist Matches (Real-Time)"
+          icon={ShieldAlert}
+          iconClass="text-red-400"
+          badge={`${alertsList.length} alerts`}
+          right={
+            <div className="flex items-center gap-3">
+              <span className="mono text-[10px] text-red-400 font-bold animate-pulse flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-red-400 shadow-sm shadow-red-400" />
+                LIVE MATCH
+              </span>
+              <button
+                onClick={() => setAlertsList([])}
+                className="mono text-[10px] text-slate-500 hover:text-slate-400 transition-colors cursor-pointer"
+              >
+                Dismiss All
+              </button>
+            </div>
+          }
+        >
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 p-3">
+            {alertsList.slice(0, 9).map(alert => (
+              <WatchlistAlertCard
+                key={alert.id}
+                alert={alert}
+                onConfirm={handleConfirmAlert}
+                onDismiss={handleDismissAlert}
+                onOpenPreview={setPreviewModalItem}
+              />
+            ))}
+          </div>
+        </Panel>
+      )}
 
       {/* ACTIVE PERSON TRACK CARDS + DETECTION CHART */}
       <div className="grid grid-cols-12 gap-4">
@@ -1667,6 +2510,71 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
           </Panel>
         </div>
       </div>
+
+      {/* FACE WATCHLIST MANAGEMENT PANEL */}
+      <Panel
+        title="Face Watchlist (Enrolled Persons)"
+        icon={Shield}
+        iconClass="text-amber-400"
+        badge={watchlistData?.length > 0 ? `${watchlistData.length} enrolled` : null}
+        right={
+          <div className="flex items-center gap-2">
+            <select
+              value={watchlistCategoryFilter}
+              onChange={e => setWatchlistCategoryFilter(e.target.value)}
+              className="mono text-[10px] px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-300 focus:outline-none cursor-pointer"
+            >
+              <option value="">All Categories</option>
+              <option value="wanted">Wanted</option>
+              <option value="missing">Missing</option>
+              <option value="vip">VIP</option>
+              <option value="poi">POI</option>
+            </select>
+            <button
+              onClick={() => setShowEnrollModal(true)}
+              className="mono text-[10px] font-bold px-3 py-1 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 transition-all flex items-center gap-1.5 cursor-pointer shadow-sm shadow-amber-500/10"
+            >
+              <Plus size={11} />
+              <span>Enroll Person</span>
+            </button>
+          </div>
+        }
+      >
+        {watchlistData && watchlistData.length > 0 ? (
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3 p-3">
+            {watchlistData.map(entry => (
+              <WatchlistCard
+                key={entry.id}
+                entry={entry}
+                onRemove={handleRemoveWatchlist}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="p-8 text-center text-slate-500 mono text-xs flex flex-col items-center gap-2">
+            <Shield size={32} className="opacity-30 text-amber-500/60" />
+            <span>No enrolled subjects in the Face Watchlist.</span>
+            <span className="text-[10px] text-slate-600">Click "+ Enroll Person" to enroll suspects with reference photographs.</span>
+          </div>
+        )}
+      </Panel>
+
+      {/* REVERSE FACE SEARCH */}
+      <Panel
+        title="Reverse Face Search (Biometric Search)"
+        icon={Search}
+        iconClass="text-violet-400"
+        right={
+          <span className="mono text-[10px]" style={{ color: 'var(--dvas-text-dim)' }}>
+            ArcFace 512-dim + ResNet50 2048-dim
+          </span>
+        }
+      >
+        <FaceSearchPanel
+          missions={missionDedupData?.missions}
+          onOpenPreview={setPreviewModalItem}
+        />
+      </Panel>
 
       {/* PERSON IDENTITIES GALLERY (deduplicated, MinIO stored) */}
       <Panel
@@ -1744,6 +2652,25 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
           reidLoading={reidLoading}
         />
       </Panel>
+
+      {/* ENROLLMENT MODAL */}
+      <EnrollmentModal
+        isOpen={showEnrollModal}
+        onClose={() => setShowEnrollModal(false)}
+        onEnrolled={() => {
+          refreshWatchlist && refreshWatchlist();
+        }}
+      />
+
+      {/* FULL-RESOLUTION PREVIEW MODAL */}
+      {previewModalItem && (
+        <GalleryPreviewModal
+          item={previewModalItem}
+          isPersonGallery={false}
+          bucket="dvas-faces"
+          onClose={() => setPreviewModalItem(null)}
+        />
+      )}
 
     </div>
   );

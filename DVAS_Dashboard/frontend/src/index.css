@@ -164,6 +164,7 @@ html, body, #root {
 .bg-slate-800 { background-color: var(--dvas-elev) !important; }
 .bg-slate-800\/40 { background-color: color-mix(in srgb, var(--dvas-elev) 60%, transparent) !important; }
 .bg-slate-800\/60 { background-color: color-mix(in srgb, var(--dvas-elev) 80%, transparent) !important; }
+.bg-slate-900\/60 { background-color: color-mix(in srgb, var(--dvas-surface) 85%, transparent) !important; }
 .bg-slate-900\/70 { background-color: color-mix(in srgb, var(--dvas-surface) 90%, transparent) !important; }
 .bg-slate-950\/50,
 .bg-slate-950\/60,

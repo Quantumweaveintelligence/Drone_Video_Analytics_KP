@@ -29,16 +29,21 @@ export function useAnalyticsFetch(path, intervalMs = 5000, enabled = true) {
   const [loading, setLoading] = useState(true);
   const [error, setError]   = useState(null);
   const mountedRef = useRef(true);
+  const abortRef = useRef(null);
 
   const doFetch = useCallback(async () => {
     if (!enabled || !path) return;
     try {
-      const res = await api.get(path);
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+      const res = await api.get(path, { signal: controller.signal });
       if (mountedRef.current) {
         setData(res.data);
         setError(null);
       }
     } catch (err) {
+      if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
       if (mountedRef.current) {
         setError(err?.response?.data?.detail || err.message || 'Fetch error');
       }
@@ -54,6 +59,7 @@ export function useAnalyticsFetch(path, intervalMs = 5000, enabled = true) {
     if (!intervalMs) return;
     const id = setInterval(doFetch, intervalMs);
     return () => {
+      abortRef.current?.abort();
       mountedRef.current = false;
       clearInterval(id);
     };
@@ -168,7 +174,8 @@ export function usePersonIdentities(droneId = '', intervalMs = 10000, missionId 
   let path = '/analytics/person/identities?limit=60';
   if (missionId) {
     path += `&mission_id=${encodeURIComponent(missionId)}`;
-  } else if (droneId) {
+  }
+  if (droneId && !missionId) {
     path += `&drone_id=${encodeURIComponent(droneId)}`;
   }
   return useAnalyticsFetch(path, intervalMs);
@@ -178,7 +185,8 @@ export function useFacesGallery(droneId = '', intervalMs = 10000, missionId = ''
   let path = '/analytics/person/gallery?limit=60';
   if (missionId) {
     path += `&mission_id=${encodeURIComponent(missionId)}`;
-  } else if (droneId) {
+  }
+  if (droneId && !missionId) {
     path += `&drone_id=${encodeURIComponent(droneId)}`;
   }
   return useAnalyticsFetch(path, intervalMs);
@@ -313,3 +321,23 @@ export function useIntrusionAnalytics(missionId = '', intervalMs = 30000) {
     : null;
   return useAnalyticsFetch(path, intervalMs, !!missionId);
 }
+
+// ── Face Recognition Watchlist hooks ─────────────────────────────────────────
+export function usePersonWatchlist(category = '', intervalMs = 15000) {
+  const path = category
+    ? `/analytics/person/watchlist?category=${encodeURIComponent(category)}`
+    : '/analytics/person/watchlist';
+  return useAnalyticsFetch(path, intervalMs);
+}
+
+export function usePersonWatchlistAlerts(droneId = '', limit = 20, intervalMs = 5000) {
+  const parts = [`limit=${limit}`];
+  if (droneId) parts.push(`drone_id=${encodeURIComponent(droneId)}`);
+  const path = `/analytics/person/watchlist/alerts?${parts.join('&')}`;
+  return useAnalyticsFetch(path, intervalMs);
+}
+
+export function usePersonAnnotationConfig(intervalMs = 10000) {
+  return useAnalyticsFetch('/analytics/person/annotation/config', intervalMs);
+}
+

@@ -69,7 +69,7 @@ _frames_processed = 0
 
 @app.on_event("startup")
 async def startup():
-    global analyzer
+    global analyzer, _stream_running, _stream_task
     await get_pool()
     for drone_id in cfg.DRONE_IDS:
         await ensure_drone(drone_id)
@@ -79,6 +79,9 @@ async def startup():
         alert_threshold=cfg.CROWD_ALERT_THRESHOLD,
     )
     log.info("Crowd Analyzer ready. Model: %s, Device: %s", MODEL_PATH, analyzer.device)
+    _stream_running = True
+    _stream_task = asyncio.create_task(_stream_loop())
+    log.info("Crowd stream loop auto-started for drones: %s", cfg.DRONE_IDS)
 
 
 @app.on_event("shutdown")

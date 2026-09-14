@@ -144,8 +144,6 @@ async def crowd_annotated_frame(user: dict = Depends(get_current_user), drone_id
     Proxy the latest heatmap-overlaid JPEG frame from crowd-analyzer.
     Used by the Crowd Analytics live feed. Returns binary JPEG — NOT JSON.
     """
-    if user["role"] == "drone_operator":
-        raise HTTPException(403, "Not permitted")
     try:
         params = {"drone_id": drone_id} if drone_id else {}
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -448,8 +446,6 @@ async def person_annotated_frame(user: dict = Depends(get_current_user), drone_i
     from person-analyzer. Used by the Person Tracking live feed.
     Returns binary JPEG — NOT JSON.
     """
-    if user["role"] == "drone_operator":
-        raise HTTPException(403, "Not permitted")
     try:
         params = {"drone_id": drone_id} if drone_id else {}
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -480,6 +476,322 @@ async def person_live_buffer(user: dict = Depends(get_current_user), drone_id: s
     if drone_id:
         url += f"?drone_id={drone_id}"
     return await _analytics_get(url)
+
+
+# ── Person Watchlist (Phase 6) ────────────────────────────────────────────────
+
+@router.get("/analytics/person/watchlist")
+async def person_watchlist(
+    user: dict = Depends(get_current_user),
+    category: str = "",
+    limit: int = 100,
+    offset: int = 0,
+):
+    """Proxy: list all active person watchlist entries."""
+    url = f"{PERSON_URL}/watchlist?limit={limit}&offset={offset}"
+    if category:
+        url += f"&category={quote(category)}"
+    return await _analytics_get(url)
+
+
+@router.get("/analytics/person/watchlist/alerts")
+async def person_watchlist_alerts(
+    user: dict = Depends(get_current_user),
+    limit: int = 50,
+    offset: int = 0,
+    mission_id: str = "",
+    drone_id: str = "",
+    category: str = "",
+):
+    """Proxy: get recent watchlist match alerts."""
+    url = f"{PERSON_URL}/watchlist/alerts?limit={limit}&offset={offset}"
+    if mission_id:
+        url += f"&mission_id={quote(mission_id)}"
+    if drone_id:
+        url += f"&drone_id={quote(drone_id)}"
+    if category:
+        url += f"&category={quote(category)}"
+    return await _analytics_get(url)
+
+
+@router.post("/analytics/person/watchlist/enroll")
+async def person_watchlist_enroll(
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Proxy multipart form upload for watchlist enrollment.
+    Forwards the raw multipart body to person-analyzer.
+    """
+    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer", "admin", "super_admin"):
+        raise HTTPException(403, "Not permitted")
+
+    body = await request.body()
+    content_type = request.headers.get("content-type", "")
+    headers = dict(_service_headers())
+    if content_type:
+        headers["content-type"] = content_type
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                f"{PERSON_URL}/watchlist/enroll",
+                content=body,
+                headers=headers,
+            )
+    except httpx.ConnectError:
+        raise HTTPException(503, "Person analytics service unavailable")
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Person analytics request timed out")
+    except Exception as exc:
+        raise HTTPException(502, f"Person analytics proxy error: {str(exc)}")
+
+    if r.status_code == 200:
+        try:
+            await write_audit_v2(
+                actor=user,
+                action="watchlist_enroll",
+                target_id=r.json().get("watchlist_id"),
+                target_type="person_watchlist",
+                details=f"Enrolled subject {r.json().get('name')} ({r.json().get('category')})",
+                status="success",
+                source_endpoint="POST /api/analytics/person/watchlist/enroll",
+                request=request,
+            )
+        except Exception as audit_err:
+            logger.warning("Audit write warning: %s", audit_err)
+
+    return Response(
+        content=r.content,
+        status_code=r.status_code,
+        media_type="application/json",
+    )
+
+
+@router.get("/analytics/person/watchlist/{watchlist_id}")
+async def person_watchlist_detail(
+    watchlist_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Proxy: get details of a specific watchlist entry."""
+    return await _analytics_get(f"{PERSON_URL}/watchlist/{watchlist_id}")
+
+
+@router.put("/analytics/person/watchlist/{watchlist_id}")
+async def person_watchlist_update(
+    watchlist_id: str,
+    request: Request,
+    user: dict = Depends(get_current_user),
+    body: dict = {},
+):
+    """Proxy: update mutable fields of a watchlist entry."""
+    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer", "admin", "super_admin"):
+        raise HTTPException(403, "Not permitted")
+    result = await _analytics_put(f"{PERSON_URL}/watchlist/{watchlist_id}", body)
+    _audit_status = "error" if isinstance(result, dict) and result.get("error") else "success"
+    try:
+        await write_audit_v2(
+            actor=user,
+            action="watchlist_update",
+            target_id=watchlist_id,
+            target_type="person_watchlist",
+            details=f"Updated watchlist entry {watchlist_id}: {list(body.keys())}",
+            status=_audit_status,
+            source_endpoint=f"PUT /api/analytics/person/watchlist/{watchlist_id}",
+            request=request,
+        )
+    except Exception as audit_err:
+        logger.warning("Audit write warning: %s", audit_err)
+    return result
+
+
+@router.delete("/analytics/person/watchlist/{watchlist_id}")
+async def person_watchlist_remove(
+    watchlist_id: str,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """Proxy: soft-delete a person from the watchlist."""
+    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer", "admin", "super_admin"):
+        raise HTTPException(403, "Not permitted")
+    result = await _analytics_delete(f"{PERSON_URL}/watchlist/{watchlist_id}")
+    _audit_status = "error" if isinstance(result, dict) and result.get("error") else "success"
+    try:
+        await write_audit_v2(
+            actor=user,
+            action="watchlist_remove",
+            target_id=watchlist_id,
+            target_type="person_watchlist",
+            details=f"Deactivated watchlist entry {watchlist_id}",
+            status=_audit_status,
+            source_endpoint=f"DELETE /api/analytics/person/watchlist/{watchlist_id}",
+            request=request,
+        )
+    except Exception as audit_err:
+        logger.warning("Audit write warning: %s", audit_err)
+    return result
+
+
+@router.post("/analytics/person/watchlist/alerts/{alert_id}/confirm")
+async def person_watchlist_alert_confirm(
+    alert_id: str,
+    request: Request,
+    user: dict = Depends(get_current_user),
+    body: dict = {},
+):
+    """Proxy: confirm a watchlist alert."""
+    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer", "admin", "super_admin", "analyst"):
+        raise HTTPException(403, "Not permitted")
+    notes = body.get("notes") or ""
+    result = await _analytics_post(
+        f"{PERSON_URL}/watchlist/alerts/{alert_id}/confirm?notes={quote(notes)}",
+        {},
+    )
+    _audit_status = "error" if isinstance(result, dict) and result.get("error") else "success"
+    try:
+        await write_audit_v2(
+            actor=user,
+            action="watchlist_alert_confirm",
+            target_id=alert_id,
+            target_type="person_watchlist_alert",
+            details=f"Confirmed alert {alert_id}: {notes}",
+            status=_audit_status,
+            source_endpoint=f"POST /api/analytics/person/watchlist/alerts/{alert_id}/confirm",
+            request=request,
+        )
+    except Exception as audit_err:
+        logger.warning("Audit write warning: %s", audit_err)
+    return result
+
+
+@router.post("/analytics/person/watchlist/alerts/{alert_id}/dismiss")
+async def person_watchlist_alert_dismiss(
+    alert_id: str,
+    request: Request,
+    user: dict = Depends(get_current_user),
+    body: dict = {},
+):
+    """Proxy: dismiss a watchlist alert."""
+    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer", "admin", "super_admin", "analyst"):
+        raise HTTPException(403, "Not permitted")
+    notes = body.get("notes") or ""
+    result = await _analytics_post(
+        f"{PERSON_URL}/watchlist/alerts/{alert_id}/dismiss?notes={quote(notes)}",
+        {},
+    )
+    _audit_status = "error" if isinstance(result, dict) and result.get("error") else "success"
+    try:
+        await write_audit_v2(
+            actor=user,
+            action="watchlist_alert_dismiss",
+            target_id=alert_id,
+            target_type="person_watchlist_alert",
+            details=f"Dismissed alert {alert_id}: {notes}",
+            status=_audit_status,
+            source_endpoint=f"POST /api/analytics/person/watchlist/alerts/{alert_id}/dismiss",
+            request=request,
+        )
+    except Exception as audit_err:
+        logger.warning("Audit write warning: %s", audit_err)
+    return result
+
+
+@router.post("/analytics/person/watchlist/gallery/reload")
+async def person_watchlist_gallery_reload(
+    user: dict = Depends(get_current_user),
+):
+    """Proxy: force reload in-memory gallery matrix."""
+    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer", "admin", "super_admin"):
+        raise HTTPException(403, "Admin or supervisor only")
+    return await _analytics_post(f"{PERSON_URL}/watchlist/gallery/reload", {})
+
+
+# ── Annotation Config (Phase 6) ──────────────────────────────────────────────
+
+@router.get("/analytics/person/annotation/config")
+async def person_annotation_config_get(
+    user: dict = Depends(get_current_user),
+):
+    """Proxy: get HUD annotation toggles."""
+    return await _analytics_get(f"{PERSON_URL}/annotation/config")
+
+
+@router.put("/analytics/person/annotation/config")
+async def person_annotation_config_set(
+    request: Request,
+    user: dict = Depends(get_current_user),
+    body: dict = {},
+):
+    """Proxy: update HUD annotation toggles."""
+    if user["role"] not in ("drone_operator", "control_room_officer", "senior_officer", "system_administrator", "admin", "super_admin", "analyst"):
+        raise HTTPException(403, "Not permitted")
+    result = await _analytics_put(f"{PERSON_URL}/annotation/config", body)
+    _audit_status = "error" if isinstance(result, dict) and result.get("error") else "success"
+    try:
+        await write_audit_v2(
+            actor=user,
+            action="annotation_config_update",
+            target_type="annotation_config",
+            details=f"Updated annotation toggles: {list(body.keys())}",
+            status=_audit_status,
+            source_endpoint="PUT /api/analytics/person/annotation/config",
+            request=request,
+        )
+    except Exception as audit_err:
+        logger.warning("Audit write warning: %s", audit_err)
+    return result
+
+
+# ── Reverse Face Search (Phase 6) ────────────────────────────────────────────
+
+@router.post("/analytics/person/faces/search")
+async def person_face_search(
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Proxy multipart form upload for reverse face search.
+    Forwards query photo, mission_id, limit, and threshold to person-analyzer.
+    """
+
+    body = await request.body()
+    content_type = request.headers.get("content-type", "")
+    headers = dict(_service_headers())
+    if content_type:
+        headers["content-type"] = content_type
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                f"{PERSON_URL}/faces/search",
+                content=body,
+                headers=headers,
+            )
+    except httpx.ConnectError:
+        raise HTTPException(503, "Person analytics service unavailable")
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Person analytics request timed out")
+    except Exception as exc:
+        raise HTTPException(502, f"Person analytics proxy error: {str(exc)}")
+
+    try:
+        await write_audit_v2(
+            actor=user,
+            action="face_search",
+            target_type="face_search",
+            details=f"Reverse face search executed (status {r.status_code})",
+            status="success" if r.status_code == 200 else "error",
+            source_endpoint="POST /api/analytics/person/faces/search",
+            request=request,
+        )
+    except Exception as audit_err:
+        logger.warning("Audit write warning: %s", audit_err)
+
+    return Response(
+        content=r.content,
+        status_code=r.status_code,
+        media_type="application/json",
+    )
 
 
 # ── Vehicle Analytics ─────────────────────────────────────────────────────────
@@ -553,8 +865,6 @@ async def vehicle_annotated_frame(user: dict = Depends(get_current_user), drone_
     from vehicle-analyzer. Used by the dashboard live feed window.
     Returns binary JPEG — NOT JSON.
     """
-    if user["role"] == "drone_operator":
-        raise HTTPException(403, "Not permitted")
     try:
         params = {"drone_id": drone_id} if drone_id else {}
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -584,8 +894,6 @@ async def anpr_annotated_frame(user: dict = Depends(get_current_user), drone_id:
     from anpr-analyzer. Used by the ANPR window in the dashboard.
     Returns binary JPEG — NOT JSON.
     """
-    if user["role"] == "drone_operator":
-        raise HTTPException(403, "Not permitted")
     try:
         params = {"drone_id": drone_id} if drone_id else {}
         async with httpx.AsyncClient(timeout=5.0) as client:

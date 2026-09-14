@@ -502,7 +502,7 @@ async def minio_image_proxy(bucket: str, key: str, _user=Depends(get_current_use
         raise HTTPException(status_code=400, detail="bucket and key are required")
 
     # Security: only allow known buckets
-    ALLOWED_BUCKETS = {"dvas-plates", "dvas-vehicles", "dvas-evidence", "dvas-faces", "dvas-heatmaps", "dvas-intrusion"}
+    ALLOWED_BUCKETS = {"dvas-plates", "dvas-vehicles", "dvas-evidence", "dvas-faces", "dvas-heatmaps", "dvas-intrusion", "dvas-watchlist"}
     if bucket not in ALLOWED_BUCKETS:
         raise HTTPException(status_code=403, detail=f"Bucket '{bucket}' not allowed")
 

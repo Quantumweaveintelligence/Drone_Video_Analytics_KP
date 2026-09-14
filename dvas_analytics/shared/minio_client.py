@@ -8,6 +8,7 @@ import asyncio
 import io
 import logging
 import time
+import uuid
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -65,6 +66,7 @@ async def ensure_all_buckets() -> None:
         cfg.BUCKET_PLATES,
         cfg.BUCKET_HEATMAPS,
         cfg.BUCKET_VEHICLES,
+        cfg.BUCKET_WATCHLIST,
     ]:
         await ensure_bucket(bucket)
 
@@ -155,6 +157,6 @@ def make_key(prefix: str, drone_id: str, suffix: str, mission_id: str = "") -> s
     Fallback: {prefix}/{drone_id}/{timestamp_ms}/{suffix}
     Example: plates/MSN-20260813-2009-02-DONE/1722245000123/plate_KL01AB1234.jpg
     """
-    ts_ms = int(time.time() * 1000)
+    ts_ms = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
     folder = mission_id if mission_id else drone_id
     return f"{prefix}/{folder}/{ts_ms}/{suffix}"

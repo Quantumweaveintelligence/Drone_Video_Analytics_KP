@@ -268,6 +268,7 @@ async def scan_active_stream_drones() -> List[str]:
     """
     Scans Valkey for keys matching `drone:frames:*` and extracts active drone_id strings.
     Allows microservices to dynamically consume streams published under any drone ID.
+    Only includes streams that contain frames (xlen > 0).
     """
     try:
         client = get_client()
@@ -284,7 +285,14 @@ async def scan_active_stream_drones() -> List[str]:
             key_str = key.decode() if isinstance(key, bytes) else key
             parts = key_str.split(":", 2)
             if len(parts) >= 3 and parts[2]:
-                drone_ids.append(parts[2])
+                did = parts[2]
+                try:
+                    # xlen is an integer query — completely safe from binary decoding errors
+                    length = await client.xlen(key)
+                    if length > 0:
+                        drone_ids.append(did)
+                except Exception:
+                    drone_ids.append(did)
         return drone_ids
     except Exception as exc:
         log.warning("Failed to scan active stream drones from Valkey: %s", exc)

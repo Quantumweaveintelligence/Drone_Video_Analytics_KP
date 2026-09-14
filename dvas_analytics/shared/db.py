@@ -6,6 +6,7 @@ All functions use a shared connection pool.
 import json
 import logging
 import uuid
+from datetime import datetime
 from typing import Dict, List, Optional, Any
 
 import asyncpg
@@ -74,28 +75,12 @@ async def upsert_track(
     """
     await ensure_drone(drone_id)
     pool = await get_pool()
-    track_id = str(uuid.uuid4())
     if tracker_id is not None:
-        row = await pool.fetchrow(
-            """
-            INSERT INTO tracks (track_id, drone_id, track_type, first_seen, last_seen,
-                                metadata, mission_id_str)
-            VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb, $7)
-            ON CONFLICT DO NOTHING
-            RETURNING track_id::text
-            """,
-            track_id, drone_id, track_type, first_seen, last_seen,
-            json.dumps({"tracker_id": tracker_id}),
-            mission_id,
-        )
-        if row:
-            return str(row["track_id"])
-        # Already exists — fetch it and update mission_id_str if now available
         if mission_id:
             existing = await pool.fetchrow(
                 """
                 SELECT track_id::text FROM tracks
-                WHERE drone_id=$1 AND track_type=$2
+                WHERE drone_id = $1 AND track_type = $2
                   AND metadata->>'tracker_id' = $3
                   AND mission_id_str = $4
                 ORDER BY first_seen DESC LIMIT 1
@@ -106,25 +91,42 @@ async def upsert_track(
             existing = await pool.fetchrow(
                 """
                 SELECT track_id::text FROM tracks
-                WHERE drone_id=$1 AND track_type=$2
+                WHERE drone_id = $1 AND track_type = $2
                   AND metadata->>'tracker_id' = $3
+                  AND last_seen > now() - interval '30 minutes'
                 ORDER BY first_seen DESC LIMIT 1
                 """,
                 drone_id, track_type, str(tracker_id),
             )
 
         if existing:
-            # Update last_seen and mission_id_str
             await pool.execute(
                 """
-                UPDATE tracks SET last_seen=$1,
+                UPDATE tracks 
+                SET last_seen = $1,
                     mission_id_str = COALESCE(mission_id_str, $2)
-                WHERE track_id=$3::uuid
+                WHERE track_id = $3::uuid
                 """,
                 last_seen, mission_id, existing["track_id"],
             )
             return existing["track_id"]
-    # Plain insert
+
+        # Track does not exist yet — insert new track
+        new_track_id = str(uuid.uuid4())
+        await pool.execute(
+            """
+            INSERT INTO tracks (track_id, drone_id, track_type, first_seen, last_seen,
+                                metadata, mission_id_str)
+            VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb, $7)
+            """,
+            new_track_id, drone_id, track_type, first_seen, last_seen,
+            json.dumps({"tracker_id": tracker_id}),
+            mission_id,
+        )
+        return new_track_id
+
+    # Plain insert (no tracker_id)
+    track_id = str(uuid.uuid4())
     await pool.execute(
         """
         INSERT INTO tracks (track_id, drone_id, track_type, first_seen, last_seen, mission_id_str)
@@ -547,16 +549,18 @@ async def write_face_embedding(
     object_key: Optional[str] = None,
     mission_id: Optional[str] = None,
     person_object_key: Optional[str] = None,
+    arcface_embedding: Optional[List[float]] = None,
 ) -> str:
     from shared.crypto import encrypt_vector
     pool = await get_pool()
     emb_id = str(uuid.uuid4())
     encrypted_emb = encrypt_vector(embedding)
+    encrypted_arcface = encrypt_vector(arcface_embedding) if arcface_embedding else None
     await pool.execute(
         """
         INSERT INTO face_embeddings
-            (id, track_id, image_path, encrypted_embedding, drone_id, object_key, mission_id, person_object_key, created_at)
-        VALUES ($1::uuid, $2::uuid, $3, $4::bytea, $5, $6, $7, $8, now())
+            (id, track_id, image_path, encrypted_embedding, drone_id, object_key, mission_id, person_object_key, arcface_embedding, created_at)
+        VALUES ($1::uuid, $2::uuid, $3, $4::bytea, $5, $6, $7, $8, $9::bytea, now())
         """,
         emb_id,
         track_id,
@@ -566,6 +570,7 @@ async def write_face_embedding(
         object_key,
         mission_id,
         person_object_key,
+        encrypted_arcface,
     )
     return emb_id
 
@@ -575,10 +580,11 @@ async def get_all_face_embeddings() -> List[Dict]:
     pool = await get_pool()
     rows = await pool.fetch(
         """
-        SELECT id, track_id, image_path, encrypted_embedding, drone_id, cluster_id,
+        SELECT id, track_id, image_path, encrypted_embedding, arcface_embedding, drone_id, cluster_id,
                is_duplicate, object_key, person_object_key, mission_id, created_at
         FROM face_embeddings
-        ORDER BY created_at
+        ORDER BY created_at DESC
+        LIMIT 50000
         """
     )
     results = []
@@ -589,6 +595,11 @@ async def get_all_face_embeddings() -> List[Dict]:
             d["embedding"] = decrypt_vector(raw)
         else:
             d["embedding"] = []
+        raw_af = d.pop("arcface_embedding", None)
+        if raw_af:
+            d["arcface_embedding"] = decrypt_vector(raw_af)
+        else:
+            d["arcface_embedding"] = None
         results.append(d)
     return results
 
@@ -599,7 +610,7 @@ async def get_face_embeddings_by_mission(mission_id: str) -> List[Dict]:
     pool = await get_pool()
     rows = await pool.fetch(
         """
-        SELECT id, track_id, image_path, encrypted_embedding, drone_id, cluster_id,
+        SELECT id, track_id, image_path, encrypted_embedding, arcface_embedding, drone_id, cluster_id,
                is_duplicate, object_key, person_object_key, mission_id, created_at
         FROM face_embeddings
         WHERE mission_id = $1
@@ -615,6 +626,11 @@ async def get_face_embeddings_by_mission(mission_id: str) -> List[Dict]:
             d["embedding"] = decrypt_vector(raw)
         else:
             d["embedding"] = []
+        raw_af = d.pop("arcface_embedding", None)
+        if raw_af:
+            d["arcface_embedding"] = decrypt_vector(raw_af)
+        else:
+            d["arcface_embedding"] = None
         results.append(d)
     return results
 
@@ -716,7 +732,8 @@ async def get_all_person_embeddings() -> List[Dict]:
         SELECT id, track_id, tracker_id, image_path, encrypted_embedding, drone_id, cluster_id,
                is_duplicate, object_key, mission_id, sharpness_score, created_at
         FROM person_embeddings
-        ORDER BY created_at
+        ORDER BY created_at DESC
+        LIMIT 50000
         """
     )
     results = []
@@ -943,11 +960,26 @@ async def get_person_identities(
     )
     results = [dict(r) for r in rows]
 
-    # If querying by mission_id and person_identities has fewer rows or is missing,
-    # fall back to person_embeddings directly to guarantee 100% data visibility
-    if mission_id and len(results) == 0:
+    # If person_identities has 0 rows for the filter, fall back to person_embeddings
+    # directly to guarantee 100% data visibility for all previous and current missions
+    if len(results) == 0:
+        conds = ["p.object_key IS NOT NULL"]
+        p_params = []
+        p_idx = 1
+        if mission_id:
+            conds.append(f"p.mission_id = ${p_idx}")
+            p_params.append(mission_id)
+            p_idx += 1
+        elif drone_id:
+            conds.append(f"p.drone_id = ${p_idx}")
+            p_params.append(drone_id)
+            p_idx += 1
+        p_params.append(limit)
+
+        # First attempt: deduplicated rows
+        w_dedup = " AND ".join(conds + ["p.is_duplicate = false"])
         emb_rows = await pool.fetch(
-            """
+            f"""
             SELECT 
                 p.id::text AS identity_id,
                 COALESCE(p.cluster_id, 0) AS cluster_id,
@@ -964,13 +996,37 @@ async def get_person_identities(
                 p.created_at AS last_seen,
                 p.created_at
             FROM person_embeddings p
-            WHERE p.mission_id = $1 AND p.is_duplicate = false AND p.object_key IS NOT NULL
+            WHERE {w_dedup}
             ORDER BY p.created_at DESC
-            LIMIT $2
+            LIMIT ${p_idx}
             """,
-            mission_id, limit,
+            *p_params,
         )
         results = [dict(r) for r in emb_rows]
+
+        # Second attempt: if no is_duplicate=false rows exist, load all detected crops
+        if len(results) == 0:
+            w_all = " AND ".join(conds)
+            emb_rows = await pool.fetch(
+                f"""
+                SELECT 
+                    p.id::text AS identity_id,
+                    COALESCE(p.cluster_id, 0) AS cluster_id,
+                    NULL AS best_image_key,
+                    p.object_key AS best_person_image_key,
+                    p.drone_id,
+                    p.mission_id,
+                    1 AS embedding_count,
+                    p.created_at AS last_seen,
+                    p.created_at
+                FROM person_embeddings p
+                WHERE {w_all}
+                ORDER BY p.created_at DESC
+                LIMIT ${p_idx}
+                """,
+                *p_params,
+            )
+            results = [dict(r) for r in emb_rows]
 
     return results
 
@@ -1000,3 +1056,352 @@ async def write_evidence_frame(
         checksum_sha256, bucket,
     )
     return frame_id
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Person Watchlist & Alerts
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def add_to_person_watchlist(
+    name: str,
+    category: str = "wanted",
+    case_ref: Optional[str] = None,
+    description: Optional[str] = None,
+    reference_image_key: Optional[str] = None,
+    reference_image_sha256: Optional[str] = None,
+    added_by: Optional[str] = None,
+    expires_at: Optional[datetime] = None,
+) -> str:
+    """Insert or reactivate a person in the face watchlist. Returns watchlist entry ID."""
+    pool = await get_pool()
+    watchlist_id = str(uuid.uuid4())
+    await pool.execute(
+        """
+        INSERT INTO person_watchlist (
+            id, name, category, case_ref, description,
+            reference_image_key, reference_image_sha256,
+            added_by, added_at, updated_at, expires_at, is_active
+        )
+        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8::uuid, now(), now(), $9, true)
+        """,
+        watchlist_id,
+        name.strip(),
+        category.strip().lower(),
+        case_ref.strip() if case_ref else None,
+        description.strip() if description else None,
+        reference_image_key,
+        reference_image_sha256,
+        added_by,
+        expires_at,
+    )
+    return watchlist_id
+
+
+async def get_person_watchlist(
+    category: Optional[str] = None,
+    is_active: bool = True,
+    limit: int = 100,
+    offset: int = 0,
+) -> List[Dict]:
+    """Get watchlist entries, optionally filtered by category and active status."""
+    pool = await get_pool()
+    conditions = ["is_active = $1"]
+    params: List = [is_active]
+    idx = 2
+
+    if category:
+        conditions.append(f"LOWER(category) = ${idx}")
+        params.append(category.strip().lower())
+        idx += 1
+
+    where = "WHERE " + " AND ".join(conditions)
+    params.extend([limit, offset])
+
+    rows = await pool.fetch(
+        f"""
+        SELECT pw.*,
+               COUNT(we.id) AS embedding_count
+        FROM person_watchlist pw
+        LEFT JOIN watchlist_embeddings we ON we.watchlist_id = pw.id
+        {where}
+        GROUP BY pw.id
+        ORDER BY pw.added_at DESC
+        LIMIT ${idx} OFFSET ${idx + 1}
+        """,
+        *params,
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_person_watchlist_entry(watchlist_id: str) -> Optional[Dict]:
+    """Get a single watchlist entry by ID with embedding count."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """
+        SELECT pw.*,
+               COUNT(we.id) AS embedding_count
+        FROM person_watchlist pw
+        LEFT JOIN watchlist_embeddings we ON we.watchlist_id = pw.id
+        WHERE pw.id = $1::uuid
+        GROUP BY pw.id
+        """,
+        watchlist_id,
+    )
+    return dict(row) if row else None
+
+
+async def update_person_watchlist(watchlist_id: str, **fields) -> None:
+    """Update mutable fields of a watchlist entry."""
+    pool = await get_pool()
+    allowed = {"name", "category", "case_ref", "description", "expires_at", "is_active", "reference_image_key", "reference_image_sha256"}
+    set_clauses = []
+    params: List = [watchlist_id]
+    idx = 2
+
+    for k, v in fields.items():
+        if k in allowed:
+            set_clauses.append(f"{k} = ${idx}")
+            params.append(v)
+            idx += 1
+
+    if not set_clauses:
+        return
+
+    set_clauses.append("updated_at = now()")
+    sql = f"UPDATE person_watchlist SET {', '.join(set_clauses)} WHERE id = $1::uuid"
+    await pool.execute(sql, *params)
+
+
+async def remove_from_person_watchlist(watchlist_id: str) -> None:
+    """Soft-delete a watchlist entry (deactivate)."""
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE person_watchlist SET is_active = false, updated_at = now() WHERE id = $1::uuid",
+        watchlist_id,
+    )
+
+
+async def delete_person_watchlist(watchlist_id: str) -> None:
+    """Permanently delete a watchlist entry and all cascade associations."""
+    pool = await get_pool()
+    await pool.execute(
+        "DELETE FROM person_watchlist WHERE id = $1::uuid",
+        watchlist_id,
+    )
+
+
+async def write_watchlist_embedding(
+    watchlist_id: str,
+    embedding: List[float],
+    augmentation_type: str = "original",
+    quality_score: float = 0.0,
+) -> str:
+    """Encrypt and store an ArcFace 512-dim embedding for a watchlist entry."""
+    from shared.crypto import encrypt_vector
+    pool = await get_pool()
+    emb_id = str(uuid.uuid4())
+    encrypted_emb = encrypt_vector(embedding)
+    await pool.execute(
+        """
+        INSERT INTO watchlist_embeddings
+            (id, watchlist_id, encrypted_embedding, augmentation_type, quality_score, created_at)
+        VALUES ($1::uuid, $2::uuid, $3::bytea, $4, $5, now())
+        """,
+        emb_id, watchlist_id, encrypted_emb, augmentation_type, quality_score,
+    )
+    return emb_id
+
+
+async def get_watchlist_embeddings(watchlist_id: str) -> List[Dict]:
+    """Retrieve all decrypted embeddings for a watchlist entry."""
+    from shared.crypto import decrypt_vector
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT id, watchlist_id, encrypted_embedding, augmentation_type, quality_score, created_at
+        FROM watchlist_embeddings
+        WHERE watchlist_id = $1::uuid
+        ORDER BY created_at ASC
+        """,
+        watchlist_id,
+    )
+    results = []
+    for r in rows:
+        d = dict(r)
+        raw = d.pop("encrypted_embedding", None)
+        if raw:
+            d["embedding"] = decrypt_vector(raw, expected_dim=512)
+        else:
+            d["embedding"] = []
+        results.append(d)
+    return results
+
+
+async def get_all_active_watchlist_with_embeddings() -> List[Dict]:
+    """
+    Fetch all active watchlist entries along with their decrypted embeddings.
+    Used by WatchlistMatcher for atomic double-buffered in-memory gallery loading.
+    """
+    from shared.crypto import decrypt_vector
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT pw.id AS watchlist_id, pw.name, pw.category, pw.case_ref,
+               we.id AS embedding_id, we.encrypted_embedding, we.augmentation_type, we.quality_score
+        FROM person_watchlist pw
+        JOIN watchlist_embeddings we ON we.watchlist_id = pw.id
+        WHERE pw.is_active = true
+          AND (pw.expires_at IS NULL OR pw.expires_at > now())
+        ORDER BY pw.id, we.created_at ASC
+        """
+    )
+    entries: Dict[str, Dict] = {}
+    for r in rows:
+        wid = str(r["watchlist_id"])
+        if wid not in entries:
+            entries[wid] = {
+                "watchlist_id": wid,
+                "name": r["name"],
+                "category": r["category"],
+                "case_ref": r["case_ref"],
+                "embeddings": [],
+            }
+        raw = r["encrypted_embedding"]
+        if raw:
+            try:
+                emb = decrypt_vector(raw, expected_dim=512)
+                entries[wid]["embeddings"].append({
+                    "embedding_id": str(r["embedding_id"]),
+                    "embedding": emb,
+                    "augmentation_type": r["augmentation_type"],
+                    "quality_score": r["quality_score"],
+                })
+            except Exception as exc:
+                log.warning("Failed to decrypt watchlist embedding %s: %s", r["embedding_id"], exc)
+    return list(entries.values())
+
+
+async def write_person_watchlist_alert(
+    watchlist_id: str,
+    name: str,
+    category: str,
+    confidence: float,
+    drone_id: Optional[str] = None,
+    mission_id: Optional[str] = None,
+    tracker_id: Optional[int] = None,
+    face_crop_key: Optional[str] = None,
+    frame_crop_key: Optional[str] = None,
+    face_crop_sha256: Optional[str] = None,
+    frame_sha256: Optional[str] = None,
+    evidence_packet_key: Optional[str] = None,
+    frame_ts: Optional[datetime] = None,
+) -> str:
+    """Record a watchlist match alert with Section 65B evidence chain fields."""
+    pool = await get_pool()
+    alert_id = str(uuid.uuid4())
+    await pool.execute(
+        """
+        INSERT INTO person_watchlist_alerts (
+            id, watchlist_id, name, category, drone_id, mission_id, tracker_id,
+            confidence, face_crop_key, frame_crop_key, face_crop_sha256, frame_sha256,
+            evidence_packet_key, detected_at, frame_ts, is_confirmed
+        )
+        VALUES (
+            $1::uuid, $2::uuid, $3, $4, $5, $6, $7,
+            $8, $9, $10, $11, $12,
+            $13, now(), $14, false
+        )
+        """,
+        alert_id, watchlist_id, name, category, drone_id, mission_id, tracker_id,
+        confidence, face_crop_key, frame_crop_key, face_crop_sha256, frame_sha256,
+        evidence_packet_key, frame_ts,
+    )
+    return alert_id
+
+
+async def get_person_watchlist_alerts(
+    limit: int = 50,
+    offset: int = 0,
+    mission_id: Optional[str] = None,
+    drone_id: Optional[str] = None,
+    category: Optional[str] = None,
+    is_confirmed: Optional[bool] = None,
+) -> List[Dict]:
+    """Retrieve recent watchlist alerts with optional filtering."""
+    pool = await get_pool()
+    conditions = []
+    params: List = []
+    idx = 1
+
+    if mission_id:
+        conditions.append(f"pwa.mission_id = ${idx}")
+        params.append(mission_id)
+        idx += 1
+    if drone_id:
+        conditions.append(f"pwa.drone_id = ${idx}")
+        params.append(drone_id)
+        idx += 1
+    if category:
+        conditions.append(f"LOWER(pwa.category) = ${idx}")
+        params.append(category.strip().lower())
+        idx += 1
+    if is_confirmed is not None:
+        conditions.append(f"pwa.is_confirmed = ${idx}")
+        params.append(is_confirmed)
+        idx += 1
+    # Exclude dismissed alerts by default
+    conditions.append("COALESCE(pwa.is_dismissed, false) = false AND (pwa.notes IS NULL OR LOWER(pwa.notes) NOT LIKE '%dismiss%')")
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.extend([min(limit, 200), offset])
+
+    rows = await pool.fetch(
+        f"""
+        SELECT pwa.*,
+               pw.case_ref, pw.description AS suspect_notes, pw.reference_image_key
+        FROM person_watchlist_alerts pwa
+        LEFT JOIN person_watchlist pw ON pw.id = pwa.watchlist_id
+        {where}
+        ORDER BY pwa.detected_at DESC
+        LIMIT ${idx} OFFSET ${idx + 1}
+        """,
+        *params,
+    )
+    return [dict(r) for r in rows]
+
+
+async def confirm_watchlist_alert(
+    alert_id: str,
+    user_id: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> None:
+    """Confirm a watchlist match alert."""
+    pool = await get_pool()
+    await pool.execute(
+        """
+        UPDATE person_watchlist_alerts
+        SET is_confirmed = true,
+            confirmed_by = $2::uuid,
+            confirmed_at = now(),
+            notes = COALESCE($3, notes)
+        WHERE id = $1::uuid
+        """,
+        alert_id, user_id, notes,
+    )
+
+
+async def dismiss_watchlist_alert(alert_id: str, notes: Optional[str] = None) -> None:
+    """Dismiss a false-positive alert."""
+    pool = await get_pool()
+    await pool.execute(
+        """
+        UPDATE person_watchlist_alerts
+        SET is_confirmed = false,
+            is_dismissed = true,
+            dismissed_at = now(),
+            notes = COALESCE($2, 'Dismissed by operator')
+        WHERE id = $1::uuid
+        """,
+        alert_id, notes,
+    )
+
