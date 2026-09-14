@@ -136,8 +136,6 @@ async def list_evidence(
     offset: int = 0,
     user: dict = Depends(get_current_user)
 ):
-    if user["role"] == "drone_operator":
-        raise HTTPException(403, "Not permitted")
     f = scope_filter_for(user)
     if "__deny__" in f:
         raise HTTPException(403, "Not permitted")
@@ -146,6 +144,10 @@ async def list_evidence(
         stmt = _apply_scope_to_query(stmt, Evidence, f)
         if stmt is None:
             raise HTTPException(403, "Not permitted")
+        
+        # If drone operator, scope to their mission scope if defined
+        if user["role"] == "drone_operator" and user.get("mission_scope"):
+            stmt = stmt.where(Evidence.mission_id.in_(user["mission_scope"]))
         
         if drone_id:
             stmt = stmt.where(Evidence.drone_id == drone_id)
@@ -160,7 +162,12 @@ async def list_evidence(
         if legal_hold_only:
             stmt = stmt.where(Evidence.legal_hold == True)
         if search:
-            stmt = stmt.where(Evidence.label.ilike(f"%{search}%"))
+            stmt = stmt.where(or_(
+                Evidence.label.ilike(f"%{search}%"),
+                Evidence.id.ilike(f"%{search}%"),
+                Evidence.mission_id.ilike(f"%{search}%"),
+                Evidence.drone_id.ilike(f"%{search}%"),
+            ))
         
         count_stmt = select(func.count()).select_from(stmt.subquery())
         total = await session.scalar(count_stmt)
@@ -324,6 +331,39 @@ async def direct_export(
         request=request
     )
     return doc
+
+
+@router.delete("/evidence/{evidence_id}")
+async def delete_evidence(
+    evidence_id: str,
+    user: dict = Depends(get_current_user),
+    request: Request = None,
+):
+    async with async_session_factory() as session:
+        result = await session.execute(select(Evidence).where(Evidence.id == evidence_id))
+        ev_obj = result.scalar_one_or_none()
+        if not ev_obj:
+            raise HTTPException(404, "Evidence not found")
+        if ev_obj.legal_hold:
+            raise HTTPException(400, "Cannot delete evidence under active legal hold")
+        
+        ev_dict = _row_to_dict(ev_obj)
+        await session.delete(ev_obj)
+        await session.commit()
+
+    await write_audit_v2(
+        actor=user,
+        action="evidence_delete",
+        target=evidence_id,
+        target_type="evidence",
+        target_id=evidence_id,
+        details=f"Evidence deleted: {ev_dict.get('label', '')}",
+        before_values=ev_dict,
+        after_values=None,
+        source_endpoint="DELETE /api/evidence/{id}",
+        request=request,
+    )
+    return {"ok": True, "deleted_id": evidence_id}
 
 
 @router.get("/exports")

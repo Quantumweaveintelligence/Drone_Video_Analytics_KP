@@ -154,6 +154,12 @@ async def ack_frames(drone_id: str, group: str, *message_ids):
 
 async def publish_confirmed_event(event: Dict[str, Any]) -> None:
     """Publish a confirmed event to drone:events:confirmed stream."""
+    # Ensure default context windows and identifiers for edge buffer extraction
+    event.setdefault("pre_event_s", 15)
+    event.setdefault("post_event_s", 15)
+    if "mission_id" not in event or not event["mission_id"]:
+        event["mission_id"] = "M-DEFAULT"
+
     client = get_client()
     await client.xadd(
         "drone:events:confirmed",
@@ -161,7 +167,7 @@ async def publish_confirmed_event(event: Dict[str, Any]) -> None:
         maxlen=10000,
         approximate=True,
     )
-    log.debug("Published confirmed event: %s", event.get("event_type"))
+    log.debug("Published confirmed event: %s for drone %s", event.get("event_type"), event.get("drone_id"))
 
 
 async def publish_analytics_result(service: str, result: Dict[str, Any]) -> None:

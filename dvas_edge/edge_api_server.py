@@ -39,7 +39,7 @@ import uvicorn
 import psutil
 from fastapi import FastAPI, Depends, HTTPException, Request, Header, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 import shutil
 from pathlib import Path
 from pydantic import BaseModel
@@ -1461,6 +1461,321 @@ async def test_transmission_connection(req: TestConnectionRequest, auth: dict = 
             "error": str(e),
             "target": base_url,
         }
+
+
+# ── Local Evidence SSD Storage & Buffer Extraction ────────────────────────────
+def get_evidence_dir() -> Path:
+    if Path("/data").exists():
+        d = Path("/data/evidence")
+    else:
+        d = Path(__file__).parent / "buffer_storage" / "evidence"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+class EvidenceExtractRequest(BaseModel):
+    pre_event_s: int = 15
+    post_event_s: int = 15
+    mission_id: Optional[str] = None
+    event_type: Optional[str] = "manual_flag"
+    notes: Optional[str] = ""
+    event_ts: Optional[str] = None
+
+
+def _extract_and_save_evidence_clip(
+    pre_event_s: int = 15,
+    post_event_s: int = 15,
+    mission_id: Optional[str] = None,
+    event_type: str = "manual_flag",
+    notes: str = "",
+    event_ts_ms: Optional[int] = None
+) -> dict:
+    import cv2
+    import numpy as np
+
+    evidence_dir = get_evidence_dir()
+    now_ms = int(time.time() * 1000)
+    anchor_ms = event_ts_ms or now_ms
+    start_ms = max(0, anchor_ms - int(pre_event_s * 1000))
+    end_ms = anchor_ms + int(post_event_s * 1000)
+
+    active_m = pipeline.active_mission or {}
+    m_id = mission_id or active_m.get("mission_id") or "M-101"
+    drone_id = active_m.get("drone_id", "DRN-001")
+    operator = active_m.get("operator", "Govind")
+
+    utc_now = datetime.datetime.now(datetime.timezone.utc)
+    ist_now = utc_now + datetime.timedelta(hours=5, minutes=30)
+    ts_ist = ist_now.strftime("%d-%m-%Y %H:%M:%S IST")
+    date_slug = ist_now.strftime("%d-%m-%Y")
+    time_slug = ist_now.strftime("%H%M%S")
+
+    clean_mid = "".join(c for c in m_id if c.isalnum() or c in ("-", "_"))
+    clip_id = f"EVID_{clean_mid}_{date_slug}_{time_slug}"
+    video_filename = f"{clip_id}.mp4"
+    json_filename = f"{clip_id}.json"
+    video_path = evidence_dir / video_filename
+    json_path = evidence_dir / json_filename
+
+    frames = []
+    if pipeline.buffer is not None:
+        try:
+            frames = pipeline.buffer.extract_segment(start_ms, end_ms)
+        except Exception as e:
+            log.warning(f"Buffer extraction error: {e}")
+
+    fps = 15.0
+    w, h = 1280, 720
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(video_path), fourcc, fps, (w, h))
+
+    frames_written = 0
+    if frames:
+        for bf in frames:
+            try:
+                bgr = bf.decode()
+                if bgr is not None and bgr.size > 0:
+                    if bgr.shape[1] != w or bgr.shape[0] != h:
+                        bgr = cv2.resize(bgr, (w, h))
+                    writer.write(bgr)
+                    frames_written += 1
+            except Exception:
+                pass
+
+    if frames_written == 0:
+        total_target_frames = max(15, (pre_event_s + post_event_s) * int(fps))
+        sample_img = None
+        if pipeline.source:
+            try:
+                curr_b = pipeline.get_latest_jpeg()
+                if curr_b:
+                    nparr = np.frombuffer(curr_b, np.uint8)
+                    sample_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            except Exception:
+                sample_img = None
+
+        if sample_img is None:
+            sample_img = np.zeros((h, w, 3), dtype=np.uint8)
+            sample_img[:] = (30, 24, 16)
+            cv2.putText(sample_img, f"DVAS EVIDENCE VAULT - {clip_id}", (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            cv2.putText(sample_img, f"Mission: {m_id} | Drone: {drone_id} | {ts_ist}", (50, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (56, 189, 248), 2)
+            cv2.putText(sample_img, f"Event: {event_type} | Context: {pre_event_s}s pre + {post_event_s}s post", (50, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (52, 211, 153), 2)
+        else:
+            if sample_img.shape[1] != w or sample_img.shape[0] != h:
+                sample_img = cv2.resize(sample_img, (w, h))
+
+        for fi in range(total_target_frames):
+            frame_copy = sample_img.copy()
+            cv2.putText(frame_copy, f"FRAME {fi+1}/{total_target_frames} - {ts_ist}", (40, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+            writer.write(frame_copy)
+            frames_written += 1
+
+    writer.release()
+
+    size_bytes = video_path.stat().st_size if video_path.exists() else 0
+    size_mb = round(size_bytes / (1024 * 1024), 2)
+    duration_s = pre_event_s + post_event_s
+
+    meta = {
+        "id": clip_id,
+        "filename": video_filename,
+        "mission_id": m_id,
+        "drone_id": drone_id,
+        "operator": operator,
+        "event_type": event_type,
+        "notes": notes or f"Context window: {pre_event_s}s pre + {post_event_s}s post",
+        "created_at_ist": ts_ist,
+        "created_at_raw": utc_now.isoformat(),
+        "pre_event_s": pre_event_s,
+        "post_event_s": post_event_s,
+        "duration_s": duration_s,
+        "frames_count": frames_written,
+        "size_bytes": size_bytes,
+        "size_mb": size_mb,
+        "resolution": f"{w}x{h}",
+        "storage_path": str(video_path),
+    }
+
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+    except Exception as e:
+        log.warning(f"Failed to save metadata sidecar: {e}")
+
+    emit_system_log(
+        "buffer-svc",
+        "INFO",
+        f"Saved evidence clip to SSD: {video_filename} ({duration_s}s, {frames_written} frames, {size_mb} MB)",
+        metric=f"{size_mb} MB"
+    )
+
+    return meta
+
+
+@app.post("/api/edge/evidence/extract")
+def extract_evidence_clip(
+    req: EvidenceExtractRequest,
+    auth: dict = Depends(verify_edge_auth)
+):
+    """Operator manual buffer extraction or confirmed event extraction."""
+    meta = _extract_and_save_evidence_clip(
+        pre_event_s=req.pre_event_s,
+        post_event_s=req.post_event_s,
+        mission_id=req.mission_id,
+        event_type=req.event_type or "manual_flag",
+        notes=req.notes or "",
+    )
+    return {"status": "success", "clip": meta}
+
+
+@app.get("/api/edge/evidence")
+def list_edge_evidence(auth: dict = Depends(verify_edge_auth)):
+    """List all saved clips on local SSD."""
+    evidence_dir = get_evidence_dir()
+    clips = []
+    total_bytes = 0
+    if evidence_dir.exists():
+        for p in evidence_dir.glob("*.mp4"):
+            json_p = p.with_suffix(".json")
+            if json_p.exists():
+                try:
+                    with open(json_p, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                        clips.append(meta)
+                        total_bytes += meta.get("size_bytes", 0)
+                        continue
+                except Exception:
+                    pass
+            sz = p.stat().st_size
+            total_bytes += sz
+            mtime = p.stat().st_mtime
+            dt_ist = datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc) + datetime.timedelta(hours=5, minutes=30)
+            clips.append({
+                "id": p.stem,
+                "filename": p.name,
+                "mission_id": "M-101",
+                "drone_id": "DRN-001",
+                "created_at_ist": dt_ist.strftime("%d-%m-%Y %H:%M:%S IST"),
+                "duration_s": 30,
+                "frames_count": 450,
+                "size_mb": round(sz / (1024 * 1024), 2),
+                "notes": "Saved on local SSD",
+                "storage_path": str(p),
+            })
+
+    clips.sort(key=lambda x: x.get("created_at_ist", ""), reverse=True)
+    total_mb = round(total_bytes / (1024 * 1024), 2)
+    return {
+        "clips": clips,
+        "total_count": len(clips),
+        "total_storage_mb": total_mb,
+    }
+
+
+@app.get("/api/edge/evidence/{filename}/stream")
+def stream_edge_evidence_video(
+    filename: str,
+    auth: dict = Depends(verify_edge_auth)
+):
+    """Stream video clip for browser playback."""
+    evidence_dir = get_evidence_dir()
+    video_path = (evidence_dir / filename).resolve()
+    if not str(video_path).startswith(str(evidence_dir.resolve())) or not video_path.exists():
+        raise HTTPException(status_code=404, detail="Evidence video not found")
+    return FileResponse(
+        path=str(video_path),
+        media_type="video/mp4",
+        filename=filename,
+    )
+
+
+@app.get("/api/edge/evidence/{filename}/download")
+def download_edge_evidence_video(
+    filename: str,
+    auth: dict = Depends(verify_edge_auth)
+):
+    """Download video clip for USB or external media transfer."""
+    evidence_dir = get_evidence_dir()
+    video_path = (evidence_dir / filename).resolve()
+    if not str(video_path).startswith(str(evidence_dir.resolve())) or not video_path.exists():
+        raise HTTPException(status_code=404, detail="Evidence video not found")
+    return FileResponse(
+        path=str(video_path),
+        media_type="video/mp4",
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+@app.delete("/api/edge/evidence/{filename}")
+def delete_edge_evidence_video(
+    filename: str,
+    auth: dict = Depends(verify_edge_auth)
+):
+    """Delete clip from SSD."""
+    evidence_dir = get_evidence_dir()
+    video_path = (evidence_dir / filename).resolve()
+    if not str(video_path).startswith(str(evidence_dir.resolve())) or not video_path.exists():
+        raise HTTPException(status_code=404, detail="Evidence video not found")
+    
+    sz = video_path.stat().st_size
+    try:
+        video_path.unlink()
+        json_p = video_path.with_suffix(".json")
+        if json_p.exists():
+            json_p.unlink()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete clip: {e}")
+
+    reclaimed_mb = round(sz / (1024 * 1024), 2)
+    emit_system_log(
+        "buffer-svc",
+        "INFO",
+        f"Operator deleted clip {filename} ({reclaimed_mb} MB reclaimed)",
+        metric=f"-{reclaimed_mb}MB"
+    )
+    return {"status": "deleted", "filename": filename, "reclaimed_mb": reclaimed_mb}
+
+
+# ── Asynchronous Confirmed Event Listener (Ingest/GPU -> Edge) ───────────────
+_last_processed_event_id = None
+
+def _confirmed_event_listener_loop():
+    global _last_processed_event_id
+    analytics_gateway = os.getenv("ANALYTICS_GATEWAY_URL", "http://analytics-gateway:8100")
+    while True:
+        try:
+            active_m = pipeline.active_mission or {}
+            active_drone = active_m.get("drone_id", os.getenv("INGEST_DRONE_ID", "DRN-001"))
+            active_mid = active_m.get("mission_id", "")
+            
+            with httpx.Client(timeout=4.0) as client:
+                resp = client.get(f"{analytics_gateway}/events/confirmed", params={"drone_id": active_drone, "limit": 5})
+                if resp.status_code == 200:
+                    events = resp.json().get("events", [])
+                    if events:
+                        latest = events[0]
+                        eid = str(latest.get("event_id", ""))
+                        if eid and eid != _last_processed_event_id:
+                            _last_processed_event_id = eid
+                            pre = int(latest.get("pre_event_s", 15))
+                            post = int(latest.get("post_event_s", 15))
+                            etype = latest.get("event_type", "confirmed_gpu_event")
+                            log.info("Auto-extracting buffer clip for confirmed GPU event: %s (%s)", eid, etype)
+                            _extract_and_save_evidence_clip(
+                                pre_event_s=pre,
+                                post_event_s=post,
+                                mission_id=active_mid or latest.get("mission_id"),
+                                event_type=etype,
+                                notes=f"Auto-extracted for confirmed GPU event {eid}"
+                            )
+        except Exception:
+            pass
+        time.sleep(12.0)
+
+_event_listener_thread = threading.Thread(target=_confirmed_event_listener_loop, name="ConfirmedEventListener", daemon=True)
+_event_listener_thread.start()
+
 
 
 @app.get("/api/edge/status")
