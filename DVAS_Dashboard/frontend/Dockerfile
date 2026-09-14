@@ -8,7 +8,7 @@ COPY package.json yarn.lock* package-lock.json* ./
 # Use npm since package-lock.json is present and yarn has DNS issues
 RUN npm install --legacy-peer-deps
 
-RUN echo "cache bust 20"
+RUN echo "cache bust 21"
 COPY . .
 RUN npm run build
 
