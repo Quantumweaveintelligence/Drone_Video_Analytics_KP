@@ -356,6 +356,7 @@ export default function IngestDashboard() {
             />
           )}
           {page === "audit" && <AuditPage audit={audit} />}
+          {page === "users" && <UsersPage users={users} reload={loadUsers} />}
         </div>
       </div>
     </AppShell>
@@ -454,10 +455,14 @@ function ConfirmModal({ open, title, message, confirmWord, onConfirm, onCancel, 
 
 /* ── Container Status Grid ───────────────────────────────────────────────── */
 function ContainerGrid({ containers, loading }) {
-  const statusColor = (s) => {
-    if (s === "running") return { bg: "var(--dvas-safe-bg)", fg: "var(--dvas-safe)" };
-    if (s === "not_found") return { bg: "rgba(100,116,139,0.1)", fg: "#64748b" };
-    return { bg: "var(--dvas-crit-bg)", fg: "var(--dvas-crit)" };
+  const statusColor = (s, h) => {
+    if (s === "running") {
+      if (h === "healthy") return { bg: "var(--dvas-safe-bg)", fg: "var(--dvas-safe)", text: "healthy" };
+      if (h === "unhealthy") return { bg: "var(--dvas-crit-bg)", fg: "var(--dvas-crit)", text: "unhealthy" };
+      return { bg: "var(--dvas-safe-bg)", fg: "var(--dvas-safe)", text: "running" };
+    }
+    if (s === "not_found") return { bg: "rgba(100,116,139,0.1)", fg: "#64748b", text: "missing" };
+    return { bg: "var(--dvas-crit-bg)", fg: "var(--dvas-crit)", text: s || "stopped" };
   };
 
   const coreNames = ["ingest_api", "nginx"];
@@ -466,14 +471,14 @@ function ContainerGrid({ containers, loading }) {
     <div className="border border-slate-800 bg-slate-900">
       <div className="p-3 border-b border-slate-800 text-sm flex items-center gap-2">
         <Terminal size={16} className="text-sky-400" />
-        Container Status
+        Container Status ({containers.length} Services)
         <span className="ml-auto mono text-[10px] text-slate-500">
           {loading ? "refreshing…" : `${containers.filter(c => c.running).length} / ${containers.length} running`}
         </span>
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-px bg-slate-800">
         {containers.map(c => {
-          const col = statusColor(c.status);
+          const col = statusColor(c.status, c.health);
           const isCore = coreNames.includes(c.short_name);
           return (
             <div key={c.name}
@@ -486,13 +491,21 @@ function ContainerGrid({ containers, loading }) {
                   <span className="text-[8px] px-1 py-0.5 rounded"
                     style={{ background: "var(--dvas-blue-bg)", color: "var(--dvas-blue)" }}>CORE</span>
                 )}
+                {c.category && !isCore && (
+                  <span className="text-[8px] px-1 py-0.5 rounded mono text-slate-400 bg-slate-800">
+                    {c.category}
+                  </span>
+                )}
               </div>
-              <div className="mono text-[11px] font-semibold text-slate-100 truncate" title={c.short_name}>
-                {c.short_name}
+              <div className="mono text-[11px] font-semibold text-slate-100 truncate" title={c.name}>
+                {c.short_name || c.name}
               </div>
-              <div className="text-[9px] px-1.5 py-0.5 rounded font-semibold uppercase tracking-wide"
-                style={{ background: col.bg, color: col.fg, width: "fit-content" }}>
-                {c.status}
+              <div className="text-[9px] px-1.5 py-0.5 rounded font-semibold uppercase tracking-wide flex items-center justify-between"
+                style={{ background: col.bg, color: col.fg }}>
+                <span>{col.text}</span>
+                {c.health && c.health !== "no_healthcheck" && c.health !== "n/a" && (
+                  <span className="text-[8px] lowercase opacity-80">({c.health})</span>
+                )}
               </div>
             </div>
           );
@@ -542,7 +555,7 @@ function ServerPage({ srv }) {
         title: `Stop Ingest Server (${controlScope === "core" ? "Frame Reception" : "Full Stack"})`,
         message: controlScope === "core"
           ? "This will stop drone_ingest_api and drone_nginx. No new frames will be accepted. Database, monitoring and analytics workers remain running. You can restart at any time."
-          : "This will stop ALL 18 ingest containers including the database. Evidence data is preserved. Only use for full maintenance windows.",
+          : `This will stop ingest containers (${containers.length || 24} stack services) including the database. Evidence data is preserved. Only use for full maintenance windows.`,
         confirmWord: "SHUTDOWN",
         danger: true,
       },
@@ -558,7 +571,7 @@ function ServerPage({ srv }) {
         title: "Restart Ingest Server",
         message: controlScope === "core"
           ? "This will restart drone_ingest_api and drone_nginx. There will be ~10 seconds of downtime for frame reception."
-          : "This will restart all ingest stack containers. Full startup may take 2–3 minutes.",
+          : `This will restart all ingest stack containers (${containers.length || 24} services). Full startup may take 2–3 minutes.`,
         confirmWord: "RESTART",
         danger: false,
       },
@@ -643,7 +656,7 @@ function ServerPage({ srv }) {
             <div className="ml-auto flex items-center gap-2">
               <span className="dvas-label" style={{ fontSize: 9 }}>SCOPE</span>
               <div className="flex rounded overflow-hidden border border-slate-700">
-                {[["core", "Core (API + Nginx)"], ["all", "Full Stack (All 18)"]].map(([val, label]) => (
+                {[["core", "Core (API + Nginx)"], ["all", `Full Stack (${containers.length || 24} Services)`]].map(([val, label]) => (
                   <button key={val} onClick={() => setControlScope(val)}
                     className="px-3 py-1.5 text-xs font-medium transition-colors"
                     style={{
@@ -662,7 +675,7 @@ function ServerPage({ srv }) {
             style={{ background: "var(--dvas-bg)", border: "1px solid var(--dvas-border)" }}>
             {controlScope === "core"
               ? "⚡ Core scope controls drone_ingest_api + drone_nginx only. Database, analytics workers, and monitoring remain running. Recommended for routine maintenance."
-              : "⚠ Full Stack scope controls all 18 ingest containers including the database. Use only for scheduled maintenance windows or security incidents."}
+              : `⚠ Full Stack scope controls all ${containers.length || 24} stack containers including the database. Use only for scheduled maintenance windows or security incidents.`}
           </div>
 
           {/* Action result banner */}

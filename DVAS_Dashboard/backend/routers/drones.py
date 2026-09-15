@@ -3,7 +3,7 @@ import json
 import hashlib
 from datetime import datetime, timezone
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
-from sqlalchemy import select, func, or_, and_
+from sqlalchemy import select, func, or_, and_, distinct
 
 from database import async_session_factory
 from models import Mission, Drone, Alert, Evidence, Export
@@ -62,21 +62,54 @@ async def list_drones(user: dict = Depends(get_current_user)):
 
 @router.get("/missions")
 async def list_missions(user: dict = Depends(get_current_user)):
-    # Synchronize missing missions from ANPR microservice
+    # Synchronize missing missions from ANPR, drone_postgres flight telemetry (tracks), and evidence captures
     try:
-        anpr_res = await _analytics_get(f"{ANPR_URL}/missions", timeout=5.0)
-        if anpr_res and "missions" in anpr_res:
-            active_mission_ids = set(anpr_res["missions"])
-            async with async_session_factory() as session:
-                existing = await session.execute(select(Mission.mission_id).where(Mission.mission_id.in_(active_mission_ids)))
+        discovered_missions = set()
+
+        # 1. Check ANPR microservice
+        try:
+            anpr_res = await _analytics_get(f"{ANPR_URL}/missions", timeout=3.0)
+            if anpr_res and "missions" in anpr_res:
+                discovered_missions.update(anpr_res["missions"])
+        except Exception:
+            pass
+
+        # 2. Check drone_postgres tracks for all recorded flight missions
+        try:
+            import asyncpg
+            conn = await asyncpg.connect("postgresql://dvas:dvas_secret@drone_postgres:5432/dvas")
+            try:
+                rows = await conn.fetch(
+                    "SELECT DISTINCT mission_id_str FROM tracks WHERE mission_id_str IS NOT NULL AND mission_id_str != ''"
+                )
+                for r in rows:
+                    if r["mission_id_str"]:
+                        discovered_missions.add(r["mission_id_str"])
+            finally:
+                await conn.close()
+        except Exception as exc:
+            logger.debug(f"Could not read missions from drone_postgres: {exc}")
+
+        async with async_session_factory() as session:
+            # 3. Check evidence table for distinct missions
+            evi_res = await session.execute(
+                select(distinct(Evidence.mission_id)).where(Evidence.mission_id != "", Evidence.mission_id.is_not(None))
+            )
+            for m in evi_res.scalars().all():
+                if m:
+                    discovered_missions.add(m)
+
+            if discovered_missions:
+                existing = await session.execute(
+                    select(Mission.mission_id).where(Mission.mission_id.in_(discovered_missions))
+                )
                 existing_ids = {row[0] for row in existing.all()}
                 
-                missing_ids = active_mission_ids - existing_ids
+                missing_ids = discovered_missions - existing_ids
                 if missing_ids:
-                    logger.info(f"Synchronizing {len(missing_ids)} missing missions from ANPR")
+                    logger.info(f"Synchronizing {len(missing_ids)} missing missions into catalog")
                     for mid in missing_ids:
-                        # Extract timestamp from mission_id like MSN-20260813-2204-52-ALPHA
-                        # Parts: MSN, YYYYMMDD, HHMM, SS, SUFFIX
+                        # Extract timestamp from mission_id like MSN-20260914-1318-14-BETA
                         started_at = ""
                         parts = mid.split("-")
                         if len(parts) >= 4 and parts[1].isdigit() and parts[2].isdigit():
@@ -87,19 +120,21 @@ async def list_missions(user: dict = Depends(get_current_user)):
                                 started_at = f"{d[:4]}-{d[4:6]}-{d[6:8]}T{t[:2]}:{t[2:4]}:{s[:2]}+00:00"
                             except Exception:
                                 pass
-                                
+                        
+                        drone_id = f"DRN-{mid}" if mid.startswith("MSN-") else ""
                         session.add(Mission(
                             mission_id=mid,
-                            name=mid,  # Fallback name
-                            status="recovered",
-                            drone_id="",
+                            name=f"Mission {mid}",
+                            status="completed",
+                            drone_id=drone_id,
+                            jurisdiction="Thiruvananthapuram",
                             operator_name="System Recovered",
-                            operator_ids=[], # Recovered missions will be visible to officers
+                            operator_ids=[],
                             started_at=started_at
                         ))
                     await session.commit()
     except Exception as e:
-        logger.warning(f"Could not synchronize missions from ANPR: {e}")
+        logger.warning(f"Could not synchronize missions: {e}")
 
     def _enrich_mission_dict(m_dict: dict) -> dict:
         obj_raw = m_dict.get("objective")
@@ -124,9 +159,14 @@ async def list_missions(user: dict = Depends(get_current_user)):
         if user.get("role") == "control_room_officer":
             jur = user.get("jurisdiction")
             if jur:
-                # Show missions in their jurisdiction OR missions with no jurisdiction set
+                # Show missions in their jurisdiction, State HQ, statewide, or with no jurisdiction set
                 stmt = stmt.where(
-                    or_(Mission.jurisdiction == jur, Mission.jurisdiction == None, Mission.jurisdiction == "")
+                    or_(
+                        Mission.jurisdiction == jur,
+                        Mission.jurisdiction.is_(None),
+                        Mission.jurisdiction == "",
+                        Mission.jurisdiction.in_(["Kerala", "State HQ", "Thiruvananthapuram"])
+                    )
                 )
         stmt = stmt.order_by(Mission.started_at.desc()).limit(300)
         result = await session.execute(stmt)

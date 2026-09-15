@@ -88,10 +88,16 @@ async def _telemetry_pump():
                     operator_name = telem.get("operator")
                     jurisdiction = telem.get("location")
                     
-                    if mission_id:
-                        drone_status = "live"
-                    elif telem.get("mission_status") == "draining":
+                    status_from_telem = telem.get("status")
+                    mission_status = telem.get("mission_status")
+                    is_draining = (status_from_telem == "draining" or mission_status == "draining")
+                    
+                    if is_draining:
                         drone_status = "draining"
+                    elif mission_id and (status_from_telem == "live" or not status_from_telem):
+                        drone_status = "live"
+                    elif status_from_telem in ("live", "degraded"):
+                        drone_status = status_from_telem
                     else:
                         drone_status = "offline"
 
@@ -109,6 +115,7 @@ async def _telemetry_pump():
                                 "type": "drone_draining", 
                                 "drone_id": drone_id,
                                 "mission_id": telem.get("mission_id"),
+                                "messages_ready": telem.get("messages_ready", telem.get("frame_count", 0)),
                                 "ts": datetime.now(timezone.utc).isoformat()
                             }
                         )
@@ -159,7 +166,7 @@ async def _telemetry_pump():
 
             # ── 3. Transition drones no longer in real_drones to offline ──────────
             async with async_session_factory() as session:
-                stale_stmt = select(Drone).where(Drone.status.in_(["live", "degraded"]))
+                stale_stmt = select(Drone).where(Drone.status.in_(["live", "degraded", "draining"]))
                 if real_drones:
                     stale_stmt = stale_stmt.where(Drone.id.not_in(list(real_drones.keys())))
                 stale_result = await session.execute(stale_stmt)
@@ -177,6 +184,13 @@ async def _telemetry_pump():
                             del _offline_countdown[drone_id]
                             logger.info(f"[GRACE] {drone_id}: Grace period expired — marking offline")
                             commit_needed = True
+                            await hub.broadcast(
+                                {
+                                    "type": "drone_offline",
+                                    "drone_id": drone_id,
+                                    "ts": datetime.now(timezone.utc).isoformat()
+                                }
+                            )
                         else:
                             logger.debug(f"[GRACE] {drone_id}: {_offline_countdown[drone_id]} polls remaining")
                 if commit_needed:
@@ -185,8 +199,11 @@ async def _telemetry_pump():
             # ── 4. Broadcast live telemetry for real active drones ───────────────
             updates = []
             for drone_id, telem in real_drones.items():
-                if not telem.get("mission_id") and telem.get("mission_status") != "draining":
+                telem_stat = telem.get("status")
+                mission_stat = telem.get("mission_status")
+                if not telem.get("mission_id") and mission_stat != "draining" and telem_stat != "draining":
                     continue
+                item_status = "draining" if (telem_stat == "draining" or mission_stat == "draining") else (telem_stat or "live")
                 updates.append({
                     "id": drone_id,
                     "lat": round(telem.get("latitude"), 6) if telem.get("latitude") is not None else None,
@@ -201,7 +218,10 @@ async def _telemetry_pump():
                     "focal_len": telem.get("focal_len"),
                     "dzoom_ratio": telem.get("dzoom_ratio"),
                     "gps_lock": telem.get("gps_lock", True) if (telem.get("latitude") is not None and telem.get("longitude") is not None) else False,
-                    "status": "live",
+                    "status": item_status,
+                    "mission_status": mission_stat or item_status,
+                    "messages_ready": telem.get("messages_ready", telem.get("frame_count", 0)),
+                    "frame_count": telem.get("frame_count", 0),
                     "mission_id": telem.get("mission_id"),
                     "mission_name": telem.get("mission_name"),
                     "operator_name": telem.get("operator"),

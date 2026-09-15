@@ -441,12 +441,12 @@ async def proxy_purge_stream(
                 try:
                     from services.websocket_hub import hub
                     import datetime
-                    await hub.broadcast(json.dumps({
+                    await hub.broadcast({
                         "type": "stream_purged",
                         "drone_id": drone_id,
                         "purged_by": user.get("preferred_username", "unknown"),
                         "ts": datetime.datetime.utcnow().isoformat()
-                    }))
+                    })
                 except Exception as e:
                     logger.warning(f"Websocket broadcast failed for stream purge: {e}")
 
@@ -469,7 +469,7 @@ async def proxy_purge_stream(
 # for listing; full access for start/stop/restart).
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Ordered list of all ingest stack containers (matches dvas_ingest docker-compose)
+# Ordered list of all ingest stack containers (20 containers)
 ALL_INGEST_CONTAINERS = [
     # Core ingest services (most critical — frame reception)
     "drone_ingest_api",
@@ -479,18 +479,19 @@ ALL_INGEST_CONTAINERS = [
     "drone_valkey",
     # Database
     "drone_postgres",
-    # Analytics workers
-
+    # Analytics workers (all 6 AI pipelines)
+    "drone_analytics_gateway",
     "drone_crowd_analyzer",
     "drone_person_analyzer",
     "drone_vehicle_analyzer",
     "drone_anpr_analyzer",
-    "drone_analytics_gateway",
-    # Evidence storage
+    "drone_intrusion_analyzer",
+    # Evidence & video storage
+    "drone_minio",
     "drone_seaweed_master",
     "drone_seaweed_volume",
     "drone_seaweed_filer",
-    # Monitoring
+    # Monitoring & alerting
     "drone_prometheus",
     "drone_grafana",
     "drone_alertmanager",
@@ -498,6 +499,52 @@ ALL_INGEST_CONTAINERS = [
     "drone_headscale",
     "drone_step_ca",
 ]
+
+# DVAS Dashboard & Edge stack containers
+ALL_DVAS_CONTAINERS = [
+    "dvas_backend",
+    "dvas_frontend",
+    "dvas_postgres",
+    "dvas_edge",
+]
+
+# Total system containers (24 services)
+ALL_SYSTEM_CONTAINERS = ALL_INGEST_CONTAINERS + ALL_DVAS_CONTAINERS
+
+# Category and tier metadata for UI grouping
+CONTAINER_METADATA = {
+    # Core Ingest
+    "drone_ingest_api": {"category": "Core Ingest", "tier": 1},
+    "drone_nginx": {"category": "Core Ingest", "tier": 1},
+    # Analytics AI Workers
+    "drone_analytics_gateway": {"category": "AI Pipeline", "tier": 2},
+    "drone_crowd_analyzer": {"category": "Crowd AI", "tier": 2},
+    "drone_person_analyzer": {"category": "Person Re-ID", "tier": 2},
+    "drone_vehicle_analyzer": {"category": "Vehicle AI", "tier": 2},
+    "drone_anpr_analyzer": {"category": "ANPR AI", "tier": 2},
+    "drone_intrusion_analyzer": {"category": "Perimeter AI", "tier": 2},
+    # Database & Queues & Auth
+    "drone_keycloak": {"category": "Identity/IAM", "tier": 3},
+    "drone_valkey": {"category": "Message Queue", "tier": 3},
+    "drone_postgres": {"category": "Analytics DB", "tier": 3},
+    # Evidence & Video Storage
+    "drone_minio": {"category": "S3 Evidence", "tier": 4},
+    "drone_seaweed_master": {"category": "Seaweed Master", "tier": 4},
+    "drone_seaweed_volume": {"category": "Seaweed Volume", "tier": 4},
+    "drone_seaweed_filer": {"category": "Seaweed Filer", "tier": 4},
+    # Monitoring & Telemetry
+    "drone_prometheus": {"category": "Prometheus", "tier": 5},
+    "drone_grafana": {"category": "Grafana", "tier": 5},
+    "drone_alertmanager": {"category": "Alertmanager", "tier": 5},
+    # Security & Mesh Network
+    "drone_headscale": {"category": "WireGuard VPN", "tier": 6},
+    "drone_step_ca": {"category": "Internal PKI", "tier": 6},
+    # Dashboard Operations
+    "dvas_backend": {"category": "Dashboard API", "tier": 7},
+    "dvas_frontend": {"category": "Operations UI", "tier": 7},
+    "dvas_postgres": {"category": "Central DB", "tier": 7},
+    "dvas_edge": {"category": "Edge Gateway", "tier": 7},
+}
 
 # "Core" scope: stops/starts only the frame-reception layer
 # DB, monitoring, and storage remain untouched for safe maintenance
@@ -516,31 +563,41 @@ def _docker_client():
 @ingest_api.get("/containers", summary="List ingest container statuses")
 async def list_containers(user: dict = Depends(_admin_user)):
     """
-    Returns the live status of every container in the dvas_ingest stack.
+    Returns the live status and health of all system containers (24 services).
     Used by the admin control panel to show a container health grid.
     """
     client = _docker_client()
     result = []
     try:
-        for name in ALL_INGEST_CONTAINERS:
+        # Check all defined system containers
+        for name in ALL_SYSTEM_CONTAINERS:
+            meta = CONTAINER_METADATA.get(name, {"category": "Service", "tier": 9})
+            short = name.replace("drone_", "").replace("dvas_", "")
             try:
                 c = client.containers.get(name)
                 attrs = c.attrs or {}
                 state = attrs.get("State", {})
+                health_state = state.get("Health", {}).get("Status", "no_healthcheck")
                 result.append({
                     "name": name,
-                    "short_name": name.replace("drone_", ""),
+                    "short_name": short,
                     "status": c.status,           # running | exited | paused | …
                     "running": c.status == "running",
+                    "health": health_state,       # healthy | unhealthy | starting | no_healthcheck
+                    "category": meta["category"],
+                    "tier": meta["tier"],
                     "started_at": state.get("StartedAt", ""),
                     "image": c.image.tags[0] if c.image.tags else "—",
                 })
             except Exception:
                 result.append({
                     "name": name,
-                    "short_name": name.replace("drone_", ""),
+                    "short_name": short,
                     "status": "not_found",
                     "running": False,
+                    "health": "missing",
+                    "category": meta["category"],
+                    "tier": meta["tier"],
                     "started_at": "",
                     "image": "—",
                 })
@@ -632,7 +689,7 @@ async def ingest_ws_relay(ws: WebSocket):
     await ws.accept()
 
     # Auth check — extract token from query param or cookie
-    from server import _authz_ws
+    from services.websocket_hub import _authz_ws
     token = ws.query_params.get("token", "") or ws.cookies.get("dvas_access_token", "")
     payload = _authz_ws(token)
     if not payload or payload.get("role") != "system_administrator":

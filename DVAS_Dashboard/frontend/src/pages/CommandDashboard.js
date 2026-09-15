@@ -18,7 +18,7 @@ import {
   Cpu, ShieldCheck, User as UserIcon, Users as UsersIcon, Car, Hash,
   UserSearch, RefreshCw, Play, Square, CheckCircle2,
   Activity, Battery, BatteryLow, BatteryMedium, BatteryFull,
-  Wifi, WifiOff, Clock, Radio, Shield, FileText,
+  Wifi, WifiOff, Clock, Radio, Shield, FileText, Image as ImageIcon,
 } from "lucide-react";
 import { useJpegPoller } from "@/hooks/useJpegPoller";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, BarChart, Bar } from "recharts";
@@ -42,6 +42,24 @@ const ALL_PAGES = [
 ];
 
 const MODEL_ICONS = { person: UserIcon, face: ShieldCheck, vehicle: Car, crowd: UsersIcon, plate: Hash, intrusion: Shield };
+
+const EVIDENCE_CATEGORIES = [
+  { key: "all",     label: "All Evidence",     Icon: FilmSlate,  desc: "All detections & alerts", countKey: "all",     dedupKey: "all_dedup" },
+  { key: "person",  label: "Person Evidence",  Icon: UserSearch, desc: "Face Re-ID & Tracks",    countKey: "person",  dedupKey: "person_dedup" },
+  { key: "vehicle", label: "Vehicle & ANPR",   Icon: Car,        desc: "Plates & Vehicle Tracks", countKey: "vehicle", dedupKey: "vehicle_dedup" },
+  { key: "crowd",   label: "Crowd & Heatmaps", Icon: UsersIcon,  desc: "Density & Congestion",    countKey: "crowd",   dedupKey: "crowd_dedup" },
+];
+
+const resolveMinioBucket = (key, bucket) => {
+  if (bucket && bucket.trim()) return bucket.trim();
+  if (!key) return "dvas-faces";
+  if (key.startsWith("vehicles/")) return "dvas-vehicles";
+  if (key.startsWith("plates/")) return "dvas-plates";
+  if (key.startsWith("intrusion/")) return "dvas-intrusion";
+  if (key.startsWith("heatmaps/")) return "dvas-heatmaps";
+  if (key.startsWith("persons/") || key.startsWith("faces/") || key.startsWith("alerts/")) return "dvas-faces";
+  return "dvas-faces";
+};
 
 function KPI({ label, value, tone = "text-sky-400" }) {
   return (
@@ -337,8 +355,12 @@ export default function CommandDashboard() {
   const [justification, setJustification] = useState("");
   const [selectedDrone, setSelectedDrone] = useState(null);
 
-  const [evidenceFilters, setEvidenceFilters] = useState({ drone_id: "", mission_id: "", event_type: "", from_ts: "", to_ts: "", legal_hold_only: false, search: "" });
+  const [evidenceCategory, setEvidenceCategory] = useState("all");
+  const [evidenceDedup, setEvidenceDedup] = useState(true);
+  const [evidenceFilters, setEvidenceFilters] = useState({ category: "all", dedup: true, drone_id: "", mission_id: "", event_type: "", from_ts: "", to_ts: "", legal_hold_only: false, search: "" });
   const [evidenceTotal, setEvidenceTotal] = useState(0);
+  const [evidenceMeta, setEvidenceMeta] = useState({ drones: [], missions: [], event_types: [], counts: {} });
+  const [loadingMoreEvidence, setLoadingMoreEvidence] = useState(false);
   const [evidenceDetail, setEvidenceDetail] = useState(null); // for detail modal
   const [reports, setReports] = useState([]);
   const [generatingReport, setGeneratingReport] = useState(null); // report_id being generated
@@ -349,17 +371,23 @@ export default function CommandDashboard() {
     mission_after_action: { mission_id: "" },
   });
 
+  const evidenceFiltersRef = useRef(evidenceFilters);
+  evidenceFiltersRef.current = evidenceFilters;
+  const evidenceCategoryRef = useRef(evidenceCategory);
+  evidenceCategoryRef.current = evidenceCategory;
+  const evidenceDedupRef = useRef(evidenceDedup);
+  evidenceDedupRef.current = evidenceDedup;
+
   const { mergeWithDrones } = useActiveStreams();
   const mergedDrones = mergeWithDrones(drones);
   const liveMissionsCount = mergedDrones.filter((d) => ["live", "draining"].includes(d.status) && Boolean(d.mission_id)).length;
 
   const load = async () => {
     try {
-      const [k, dR, aR, eR, mR, xR, cR, rptR, incR, sugR] = await Promise.all([
+      const [k, dR, aR, mR, xR, cR, rptR, incR, sugR, metaR] = await Promise.all([
         api.get("/command/kpis"),
         api.get("/drones"),
         api.get("/alerts"),
-        api.get("/evidence"),
         api.get("/missions"),
         // CRO now has access to their own export requests
         api.get("/exports").catch(() => ({ data: [] })),
@@ -367,19 +395,23 @@ export default function CommandDashboard() {
         api.get("/reports").catch(() => ({ data: [] })),
         api.get("/incidents").catch(() => ({ data: [] })),
         api.get("/analytics/suggestions").catch(() => ({ data: [] })),
+        api.get("/evidence/meta").catch(() => ({ data: { drones: [], missions: [], event_types: [], counts: {} } })),
       ]);
       setKpis(k.data); setDrones(dR.data); setAlerts(aR.data);
       if (incR?.data && Array.isArray(incR.data)) setIncidents(incR.data);
       if (sugR?.data && Array.isArray(sugR.data)) setSuggestions(sugR.data);
-      const eData = Array.isArray(eR.data) ? eR.data : (eR.data.items || []);
-      setEvidence(eData);
-      setEvidenceTotal(eR.data.total || eData.length);
+      if (metaR?.data) setEvidenceMeta(metaR.data);
       setMissions(mR.data); setExports(xR.data); setCrowd(cR.data.series || []);
       setReports(rptR.data || []);
     } catch (e) { console.error(e); }
   };
 
-  useEffect(() => { load(); const t = setInterval(load, 5000); return () => clearInterval(t); }, []);
+  useEffect(() => {
+    load();
+    loadFilteredEvidence(evidenceFiltersRef.current, evidenceCategoryRef.current, evidenceDedupRef.current);
+    const t = setInterval(load, 5000);
+    return () => clearInterval(t);
+  }, []);
 
   // WebSocket live updates
   const { connected } = useDvasSocket((msg) => {
@@ -449,17 +481,64 @@ export default function CommandDashboard() {
     } catch (e) { alert(e.response?.data?.detail || "failed"); }
   };
 
-  const loadFilteredEvidence = async (filters) => {
+  const loadFilteredEvidence = async (filters, cat, isDedup) => {
       try {
+          const activeFilters = filters ?? evidenceFiltersRef.current;
+          const activeCat = cat ?? evidenceCategoryRef.current;
+          const activeDedup = isDedup ?? evidenceDedupRef.current;
           const params = new URLSearchParams();
-          Object.entries(filters).forEach(([k, v]) => {
-              if (v !== "" && v !== false) params.set(k, v);
+          const merged = { ...activeFilters, category: activeCat, dedup: activeDedup };
+          Object.entries(merged).forEach(([k, v]) => {
+              if (v !== "" && v !== false && v !== undefined && v !== null) params.set(k, v);
           });
+          params.set("limit", "60");
+          params.set("offset", "0");
           const res = await api.get(`/evidence?${params.toString()}`);
           const data = res.data;
           setEvidence(Array.isArray(data) ? data : (data.items || []));
           setEvidenceTotal(data.total || 0);
       } catch (e) { console.error(e); }
+  };
+
+  const loadMoreEvidence = async () => {
+      if (loadingMoreEvidence || evidence.length >= evidenceTotal) return;
+      setLoadingMoreEvidence(true);
+      try {
+          const params = new URLSearchParams();
+          const merged = { ...evidenceFiltersRef.current, category: evidenceCategoryRef.current, dedup: evidenceDedupRef.current };
+          Object.entries(merged).forEach(([k, v]) => {
+              if (v !== "" && v !== false && v !== undefined && v !== null) params.set(k, v);
+          });
+          params.set("offset", String(evidence.length));
+          params.set("limit", "60");
+          const res = await api.get(`/evidence?${params.toString()}`);
+          const data = res.data;
+          const items = Array.isArray(data) ? data : (data.items || []);
+          setEvidence(prev => [...prev, ...items]);
+          setEvidenceTotal(data.total || 0);
+      } catch (e) {
+          console.error("Load more evidence failed:", e);
+      } finally {
+          setLoadingMoreEvidence(false);
+      }
+  };
+
+  const handleCategoryChange = (cat) => {
+    setEvidenceCategory(cat);
+    evidenceCategoryRef.current = cat;
+    const newFilters = { ...evidenceFiltersRef.current, category: cat };
+    setEvidenceFilters(newFilters);
+    evidenceFiltersRef.current = newFilters;
+    loadFilteredEvidence(newFilters, cat, evidenceDedupRef.current);
+  };
+
+  const handleDedupToggle = (checked) => {
+    setEvidenceDedup(checked);
+    evidenceDedupRef.current = checked;
+    const newFilters = { ...evidenceFiltersRef.current, dedup: checked };
+    setEvidenceFilters(newFilters);
+    evidenceFiltersRef.current = newFilters;
+    loadFilteredEvidence(newFilters, evidenceCategoryRef.current, checked);
   };
 
   const toggleLegalHold = async (ev) => {
@@ -843,32 +922,99 @@ export default function CommandDashboard() {
 
       {tab === "evidence" && (
           <div className="space-y-4">
+              {/* Category Selector Cards */}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  {EVIDENCE_CATEGORIES.map(cat => {
+                      const isSelected = evidenceCategory === cat.key;
+                      const count = evidenceDedup
+                          ? (evidenceMeta.counts?.[cat.dedupKey] ?? 0)
+                          : (evidenceMeta.counts?.[cat.countKey] ?? 0);
+                      const CatIcon = cat.Icon;
+                      return (
+                          <button
+                              key={cat.key}
+                              data-testid={`evidence-cat-${cat.key}`}
+                              type="button"
+                              onClick={() => handleCategoryChange(cat.key)}
+                              className={`flex items-center gap-3 p-3 rounded-xl text-left transition-all border ${
+                                  isSelected
+                                      ? "bg-slate-800/90 border-sky-500 shadow-md shadow-sky-500/10 ring-1 ring-sky-500/30"
+                                      : "bg-slate-900/60 border-slate-800 hover:border-slate-700 hover:bg-slate-800/40"
+                              }`}
+                          >
+                              <div className={`p-2.5 rounded-lg shrink-0 ${
+                                  isSelected ? "bg-sky-500/20 text-sky-400" : "bg-slate-800 text-slate-400"
+                              }`}>
+                                  <CatIcon size={18} />
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                  <div className={`text-xs font-semibold truncate ${isSelected ? "text-white" : "text-slate-300"}`}>
+                                      {cat.label}
+                                  </div>
+                                  <div className="flex items-center gap-1.5 mt-0.5">
+                                      <span className="mono text-xs font-bold text-sky-400">
+                                          {count ? count.toLocaleString() : "—"}
+                                      </span>
+                                      <span className="text-[10px] text-slate-500">
+                                          {evidenceDedup ? "unique captures" : "total events"}
+                                      </span>
+                                  </div>
+                              </div>
+                          </button>
+                      );
+                  })}
+              </div>
+
               {/* Search & Filter Bar */}
               <div className="rounded-xl p-4 space-y-3" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
-                  <div className="flex items-center gap-2 text-sm font-semibold" style={{ color: "var(--dvas-text)" }}>
-                      <FilmSlate size={16} className="text-sky-500" /> Evidence Vault
-                      <span className="ml-auto mono text-[10px] text-slate-500">{evidenceTotal} items</span>
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-sm font-semibold" style={{ color: "var(--dvas-text)" }}>
+                      <div className="flex items-center gap-2">
+                          <FilmSlate size={16} className="text-sky-500" /> Evidence Vault
+                          <span className="text-xs font-normal text-slate-400">
+                              · <span className="capitalize text-sky-400 font-medium">{evidenceCategory}</span>
+                          </span>
+                      </div>
+                      <div className="flex items-center gap-3">
+                          {/* Deduplication Toggle Switch */}
+                          <label className="flex items-center gap-2 cursor-pointer select-none bg-slate-800/80 px-2.5 py-1 rounded border border-slate-700 hover:border-slate-600 transition-colors">
+                              <input
+                                  type="checkbox"
+                                  checked={evidenceDedup}
+                                  onChange={e => handleDedupToggle(e.target.checked)}
+                                  className="accent-sky-500 h-3.5 w-3.5 rounded cursor-pointer"
+                              />
+                              <span className="text-xs text-slate-300">Deduplicate Captures</span>
+                              <span className={`text-[9px] mono px-1.5 py-0.2 rounded font-bold ${
+                                  evidenceDedup ? "bg-sky-500/20 text-sky-300 border border-sky-500/30" : "bg-slate-700 text-slate-400"
+                              }`}>
+                                  {evidenceDedup ? "ON" : "OFF"}
+                              </span>
+                          </label>
+                          <span className="mono text-[10px] text-slate-500">
+                              Showing {evidence.length} of {evidenceTotal} {evidenceDedup ? "unique" : "items"}
+                          </span>
+                      </div>
                   </div>
                   <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2">
-                      <select value={evidenceFilters.drone_id} onChange={e => { const f = {...evidenceFilters, drone_id: e.target.value}; setEvidenceFilters(f); loadFilteredEvidence(f); }} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200">
+                      <select value={evidenceFilters.drone_id} onChange={e => { const f = {...evidenceFilters, drone_id: e.target.value}; setEvidenceFilters(f); evidenceFiltersRef.current = f; loadFilteredEvidence(f); }} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200">
                           <option value="">All Drones</option>
-                          {[...new Set(drones.map(d => d.id))].map(id => <option key={id} value={id}>{id}</option>)}
+                          {[...new Set([...(evidenceMeta.drones || []), ...drones.map(d => d.id)])].filter(Boolean).sort().map(id => <option key={id} value={id}>{id}</option>)}
                       </select>
-                      <select value={evidenceFilters.mission_id} onChange={e => { const f = {...evidenceFilters, mission_id: e.target.value}; setEvidenceFilters(f); loadFilteredEvidence(f); }} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200">
+                      <select value={evidenceFilters.mission_id} onChange={e => { const f = {...evidenceFilters, mission_id: e.target.value}; setEvidenceFilters(f); evidenceFiltersRef.current = f; loadFilteredEvidence(f); }} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200">
                           <option value="">All Missions</option>
-                          {missions.map(m => <option key={m.mission_id} value={m.mission_id}>{m.mission_id}</option>)}
+                          {[...new Set([...(evidenceMeta.missions || []), ...missions.map(m => m.mission_id)])].filter(Boolean).sort().map(mid => <option key={mid} value={mid}>{mid}</option>)}
                       </select>
-                      <select value={evidenceFilters.event_type} onChange={e => { const f = {...evidenceFilters, event_type: e.target.value}; setEvidenceFilters(f); loadFilteredEvidence(f); }} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200">
-                          <option value="">All Types</option>
-                          {["crowd_surge","vehicle_anomaly","perimeter_intrusion","unattended_object","wrong_way","crowd_threshold","theft_alert","intrusion_alert","vehicle_detected"].map(t => <option key={t} value={t}>{t.replace(/_/g, ' ')}</option>)}
+                      <select value={evidenceFilters.event_type} onChange={e => { const f = {...evidenceFilters, event_type: e.target.value}; setEvidenceFilters(f); evidenceFiltersRef.current = f; loadFilteredEvidence(f); }} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200">
+                          <option value="">All Event Types</option>
+                          {[...new Set([...(evidenceMeta.event_types || []), "person_detected","vehicle_detected","crowd_threshold","crowd_surge","vehicle_anomaly","perimeter_intrusion","unattended_object","wrong_way","theft_alert","intrusion_alert"])].filter(Boolean).sort().map(t => <option key={t} value={t}>{t.replace(/_/g, ' ')}</option>)}
                       </select>
-                      <input type="date" value={evidenceFilters.from_ts?.split('T')[0] || ""} onChange={e => { const f = {...evidenceFilters, from_ts: e.target.value ? e.target.value + "T00:00:00" : ""}; setEvidenceFilters(f); loadFilteredEvidence(f); }} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200" placeholder="From" />
-                      <input type="date" value={evidenceFilters.to_ts?.split('T')[0] || ""} onChange={e => { const f = {...evidenceFilters, to_ts: e.target.value ? e.target.value + "T23:59:59" : ""}; setEvidenceFilters(f); loadFilteredEvidence(f); }} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200" placeholder="To" />
+                      <input type="date" value={evidenceFilters.from_ts?.split('T')[0] || ""} onChange={e => { const f = {...evidenceFilters, from_ts: e.target.value ? e.target.value + "T00:00:00" : ""}; setEvidenceFilters(f); evidenceFiltersRef.current = f; loadFilteredEvidence(f); }} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200" placeholder="From" />
+                      <input type="date" value={evidenceFilters.to_ts?.split('T')[0] || ""} onChange={e => { const f = {...evidenceFilters, to_ts: e.target.value ? e.target.value + "T23:59:59" : ""}; setEvidenceFilters(f); evidenceFiltersRef.current = f; loadFilteredEvidence(f); }} className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200" placeholder="To" />
                       <label className="flex items-center gap-1 text-[10px] text-amber-400 cursor-pointer">
-                          <input type="checkbox" checked={evidenceFilters.legal_hold_only} onChange={e => { const f = {...evidenceFilters, legal_hold_only: e.target.checked}; setEvidenceFilters(f); loadFilteredEvidence(f); }} className="accent-amber-500" />
+                          <input type="checkbox" checked={evidenceFilters.legal_hold_only} onChange={e => { const f = {...evidenceFilters, legal_hold_only: e.target.checked}; setEvidenceFilters(f); evidenceFiltersRef.current = f; loadFilteredEvidence(f); }} className="accent-amber-500" />
                           Legal Hold Only
                       </label>
-                      <input type="text" value={evidenceFilters.search} onChange={e => { const f = {...evidenceFilters, search: e.target.value}; setEvidenceFilters(f); }} onKeyDown={e => { if (e.key === "Enter") loadFilteredEvidence(evidenceFilters); }} placeholder="Search label..." className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200 placeholder-slate-500" />
+                      <input type="text" value={evidenceFilters.search} onChange={e => { const f = {...evidenceFilters, search: e.target.value}; setEvidenceFilters(f); evidenceFiltersRef.current = f; }} onKeyDown={e => { if (e.key === "Enter") loadFilteredEvidence(evidenceFiltersRef.current); }} placeholder="Search label..." className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200 placeholder-slate-500" />
                   </div>
               </div>
 
@@ -878,13 +1024,25 @@ export default function CommandDashboard() {
                       <div key={ev.id} data-testid={`evidence-${ev.id}`} className="rounded-xl overflow-hidden" style={{ background: "var(--dvas-surface)", border: "1px solid var(--dvas-border)" }}>
                           <div className="aspect-video relative overflow-hidden bg-slate-900" style={{ background: "var(--dvas-surface-2)" }}>
                               {ev.thumbnail ? (
-                                  <img src={ev.thumbnail.startsWith('http') ? ev.thumbnail : `/api/minio/image?bucket=${encodeURIComponent(ev.image_bucket || 'dvas-faces')}&key=${encodeURIComponent(ev.thumbnail)}`} alt="" className="w-full h-full object-cover opacity-90" onError={(e) => { e.target.style.display = 'none'; }} />
-                              ) : (
-                                  <div className="w-full h-full flex flex-col items-center justify-center text-slate-600 gap-1">
-                                      <FilmSlate size={32} />
-                                      <span className="mono text-[10px] text-slate-500">{ev.event_type}</span>
-                                  </div>
-                              )}
+                                  <img
+                                      src={ev.thumbnail.startsWith('http') ? ev.thumbnail : `/api/minio/image?bucket=${encodeURIComponent(resolveMinioBucket(ev.thumbnail, ev.image_bucket))}&key=${encodeURIComponent(ev.thumbnail)}`}
+                                      alt=""
+                                      className="w-full h-full object-cover opacity-90 transition-opacity hover:opacity-100"
+                                      onError={(e) => {
+                                          e.target.onerror = null;
+                                          e.target.style.display = 'none';
+                                          const fb = e.target.parentElement.querySelector('.thumbnail-fallback');
+                                          if (fb) fb.style.display = 'flex';
+                                      }}
+                                  />
+                              ) : null}
+                              <div
+                                  className="thumbnail-fallback w-full h-full flex flex-col items-center justify-center text-slate-500 gap-1.5"
+                                  style={{ display: ev.thumbnail ? 'none' : 'flex' }}
+                              >
+                                  <ImageIcon size={28} className="text-slate-600" />
+                                  <span className="mono text-[10px] text-slate-500 uppercase tracking-wider">{ev.event_type?.replace(/_/g, ' ')}</span>
+                              </div>
                               <button data-testid={`play-${ev.id}`} onClick={() => setPlaying(ev)} className="absolute inset-0 flex items-center justify-center bg-black/20 hover:bg-black/40 transition-colors text-white">
                                   <div className="border border-white/70 px-3 py-1 text-xs bg-black/60 rounded flex items-center gap-1.5">
                                       <Play size={11} fill="currentColor" /> View Evidence
@@ -892,6 +1050,15 @@ export default function CommandDashboard() {
                               </button>
                               {ev.legal_hold && (
                                   <span className="absolute top-2 left-2 mono text-[10px] px-1.5 py-0.5 border border-red-500/50 bg-white/90 text-red-500 uppercase flex items-center gap-1 shadow-sm rounded-sm"><FolderLock size={10} /> hold</span>
+                              )}
+                              {ev.duplicate_count > 1 && (
+                                  <span
+                                      className="absolute bottom-2 left-2 mono text-[10px] px-2 py-0.5 rounded bg-sky-950/90 text-sky-300 border border-sky-600/70 flex items-center gap-1 font-semibold backdrop-blur-sm shadow-md"
+                                      title={`${ev.duplicate_count} detections share this visual capture`}
+                                  >
+                                      <span className="w-1.5 h-1.5 rounded-full bg-sky-400"></span>
+                                      {ev.duplicate_count} detections
+                                  </span>
                               )}
                               <button onClick={() => openEvidenceDetail(ev.id)} className="absolute top-2 right-2 mono text-[10px] px-1.5 py-0.5 border border-slate-400/50 bg-black/60 text-slate-200 hover:bg-black/80 rounded-sm">Details</button>
                           </div>
@@ -928,6 +1095,30 @@ export default function CommandDashboard() {
                       </div>
                   ))}
               </div>
+              {/* Load More Pagination */}
+              {evidence.length < evidenceTotal && (
+                  <div className="flex justify-center pt-2 pb-4">
+                      <button
+                          onClick={loadMoreEvidence}
+                          disabled={loadingMoreEvidence}
+                          className="px-6 py-2.5 rounded-lg bg-sky-600/20 border border-sky-500/50 hover:bg-sky-600/30 text-sky-300 text-xs font-semibold flex items-center gap-2 transition-all disabled:opacity-50 shadow-sm"
+                      >
+                          {loadingMoreEvidence ? (
+                              <>
+                                  <RefreshCw size={13} className="animate-spin" />
+                                  <span>Loading more evidence...</span>
+                              </>
+                          ) : (
+                              <>
+                                  <span>Load More Evidence</span>
+                                  <span className="mono text-[10px] text-sky-400 bg-sky-950/80 px-2 py-0.5 rounded border border-sky-800/60">
+                                      +{Math.min(60, evidenceTotal - evidence.length)} remaining
+                                  </span>
+                              </>
+                          )}
+                      </button>
+                  </div>
+              )}
               {evidence.length === 0 && <div className="text-center text-slate-500 py-12 text-sm">No evidence items match the current filters</div>}
           </div>
       )}
@@ -1221,26 +1412,54 @@ export default function CommandDashboard() {
             </div>
             {(playing.primary_image_key || playing.thumbnail) ? (
               <div className="w-full aspect-video bg-slate-900 flex items-center justify-center gap-4 p-4">
-                <img
-                  src={`/api/minio/image?bucket=${encodeURIComponent(playing.image_bucket || 'dvas-faces')}&key=${encodeURIComponent(playing.primary_image_key || playing.thumbnail)}`}
-                  alt="Evidence capture"
-                  className="max-h-full max-w-[48%] object-contain rounded border border-slate-700"
-                  onError={(e) => { e.target.style.display = 'none'; }}
-                />
-                {playing.secondary_image_key && (
+                <div className={`relative flex flex-col items-center justify-center h-full ${playing.secondary_image_key ? 'max-w-[48%]' : 'max-w-[85%]'}`}>
                   <img
-                    src={`/api/minio/image?bucket=${encodeURIComponent(playing.image_bucket === 'dvas-vehicles' ? 'dvas-plates' : playing.image_bucket || 'dvas-faces')}&key=${encodeURIComponent(playing.secondary_image_key)}`}
-                    alt="Secondary evidence capture"
-                    className="max-h-full max-w-[48%] object-contain rounded border border-slate-700"
-                    onError={(e) => { e.target.style.display = 'none'; }}
+                    src={`/api/minio/image?bucket=${encodeURIComponent(resolveMinioBucket(playing.primary_image_key || playing.thumbnail, playing.image_bucket))}&key=${encodeURIComponent(playing.primary_image_key || playing.thumbnail)}`}
+                    alt="Primary Evidence"
+                    className="max-h-[calc(100%-24px)] object-contain rounded border border-slate-700 shadow-md"
+                    onError={(e) => {
+                      e.target.onerror = null;
+                      e.target.style.display = 'none';
+                      const fb = e.target.parentElement.querySelector('.modal-img-fallback');
+                      if (fb) fb.style.display = 'flex';
+                    }}
                   />
+                  <div className="modal-img-fallback hidden flex-col items-center justify-center p-4 text-slate-500 border border-slate-800 rounded bg-slate-950">
+                    <ImageIcon size={24} className="text-slate-600 mb-1" />
+                    <span className="text-[10px] mono">Primary capture unavailable</span>
+                  </div>
+                  <span className="text-[10px] mono text-slate-400 mt-1 uppercase tracking-wider">
+                    {playing.event_type === "vehicle_detected" ? "Vehicle Crop" : playing.event_type === "person_detected" ? "Full Body Crop" : playing.event_type?.includes("crowd") ? "Density Heatmap" : "Primary Capture"}
+                  </span>
+                </div>
+                {playing.secondary_image_key && (
+                  <div className="relative flex flex-col items-center justify-center h-full max-w-[48%]">
+                    <img
+                      src={`/api/minio/image?bucket=${encodeURIComponent(resolveMinioBucket(playing.secondary_image_key, playing.secondary_image_key.startsWith('plates/') ? 'dvas-plates' : (playing.image_bucket === 'dvas-vehicles' ? 'dvas-plates' : 'dvas-faces')))}&key=${encodeURIComponent(playing.secondary_image_key)}`}
+                      alt="Secondary Evidence"
+                      className="max-h-[calc(100%-24px)] object-contain rounded border border-slate-700 shadow-md"
+                      onError={(e) => {
+                        e.target.onerror = null;
+                        e.target.style.display = 'none';
+                        const fb = e.target.parentElement.querySelector('.modal-img-fallback-sec');
+                        if (fb) fb.style.display = 'flex';
+                      }}
+                    />
+                    <div className="modal-img-fallback-sec hidden flex-col items-center justify-center p-4 text-slate-500 border border-slate-800 rounded bg-slate-950">
+                      <ImageIcon size={24} className="text-slate-600 mb-1" />
+                      <span className="text-[10px] mono">Secondary capture unavailable</span>
+                    </div>
+                    <span className="text-[10px] mono text-sky-400 mt-1 uppercase tracking-wider">
+                      {playing.event_type === "vehicle_detected" || playing.secondary_image_key.startsWith("plates/") ? "License Plate Read" : "Face Biometric Crop"}
+                    </span>
+                  </div>
                 )}
               </div>
             ) : (
               <div className="w-full aspect-video bg-slate-900 flex flex-col items-center justify-center text-slate-500 p-8">
-                <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" className="mb-4 text-slate-600"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-                <p className="text-sm font-medium">Image Unavailable</p>
-                <p className="text-xs text-slate-600 mt-1">Event recorded without visual capture</p>
+                <ImageIcon size={48} className="mb-4 text-slate-600" />
+                <p className="text-sm font-medium text-slate-300">Image Unavailable</p>
+                <p className="text-xs text-slate-500 mt-1">Event recorded without visual crop attachment</p>
               </div>
             )}
             <div className="p-3 mono text-[11px] text-slate-400 flex flex-wrap gap-3">

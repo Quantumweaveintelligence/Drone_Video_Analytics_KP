@@ -451,11 +451,15 @@ async def _stream_loop():
             if drone_id not in last_ids:
                 last_ids[drone_id] = "0"
             try:
-                new_id, frames = await xread_frames(
-                    drone_id, last_ids[drone_id], count=1, block_ms=10
+                frames = await xreadgroup_frames(
+                    "analytics", "person-analyzer", drone_id, ">", count=2, block_ms=100
                 )
-                last_ids[drone_id] = new_id
-                for f in frames:
+                if not frames:
+                    continue
+
+                processed_ids = []
+                for entry_id, f in frames:
+                    processed_ids.append(entry_id)
                     raw = f.get("jpeg_b64", "")
                     if not raw:
                         continue
@@ -780,6 +784,9 @@ async def _stream_loop():
                         _reid_frame_counter = 0
                         asyncio.create_task(_safe_task(_run_person_reid_clustering(), "Person Re-ID Clustering"))
                         asyncio.create_task(_safe_task(_run_reid_clustering(), "Face Re-ID Clustering"))
+
+                if processed_ids:
+                    await ack_frames(drone_id, "analytics", *processed_ids)
 
             except asyncio.CancelledError:
                 return
@@ -1853,11 +1860,17 @@ async def face_search(
             x1, y1, x2, y2, face_conf = best_face
             face_crop = img_bgr[max(0, int(y1)):int(y2), max(0, int(x1)):int(x2)]
         else:
-            raise HTTPException(
-                422,
-                "No face detected in the uploaded image. "
-                "Please upload a clear photo with a visible face."
-            )
+            # Fallback 2: Check if image is already a pre-cropped face/mugshot
+            h_img, w_img = img_bgr.shape[:2]
+            if h_img >= 30 and w_img >= 30:
+                test_emb = arcface_recognizer.extract_embedding(img_bgr, quality_check=False)
+                if test_emb:
+                    face_crop = img_bgr
+                    face_conf = 1.0  # Operator-provided tight face crop
+                else:
+                    raise HTTPException(422, "No face detected in the uploaded image — try a clearer photo")
+            else:
+                raise HTTPException(422, "No face detected in the uploaded image — try a clearer photo")
 
     if face_crop.size == 0:
         raise HTTPException(422, "Extracted face crop is empty")

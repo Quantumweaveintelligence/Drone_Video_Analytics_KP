@@ -111,24 +111,36 @@ function fmtIST(isoTs) {
 function toProxiedUrl(objectKeyOrUrl, bucket = 'dvas-faces') {
   if (!objectKeyOrUrl) return null;
 
-  // Already a proxied URL — pass through
-  if (objectKeyOrUrl.startsWith('/api/minio/')) return objectKeyOrUrl;
+  const token = typeof window !== 'undefined'
+    ? (localStorage.getItem('dvas_token') || localStorage.getItem('token') || '')
+    : '';
+  const tokenParam = token ? `token=${encodeURIComponent(token)}` : '';
+
+  const appendToken = (url) => {
+    if (!tokenParam || url.includes('token=')) return url;
+    return url.includes('?') ? `${url}&${tokenParam}` : `${url}?${tokenParam}`;
+  };
+
+  // Already a proxied URL — pass through (ensure token is attached)
+  if (objectKeyOrUrl.startsWith('/api/minio/')) {
+    return appendToken(objectKeyOrUrl);
+  }
 
   // Internal MinIO presigned URL: http://minio:9000/<bucket>/<key>?...
-  if (objectKeyOrUrl.startsWith('http://minio') || objectKeyOrUrl.startsWith('http://localhost')) {
+  if (objectKeyOrUrl.startsWith('http://minio') || objectKeyOrUrl.startsWith('http://localhost') || objectKeyOrUrl.startsWith('http://127.0.0.1')) {
     try {
       const u = new URL(objectKeyOrUrl);
       const parts = u.pathname.split('/').filter(Boolean); // ['<bucket>', ...rest]
       if (parts.length >= 2) {
         const b = parts[0];
         const k = parts.slice(1).join('/');
-        return `/api/minio/image?bucket=${encodeURIComponent(b)}&key=${encodeURIComponent(k)}`;
+        return appendToken(`/api/minio/image?bucket=${encodeURIComponent(b)}&key=${encodeURIComponent(k)}`);
       }
     } catch { /* ignore parse errors */ }
   }
 
   // Plain object_key string (e.g. "faces/DRN-001/...jpg")
-  return `/api/minio/image?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(objectKeyOrUrl)}`;
+  return appendToken(`/api/minio/image?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(objectKeyOrUrl)}`);
 }
 
 /* ───────────────────────────────────────────────────────────────
@@ -1050,12 +1062,14 @@ function GalleryPreviewModal({ item, isPersonGallery, bucket, onClose }) {
       : toProxiedUrl(faceRawUrl, bucket);
   }
 
-  const clusterLabel = item.cluster_id != null ? `Cluster #${item.cluster_id}` : `Identity #${item.identity_id || item.id || '—'}`;
+  const clusterLabel = item.name
+    ? `${item.name}${item.category ? ` · [${item.category.toUpperCase()}]` : ''}`
+    : (item.cluster_id != null ? `Cluster #${item.cluster_id}` : `Identity #${item.identity_id || item.id || '—'}`);
   const drone = item.drone_id || '—';
-  const msnId = item.mission_id || '—';
+  const msnId = item.case_ref || item.mission_id || '—';
   const timestamp = item.last_seen || item.created_at || item.ts;
   const count = item.embedding_count || 1;
-  const accentColor = isPersonGallery ? '#38bdf8' : '#fbbf24';
+  const accentColor = item.name ? '#fbbf24' : isPersonGallery ? '#38bdf8' : '#fbbf24';
 
   const copyToClipboard = (text, type) => {
     navigator.clipboard.writeText(text);
@@ -1091,7 +1105,7 @@ function GalleryPreviewModal({ item, isPersonGallery, bucket, onClose }) {
           }}
         >
           <div className="flex items-center gap-2">
-            {isPersonGallery ? <Users size={18} style={{ color: accentColor }} /> : <Fingerprint size={18} style={{ color: accentColor }} />}
+            {item.name ? <Shield size={18} className="text-amber-400" /> : isPersonGallery ? <Users size={18} style={{ color: accentColor }} /> : <Fingerprint size={18} style={{ color: accentColor }} />}
             <span className="mono font-bold text-sm" style={{ color: accentColor }}>
               {clusterLabel}
             </span>
@@ -1644,7 +1658,8 @@ function WatchlistAlertCard({ alert, onConfirm, onDismiss, onOpenPreview }) {
   );
 }
 
-function WatchlistCard({ entry, onRemove }) {
+function WatchlistCard({ entry, onRemove, onOpenPreview }) {
+  const [imgError, setImgError] = useState(false);
   const categoryColors = {
     wanted:  { text: '#ef4444', badge: 'bg-red-500/20 text-red-300 border-red-500/30' },
     missing: { text: '#fb923c', badge: 'bg-orange-500/20 text-orange-300 border-orange-500/30' },
@@ -1653,19 +1668,42 @@ function WatchlistCard({ entry, onRemove }) {
   };
   const cat = (entry.category || 'wanted').toLowerCase();
   const colors = categoryColors[cat] || categoryColors.wanted;
+  const hasImage = entry.reference_image_url && !imgError;
 
   return (
     <div className="rounded-xl p-3 flex flex-col justify-between gap-3 relative group"
       style={{ background: 'var(--dvas-surface-2)', border: '1px solid var(--dvas-border)' }}>
       <div className="flex items-start gap-3">
-        {/* Photo thumbnail */}
-        <div className="w-16 h-16 rounded-lg overflow-hidden shrink-0 bg-black/50 border border-slate-700/50">
-          {entry.reference_image_url ? (
-            <img
-              src={toProxiedUrl(entry.reference_image_url, 'dvas-watchlist')}
-              alt={entry.name}
-              className="w-full h-full object-cover"
-            />
+        {/* Photo thumbnail with click-to-preview */}
+        <div
+          className={`w-16 h-16 rounded-lg overflow-hidden shrink-0 bg-black/50 border border-slate-700/50 relative group ${hasImage ? 'cursor-pointer hover:border-amber-500/50' : ''}`}
+          onClick={() => {
+            if (hasImage && onOpenPreview) {
+              onOpenPreview({
+                image_url: entry.reference_image_url,
+                object_key: entry.reference_image_key,
+                name: entry.name,
+                category: entry.category,
+                case_ref: entry.case_ref,
+                description: entry.description,
+                bucket: 'dvas-watchlist',
+              });
+            }
+          }}
+          title={hasImage ? "Click to view full-resolution photograph" : undefined}
+        >
+          {hasImage ? (
+            <>
+              <img
+                src={toProxiedUrl(entry.reference_image_url, 'dvas-watchlist')}
+                alt={entry.name}
+                className="w-full h-full object-cover group-hover:scale-105 transition-transform"
+                onError={() => setImgError(true)}
+              />
+              <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                <Maximize2 size={13} className="text-white" />
+              </div>
+            </>
           ) : (
             <div className="w-full h-full flex items-center justify-center text-slate-600">
               <Users size={20} />
@@ -1727,14 +1765,30 @@ function EnrollmentModal({ isOpen, onClose, onEnrolled }) {
   const [previewUrl, setPreviewUrl] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
+  const [successMsg, setSuccessMsg] = useState(null);
   const fileInputRef = useRef(null);
+
+  const handleClose = useCallback(() => {
+    setName('');
+    setCategory('wanted');
+    setCaseRef('');
+    setDescription('');
+    setFile(null);
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    setPreviewUrl(null);
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    onClose && onClose();
+  }, [previewUrl, onClose]);
 
   const handleFileChange = (e) => {
     const f = e.target.files?.[0];
     if (!f) return;
     setFile(f);
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
     setPreviewUrl(URL.createObjectURL(f));
     setErrorMsg(null);
+    setSuccessMsg(null);
   };
 
   const handleSubmit = async (e) => {
@@ -1750,6 +1804,7 @@ function EnrollmentModal({ isOpen, onClose, onEnrolled }) {
 
     setSubmitting(true);
     setErrorMsg(null);
+    setSuccessMsg(null);
 
     const formData = new FormData();
     formData.append('name', name.trim());
@@ -1761,8 +1816,12 @@ function EnrollmentModal({ isOpen, onClose, onEnrolled }) {
     try {
       const res = await api.post('/analytics/person/watchlist/enroll', formData);
       if (res.data?.status === 'enrolled') {
-        onEnrolled && onEnrolled(res.data);
-        onClose();
+        const embCount = res.data.embeddings_stored || 3;
+        setSuccessMsg(`Subject "${res.data.name || name}" enrolled successfully with ${embCount} biometric face embeddings!`);
+        setTimeout(() => {
+          onEnrolled && onEnrolled(res.data);
+          handleClose();
+        }, 1200);
       } else {
         setErrorMsg(res.data?.detail || 'Enrollment failed');
       }
@@ -1785,7 +1844,7 @@ function EnrollmentModal({ isOpen, onClose, onEnrolled }) {
             <Shield className="text-amber-400" size={18} />
             <span className="font-bold text-white text-sm tracking-wide">Enroll Person to Face Watchlist</span>
           </div>
-          <button onClick={onClose} className="text-slate-400 hover:text-white transition-colors cursor-pointer">
+          <button onClick={handleClose} disabled={submitting} className="text-slate-400 hover:text-white transition-colors cursor-pointer">
             <X size={18} />
           </button>
         </div>
@@ -1795,6 +1854,13 @@ function EnrollmentModal({ isOpen, onClose, onEnrolled }) {
             <div className="p-3 rounded-lg bg-red-500/15 border border-red-500/30 text-red-300 mono text-xs flex items-center gap-2">
               <AlertTriangle size={15} className="shrink-0 text-red-400" />
               <span>{errorMsg}</span>
+            </div>
+          )}
+
+          {successMsg && (
+            <div className="p-3 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 mono text-xs flex items-center gap-2">
+              <Check size={15} className="shrink-0 text-emerald-400" />
+              <span>{successMsg}</span>
             </div>
           )}
 
@@ -1897,7 +1963,7 @@ function EnrollmentModal({ isOpen, onClose, onEnrolled }) {
           <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
             <button
               type="button"
-              onClick={onClose}
+              onClick={handleClose}
               disabled={submitting}
               className="px-4 py-2 rounded-lg mono text-xs text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
             >
@@ -2407,6 +2473,8 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
   const faces      = Array.isArray(facesData)             ? facesData
     : Array.isArray(facesData?.gallery)                   ? facesData.gallery
     : Array.isArray(facesData?.faces)                     ? facesData.faces : [];
+  const watchlist  = Array.isArray(watchlistData)         ? watchlistData
+    : Array.isArray(watchlistData?.watchlist)             ? watchlistData.watchlist : [];
 
   // Live persons from in-memory buffer (has crop_b64 pairs)
   const livePersons = Array.isArray(liveData?.persons)
@@ -2516,7 +2584,7 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
         title="Face Watchlist (Enrolled Persons)"
         icon={Shield}
         iconClass="text-amber-400"
-        badge={watchlistData?.length > 0 ? `${watchlistData.length} enrolled` : null}
+        badge={watchlist.length > 0 ? `${watchlist.length}${watchlistCategoryFilter ? ` (${watchlistCategoryFilter})` : ''} enrolled` : null}
         right={
           <div className="flex items-center gap-2">
             <select
@@ -2540,21 +2608,35 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
           </div>
         }
       >
-        {watchlistData && watchlistData.length > 0 ? (
+        {watchlistLoading && watchlist.length === 0 ? (
+          <div className="p-8 text-center text-slate-500 mono text-xs flex flex-col items-center gap-2">
+            <div className="w-5 h-5 border-2 border-amber-500/40 border-t-amber-400 rounded-full animate-spin" />
+            <span>Loading watchlist...</span>
+          </div>
+        ) : watchlist.length > 0 ? (
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3 p-3">
-            {watchlistData.map(entry => (
+            {watchlist.map(entry => (
               <WatchlistCard
                 key={entry.id}
                 entry={entry}
                 onRemove={handleRemoveWatchlist}
+                onOpenPreview={setPreviewModalItem}
               />
             ))}
           </div>
         ) : (
           <div className="p-8 text-center text-slate-500 mono text-xs flex flex-col items-center gap-2">
             <Shield size={32} className="opacity-30 text-amber-500/60" />
-            <span>No enrolled subjects in the Face Watchlist.</span>
-            <span className="text-[10px] text-slate-600">Click "+ Enroll Person" to enroll suspects with reference photographs.</span>
+            <span>
+              {watchlistCategoryFilter
+                ? `No enrolled subjects found in category "${watchlistCategoryFilter.toUpperCase()}".`
+                : 'No enrolled subjects in the Face Watchlist.'}
+            </span>
+            <span className="text-[10px] text-slate-600">
+              {watchlistCategoryFilter
+                ? 'Select "All Categories" or click "+ Enroll Person" to enroll a suspect in this category.'
+                : 'Click "+ Enroll Person" to enroll suspects with reference photographs.'}
+            </span>
           </div>
         )}
       </Panel>
@@ -2667,7 +2749,7 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
         <GalleryPreviewModal
           item={previewModalItem}
           isPersonGallery={false}
-          bucket="dvas-faces"
+          bucket={previewModalItem.bucket || 'dvas-faces'}
           onClose={() => setPreviewModalItem(null)}
         />
       )}

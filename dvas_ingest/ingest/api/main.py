@@ -649,15 +649,31 @@ async def mission_start(
         del _ingest_stats[req.drone_id]
 
     _active_missions[req.drone_id] = {
-        "mission_id":  req.mission_id,
+        "mission_id":   req.mission_id,
         "mission_name": req.mission_name,
-        "started_at":  ts,
-        "operator":    req.operator or extract_username(claims),
-        "location":    req.location,
-        "latitude":    req.latitude,
-        "longitude":   req.longitude,
-        "geofence":    req.geofence,
+        "status":       "active",
+        "started_at":   ts,
+        "operator":     req.operator or extract_username(claims),
+        "location":     req.location,
+        "latitude":     req.latitude,
+        "longitude":    req.longitude,
+        "geofence":     req.geofence,
     }
+    if _qm:
+        _qm.start_mission(req.drone_id, req.mission_id)
+
+    if req.drone_id not in _latest_metadata:
+        _latest_metadata[req.drone_id] = {}
+    _latest_metadata[req.drone_id].update({
+        "drone_id":       req.drone_id,
+        "mission_id":     req.mission_id,
+        "mission_name":   req.mission_name,
+        "mission_status": "active",
+        "status":         "live",
+        "operator":       req.operator or extract_username(claims),
+        "location":       req.location,
+        "last_seen":      ts,
+    })
 
     try:
         valkey = getattr(_qm, "_client", None) or getattr(_qm, "_redis", None)
@@ -897,15 +913,23 @@ async def ingest_model_suggestion(
     return {"status": "ok", "suggestion_id": sugg_id, "received_at": ts}
 
 
-async def _auto_cleanup_consumed_streams():
-    """Periodically check for fully-consumed draining streams and auto-clean."""
+async def _auto_cleanup_consumed_streams(min_drain_sec: float = 20.0):
+    """Periodically check for fully-consumed draining streams and auto-clean after grace period."""
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(15)
         try:
             for drone_id in list(_active_missions.keys()):
                 mission = _active_missions[drone_id]
                 if mission.get("status") != "draining":
                     continue
+                drain_start = mission.get("drain_started_at")
+                if not drain_start and drone_id in _qm._stats:
+                    drain_start = _qm._stats[drone_id].drain_started_at
+                
+                # Enforce minimum grace period so operator/dashboard can observe draining
+                if drain_start and (time.time() - drain_start) < min_drain_sec:
+                    continue
+
                 if await _qm.is_fully_consumed(drone_id):
                     log.info(f"[AUTO-CLEANUP] {drone_id}: Fully consumed — purging")
                     await _qm.purge_stream(drone_id)
@@ -924,23 +948,24 @@ async def _auto_cleanup_consumed_streams():
             log.warning(f"[AUTO-CLEANUP] Error: {e}")
 
 
-async def _monitor_queue_drain(drone_id: str, mission_id: str, max_wait_sec: float = 300.0):
+async def _monitor_queue_drain(drone_id: str, mission_id: str, max_wait_sec: float = 300.0, min_drain_sec: float = 20.0):
     """
     Consumer-group-aware drain. Waits until all analytics consumers have ACKed
-    all pending entries, OR until max_wait_sec (5 min).
+    all pending entries AND min_drain_sec (20s) has elapsed, OR until max_wait_sec (5 min).
     Does NOT auto-purge on timeout — stream preserved for manual officer purge.
     """
     start = time.monotonic()
     while (time.monotonic() - start) < max_wait_sec:
         try:
-            if await _qm.is_fully_consumed(drone_id):
+            elapsed = time.monotonic() - start
+            if elapsed >= min_drain_sec and await _qm.is_fully_consumed(drone_id):
                 current_mission = _active_missions.get(drone_id, {})
                 if current_mission.get("mission_id") != mission_id:
                     log.info(f"[DRAIN] {drone_id}: Mission {mission_id} superseded by {current_mission.get('mission_id')} — aborting drain cleanup")
                     _drain_tasks.pop(drone_id, None)
                     return
 
-                log.info(f"[DRAIN] {drone_id}/{mission_id}: All consumers finished — auto-cleaning")
+                log.info(f"[DRAIN] {drone_id}/{mission_id}: All consumers finished and grace period satisfied — auto-cleaning")
                 await _qm.purge_stream(drone_id)
                 try:
                     valkey = getattr(_qm, "_client", None) or getattr(_qm, "_redis", None)
@@ -988,6 +1013,14 @@ async def mission_end(
         _qm.mark_mission_draining(req.drone_id, req.mission_id, req.frames_sent)
     if req.drone_id in _active_missions:
         _active_missions[req.drone_id]["status"] = "draining"
+        _active_missions[req.drone_id]["drain_started_at"] = time.time()
+    else:
+        _active_missions[req.drone_id] = {
+            "mission_id": req.mission_id,
+            "status": "draining",
+            "drone_id": req.drone_id,
+            "drain_started_at": time.time(),
+        }
 
     try:
         valkey = getattr(_qm, "_client", None) or getattr(_qm, "_redis", None)
@@ -998,6 +1031,7 @@ async def mission_end(
     
     if req.drone_id in _latest_metadata:
         _latest_metadata[req.drone_id]["mission_status"] = "draining"
+        _latest_metadata[req.drone_id]["status"] = "draining"
         _latest_metadata[req.drone_id]["drain_started_at"] = ts
 
     if req.drone_id in _drain_tasks:
@@ -1062,9 +1096,12 @@ async def get_active_streams():
             if cursor == 0:
                 break
 
+        found_key_strs = {k.decode() if isinstance(k, bytes) else k for k in found_keys}
+        for d in _active_missions:
+            found_key_strs.add(f"drone:frames:{d}")
+
         drones = []
-        for key in found_keys:
-            key_str = key.decode() if isinstance(key, bytes) else key
+        for key_str in found_key_strs:
             parts = key_str.split(":", 2)
             if len(parts) < 3:
                 continue
@@ -1079,7 +1116,9 @@ async def get_active_streams():
             
             # Determine live vs draining vs offline
             is_active_mission = drone_id in _active_missions
-            mission_stat = _qm._stats.get(drone_id).mission_status if drone_id in _qm._stats else "idle"
+            active_mission_info = _active_missions.get(drone_id, {})
+            active_mission_status = active_mission_info.get("status")
+            mission_stat = active_mission_status or (_qm._stats.get(drone_id).mission_status if drone_id in _qm._stats else "idle")
             
             # Check if we received a frame recently (within 15s) — strong live signal
             recently_seen = False
@@ -1092,13 +1131,13 @@ async def get_active_streams():
                 except Exception:
                     pass
             
-            # If 0 frames exist in stream, skip reporting as active
+            # If 0 frames exist in stream, skip reporting as active UNLESS mission is draining or active
             if frame_count == 0 and not is_active_mission and not recently_seen:
                 continue
 
             stream_status = "live"
             if mission_stat == "draining":
-                stream_status = "draining" if frame_count > 0 else "offline"
+                stream_status = "draining"
             elif not is_active_mission and not recently_seen:
                 stream_status = "draining" if frame_count > 0 else "offline"
 
@@ -1109,6 +1148,7 @@ async def get_active_streams():
                 "frames_received": frame_count,
                 "messages_ready":  frame_count,
                 "status":          stream_status,
+                "mission_status":  mission_stat,
                 "mission_id":      meta.get("mission_id") or _active_missions.get(drone_id, {}).get("mission_id"),
                 "mission_name":    meta.get("mission_name") or _active_missions.get(drone_id, {}).get("mission_name"),
                 "operator":        meta.get("operator") or _active_missions.get(drone_id, {}).get("operator"),

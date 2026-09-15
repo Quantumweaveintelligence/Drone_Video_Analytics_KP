@@ -3,7 +3,7 @@ import AppShell from "@/components/layout/AppShell";
 import { api, ROLE_LABELS } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { useI18n } from "@/context/I18nContext";
-import { ShieldCheck, Users, ClipboardList, Folder, Settings, Key, FileText, ShieldAlert, Download, Server, Activity } from "lucide-react";
+import { ShieldCheck, Users, ClipboardList, Folder, Settings, Key, FileText, ShieldAlert, Download, Server, Activity, Plus, Trash2 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 
 // 4-role model: supervisory_officer pages merged into senior_officer
@@ -32,6 +32,45 @@ export default function AdminDashboard() {
   const [logs, setLogs] = useState([]);
   const [chainInfo, setChainInfo] = useState(null);
   const [users, setUsers] = useState([]);
+  const [userForm, setUserForm] = useState({ email: "", name: "", password: "", role: "drone_operator", jurisdiction: "", mission_scope: "" });
+  const [userBusy, setUserBusy] = useState(false);
+  const [userMsg, setUserMsg] = useState("");
+
+  const reloadUsers = async () => {
+    try {
+      const res = await api.get("/users");
+      setUsers(Array.isArray(res.data) ? res.data : []);
+    } catch (e) {
+      setUsers([]);
+    }
+  };
+
+  const handleCreateUser = async (e) => {
+    e.preventDefault(); setUserBusy(true); setUserMsg("");
+    try {
+      await api.post("/users", {
+        ...userForm,
+        mission_scope: userForm.mission_scope.split(",").map(s => s.trim()).filter(Boolean),
+      });
+      setUserForm({ email: "", name: "", password: "", role: "drone_operator", jurisdiction: "", mission_scope: "" });
+      setUserMsg("User created successfully.");
+      reloadUsers();
+    } catch (err) {
+      setUserMsg(err.response?.data?.detail || "Failed to create user");
+    } finally {
+      setUserBusy(false);
+    }
+  };
+
+  const handleSuspendUser = async (id) => {
+    if (!window.confirm("Suspend this user?")) return;
+    try {
+      await api.delete(`/users/${id}`);
+      reloadUsers();
+    } catch (err) {
+      alert("Failed to suspend user");
+    }
+  };
   const [q, setQ] = useState("");
   // Audit scope toggle: senior_officer has both jurisdiction-detail AND cross-jurisdiction aggregate
   const [auditScope, setAuditScope] = useState("detail"); // "detail" | "aggregate"
@@ -69,7 +108,7 @@ export default function AdminDashboard() {
         .catch(() => setLogs([]));
       api.get("/audit-logs/verify").then(r => setChainInfo(r.data)).catch(()=>setChainInfo(null));
     }
-    if (page === "users" && user.role === "system_administrator") api.get("/users").then(r => setUsers(r.data)).catch(()=>{});
+    if (page === "users" && user.role === "system_administrator") reloadUsers();
   }, [page, q]);
 
   return (
@@ -132,11 +171,130 @@ export default function AdminDashboard() {
 
         <div className="min-w-0">
           {page === "users" && user.role === "system_administrator" && (
-            <div className="border border-slate-800 bg-slate-900">
-              <div className="p-3 border-b border-slate-800 text-sm flex items-center gap-2"><Users size={16} className="text-sky-400"/> {t("admin.page.users")}</div>
-              <table className="w-full text-xs"><thead className="bg-slate-950/60"><tr>{[t("table.name"),t("table.email"),t("table.role"),t("table.jurisdiction"),t("table.missionScope"),t("table.status")].map(h=><th key={h} className="text-left px-3 py-2 dvas-label border-b border-slate-800" style={{fontSize:10}}>{h}</th>)}</tr></thead>
-                <tbody className="mono">{users.map(u=>(<tr key={u.id} className="hover:bg-slate-800/40"><td className="px-3 py-2 border-b border-slate-800/60 text-slate-100">{u.name}</td><td className="px-3 py-2 border-b border-slate-800/60">{u.email}</td><td className="px-3 py-2 border-b border-slate-800/60"><span className="px-1.5 py-0.5 border border-sky-500/40 bg-sky-500/10 text-sky-300 text-[10px]">{t(`role.${u.role}`)}</span></td><td className="px-3 py-2 border-b border-slate-800/60">{u.jurisdiction}</td><td className="px-3 py-2 border-b border-slate-800/60 text-slate-400">{(u.mission_scope||[]).join(", ")||"-"}</td><td className="px-3 py-2 border-b border-slate-800/60">{u.suspended?<span className="text-red-400">{t("common.suspended")}</span>:<span className="text-emerald-400">{t("common.active")}</span>}</td></tr>))}</tbody></table>
-              <div className="p-3 border-t border-slate-800 mono text-[11px] text-slate-500">Full CRUD (create / suspend) is available under Ingest → User &amp; Role Management. Every change is auto-logged.</div>
+            <div className="space-y-4">
+              {/* Create User Form */}
+              <div className="border border-slate-800 bg-slate-900">
+                <div className="p-3 border-b border-slate-800 text-sm flex items-center gap-2">
+                  <Plus size={16} className="text-sky-400" /> Create User (Every change is auto-logged to Audit Trail)
+                </div>
+                <form onSubmit={handleCreateUser} className="p-3 grid grid-cols-1 md:grid-cols-6 gap-2">
+                  <input
+                    data-testid="admin-user-email"
+                    required
+                    type="email"
+                    placeholder="email (e.g. officer@dvas.kp)"
+                    value={userForm.email}
+                    onChange={e => setUserForm({ ...userForm, email: e.target.value })}
+                    className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono"
+                  />
+                  <input
+                    data-testid="admin-user-name"
+                    required
+                    placeholder="full name"
+                    value={userForm.name}
+                    onChange={e => setUserForm({ ...userForm, name: e.target.value })}
+                    className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono"
+                  />
+                  <input
+                    data-testid="admin-user-password"
+                    required
+                    type="password"
+                    placeholder="initial password"
+                    value={userForm.password}
+                    onChange={e => setUserForm({ ...userForm, password: e.target.value })}
+                    className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono"
+                  />
+                  <select
+                    data-testid="admin-user-role"
+                    value={userForm.role}
+                    onChange={e => setUserForm({ ...userForm, role: e.target.value })}
+                    className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono"
+                  >
+                    {Object.entries(ROLE_LABELS).map(([k, v]) => (
+                      <option key={k} value={k}>{v}</option>
+                    ))}
+                  </select>
+                  <input
+                    data-testid="admin-user-jurisdiction"
+                    placeholder="jurisdiction (e.g. TVM_NORTH)"
+                    value={userForm.jurisdiction}
+                    onChange={e => setUserForm({ ...userForm, jurisdiction: e.target.value })}
+                    className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono"
+                  />
+                  <input
+                    data-testid="admin-user-missions"
+                    placeholder="mission scope (e.g. M-101, M-102)"
+                    value={userForm.mission_scope}
+                    onChange={e => setUserForm({ ...userForm, mission_scope: e.target.value })}
+                    className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono"
+                  />
+                  <button
+                    data-testid="admin-user-create-btn"
+                    disabled={userBusy}
+                    className="col-span-6 md:col-span-6 bg-sky-600 hover:bg-sky-500 text-white text-xs py-2 font-medium"
+                  >
+                    {userBusy ? "Creating User in Keycloak…" : "Create & Provision User"}
+                  </button>
+                  {userMsg && (
+                    <div className={`col-span-6 mono text-[11px] ${userMsg.includes("successfully") ? "text-emerald-400" : "text-red-400"}`}>
+                      {userMsg}
+                    </div>
+                  )}
+                </form>
+              </div>
+
+              {/* User Directory */}
+              <div className="border border-slate-800 bg-slate-900">
+                <div className="p-3 border-b border-slate-800 text-sm flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Users size={16} className="text-sky-400" /> User Directory
+                  </div>
+                  <span className="mono text-xs text-slate-400">{users.length} registered officers</span>
+                </div>
+                <table className="w-full text-xs">
+                  <thead className="bg-slate-950/60">
+                    <tr>
+                      {[t("table.name"), t("table.email"), t("table.role"), t("table.jurisdiction"), t("table.missionScope"), t("table.status"), "Actions"].map(h => (
+                        <th key={h} className="text-left px-3 py-2 dvas-label border-b border-slate-800" style={{ fontSize: 10 }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="mono">
+                    {users.map(u => (
+                      <tr key={u.id} className="hover:bg-slate-800/40">
+                        <td className="px-3 py-2 border-b border-slate-800/60 text-slate-100 font-medium">{u.name}</td>
+                        <td className="px-3 py-2 border-b border-slate-800/60 text-slate-300">{u.email}</td>
+                        <td className="px-3 py-2 border-b border-slate-800/60">
+                          <span className="px-1.5 py-0.5 border border-sky-500/40 bg-sky-500/10 text-sky-300 text-[10px]">
+                            {ROLE_LABELS[u.role] || u.role}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2 border-b border-slate-800/60">{u.jurisdiction || "—"}</td>
+                        <td className="px-3 py-2 border-b border-slate-800/60 text-slate-400">
+                          {(u.mission_scope || []).join(", ") || "—"}
+                        </td>
+                        <td className="px-3 py-2 border-b border-slate-800/60">
+                          {u.suspended ? (
+                            <span className="text-red-400 font-semibold">{t("common.suspended")}</span>
+                          ) : (
+                            <span className="text-emerald-400 font-semibold">{t("common.active")}</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2 border-b border-slate-800/60">
+                          {!u.suspended && (
+                            <button
+                              onClick={() => handleSuspendUser(u.id)}
+                              className="px-2 py-1 border border-red-600/60 text-red-300 hover:bg-red-500/10 inline-flex items-center gap-1 text-[11px]"
+                            >
+                              <Trash2 size={11} /> Suspend
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
           )}
 

@@ -51,6 +51,7 @@ class DroneQueueStats:
     mission_started: Optional[float] = None
     mission_status:  str   = "idle"  # "active", "draining", "ended", "idle"
     drain_target_seq: Optional[int] = None
+    drain_started_at: Optional[float] = None
     queue_depth:     int   = 0
     errors:          int   = 0
 
@@ -165,19 +166,33 @@ class QueueManager:
             return {}
 
     async def is_fully_consumed(self, drone_id: str) -> bool:
-        """True when all consumers in the 'analytics' group have ACKed all entries."""
+        """
+        True only when the stream has no entries OR all consumers in the 'analytics'
+        group have ACKed all entries and consumer lag is zero.
+        Never returns True if there are unconsumed frames and no consumer groups exist.
+        """
+        if not self._connected:
+            await self.connect()
         stream_key = f"drone:frames:{drone_id}"
         try:
+            xlen = await self._client.xlen(stream_key)
+            if xlen == 0:
+                return True
             groups = await self._client.xinfo_groups(stream_key)
             if not groups:
-                return True
+                return False
+            has_active_consumer = False
             for g in groups:
+                consumers = g.get("consumers", 0)
                 pending = g.get("pending", 0)
                 lag = g.get("lag", 0)
-                if pending > 0 or lag > 0:
+                if consumers > 0:
+                    has_active_consumer = True
+                if pending > 0 or (lag is not None and lag > 0):
                     return False
-            return True
-        except Exception:
+            return has_active_consumer
+        except Exception as exc:
+            log.debug("is_fully_consumed check failed for %s: %s", drone_id, exc)
             return False
 
     # ── Frame publishing ──────────────────────────────────────────────────────
@@ -278,9 +293,11 @@ class QueueManager:
         self._stats[drone_id].drain_target_seq = None
 
     def mark_mission_draining(self, drone_id: str, mission_id: str, last_seq: Optional[int] = None) -> None:
-        if drone_id in self._stats:
-            self._stats[drone_id].mission_status   = "draining"
-            self._stats[drone_id].drain_target_seq = last_seq
+        if drone_id not in self._stats:
+            self._stats[drone_id] = DroneQueueStats(drone_id=drone_id)
+        self._stats[drone_id].mission_status   = "draining"
+        self._stats[drone_id].drain_target_seq = last_seq
+        self._stats[drone_id].drain_started_at = time.time()
 
     def end_mission(self, drone_id: str, mission_id: str) -> None:
         if drone_id in self._stats:

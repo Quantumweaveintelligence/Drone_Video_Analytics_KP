@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, update, func, or_
+from sqlalchemy import select, update, func, or_, distinct, case
 from jose import jwt
 
 from database import async_session_factory
@@ -123,32 +123,59 @@ async def ack_alert(
     return {"ok": True}
 
 
+PERSON_EVENT_TYPES = ["person_detected", "perimeter_intrusion", "intrusion_alert"]
+VEHICLE_EVENT_TYPES = ["vehicle_detected", "vehicle_anomaly", "wrong_way", "theft_alert"]
+CROWD_EVENT_TYPES = ["crowd_threshold", "crowd_surge", "unattended_object"]
+
+
 @router.get("/evidence")
 async def list_evidence(
     drone_id: str = "",
     mission_id: str = "",
     event_type: str = "",
+    category: str = "",
+    dedup: bool = True,
     from_ts: str = "",
     to_ts: str = "",
     legal_hold_only: bool = False,
     search: str = "",
-    limit: int = 200,
+    limit: int = 60,
     offset: int = 0,
     user: dict = Depends(get_current_user)
 ):
-    f = scope_filter_for(user)
-    if "__deny__" in f:
-        raise HTTPException(403, "Not permitted")
+    role = user.get("role")
     async with async_session_factory() as session:
         stmt = select(Evidence)
-        stmt = _apply_scope_to_query(stmt, Evidence, f)
-        if stmt is None:
-            raise HTTPException(403, "Not permitted")
+        if role in ("system_administrator", "senior_officer"):
+            pass  # State-wide aggregate access
+        elif role == "control_room_officer":
+            jur = user.get("jurisdiction")
+            if jur and not (drone_id or mission_id):
+                stmt = stmt.where(or_(
+                    Evidence.jurisdiction == jur,
+                    Evidence.jurisdiction.is_(None),
+                    Evidence.jurisdiction == "",
+                    Evidence.jurisdiction.in_(["Kerala", "State HQ", "Thiruvananthapuram"])
+                ))
+        elif role == "drone_operator":
+            if user.get("mission_scope"):
+                stmt = stmt.where(Evidence.mission_id.in_(user["mission_scope"]))
+        else:
+            f = scope_filter_for(user)
+            if "__deny__" in f:
+                raise HTTPException(403, "Not permitted")
+            stmt = _apply_scope_to_query(stmt, Evidence, f)
+            if stmt is None:
+                raise HTTPException(403, "Not permitted")
         
-        # If drone operator, scope to their mission scope if defined
-        if user["role"] == "drone_operator" and user.get("mission_scope"):
-            stmt = stmt.where(Evidence.mission_id.in_(user["mission_scope"]))
-        
+        # High-level category filtering
+        if category == "person":
+            stmt = stmt.where(Evidence.event_type.in_(PERSON_EVENT_TYPES))
+        elif category == "vehicle":
+            stmt = stmt.where(Evidence.event_type.in_(VEHICLE_EVENT_TYPES))
+        elif category == "crowd":
+            stmt = stmt.where(Evidence.event_type.in_(CROWD_EVENT_TYPES))
+
         if drone_id:
             stmt = stmt.where(Evidence.drone_id == drone_id)
         if mission_id:
@@ -169,16 +196,85 @@ async def list_evidence(
                 Evidence.drone_id.ilike(f"%{search}%"),
             ))
         
-        count_stmt = select(func.count()).select_from(stmt.subquery())
-        total = await session.scalar(count_stmt)
-        
-        stmt = stmt.order_by(Evidence.ts.desc()).offset(offset).limit(limit)
-        result = await session.execute(stmt)
-        
-        return {
-            "items": [_row_to_dict(r) for r in result.scalars().all()],
-            "total": total
+        if dedup:
+            dedup_key = case(
+                (func.nullif(Evidence.primary_image_key, '') != None, Evidence.primary_image_key),
+                else_=Evidence.id
+            ).label('dedup_key')
+            dup_count = func.count().over(partition_by=dedup_key).label('duplicate_count')
+
+            inner = (
+                stmt.add_columns(dup_count)
+                .distinct(dedup_key)
+                .order_by(dedup_key, Evidence.ts.desc())
+                .subquery('deduped')
+            )
+
+            count_stmt = select(func.count()).select_from(inner)
+            total = await session.scalar(count_stmt)
+
+            outer = select(inner).order_by(inner.c.ts.desc()).offset(offset).limit(limit)
+            result = await session.execute(outer)
+            items = [dict(r) for r in result.mappings().all()]
+
+            return {
+                "items": items,
+                "total": total or 0
+            }
+        else:
+            count_stmt = select(func.count()).select_from(stmt.subquery())
+            total = await session.scalar(count_stmt)
+
+            stmt = stmt.order_by(Evidence.ts.desc()).offset(offset).limit(limit)
+            result = await session.execute(stmt)
+            items = []
+            for r in result.scalars().all():
+                d = _row_to_dict(r)
+                d["duplicate_count"] = 1
+                items.append(d)
+
+            return {
+                "items": items,
+                "total": total or 0
+            }
+
+
+@router.get("/evidence/meta")
+async def get_evidence_meta(user: dict = Depends(get_current_user)):
+    async with async_session_factory() as session:
+        drones = (await session.execute(
+            select(distinct(Evidence.drone_id)).where(Evidence.drone_id != "", Evidence.drone_id.is_not(None))
+        )).scalars().all()
+        missions = (await session.execute(
+            select(distinct(Evidence.mission_id)).where(Evidence.mission_id != "", Evidence.mission_id.is_not(None))
+        )).scalars().all()
+        types = (await session.execute(
+            select(distinct(Evidence.event_type)).where(Evidence.event_type != "", Evidence.event_type.is_not(None))
+        )).scalars().all()
+
+        dedup_key = case(
+            (func.nullif(Evidence.primary_image_key, '') != None, Evidence.primary_image_key),
+            else_=Evidence.id
+        )
+
+        counts = {
+            "all": (await session.scalar(select(func.count(Evidence.id)))) or 0,
+            "all_dedup": (await session.scalar(select(func.count(distinct(dedup_key))))) or 0,
+            "person": (await session.scalar(select(func.count(Evidence.id)).where(Evidence.event_type.in_(PERSON_EVENT_TYPES)))) or 0,
+            "person_dedup": (await session.scalar(select(func.count(distinct(dedup_key))).where(Evidence.event_type.in_(PERSON_EVENT_TYPES)))) or 0,
+            "vehicle": (await session.scalar(select(func.count(Evidence.id)).where(Evidence.event_type.in_(VEHICLE_EVENT_TYPES)))) or 0,
+            "vehicle_dedup": (await session.scalar(select(func.count(distinct(dedup_key))).where(Evidence.event_type.in_(VEHICLE_EVENT_TYPES)))) or 0,
+            "crowd": (await session.scalar(select(func.count(Evidence.id)).where(Evidence.event_type.in_(CROWD_EVENT_TYPES)))) or 0,
+            "crowd_dedup": (await session.scalar(select(func.count(distinct(dedup_key))).where(Evidence.event_type.in_(CROWD_EVENT_TYPES)))) or 0,
         }
+
+        return {
+            "drones": sorted([d for d in drones if d]),
+            "missions": sorted([m for m in missions if m]),
+            "event_types": sorted([t for t in types if t]),
+            "counts": counts
+        }
+
 
 
 @router.get("/evidence/{evidence_id}")

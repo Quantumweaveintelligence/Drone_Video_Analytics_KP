@@ -1446,14 +1446,27 @@ function MissionHistory() {
 }
 export default function TrafficAnalytics({ drones, onNavigateTab }) {
   const { streams, loading: dronesLoading } = useActiveStreams();
-  const activeDrones = streams.map(s => ({
-    drone_id: s.drone_id,
-    mission_id: s.mission_id,
-    status: s.status,
-    messages_ready: s.messages_ready,
-    consumer_lag: s.consumer_lag,
-    frames_received: s.status === 'live' || (s.messages_ready || 0) > 0 ? 1 : 0
-  }));
+  const activeDrones = (streams && streams.length > 0
+    ? streams.map(s => ({
+        drone_id: s.drone_id || s.id || '',
+        mission_id: s.mission_id,
+        status: s.status,
+        messages_ready: s.messages_ready ?? 0,
+        consumer_lag: s.consumer_lag,
+        frames_received: s.status === 'live' || (s.messages_ready || 0) > 0 ? 1 : 0
+      }))
+    : (drones && drones.length > 0
+        ? drones.filter(d => (d.status === 'live' || d.status === 'draining') && !/^DRN-00[1-5]$/i.test(d.id || d.drone_id)).map(d => ({
+            drone_id: d.drone_id || d.id || '',
+            mission_id: d.mission_id,
+            status: d.status,
+            messages_ready: d.messages_ready ?? 0,
+            consumer_lag: d.consumer_lag,
+            frames_received: d.status === 'live' || (d.messages_ready || 0) > 0 ? 1 : 0
+          }))
+        : [])
+  ).filter(d => Boolean(d.drone_id));
+
   const [activeDrone, setActiveDrone] = useState(null);
   const [activeMissionId, setActiveMissionId] = useState(null); // current mission_id for selected drone
   const [feedMode, setFeedMode]       = useState('vehicle');
@@ -1464,17 +1477,17 @@ export default function TrafficAnalytics({ drones, onNavigateTab }) {
   useEffect(() => {
     if (activeDrones.length === 0) return;
     setActiveDrone(prev => {
-      if (prev && activeDrones.find(d => d.drone_id === prev)) return prev; // keep if still active
+      if (prev && activeDrones.find(d => (d.drone_id || d.id) === prev)) return prev; // keep if still active
       // Pick first drone with frames, else first in list
       const live = activeDrones.find(d => (d.frames_received || 0) > 0);
-      return (live || activeDrones[0])?.drone_id || null;
+      return (live || activeDrones[0])?.drone_id || (live || activeDrones[0])?.id || null;
     });
   }, [activeDrones]);
 
   // Track the current mission_id for the selected drone from ingest telemetry
   useEffect(() => {
     if (!activeDrone || !activeDrones.length) return;
-    const drone = activeDrones.find(d => d.drone_id === activeDrone);
+    const drone = activeDrones.find(d => (d.drone_id || d.id) === activeDrone);
     const missionId = drone?.mission_id || null;
     setActiveMissionId(prev => {
       if (prev !== missionId) return missionId;
@@ -1559,13 +1572,18 @@ export default function TrafficAnalytics({ drones, onNavigateTab }) {
               </span>
             )}
             {activeDrones.map(d => {
+              const droneId = d?.drone_id || d?.id || '';
+              if (!droneId) return null;
               const isLive = (d.frames_received || 0) > 0;
-              const isSelected = activeDrone === d.drone_id;
+              const isSelected = activeDrone === droneId;
               const isDraining = d.status === 'draining';
+              const displayId = typeof droneId === 'string'
+                ? droneId.replace(/DRONE_KL_/i, 'DRN-').replace(/DRONE_/i, 'DRN-')
+                : String(droneId);
               return (
-                <button key={d.drone_id} onClick={() => setActiveDrone(d.drone_id)}
+                <button key={droneId} onClick={() => setActiveDrone(droneId)}
                   className="mono text-[10px] px-2 py-1 rounded transition-all flex items-center gap-1"
-                  title={`${d.drone_id} — ${isLive ? 'streaming' : 'no frames'}`}
+                  title={`${droneId} — ${isLive ? 'streaming' : 'no frames'}`}
                   style={{
                     background: isSelected ? 'rgba(139,92,246,0.15)':'var(--dvas-surface-2)',
                     color: isSelected ? '#a78bfa' : isLive ? 'var(--dvas-text)' : 'var(--dvas-text-muted)',
@@ -1577,7 +1595,7 @@ export default function TrafficAnalytics({ drones, onNavigateTab }) {
                   {isDraining && (
                     <span className="w-1.5 h-1.5 rounded-full bg-amber-400 dvas-live-dot shrink-0" />
                   )}
-                  {d.drone_id.replace(/DRONE_KL_/i, 'DRN-').replace(/DRONE_/i, 'DRN-')}
+                  {displayId}
                   {isDraining && (
                     <span className="text-[8px] bg-amber-800/60 text-amber-300 px-1.5 py-0.5 rounded ml-1 font-bold">DRAINING</span>
                   )}
@@ -1633,7 +1651,7 @@ export default function TrafficAnalytics({ drones, onNavigateTab }) {
           </div>
         </div>
         {(() => {
-          const selectedDroneObj = activeDrones.find(d => d.drone_id === activeDrone);
+          const selectedDroneObj = activeDrones.find(d => (d.drone_id || d.id) === activeDrone);
           const remaining = selectedDroneObj?.consumer_lag ? Object.values(selectedDroneObj.consumer_lag).reduce((sum, v) => sum + v, 0) : (selectedDroneObj?.messages_ready ?? 0);
           if (selectedDroneObj?.status === 'draining') {
             return (

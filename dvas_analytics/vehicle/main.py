@@ -313,15 +313,14 @@ async def _stream_loop():
 
                 processed_ids = []
                 for entry_id, f in frames:
+                    processed_ids.append(entry_id)
                     raw = f.get("jpeg_b64", "")
                     if not raw:
-                        processed_ids.append(entry_id)
                         continue
                     img_bytes = base64.b64decode(raw)
                     nparr  = np.frombuffer(img_bytes, np.uint8)
                     frame  = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     if frame is None:
-                        processed_ids.append(entry_id)
                         continue
 
                     result = analyzer.analyze_frame(frame, drone_id=drone_id, save_crops=True)
@@ -403,6 +402,9 @@ async def _stream_loop():
                         "frame_count": _frames_processed,
                     })
                     _frames_processed += 1
+
+                if processed_ids:
+                    await ack_frames(drone_id, "analytics", *processed_ids)
 
             except asyncio.CancelledError:
                 return

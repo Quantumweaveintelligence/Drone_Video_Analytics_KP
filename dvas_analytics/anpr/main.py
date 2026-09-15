@@ -544,6 +544,9 @@ async def _stream_loop():
                     })
                     _frames_processed += 1
 
+                if all_entry_ids:
+                    await ack_frames(drone_id, "analytics", *all_entry_ids)
+
             except asyncio.CancelledError:
                 return
             except Exception as exc:

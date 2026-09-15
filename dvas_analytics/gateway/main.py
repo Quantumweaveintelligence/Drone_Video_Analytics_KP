@@ -221,7 +221,7 @@ async def list_confirmed_events(
     """List recent confirmed events for evidence sync pipeline."""
     pool = await get_pool()
     
-    query = "SELECT event_id::text, mission_id::text, drone_id, event_type, confidence, ts, latitude, longitude, attributes::text, status, created_at FROM confirmed_events"
+    query = "SELECT event_id::text, mission_id::text, drone_id, track_id::text, event_type, confidence, ts, latitude, longitude, attributes::text, status, created_at FROM confirmed_events"
     params = []
     conditions = []
     
