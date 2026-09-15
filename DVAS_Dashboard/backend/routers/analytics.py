@@ -1511,3 +1511,88 @@ async def update_suggestion_status(
     return {"status": "ok", "suggestion_id": suggestion_id, "new_status": new_status}
 
 
+@router.delete("/analytics/suggestions/{suggestion_id}")
+async def delete_model_suggestion(
+    suggestion_id: str,
+    user: dict = Depends(get_current_user),
+    request: Request = None,
+):
+    """Delete a specific AI model suggestion and its associated alert record."""
+    from database import async_session_factory
+    from models import AIModelSuggestion, Alert
+    from sqlalchemy import delete
+    from services.websocket_hub import hub
+
+    async with async_session_factory() as session:
+        sugg = await session.get(AIModelSuggestion, suggestion_id)
+        if not sugg:
+            raise HTTPException(404, "Model suggestion not found")
+        sugg_dict = _row_to_dict(sugg)
+        await session.delete(sugg)
+        await session.execute(delete(Alert).where(Alert.id == suggestion_id))
+        await session.commit()
+
+    try:
+        await write_audit_v2(
+            actor=user,
+            action="DELETE_MODEL_SUGGESTION",
+            action_type="delete",
+            category="operations",
+            severity="info",
+            target=suggestion_id,
+            target_type="ai_model_suggestion",
+            target_id=suggestion_id,
+            details=f"AI Model Suggestion {suggestion_id} deleted",
+            source_module="edge",
+            request=request,
+        )
+    except Exception as audit_err:
+        logger.warning(f"Could not write audit for DELETE_MODEL_SUGGESTION: {audit_err}")
+
+    await hub.broadcast({
+        "type": "model_suggestion_deleted",
+        "suggestion_id": suggestion_id,
+    })
+    return {"status": "ok", "deleted_id": suggestion_id}
+
+
+@router.delete("/analytics/suggestions")
+async def clear_all_model_suggestions(
+    user: dict = Depends(get_current_user),
+    request: Request = None,
+):
+    """Clear all AI model suggestions and associated alert records."""
+    from database import async_session_factory
+    from models import AIModelSuggestion, Alert
+    from sqlalchemy import delete
+    from services.websocket_hub import hub
+
+    async with async_session_factory() as session:
+        res = await session.execute(delete(AIModelSuggestion))
+        count = res.rowcount
+        await session.execute(delete(Alert).where(Alert.id.like("SUGG-%")))
+        await session.commit()
+
+    try:
+        await write_audit_v2(
+            actor=user,
+            action="CLEAR_ALL_MODEL_SUGGESTIONS",
+            action_type="delete",
+            category="operations",
+            severity="warning",
+            target="all_suggestions",
+            target_type="ai_model_suggestion",
+            details=f"Cleared {count} AI model suggestions",
+            source_module="edge",
+            request=request,
+        )
+    except Exception as audit_err:
+        logger.warning(f"Could not write audit for CLEAR_ALL_MODEL_SUGGESTIONS: {audit_err}")
+
+    await hub.broadcast({
+        "type": "model_suggestions_cleared",
+        "count": count,
+    })
+    return {"status": "ok", "deleted_count": count}
+
+

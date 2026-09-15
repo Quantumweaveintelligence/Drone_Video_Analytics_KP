@@ -109,6 +109,7 @@ function LanguageToggle() {
 /* ---------- Notification bell drawer ---------- */
 function NotificationBell() {
   const { user } = useAuth();
+  const isEdgeOperator = user?.role === "drone_operator";
   const { t } = useI18n();
   const nav = useNavigate();
   const [notifications, setNotifications] = useState([]);
@@ -128,7 +129,7 @@ function NotificationBell() {
 
   // Load initial notifications from alerts, incidents, and model suggestions
   const loadNotifications = async () => {
-    if (!user) return;
+    if (!user || isEdgeOperator) return;
     try {
       const [alertsRes, incsRes, suggsRes] = await Promise.allSettled([
         api.get("/alerts"),
@@ -243,14 +244,15 @@ function NotificationBell() {
   };
 
   useEffect(() => {
+    if (isEdgeOperator) return;
     loadNotifications();
     const interval = setInterval(loadNotifications, 5000);
     return () => clearInterval(interval);
-  }, [user]);
+  }, [user, isEdgeOperator]);
 
   // Real-time WebSocket listener
   useDvasSocket((msg) => {
-    if (!user) return;
+    if (!user || isEdgeOperator) return;
     const eventType = msg.type || msg.event;
 
     // A. AI Model Suggestion: format "<MISSION ID>: Suggests <AI Model name>"
@@ -339,6 +341,20 @@ function NotificationBell() {
       setFlash(true);
       setTimeout(() => setFlash(false), 1200);
     }
+
+    // D. Deletion / Clear events from Edge
+    else if (eventType === "incident_deleted") {
+      setNotifications((prev) => prev.filter(x => x.id !== msg.incident_id));
+    }
+    else if (eventType === "incidents_cleared") {
+      setNotifications((prev) => prev.filter(x => x.type !== "incident"));
+    }
+    else if (eventType === "model_suggestion_deleted") {
+      setNotifications((prev) => prev.filter(x => x.id !== msg.suggestion_id));
+    }
+    else if (eventType === "model_suggestions_cleared") {
+      setNotifications((prev) => prev.filter(x => x.type !== "model_suggestion"));
+    }
   });
 
   useEffect(() => {
@@ -406,6 +422,8 @@ function NotificationBell() {
   });
 
   const preview = filtered.slice(0, 15);
+
+  if (isEdgeOperator) return null;
 
   return (
     <div className="relative" ref={rootRef}>
@@ -849,7 +867,7 @@ export default function AppShell({ children, title, subtitle }) {
 
           <div className="ml-auto flex items-center gap-2">
             <HealthDot />
-            <NotificationBell />
+            {user?.role !== "drone_operator" && <NotificationBell />}
             <LanguageToggle />
             <ThemeToggle />
             <UserMenu onLogout={doLogout} />

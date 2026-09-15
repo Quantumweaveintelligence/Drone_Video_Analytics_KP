@@ -10,7 +10,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Request, Body
-from sqlalchemy import select, update, desc
+from sqlalchemy import select, update, desc, delete
 import httpx
 
 from database import async_session_factory
@@ -291,3 +291,78 @@ async def resend_incident(
         inc.sent_to_ingest = sent
         await session.commit()
         return {"status": "ok", "incident_id": incident_id, "sent_to_ingest": sent}
+
+
+@router.delete("/{incident_id}")
+async def delete_incident(
+    incident_id: str,
+    user: dict = Depends(get_current_user),
+    request: Request = None,
+):
+    """Delete an operational incident and its associated alert record."""
+    async with async_session_factory() as session:
+        inc = await session.get(Incident, incident_id)
+        if not inc:
+            raise HTTPException(404, "Incident not found")
+        inc_dict = _row_to_dict(inc)
+        await session.delete(inc)
+        await session.execute(delete(Alert).where(Alert.id == incident_id))
+        await session.commit()
+
+    try:
+        await write_audit_v2(
+            actor=user,
+            action="DELETE_INCIDENT",
+            action_type="delete",
+            category="operations",
+            severity="info",
+            target=incident_id,
+            target_type="incident",
+            target_id=incident_id,
+            details=f"Incident {incident_id} ({inc_dict.get('title')}) deleted by operator",
+            source_module="edge",
+            request=request,
+        )
+    except Exception as audit_err:
+        logger.warning(f"Could not write audit for DELETE_INCIDENT: {audit_err}")
+
+    await hub.broadcast({
+        "type": "incident_deleted",
+        "incident_id": incident_id,
+    })
+    return {"status": "ok", "deleted_id": incident_id}
+
+
+@router.delete("")
+async def clear_all_incidents(
+    user: dict = Depends(get_current_user),
+    request: Request = None,
+):
+    """Clear all operational incidents and associated alert records."""
+    async with async_session_factory() as session:
+        res = await session.execute(delete(Incident))
+        count = res.rowcount
+        await session.execute(delete(Alert).where(Alert.id.like("INC-%")))
+        await session.commit()
+
+    try:
+        await write_audit_v2(
+            actor=user,
+            action="CLEAR_ALL_INCIDENTS",
+            action_type="delete",
+            category="operations",
+            severity="warning",
+            target="all_incidents",
+            target_type="incident",
+            details=f"Cleared {count} incidents from operational log",
+            source_module="edge",
+            request=request,
+        )
+    except Exception as audit_err:
+        logger.warning(f"Could not write audit for CLEAR_ALL_INCIDENTS: {audit_err}")
+
+    await hub.broadcast({
+        "type": "incidents_cleared",
+        "count": count,
+    })
+    return {"status": "ok", "deleted_count": count}

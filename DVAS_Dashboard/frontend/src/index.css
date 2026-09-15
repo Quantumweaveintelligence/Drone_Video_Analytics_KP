@@ -2,7 +2,16 @@
 @tailwind components;
 @tailwind utilities;
 
-@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+Malayalam:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+Malayalam:wght@400;500;600;700;800;900&family=Baloo+Chettan+2:wght@600;700;800&family=Montserrat:wght@700;800;900&display=swap');
+
+.font-malayalam {
+  font-family: 'Baloo Chettan 2', 'Noto Sans Malayalam', sans-serif;
+}
+
+.font-kerala-en {
+  font-family: 'Montserrat', 'Plus Jakarta Sans', sans-serif;
+  letter-spacing: 0.04em;
+}
 
 /* =========================================================
    DVAS Design System v2 — "Soft SaaS"
@@ -159,27 +168,68 @@ html, body, #root {
    ========================================================= */
 
 /* ---- Backgrounds ---- */
-.bg-slate-950 { background-color: var(--dvas-surface-2) !important; }
-.bg-slate-900 { background-color: var(--dvas-surface) !important; }
-.bg-slate-800 { background-color: var(--dvas-elev) !important; }
-.bg-slate-800\/40 { background-color: color-mix(in srgb, var(--dvas-elev) 60%, transparent) !important; }
-.bg-slate-800\/60 { background-color: color-mix(in srgb, var(--dvas-elev) 80%, transparent) !important; }
-.bg-slate-900\/60 { background-color: color-mix(in srgb, var(--dvas-surface) 85%, transparent) !important; }
-.bg-slate-900\/70 { background-color: color-mix(in srgb, var(--dvas-surface) 90%, transparent) !important; }
+.bg-slate-950,
+.bg-slate-950\/30,
+.bg-slate-950\/40,
 .bg-slate-950\/50,
 .bg-slate-950\/60,
+.bg-slate-950\/70,
+.bg-slate-950\/80,
 .bg-slate-950\/90 { background-color: var(--dvas-surface-2) !important; }
+
+.bg-slate-900,
+.bg-slate-900\/50,
+.bg-slate-900\/60,
+.bg-slate-900\/70,
+.bg-slate-900\/80,
+.bg-slate-900\/90,
+.bg-slate-900\/95 { background-color: var(--dvas-surface) !important; }
+
+.bg-slate-800,
+.bg-slate-800\/20,
+.bg-slate-800\/30,
+.bg-slate-800\/40,
+.bg-slate-800\/50,
+.bg-slate-800\/60,
+.bg-slate-800\/70,
+.bg-slate-800\/80,
+.bg-slate-800\/90 { background-color: var(--dvas-elev) !important; }
+
+.bg-sky-950,
+.bg-sky-950\/40,
+.bg-sky-950\/50,
+.bg-sky-950\/60,
+.bg-sky-950\/80 { background-color: var(--dvas-info-bg) !important; }
+
 .bg-\[\#020617\] { background-color: var(--dvas-root) !important; }
 .bg-\[\#0b1220\] { background-color: var(--dvas-topbar) !important; }
+
+/* ---- Dropdown options fix ---- */
+option {
+  background-color: var(--dvas-surface);
+  color: var(--dvas-text);
+}
 
 /* ---- Borders — soften to token ---- */
 .border-slate-950,
 .border-slate-900,
 .border-slate-800,
+.border-slate-800\/40,
+.border-slate-800\/50,
 .border-slate-800\/60,
+.border-slate-800\/70,
+.border-slate-800\/80,
+.border-slate-800\/90,
 .border-slate-700 { border-color: var(--dvas-border) !important; }
 .border-slate-600 { border-color: var(--dvas-border-strong) !important; }
-.divide-slate-800 > * + * { border-color: var(--dvas-border) !important; }
+.border-sky-800\/50,
+.border-sky-800 { border-color: var(--dvas-border) !important; }
+
+.divide-slate-800 > * + *,
+.divide-slate-800\/50 > * + *,
+.divide-slate-800\/60 > * + *,
+.divide-slate-800\/70 > * + *,
+.divide-slate-800\/80 > * + * { border-color: var(--dvas-border) !important; }
 
 /* ---- Text ---- */
 .text-slate-100,
@@ -199,8 +249,11 @@ html, body, #root {
 .bg-amber-500\/5 { background-color: var(--dvas-warn-bg) !important; }
 .bg-red-500\/10 { background-color: var(--dvas-crit-bg) !important; }
 
+.text-sky-100,
+.text-sky-200,
 .text-sky-300,
 .text-sky-400,
+.text-blue-200,
 .text-blue-300,
 .text-blue-400 { color: var(--dvas-blue) !important; }
 .text-emerald-300,
@@ -217,8 +270,11 @@ html.dark .text-amber-300,
 html.dark .text-amber-400 { color: #FBBF24 !important; }
 html.dark .text-red-300,
 html.dark .text-red-400 { color: #F87171 !important; }
+html.dark .text-sky-100,
+html.dark .text-sky-200,
 html.dark .text-sky-300,
 html.dark .text-sky-400,
+html.dark .text-blue-200,
 html.dark .text-blue-300,
 html.dark .text-blue-400 { color: #60A5FA !important; }
 
