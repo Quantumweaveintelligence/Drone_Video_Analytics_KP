@@ -78,7 +78,23 @@ const en = {
   "cmd.page.models": "Detection Models",
   "cmd.page.exports": "Export Requests",
   "cmd.page.aggregated": "District / State View",
-  "cmd.page.reports": "Reports",
+  "cmd.page.reports": "Reports & Briefs",
+  "cmd.page.crowd": "Crowd Analytics",
+  "cmd.page.traffic": "Traffic & ANPR",
+  "cmd.page.person": "Person Tracking",
+  "cmd.page.intrusion": "Intrusion Detection",
+  "nav.edgeDashboard": "Dashboard",
+  "nav.missionControl": "Mission Control",
+  "nav.liveMonitoring": "Live Monitoring",
+  "nav.gpsTelemetry": "GPS & Telemetry",
+  "nav.bufferAndChange": "Buffer & Change",
+  "nav.frameSelection": "Frame Selection Analytics",
+  "nav.incidents": "Incidents",
+  "nav.evidenceManagement": "Evidence Management",
+  "nav.systemHealth": "System Health",
+  "nav.logsAudit": "Logs & Audit",
+  "nav.settings": "Settings",
+  "admin.page.audit": "Audit Log Explorer",
 
   "cmd.multiDroneGrid": "Multi-Drone Grid",
   "cmd.dronesInScope": "drones in scope",
@@ -433,7 +449,17 @@ export function I18nProvider({ children }) {
 
   const setLang = useCallback((l) => setLangState(l), []);
   const t = useCallback(
-    (key) => (DICTS[lang] && DICTS[lang][key]) || DICTS.en[key] || key,
+    (key, fallback) => {
+      if (!key) return fallback || "";
+      const val = (DICTS[lang] && DICTS[lang][key]) || (DICTS.en && DICTS.en[key]);
+      if (val !== undefined && val !== null && val !== "") return val;
+      if (fallback !== undefined && fallback !== null && fallback !== "") return fallback;
+      if (typeof key === "string" && (key.includes(".") || key.includes("_"))) {
+        const last = key.split(".").pop();
+        return last.replace(/_/g, " ").replace(/\w/g, (c) => c.toUpperCase());
+      }
+      return key;
+    },
     [lang]
   );
 
