@@ -18,7 +18,7 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 
 sys.path.insert(0, "/analytics")
 from shared.config import cfg, get_drone_aliases
@@ -30,7 +30,7 @@ from shared.db import (
 from shared.redis_client import (
     close_client, publish_analytics_result, publish_confirmed_event,
     xread_frames, xreadgroup_frames, ack_frames, hset_vehicle_track, hget_vehicle_track,
-    scan_active_stream_drones,
+    scan_active_stream_drones, get_latest_stream_frame,
 )
 from shared import minio_client as minio
 from vehicle.analyzer import VehicleAnalyzer
@@ -308,7 +308,7 @@ async def _stream_loop():
                 last_ids[drone_id] = "0"
             try:
                 frames = await xreadgroup_frames(
-                    "analytics", "vehicle-analyzer", drone_id, ">", count=4, block_ms=100
+                    "vehicle-group", "vehicle-analyzer", drone_id, ">", count=4, block_ms=100
                 )
 
                 processed_ids = []
@@ -323,7 +323,9 @@ async def _stream_loop():
                     if frame is None:
                         continue
 
-                    result = analyzer.analyze_frame(frame, drone_id=drone_id, save_crops=True)
+                    result = await asyncio.to_thread(
+                        analyzer.analyze_frame, frame, drone_id=drone_id, save_crops=True
+                    )
                     ts     = datetime.now(timezone.utc)
 
                     # Extract mission_id from stream frame metadata
@@ -340,8 +342,8 @@ async def _stream_loop():
 
                     # ── Annotate frame and cache for dashboard ────────────────
                     import time as _time
-                    annotated_bytes = _draw_vehicle_annotations(
-                        frame, result.get("vehicles", []), drone_id
+                    annotated_bytes = await asyncio.to_thread(
+                        _draw_vehicle_annotations, frame, result.get("vehicles", []), drone_id
                     )
                     if annotated_bytes:
                         _last_annotated[drone_id]    = annotated_bytes
@@ -370,6 +372,17 @@ async def _stream_loop():
                                 cfg.BUCKET_VEHICLES, key, crop_bytes, "image/jpeg"
                             )
 
+                        if veh_image_key and track_id:
+                            pool = await get_pool()
+                            await pool.execute(
+                                """
+                                UPDATE tracks
+                                SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('vehicle_image_key', $1::text)
+                                WHERE track_id = $2::uuid
+                                """,
+                                veh_image_key, track_id,
+                            )
+
                         await write_vehicle_attributes(
                             track_id=track_id,
                             event_id=None,
@@ -378,7 +391,9 @@ async def _stream_loop():
                             make_model_top3=veh.get("make_model_top3", []),
                             speed_kph=veh.get("speed_info", {}).get("kph"),
                             speed_reliability=veh.get("speed_info", {}).get("reliability"),
+                            mission_id=frame_mission_id,
                         )
+
 
                         await hset_vehicle_track(
                             tracker_id=tracker_id,
@@ -404,7 +419,7 @@ async def _stream_loop():
                     _frames_processed += 1
 
                 if processed_ids:
-                    await ack_frames(drone_id, "analytics", *processed_ids)
+                    await ack_frames(drone_id, "vehicle-group", *processed_ids)
 
             except asyncio.CancelledError:
                 return
@@ -443,7 +458,9 @@ FRAME_CACHE_TTL_SEC = 6.0
 async def annotated_latest(drone_id: str = ""):
     """
     Returns the most recently annotated JPEG frame (with vehicle bounding boxes).
-    Strictly verifies drone ID / alias and enforces a freshness TTL window.
+    If a live stream is ongoing, serves live frame with X-Feed-Status: live.
+    If the stream has ended or paused, serves the last known annotated frame with X-Feed-Status: offline.
+    If not in memory (e.g. after container restart), loads and analyzes the latest frame from Redis.
     """
     import time as _time
     now = _time.monotonic()
@@ -455,34 +472,58 @@ async def annotated_latest(drone_id: str = ""):
         aliases = get_drone_aliases(drone_id)
         for alias in aliases:
             if alias in _last_annotated:
-                age = now - _last_annotated_ts.get(alias, 0)
-                if age <= FRAME_CACHE_TTL_SEC:
-                    frame_bytes = _last_annotated[alias]
-                    matched_drone_id = alias
-                    frame_age = age
-                    break
+                frame_bytes = _last_annotated[alias]
+                matched_drone_id = alias
+                frame_age = now - _last_annotated_ts.get(alias, 0)
+                break
     elif _last_annotated:
-        # If no specific drone requested, find the freshest frame within TTL
+        # If no specific drone requested, find the freshest frame
         best_drone = max(_last_annotated_ts, key=_last_annotated_ts.get, default=None)
         if best_drone:
-            age = now - _last_annotated_ts.get(best_drone, 0)
-            if age <= FRAME_CACHE_TTL_SEC:
-                frame_bytes = _last_annotated.get(best_drone)
-                matched_drone_id = best_drone
-                frame_age = age
+            frame_bytes = _last_annotated.get(best_drone)
+            matched_drone_id = best_drone
+            frame_age = now - _last_annotated_ts.get(best_drone, 0)
+
+    # If no in-memory frame, try to recover the latest frame from the Redis stream
+    if not frame_bytes and drone_id:
+        aliases = get_drone_aliases(drone_id)
+        for alias in aliases:
+            recovered_frame = await get_latest_stream_frame(alias)
+            if recovered_frame is not None and analyzer and analyzer.ready:
+                try:
+                    result = await asyncio.to_thread(
+                        analyzer.analyze_frame, recovered_frame, drone_id=alias, save_crops=False
+                    )
+                    annotated_bytes = await asyncio.to_thread(
+                        _draw_vehicle_annotations, recovered_frame, result.get("vehicles", []), alias
+                    )
+                    if annotated_bytes:
+                        _last_annotated[alias] = annotated_bytes
+                        _last_annotated_ts[alias] = 0.0  # Mark as historical
+                        frame_bytes = annotated_bytes
+                        matched_drone_id = alias
+                        frame_age = 999.0
+                        break
+                except Exception as exc:
+                    log.warning("Failed to recover and annotate vehicle frame for %s: %s", alias, exc)
 
     if not frame_bytes:
-        raise HTTPException(404, "No live annotated frame available (feed offline or expired)")
+        raise HTTPException(404, "No annotated frame available (feed offline or expired)")
 
-    return StreamingResponse(
-        io.BytesIO(frame_bytes),
+    is_live = frame_age <= FRAME_CACHE_TTL_SEC
+    feed_status = "live" if is_live else "offline"
+
+    return Response(
+        content=frame_bytes,
         media_type="image/jpeg",
         headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma":        "no-cache",
-            "Expires":       "0",
-            "X-Drone-ID":    matched_drone_id or drone_id,
-            "X-Frame-Age":   f"{frame_age:.2f}s",
+            "Cache-Control":   "no-cache, no-store, must-revalidate",
+            "Pragma":          "no-cache",
+            "Expires":         "0",
+            "X-Drone-ID":      matched_drone_id or drone_id,
+            "X-Frame-Age":     f"{frame_age:.2f}s",
+            "X-Feed-Status":   feed_status,
+            "X-Stream-Status": feed_status,
         },
     )
 

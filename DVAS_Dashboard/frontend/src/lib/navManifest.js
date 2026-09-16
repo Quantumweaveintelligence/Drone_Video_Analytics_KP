@@ -42,7 +42,7 @@ export const NAV_MANIFEST = {
       sectionKey: "nav.section.analytics",
       items: [
         { key: "crowd", path: "/command/crowd", labelKey: "cmd.page.crowd", fallback: "Crowd Analytics", Icon: Users },
-        { key: "traffic", path: "/command/traffic", labelKey: "cmd.page.traffic", fallback: "Traffic & ANPR", Icon: Car },
+        { key: "traffic", path: "/command/traffic", labelKey: "cmd.page.traffic", fallback: "Vehicle & Vessel", Icon: Car },
         { key: "person", path: "/command/person", labelKey: "cmd.page.person", fallback: "Person Tracking", Icon: UserSearch },
         { key: "intrusion", path: "/command/intrusion", labelKey: "cmd.page.intrusion", fallback: "Intrusion Detection", Icon: Shield },
       ]
@@ -74,7 +74,7 @@ export const NAV_MANIFEST = {
       sectionKey: "nav.section.analytics",
       items: [
         { key: "crowd", path: "/command/crowd", labelKey: "cmd.page.crowd", fallback: "Crowd Analytics", Icon: Users },
-        { key: "traffic", path: "/command/traffic", labelKey: "cmd.page.traffic", fallback: "Traffic & ANPR", Icon: Car },
+        { key: "traffic", path: "/command/traffic", labelKey: "cmd.page.traffic", fallback: "Vehicle & Vessel", Icon: Car },
         { key: "person", path: "/command/person", labelKey: "cmd.page.person", fallback: "Person Tracking", Icon: UserSearch },
         { key: "intrusion", path: "/command/intrusion", labelKey: "cmd.page.intrusion", fallback: "Intrusion Detection", Icon: Shield },
       ]

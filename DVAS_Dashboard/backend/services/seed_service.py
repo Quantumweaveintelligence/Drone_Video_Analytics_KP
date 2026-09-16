@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import select, delete, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from database import engine, async_session_factory
-from models import Base, AuditLog, Mission, Drone, Alert, Evidence, Export, Report
+from models import Base, AuditLog, Mission, Drone, Alert, Evidence, Export, Report, User
 from audit_service import _audit_hash
 
 logger = logging.getLogger(__name__)
@@ -82,11 +82,11 @@ async def seed_data():
     async with async_session_factory() as session:
         user_ids_by_email = {u["email"]: "seed-id" for u in SEED_USERS}
 
-        # If missions already seeded, ensure audit chain exists then return
-        mission_count = (await session.execute(
-            select(func.count()).select_from(Mission)
+        # If users already exist, ensure audit chain exists then return
+        user_count = (await session.execute(
+            select(func.count()).select_from(User)
         )).scalar() or 0
-        if mission_count > 0:
+        if user_count > 0:
             audit_count = (await session.execute(
                 select(func.count()).select_from(AuditLog)
             )).scalar() or 0
@@ -211,6 +211,7 @@ async def seed_data():
 
         # NOTE: Seed alerts removed — alerts table now only holds real
         # operator-submitted incidents and AI model suggestions.
+        alert_types = ["person_detected", "vehicle_detected", "crowd_threshold", "intrusion_alert"]
 
         evidence_items = []
         for i in range(14):

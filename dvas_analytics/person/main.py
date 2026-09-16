@@ -452,7 +452,7 @@ async def _stream_loop():
                 last_ids[drone_id] = "0"
             try:
                 frames = await xreadgroup_frames(
-                    "analytics", "person-analyzer", drone_id, ">", count=2, block_ms=100
+                    "person-group", "person-analyzer", drone_id, ">", count=2, block_ms=100
                 )
                 if not frames:
                     continue
@@ -786,7 +786,7 @@ async def _stream_loop():
                         asyncio.create_task(_safe_task(_run_reid_clustering(), "Face Re-ID Clustering"))
 
                 if processed_ids:
-                    await ack_frames(drone_id, "analytics", *processed_ids)
+                    await ack_frames(drone_id, "person-group", *processed_ids)
 
             except asyncio.CancelledError:
                 return

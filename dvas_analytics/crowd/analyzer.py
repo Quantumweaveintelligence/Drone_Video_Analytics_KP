@@ -74,10 +74,12 @@ def make_layers(cfg, in_channels=3, batch_norm=False, dilation=False):
 
 
 class CrowdAnalyzer:
-    FRAME_CACHE_TTL_SEC = 6.0
+    FRAME_CACHE_TTL_SEC = 15.0
 
     def __init__(self, model_path, device=None, alert_threshold=150):
-        self._lock = threading.Lock()
+        self._infer_lock = threading.Lock()
+        self._frame_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
         self.alert_threshold = alert_threshold
         
         if device is None:
@@ -159,7 +161,7 @@ class CrowdAnalyzer:
 
     def switch_model(self, new_model_path):
         """Thread-safe method to switch the active model weights with rollback on failure."""
-        with self._lock:
+        with self._infer_lock:
             old_ready = self.ready
             old_model = self.model
             old_path = self._model_path
@@ -182,7 +184,7 @@ class CrowdAnalyzer:
 
     def reset_session(self):
         """Clears session data."""
-        with self._lock:
+        with self._stats_lock:
             self._session_counts = []
             self._session_start_time = time.time()
             self._session_alert_timestamps = []
@@ -192,7 +194,7 @@ class CrowdAnalyzer:
 
     def get_session_summary(self):
         """Returns statistical summary of the current session."""
-        with self._lock:
+        with self._stats_lock:
             total_frames = len(self._session_counts)
             duration = time.time() - self._session_start_time
             
@@ -234,7 +236,9 @@ class CrowdAnalyzer:
                 "alert_timestamps": self._session_alert_timestamps.copy()
             }
 
-    def _infer(self, frame_bgr, max_dim=1536):
+    def _infer(self, frame_bgr, max_dim=None):
+        if max_dim is None:
+            max_dim = 1280 if self.device.type == "cuda" else 640
         h, w = frame_bgr.shape[:2]
         
         # Resize if longer side > max_dim
@@ -281,7 +285,7 @@ class CrowdAnalyzer:
         _, jpeg = cv2.imencode('.jpg', blended, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         jpeg_bytes = jpeg.tobytes()
         
-        with self._lock:
+        with self._frame_lock:
             self._last_annotated_frames[drone_id] = {
                 "jpeg": jpeg_bytes,
                 "ts": time.time(),
@@ -293,7 +297,7 @@ class CrowdAnalyzer:
 
     def get_last_annotated_frame(self, drone_id=""):
         """Returns (jpeg_bytes, matched_drone_id, age_sec, count, label) or (None, None, 0, 0, '')."""
-        with self._lock:
+        with self._frame_lock:
             if not self._last_annotated_frames:
                 return None, None, 0.0, 0, ""
 
@@ -348,7 +352,7 @@ class CrowdAnalyzer:
             
         start_t = time.perf_counter()
         
-        with self._lock:
+        with self._infer_lock:
             density_map = self._infer(frame_bgr)
             
         count = max(0.0, float(np.sum(density_map)))
@@ -371,7 +375,7 @@ class CrowdAnalyzer:
         
         # Update session stats
         ts_iso = datetime.now(timezone.utc).isoformat()
-        with self._lock:
+        with self._stats_lock:
             self._session_counts.append(count)
             if alert_triggered:
                 self._session_alert_timestamps.append(ts_iso)

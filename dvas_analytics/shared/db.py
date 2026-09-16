@@ -18,6 +18,16 @@ log = logging.getLogger(__name__)
 _pool: Optional[asyncpg.Pool] = None
 
 
+async def _init_conn(conn):
+    """Register jsonb codec so asyncpg returns dicts/lists instead of strings."""
+    await conn.set_type_codec(
+        'jsonb', encoder=json.dumps, decoder=json.loads, schema='pg_catalog'
+    )
+    await conn.set_type_codec(
+        'json', encoder=json.dumps, decoder=json.loads, schema='pg_catalog'
+    )
+
+
 async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
@@ -26,6 +36,7 @@ async def get_pool() -> asyncpg.Pool:
             min_size=2,
             max_size=10,
             command_timeout=30,
+            init=_init_conn,
         )
         log.info("DB pool created: %s", cfg.DATABASE_URL)
     return _pool
@@ -248,15 +259,16 @@ async def write_vehicle_attributes(
     speed_reliability: Optional[str] = None,
     direction_label: Optional[str] = None,
     traffic_state: Optional[str] = None,
+    mission_id: Optional[str] = None,
 ) -> None:
     pool = await get_pool()
     await pool.execute(
         """
         INSERT INTO vehicle_attributes
             (track_id, event_id, vehicle_type, colour_top3, make_model_top3,
-             speed_kph, speed_reliability, direction_label, traffic_state)
+             speed_kph, speed_reliability, direction_label, traffic_state, mission_id_str)
         VALUES
-            ($1::uuid, $2::uuid, $3, $4::jsonb, $5::jsonb, $6, $7, $8, $9)
+            ($1::uuid, $2::uuid, $3, $4::jsonb, $5::jsonb, $6, $7, $8, $9, $10)
         """,
         track_id,
         event_id,
@@ -267,7 +279,9 @@ async def write_vehicle_attributes(
         speed_reliability,
         direction_label,
         traffic_state,
+        mission_id,
     )
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -424,75 +438,174 @@ async def get_plates_by_mission(
     sort: str = "newest",
     limit: int = 24,
     offset: int = 0,
+    has_plate: Optional[bool] = None,
 ) -> Dict:
     """
-    Query historical plate reads scoped directly to a mission_id string.
-    Returns pagination metadata + vehicles with presigned image URLs.
+    Query vehicle detection and plate read history scoped directly to a mission_id.
+    Returns deduplicated vehicle records per tracker_id with plate reads, vehicle attributes,
+    and presigned MinIO image keys.
     """
     pool = await get_pool()
     limit = min(limit, 200)
 
-    conditions = ["pr.mission_id_str = $1"]
+    conditions = []
     params: List = [mission_id]
     idx = 2
 
     if plate_search:
-        conditions.append(f"pr.plate_text ILIKE ${idx}")
+        conditions.append(f"v.plate_text ILIKE ${idx}")
         params.append(f"%{plate_search.upper().strip()}%")
         idx += 1
 
     if vehicle_type and vehicle_type.lower() != "all":
-        conditions.append(f"LOWER(va.vehicle_type) = ${idx}")
+        conditions.append(f"LOWER(v.vehicle_type) = ${idx}")
         params.append(vehicle_type.lower().strip())
         idx += 1
 
-    where_clause = "WHERE " + " AND ".join(conditions)
+    if has_plate:
+        conditions.append("((v.plate_text IS NOT NULL AND TRIM(v.plate_text) != '') OR v.plate_image_key IS NOT NULL)")
+
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
     sort_map = {
-        "newest":     "pr.created_at DESC",
-        "oldest":     "pr.created_at ASC",
-        "confidence": "pr.ocr_confidence DESC NULLS LAST",
-        "plate_az":   "pr.plate_text ASC NULLS LAST",
+        "newest":       "v.created_at DESC",
+        "oldest":       "v.created_at ASC",
+        "confidence":   "v.ocr_confidence DESC NULLS LAST, v.created_at DESC",
+        "plate_az":     "v.plate_text ASC NULLS LAST, v.created_at DESC",
+        "plates_first": "CASE WHEN (v.plate_text IS NOT NULL AND TRIM(v.plate_text) != '') OR v.plate_image_key IS NOT NULL THEN 0 ELSE 1 END, v.created_at DESC",
     }
-    order_by = sort_map.get(sort, "pr.created_at DESC")
+    order_by = sort_map.get(sort, "v.created_at DESC")
 
-    count_row = await pool.fetchrow(
-        f"""
-        SELECT COUNT(*) AS total
-        FROM plate_reads pr
-        JOIN tracks t ON t.track_id = pr.track_id
-        LEFT JOIN vehicle_attributes va ON va.track_id = t.track_id
-        {where_clause}
-        """,
-        *params,
-    )
-    total = count_row["total"] if count_row else 0
-
-    params.extend([limit, offset])
-    rows = await pool.fetch(
-        f"""
+    cte_base = """
+    WITH ranked_tracks AS (
         SELECT
-            pr.id, pr.plate_text, pr.ocr_confidence, pr.is_reliable,
-            pr.plate_image_key, pr.vehicle_image_key, pr.created_at, pr.mission_id_str,
-            t.drone_id, t.first_seen, t.last_seen,
+            t.track_id,
+            t.drone_id,
+            t.mission_id_str,
+            COALESCE(t.metadata->>'tracker_id', t.track_id::text) AS tracker_key,
             t.metadata->>'tracker_id' AS tracker_id,
-            va.vehicle_type, va.colour_top3, va.speed_kph
+            t.metadata->>'vehicle_image_key' AS meta_veh_img,
+            t.metadata->>'plate_image_key' AS meta_plate_img,
+            t.first_seen,
+            t.last_seen,
+            ROW_NUMBER() OVER (
+                PARTITION BY t.drone_id, COALESCE(t.metadata->>'tracker_id', t.track_id::text)
+                ORDER BY t.last_seen DESC
+            ) as trk_rn
+        FROM tracks t
+        WHERE t.mission_id_str = $1 AND t.track_type = 'vehicle'
+    ),
+    best_plates AS (
+        SELECT 
+            COALESCE(t.drone_id, '') AS drone_id,
+            COALESCE(t.metadata->>'tracker_id', pr.track_id::text) AS tracker_key,
+            pr.plate_text, pr.ocr_confidence, pr.is_reliable,
+            pr.plate_image_key, pr.vehicle_image_key, pr.created_at,
+            ROW_NUMBER() OVER (
+                PARTITION BY COALESCE(t.drone_id, ''), COALESCE(t.metadata->>'tracker_id', pr.track_id::text)
+                ORDER BY pr.ocr_confidence DESC, pr.created_at DESC
+            ) as rn
         FROM plate_reads pr
-        JOIN tracks t ON t.track_id = pr.track_id
-        LEFT JOIN vehicle_attributes va ON va.track_id = t.track_id
-        {where_clause}
-        ORDER BY {order_by}
-        LIMIT ${idx} OFFSET ${idx + 1}
-        """,
-        *params,
+        LEFT JOIN tracks t ON t.track_id = pr.track_id
+        WHERE pr.mission_id_str = $1
+    ),
+    latest_va AS (
+        SELECT 
+            t.drone_id,
+            COALESCE(t.metadata->>'tracker_id', va.track_id::text) AS tracker_key,
+            va.vehicle_type, va.colour_top3, va.speed_kph,
+            ROW_NUMBER() OVER (
+                PARTITION BY t.drone_id, COALESCE(t.metadata->>'tracker_id', va.track_id::text)
+                ORDER BY va.id DESC
+            ) as rn
+        FROM tracks t
+        JOIN vehicle_attributes va ON va.track_id = t.track_id
+        WHERE t.mission_id_str = $1 AND t.track_type = 'vehicle'
+    ),
+    best_vpl AS (
+        SELECT
+            vpl.tracker_id,
+            vpl.drone_id,
+            vpl.mission_id_str,
+            vpl.plate_text,
+            vpl.plate_conf,
+            vpl.plate_image_key,
+            vpl.vehicle_image_key,
+            vpl.vehicle_type,
+            vpl.colour,
+            ROW_NUMBER() OVER (
+                PARTITION BY vpl.drone_id, vpl.mission_id_str, vpl.tracker_id
+                ORDER BY vpl.id DESC
+            ) as rn
+        FROM vehicle_plate_links vpl
+        WHERE vpl.mission_id_str = $1
+    ),
+    unified_vehicles AS (
+        SELECT 
+            rt.track_id,
+            rt.tracker_id,
+            rt.drone_id,
+            rt.mission_id_str,
+            COALESCE(bp.plate_text, vpl.plate_text) AS plate_text,
+            COALESCE(bp.ocr_confidence, vpl.plate_conf) AS ocr_confidence,
+            COALESCE(bp.is_reliable, false) AS is_reliable,
+            COALESCE(bp.plate_image_key, vpl.plate_image_key, rt.meta_plate_img) AS plate_image_key,
+            COALESCE(bp.vehicle_image_key, vpl.vehicle_image_key, rt.meta_veh_img) AS vehicle_image_key,
+            COALESCE(va.vehicle_type, vpl.vehicle_type, 'car') AS vehicle_type,
+            va.colour_top3,
+            COALESCE(vpl.colour, '') AS colour,
+            va.speed_kph,
+            rt.first_seen,
+            rt.last_seen,
+            COALESCE(bp.created_at, rt.first_seen) AS created_at
+        FROM ranked_tracks rt
+        LEFT JOIN best_plates bp ON bp.drone_id = rt.drone_id 
+            AND bp.tracker_key = rt.tracker_key 
+            AND bp.rn = 1
+        LEFT JOIN best_vpl vpl ON vpl.tracker_id = (CASE WHEN rt.tracker_id ~ '^-?[0-9]+$' THEN rt.tracker_id::bigint ELSE NULL END)
+            AND vpl.drone_id = rt.drone_id 
+            AND vpl.mission_id_str = rt.mission_id_str
+            AND vpl.rn = 1
+        LEFT JOIN latest_va va ON va.drone_id = rt.drone_id 
+            AND va.tracker_key = rt.tracker_key 
+            AND va.rn = 1
+        WHERE rt.trk_rn = 1
     )
+    """
+
+    count_query = f"""
+    {cte_base}
+    SELECT 
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE (v.plate_text IS NOT NULL AND TRIM(v.plate_text) != '') OR v.plate_image_key IS NOT NULL) AS total_plates_read
+    FROM unified_vehicles v
+    {where_clause}
+    """
+    count_row = await pool.fetchrow(count_query, *params)
+    total = count_row["total"] if count_row else 0
+    total_plates_read = count_row["total_plates_read"] if count_row else 0
+
+    data_params = list(params)
+    data_params.extend([limit, offset])
+    data_query = f"""
+    {cte_base}
+    SELECT v.*
+    FROM unified_vehicles v
+    {where_clause}
+    ORDER BY {order_by}
+    LIMIT ${idx} OFFSET ${idx + 1}
+    """
+    rows = await pool.fetch(data_query, *data_params)
+
     return {
         "total": total,
+        "total_plates_read": total_plates_read,
         "rows": [dict(r) for r in rows],
         "offset": offset,
         "limit": limit,
         "has_more": (offset + limit) < total,
     }
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1405,3 +1518,242 @@ async def dismiss_watchlist_alert(alert_id: str, notes: Optional[str] = None) ->
         alert_id, notes,
     )
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Maritime Vessel Tracking DB Helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def upsert_vessel_track(
+    pool,
+    drone_id: str,
+    mission_id: Optional[str],
+    tracker_id: int,
+    class_id: int,
+    class_name: str,
+    confidence: float,
+    bbox_xyxy: list,
+    size_bucket: str,
+    direction: str,
+    is_stationary: bool,
+    trajectory: list,
+    thumbnail_key: Optional[str] = None,
+) -> None:
+    """Insert or update a tracked maritime vessel in vessel_tracks."""
+    import json
+    bbox_json = json.dumps(bbox_xyxy)
+    traj_json = json.dumps(trajectory)
+    query = """
+    INSERT INTO vessel_tracks (
+        drone_id, mission_id, tracker_id, class_id, class_name,
+        size_bucket, direction, is_stationary, confidence,
+        first_seen, last_seen, duration_s, bbox_xyxy, trajectory, thumbnail_key
+    ) VALUES (
+        $1, $2, $3, $4, $5,
+        $6, $7, $8, $9,
+        now(), now(), 0, $10::jsonb, $11::jsonb, $12
+    )
+    ON CONFLICT (drone_id, tracker_id, COALESCE(mission_id, ''))
+    DO UPDATE SET
+        class_id = EXCLUDED.class_id,
+        class_name = EXCLUDED.class_name,
+        size_bucket = EXCLUDED.size_bucket,
+        direction = EXCLUDED.direction,
+        is_stationary = EXCLUDED.is_stationary,
+        confidence = EXCLUDED.confidence,
+        last_seen = now(),
+        duration_s = EXTRACT(EPOCH FROM (now() - vessel_tracks.first_seen)),
+        bbox_xyxy = EXCLUDED.bbox_xyxy,
+        trajectory = EXCLUDED.trajectory,
+        thumbnail_key = COALESCE(EXCLUDED.thumbnail_key, vessel_tracks.thumbnail_key)
+    """
+    await pool.execute(
+        query,
+        drone_id, mission_id, tracker_id, class_id, class_name,
+        size_bucket, direction, is_stationary, float(confidence),
+        bbox_json, traj_json, thumbnail_key
+    )
+
+
+async def write_vessel_event(
+    pool,
+    drone_id: str,
+    mission_id: Optional[str],
+    tracker_id: int,
+    event_type: str,
+    class_name: str,
+    confidence: float,
+    snapshot_key: Optional[str] = None,
+    details: Optional[dict] = None,
+) -> str:
+    """Write a confirmed vessel alert / event to vessel_events."""
+    import json
+    details_json = json.dumps(details or {})
+    row = await pool.fetchrow(
+        """
+        INSERT INTO vessel_events (
+            drone_id, mission_id, tracker_id, event_type,
+            class_name, confidence, snapshot_key, details, ts
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8::jsonb, now()
+        )
+        RETURNING event_id::text
+        """,
+        drone_id, mission_id, tracker_id, event_type,
+        class_name, float(confidence), snapshot_key, details_json
+    )
+    return row["event_id"] if row else ""
+
+
+async def get_active_vessel_tracks(
+    pool,
+    drone_id: Optional[str] = None,
+    mission_id: Optional[str] = None,
+    limit: int = 100,
+) -> List[dict]:
+    """Retrieve active or recently seen vessel tracks (last 10 minutes)."""
+    where = "WHERE last_seen > now() - interval '10 minutes'"
+    params = []
+    if drone_id:
+        params.append(drone_id)
+        where += f" AND drone_id = ${len(params)}"
+    if mission_id:
+        params.append(mission_id)
+        where += f" AND mission_id = ${len(params)}"
+    params.append(min(limit, 200))
+    limit_clause = f" LIMIT ${len(params)}"
+
+    rows = await pool.fetch(
+        f"""
+        SELECT id, drone_id, mission_id, tracker_id, class_id, class_name,
+               size_bucket, direction, is_stationary, confidence,
+               first_seen, last_seen, duration_s, bbox_xyxy, trajectory, thumbnail_key
+        FROM vessel_tracks
+        {where}
+        ORDER BY last_seen DESC
+        {limit_clause}
+        """,
+        *params
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_vessel_class_stats(
+    pool,
+    drone_id: Optional[str] = None,
+    mission_id: Optional[str] = None,
+) -> List[dict]:
+    """Aggregate unique vessel counts grouped by class."""
+    conditions = []
+    params = []
+    if drone_id:
+        params.append(drone_id)
+        conditions.append(f"drone_id = ${len(params)}")
+    if mission_id:
+        params.append(mission_id)
+        conditions.append(f"mission_id = ${len(params)}")
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    rows = await pool.fetch(
+        f"""
+        SELECT class_name, COUNT(*) as count,
+               ROUND(AVG(confidence)::numeric, 2) as avg_confidence
+        FROM vessel_tracks
+        {where}
+        GROUP BY class_name
+        ORDER BY count DESC
+        """,
+        *params
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_vessel_events(
+    pool,
+    drone_id: Optional[str] = None,
+    mission_id: Optional[str] = None,
+    event_type: Optional[str] = None,
+    limit: int = 50,
+) -> List[dict]:
+    """Retrieve recent vessel events."""
+    conditions = []
+    params = []
+    if drone_id:
+        params.append(drone_id)
+        conditions.append(f"drone_id = ${len(params)}")
+    if mission_id:
+        params.append(mission_id)
+        conditions.append(f"mission_id = ${len(params)}")
+    if event_type:
+        params.append(event_type)
+        conditions.append(f"event_type = ${len(params)}")
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(min(limit, 200))
+    limit_idx = len(params)
+
+    rows = await pool.fetch(
+        f"""
+        SELECT event_id::text, drone_id, mission_id, tracker_id,
+               event_type, class_name, confidence, snapshot_key,
+               details, ts
+        FROM vessel_events
+        {where}
+        ORDER BY ts DESC
+        LIMIT ${limit_idx}
+        """,
+        *params
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_vessel_summary_stats(
+    pool,
+    drone_id: Optional[str] = None,
+    mission_id: Optional[str] = None,
+) -> dict:
+    """Retrieve summary metrics for maritime analytics dashboard."""
+    params = []
+    filters = []
+    if drone_id:
+        params.append(drone_id)
+        filters.append(f"drone_id = ${len(params)}")
+    if mission_id:
+        params.append(mission_id)
+        filters.append(f"mission_id = ${len(params)}")
+
+    extra_and = (" AND " + " AND ".join(filters)) if filters else ""
+
+    live_row = await pool.fetchrow(
+        f"""
+        SELECT COUNT(*) as live_count
+        FROM vessel_tracks
+        WHERE last_seen > now() - interval '15 seconds' {extra_and}
+        """,
+        *params
+    )
+    total_row = await pool.fetchrow(
+        f"""
+        SELECT COUNT(*) as total_unique,
+               COUNT(*) FILTER (WHERE is_stationary = true) as stationary_count,
+               COUNT(*) FILTER (WHERE is_stationary = false) as moving_count
+        FROM vessel_tracks
+        WHERE 1=1 {extra_and}
+        """,
+        *params
+    )
+    events_row = await pool.fetchrow(
+        f"""
+        SELECT COUNT(*) as proximity_alerts
+        FROM vessel_events
+        WHERE event_type = 'proximity_alert'
+          AND ts > now() - interval '24 hours' {extra_and}
+        """,
+        *params
+    )
+    return {
+        "live_count": live_row["live_count"] if live_row else 0,
+        "cumulative_count": total_row["total_unique"] if total_row else 0,
+        "stationary_count": total_row["stationary_count"] if total_row else 0,
+        "moving_count": total_row["moving_count"] if total_row else 0,
+        "proximity_alerts_24h": events_row["proximity_alerts"] if events_row else 0,
+    }

@@ -55,6 +55,7 @@ _SERVICES = {
     "vehicle":   cfg.VEHICLE_URL,
     "anpr":      cfg.ANPR_URL,
     "intrusion": cfg.INTRUSION_URL,
+    "vessel":    cfg.VESSEL_URL,
 }
 
 # Redis stream names for each service
@@ -65,6 +66,7 @@ _ANALYTICS_STREAMS = [
     "analytics:vehicle:results",
     "analytics:anpr:results",
     "analytics:intrusion:results",
+    "analytics:vessel:results",
     "drone:events:confirmed",
 ]
 
@@ -161,10 +163,21 @@ async def summary():
     except Exception:
         intrusion_count = 0  # Table may not exist yet
 
+    # Active vessel tracks (last 5 min)
+    try:
+        vessel_row = await pool.fetchrow(
+            "SELECT COUNT(*) as cnt FROM vessel_tracks "
+            "WHERE last_seen > now() - interval '5 minutes'"
+        )
+        vessel_count = vessel_row["cnt"] if vessel_row else 0
+    except Exception:
+        vessel_count = 0
+
     return {
         "ts":                     datetime.now(timezone.utc).isoformat(),
         "active_persons":         person_row["cnt"] if person_row else 0,
         "active_vehicles":        vehicle_row["cnt"] if vehicle_row else 0,
+        "active_vessels":         vessel_count,
         "plates_read_today":      plates_row["cnt"] if plates_row else 0,
         "current_crowd_count":    float(crowd_count),
         "theft_alerts_today":     theft_row["cnt"] if theft_row else 0,
@@ -306,9 +319,13 @@ async def events_stream(drone_id: Optional[str] = Query(default=None)):
 
                             # Tag which service this came from
                             service_tag = stream_key.split(":")[1] if ":" in stream_key else stream_key
+                            payload_obj = json.loads(data_str) if data_str else {}
                             envelope = json.dumps({
-                                "stream":  service_tag,
-                                "payload": json.loads(data_str) if data_str else {},
+                                "stream":   service_tag,
+                                "service":  service_tag,
+                                "payload":  payload_obj,
+                                "data":     payload_obj,
+                                "drone_id": payload_obj.get("drone_id") if isinstance(payload_obj, dict) else None,
                             })
                             yield f"data: {envelope}\n\n"
                 else:
@@ -355,6 +372,12 @@ async def prometheus_metrics():
     except Exception:
         intrusion_count = 0
 
+    try:
+        vessel_row = await pool.fetchrow("SELECT COUNT(*) as cnt FROM vessel_tracks")
+        vessel_count = vessel_row["cnt"] if vessel_row else 0
+    except Exception:
+        vessel_count = 0
+
     ts_ms = int(time.time() * 1000)
     lines = [
         "# HELP dvas_person_tracks_total Total person tracks",
@@ -363,6 +386,9 @@ async def prometheus_metrics():
         "# HELP dvas_vehicle_tracks_total Total vehicle tracks",
         "# TYPE dvas_vehicle_tracks_total counter",
         f"dvas_vehicle_tracks_total {vehicle_row['cnt'] if vehicle_row else 0} {ts_ms}",
+        "# HELP dvas_vessel_tracks_total Total vessel tracks",
+        "# TYPE dvas_vessel_tracks_total counter",
+        f"dvas_vessel_tracks_total {vessel_count} {ts_ms}",
         "# HELP dvas_confirmed_events_total Total confirmed events",
         "# TYPE dvas_confirmed_events_total counter",
         f"dvas_confirmed_events_total {events_row['cnt'] if events_row else 0} {ts_ms}",

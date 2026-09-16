@@ -624,6 +624,51 @@ services:
       retries:      3
       start_period: 90s   # YOLOv8s model load time
 
+  vessel-analyzer:
+    build:
+      context:    ../dvas_analytics
+      dockerfile: vessel/Dockerfile
+    container_name: drone_vessel_analyzer
+    networks: [drone-net]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8106:8106"   # REST API — Maritime vessel tracking (localhost only)
+    environment:
+      DATABASE_URL: postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
+      REDIS_URL:    redis://valkey:6379/0
+      DRONE_IDS:    "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005,DRN-001,DRN-002,DRN-003,DRN-004,DRN-005}"
+      VESSEL_MODEL_PATH: /analytics/vessel/models/yolov8s.pt
+      LOG_LEVEL:    INFO
+      ANALYTICS_SERVICE_KEY: "${ANALYTICS_SERVICE_KEY}"
+      MINIO_ENDPOINT:   minio:9000
+      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-minioadmin}"
+      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-minioadmin}"
+      MINIO_SECURE:     "false"
+      BUCKET_VESSELS_MARITIME: dvas-vessels-maritime
+      VESSEL_CONFIDENCE: "0.50"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver:       nvidia
+              count:        1
+              capabilities: [gpu]
+    volumes:
+      - analytics_evidence:/data/evidence
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test:         ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8106/health')"]
+      interval:     30s
+      timeout:      10s
+      retries:      3
+      start_period: 90s
+
   # ════════════════════════════════════════════════════════════════════════════
   # OBJECT STORAGE — MinIO (S3-compatible)
   # Stores: face crops, vehicle crops, plate images, crowd heatmaps, evidence
@@ -670,7 +715,9 @@ services:
         mc mb --ignore-existing local/dvas-heatmaps &&
         mc mb --ignore-existing local/dvas-vehicles &&
         mc mb --ignore-existing local/dvas-intrusion &&
+        mc mb --ignore-existing local/dvas-vessels-maritime &&
         mc anonymous set download local/dvas-evidence &&
+        mc anonymous set download local/dvas-vessels-maritime &&
         echo '[minio-init] All buckets ready.'
       "
     environment:
@@ -700,6 +747,7 @@ services:
       VEHICLE_URL:  http://vehicle-analyzer:8103
       ANPR_URL:     http://anpr-analyzer:8104
       INTRUSION_URL: http://intrusion-analyzer:8105
+      VESSEL_URL:   http://vessel-analyzer:8106
       MINIO_ENDPOINT:   minio:9000
       MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-minioadmin}"
       MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-minioadmin}"
@@ -720,6 +768,8 @@ services:
       anpr-analyzer:
         condition: service_healthy
       intrusion-analyzer:
+        condition: service_healthy
+      vessel-analyzer:
         condition: service_healthy
     healthcheck:
       test:         ["CMD", "curl", "-f", "http://localhost:8100/health"]

@@ -173,6 +173,38 @@ async def _resolve_image_keys(event_type, event_id, track_id, drone_id, ts, miss
                     primary_key = irow['snapshot_key']
                     bucket = "dvas-intrusion"
 
+            elif event_type.startswith("vessel") or event_type in ("vessel_detected", "vessel_proximity", "vessel_loitering"):
+                v_row = None
+                if event_id:
+                    try:
+                        v_row = await conn.fetchrow(
+                            "SELECT snapshot_key FROM vessel_events WHERE event_id = $1::uuid LIMIT 1",
+                            event_id
+                        )
+                    except Exception:
+                        pass
+                if not v_row and track_id:
+                    try:
+                        t_row = await conn.fetchrow(
+                            "SELECT thumbnail_key FROM vessel_tracks WHERE tracker_id = $1::int LIMIT 1",
+                            int(track_id)
+                        )
+                        if t_row and t_row['thumbnail_key']:
+                            primary_key = t_row['thumbnail_key']
+                            bucket = "dvas-vessels-maritime"
+                    except Exception:
+                        pass
+                if not v_row and not primary_key and drone_id:
+                    v_row = await conn.fetchrow(
+                        """SELECT snapshot_key FROM vessel_events 
+                           WHERE drone_id = $1 AND snapshot_key IS NOT NULL AND snapshot_key != '' 
+                           ORDER BY abs(extract(epoch from (ts - $2))) ASC LIMIT 1""",
+                        drone_id, ts_dt
+                    )
+                if v_row and v_row['snapshot_key']:
+                    primary_key = v_row['snapshot_key']
+                    bucket = "dvas-vessels-maritime"
+
             elif event_type in ("crowd_threshold", "crowd_surge"):
                 crow = None
                 if drone_id:

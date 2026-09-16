@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 
 sys.path.insert(0, "/analytics")
@@ -25,14 +25,15 @@ from shared.config import cfg, get_drone_aliases
 from shared.auth import verify_service_key
 from shared.db import (
     close_pool, ensure_drone, get_pool, upsert_track,
-    write_confirmed_event, write_plate_read,
+    write_confirmed_event, write_plate_read, write_vehicle_attributes,
     get_recent_plates, get_plates_by_mission, add_to_watchlist, remove_from_watchlist,
     get_watchlist, is_watchlisted, write_vehicle_plate_link,
 )
+
 from shared.redis_client import (
     close_client, publish_analytics_result, publish_confirmed_event,
     xread_frames, xreadgroup_frames, ack_frames, hget_vehicle_track, hset_vehicle_track,
-    scan_active_stream_drones,
+    scan_active_stream_drones, get_latest_stream_frame,
 )
 from shared import minio_client as minio
 from anpr.analyzer import ANPRAnalyzer
@@ -351,7 +352,7 @@ async def _stream_loop():
                 last_ids[drone_id] = "0"
             try:
                 frames = await xreadgroup_frames(
-                    "analytics", "anpr-analyzer", drone_id, ">", count=2, block_ms=100
+                    "anpr-group", "anpr-analyzer", drone_id, ">", count=2, block_ms=100
                 )
 
                 if not frames:
@@ -399,7 +400,9 @@ async def _stream_loop():
                         active_drone_missions[drone_id] = frame_mission_id
 
                     _frames_processed += 1
-                    result = analyzer.analyze_frame(frame, drone_id=drone_id, mission_id=frame_mission_id)
+                    result = await asyncio.to_thread(
+                        analyzer.analyze_frame, frame, drone_id=drone_id, mission_id=frame_mission_id
+                    )
                     if _frames_processed % 50 == 1 or result.get("plates_read", 0) > 0:
                         log.info("ANPR [%s]: frame #%d done — vehicles=%d plates_read=%d inference_ms=%.0f",
                                  drone_id, _frames_processed, result.get("total_vehicles", 0),
@@ -408,8 +411,8 @@ async def _stream_loop():
 
                     # ── Annotate frame and cache for dashboard ─────────────────
                     import time as _time
-                    annotated_bytes = _draw_anpr_annotations(
-                        frame, result.get("plate_reads", []), drone_id
+                    annotated_bytes = await asyncio.to_thread(
+                        _draw_anpr_annotations, frame, result.get("plate_reads", []), drone_id
                     )
                     if annotated_bytes:
                         _last_annotated[drone_id]    = annotated_bytes
@@ -446,7 +449,9 @@ async def _stream_loop():
 
                     # ── Persist plates ─────────────────────────────────────────
                     for plate in result.get("plate_reads", []):
-                        if not (plate.get("plate_text") and plate.get("is_reliable")):
+                        has_plate_crop = bool(plate.get("plate_crop_b64"))
+                        has_valid_plate = bool(plate.get("plate_text") and plate.get("is_reliable"))
+                        if not (has_valid_plate or has_plate_crop):
                             continue
                         tracker_id = plate.get("tracker_id")
                         track_id   = await upsert_track(
@@ -457,9 +462,10 @@ async def _stream_loop():
                         plate_crop_b64  = plate.get("plate_crop_b64")
                         if plate_crop_b64:
                             plate_bytes_data = base64.b64decode(plate_crop_b64)
+                            plate_name_part = plate.get("plate_text") or f"veh_{tracker_id}"
                             key = minio.make_key(
                                 "plates", drone_id,
-                                f"plate_{plate['plate_text']}_{int(ts.timestamp()*1000)}.jpg",
+                                f"plate_{plate_name_part}_{int(ts.timestamp()*1000)}.jpg",
                                 mission_id=frame_mission_id or "",
                             )
                             plate_image_key = await minio.upload_bytes(
@@ -480,16 +486,42 @@ async def _stream_loop():
                                 cfg.BUCKET_VEHICLES, key, veh_bytes_data, "image/jpeg"
                             )
 
+                        if plate_image_key or has_valid_plate:
+                            await write_plate_read(
+                                track_id=track_id, event_id=None,
+                                plate_text=plate.get("plate_text") or "",
+                                ocr_confidence=plate.get("ocr_confidence") or 0.0,
+                                is_reliable=plate.get("is_reliable", False),
+                                plate_image_key=plate_image_key,
+                                vehicle_image_key=vehicle_image_key,
+                                mission_id=frame_mission_id,
+                            )
 
-                        await write_plate_read(
-                            track_id=track_id, event_id=None,
-                            plate_text=plate["plate_text"],
-                            ocr_confidence=plate["ocr_confidence"],
-                            is_reliable=plate["is_reliable"],
-                            plate_image_key=plate_image_key,
-                            vehicle_image_key=vehicle_image_key,
+                        await write_vehicle_attributes(
+                            track_id=track_id,
+                            event_id=None,
+                            vehicle_type=plate.get("vehicle_type", "car"),
+                            colour_top3=[],
+                            make_model_top3=[],
+                            speed_kph=None,
+                            speed_reliability=None,
                             mission_id=frame_mission_id,
                         )
+
+                        if (vehicle_image_key or plate_image_key) and track_id:
+                            pool = await get_pool()
+                            meta_updates = {}
+                            if vehicle_image_key: meta_updates["vehicle_image_key"] = vehicle_image_key
+                            if plate_image_key: meta_updates["plate_image_key"] = plate_image_key
+                            await pool.execute(
+                                """
+                                UPDATE tracks
+                                SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb
+                                WHERE track_id = $2::uuid
+                                """,
+                                _json.dumps(meta_updates), track_id,
+                            )
+
 
                         if tracker_id is not None:
                             await hset_vehicle_track(
@@ -545,7 +577,7 @@ async def _stream_loop():
                     _frames_processed += 1
 
                 if all_entry_ids:
-                    await ack_frames(drone_id, "analytics", *all_entry_ids)
+                    await ack_frames(drone_id, "anpr-group", *all_entry_ids)
 
             except asyncio.CancelledError:
                 return
@@ -616,7 +648,9 @@ FRAME_CACHE_TTL_SEC = 6.0
 async def annotated_latest(drone_id: str = ""):
     """
     Returns the most recently annotated JPEG frame with plate bounding boxes + OCR text.
-    Strictly verifies drone ID / alias and enforces a freshness TTL window.
+    If a live stream is ongoing, serves live frame with X-Feed-Status: live.
+    If the stream has ended or paused, serves the last known annotated frame with X-Feed-Status: offline.
+    If not in memory (e.g. after container restart), loads and analyzes the latest frame from Redis.
     """
     import time as _time
     now = _time.monotonic()
@@ -628,33 +662,57 @@ async def annotated_latest(drone_id: str = ""):
         aliases = get_drone_aliases(drone_id)
         for alias in aliases:
             if alias in _last_annotated:
-                age = now - _last_annotated_ts.get(alias, 0)
-                if age <= FRAME_CACHE_TTL_SEC:
-                    frame_bytes = _last_annotated[alias]
-                    matched_drone_id = alias
-                    frame_age = age
-                    break
+                frame_bytes = _last_annotated[alias]
+                matched_drone_id = alias
+                frame_age = now - _last_annotated_ts.get(alias, 0)
+                break
     elif _last_annotated:
         best_drone = max(_last_annotated_ts, key=_last_annotated_ts.get, default=None)
         if best_drone:
-            age = now - _last_annotated_ts.get(best_drone, 0)
-            if age <= FRAME_CACHE_TTL_SEC:
-                frame_bytes = _last_annotated.get(best_drone)
-                matched_drone_id = best_drone
-                frame_age = age
+            frame_bytes = _last_annotated.get(best_drone)
+            matched_drone_id = best_drone
+            frame_age = now - _last_annotated_ts.get(best_drone, 0)
+
+    # If no in-memory frame, try to recover the latest frame from the Redis stream
+    if not frame_bytes and drone_id:
+        aliases = get_drone_aliases(drone_id)
+        for alias in aliases:
+            recovered_frame = await get_latest_stream_frame(alias)
+            if recovered_frame is not None and analyzer and analyzer.ready:
+                try:
+                    result = await asyncio.to_thread(
+                        analyzer.analyze_frame, recovered_frame, drone_id=alias
+                    )
+                    annotated_bytes = await asyncio.to_thread(
+                        _draw_anpr_annotations, recovered_frame, result.get("plate_reads", []), alias
+                    )
+                    if annotated_bytes:
+                        _last_annotated[alias] = annotated_bytes
+                        _last_annotated_ts[alias] = 0.0  # Mark as historical
+                        frame_bytes = annotated_bytes
+                        matched_drone_id = alias
+                        frame_age = 999.0
+                        break
+                except Exception as exc:
+                    log.warning("ANPR failed to recover and annotate frame for %s: %s", alias, exc)
 
     if not frame_bytes:
         raise HTTPException(404, "No live ANPR annotated frame available (feed offline or expired)")
 
-    return StreamingResponse(
-        io.BytesIO(frame_bytes),
+    is_live = frame_age <= FRAME_CACHE_TTL_SEC
+    feed_status = "live" if is_live else "offline"
+
+    return Response(
+        content=frame_bytes,
         media_type="image/jpeg",
         headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma":        "no-cache",
-            "Expires":       "0",
-            "X-Drone-ID":    matched_drone_id or drone_id,
-            "X-Frame-Age":   f"{frame_age:.2f}s",
+            "Cache-Control":   "no-cache, no-store, must-revalidate",
+            "Pragma":          "no-cache",
+            "Expires":         "0",
+            "X-Drone-ID":      matched_drone_id or drone_id,
+            "X-Frame-Age":     f"{frame_age:.2f}s",
+            "X-Feed-Status":   feed_status,
+            "X-Stream-Status": feed_status,
         },
     )
 
@@ -764,6 +822,7 @@ async def plates_by_mission(
     sort: str = "newest",
     limit: int = 24,
     offset: int = 0,
+    has_plate: Optional[bool] = None,
 ):
     """
     Query historical plate reads for a given mission or drone + time window.
@@ -783,6 +842,7 @@ async def plates_by_mission(
             sort=sort,
             limit=limit,
             offset=offset,
+            has_plate=has_plate,
         )
         vehicles = []
         plates_read_count = 0
@@ -819,13 +879,14 @@ async def plates_by_mission(
             vehicles.append(d)
         return {
             "total": result["total"],
-            "total_plates_read": plates_read_count,
+            "total_plates_read": result.get("total_plates_read", plates_read_count),
             "vehicles": vehicles,
             "offset": offset,
             "limit": limit,
             "has_more": result["has_more"],
             "mission_id": mission_id,
         }
+
 
     # ── Fallback: drone_id + time range (backward compat) ─────────────────────
     # Build WHERE clauses dynamically

@@ -124,7 +124,7 @@ async def ack_alert(
 
 
 PERSON_EVENT_TYPES = ["person_detected", "perimeter_intrusion", "intrusion_alert"]
-VEHICLE_EVENT_TYPES = ["vehicle_detected", "vehicle_anomaly", "wrong_way", "theft_alert"]
+VEHICLE_EVENT_TYPES = ["vehicle_detected", "vehicle_anomaly", "wrong_way", "theft_alert", "vessel_detected", "vessel_proximity", "vessel_loitering"]
 CROWD_EVENT_TYPES = ["crowd_threshold", "crowd_surge", "unattended_object"]
 
 

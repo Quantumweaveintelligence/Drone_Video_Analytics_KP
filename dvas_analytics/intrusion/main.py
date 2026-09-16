@@ -222,7 +222,7 @@ async def _stream_loop():
                 last_ids[drone_id] = "0"
             try:
                 frames = await xreadgroup_frames(
-                    "analytics", "intrusion-analyzer", drone_id, ">", count=1, block_ms=10
+                    "intrusion-group", "intrusion-analyzer", drone_id, ">", count=1, block_ms=10
                 )
 
                 processed_ids = []
@@ -640,7 +640,7 @@ async def _stream_loop():
 
                     if processed_ids:
                         try:
-                            await ack_frames(drone_id, "analytics", *processed_ids)
+                            await ack_frames(drone_id, "intrusion-group", *processed_ids)
                         except Exception as ack_err:
                             log.warning("ACK error for %s: %s", drone_id, ack_err)
 

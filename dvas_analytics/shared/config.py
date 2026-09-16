@@ -28,6 +28,7 @@ class Config:
     BUCKET_PLATES:    str = os.getenv("BUCKET_PLATES",    "dvas-plates")
     BUCKET_HEATMAPS:  str = os.getenv("BUCKET_HEATMAPS",  "dvas-heatmaps")
     BUCKET_VEHICLES:  str = os.getenv("BUCKET_VEHICLES",  "dvas-vehicles")
+    BUCKET_VESSELS_MARITIME: str = os.getenv("BUCKET_VESSELS_MARITIME", "dvas-vessels-maritime")
 
     # Presigned URL expiry (seconds) for dashboard image display
     MINIO_URL_EXPIRY: int = int(os.getenv("MINIO_URL_EXPIRY", "3600"))
@@ -77,6 +78,13 @@ class Config:
     VEHICLE_URL: str = os.getenv("VEHICLE_URL", "http://vehicle-analyzer:8103")
     ANPR_URL:    str = os.getenv("ANPR_URL",    "http://anpr-analyzer:8104")
     INTRUSION_URL: str = os.getenv("INTRUSION_URL", "http://intrusion-analyzer:8105")
+    VESSEL_URL:  str = os.getenv("VESSEL_URL",   "http://vessel-analyzer:8106")
+
+    # ── Maritime Vessel Tracking ───────────────────────────────────────────
+    VESSEL_CONFIDENCE:              float = float(os.getenv("VESSEL_CONFIDENCE", "0.50"))
+    VESSEL_PERSON_CONFIDENCE:       float = float(os.getenv("VESSEL_PERSON_CONFIDENCE", "0.25"))
+    VESSEL_STATIONARY_THRESHOLD_PX: float = float(os.getenv("VESSEL_STATIONARY_THRESHOLD_PX", "6.0"))
+    VESSEL_PROXIMITY_THRESHOLD_PX:  float = float(os.getenv("VESSEL_PROXIMITY_THRESHOLD_PX", "90.0"))
 
     # ── Intrusion Detection ───────────────────────────────────────────────
     BUCKET_INTRUSION:  str = os.getenv("BUCKET_INTRUSION",  "dvas-intrusion")

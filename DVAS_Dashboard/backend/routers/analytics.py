@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from typing import Optional, List, Dict, Any
 from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
@@ -12,6 +13,7 @@ from core.security import get_current_user, _row_to_dict
 from core.analytics_client import _analytics_get, _analytics_post, _analytics_put, _analytics_delete, _service_headers
 from core.config import (
     ANALYTICS_BASE, CROWD_URL, PERSON_URL, VEHICLE_URL, ANPR_URL, INTRUSION_URL,
+    VESSEL_URL,
 )
 from audit_service import write_audit_v2
 from schemas.models import WatchlistAddIn
@@ -44,13 +46,15 @@ async def analytics_models_status(user: dict = Depends(get_current_user)):
         _analytics_get(f"{VEHICLE_URL}/health"),
         _analytics_get(f"{ANPR_URL}/health"),
         _analytics_get(f"{INTRUSION_URL}/health"),
+        _analytics_get(f"{VESSEL_URL}/health"),
     )
     return {
-        "crowd":   results[0],
-        "person":  results[1],
-        "vehicle": results[2],
-        "anpr":    results[3],
+        "crowd":     results[0],
+        "person":    results[1],
+        "vehicle":   results[2],
+        "anpr":      results[3],
         "intrusion": results[4],
+        "vessel":    results[5],
     }
 
 
@@ -146,7 +150,7 @@ async def crowd_annotated_frame(user: dict = Depends(get_current_user), drone_id
     """
     try:
         params = {"drone_id": drone_id} if drone_id else {}
-        async with httpx.AsyncClient(timeout=8.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get(f"{CROWD_URL}/annotated/latest", params=params)
         if r.status_code == 200:
             headers = {
@@ -867,14 +871,14 @@ async def vehicle_annotated_frame(user: dict = Depends(get_current_user), drone_
     """
     try:
         params = {"drone_id": drone_id} if drone_id else {}
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(f"{VEHICLE_URL}/annotated/latest", params=params)
         if r.status_code == 200:
             headers = {
                 "Cache-Control": "no-cache, no-store, must-revalidate",
                 "Pragma":        "no-cache",
             }
-            for h in ["X-Drone-ID", "X-Frame-Age", "X-Mission-ID"]:
+            for h in ["X-Drone-ID", "X-Frame-Age", "X-Mission-ID", "X-Feed-Status", "X-Stream-Status"]:
                 if h in r.headers:
                     headers[h] = r.headers[h]
             return Response(
@@ -884,7 +888,7 @@ async def vehicle_annotated_frame(user: dict = Depends(get_current_user), drone_
             )
         raise HTTPException(r.status_code, "No live annotated frame available")
     except httpx.RequestError:
-        raise HTTPException(503, "Vehicle analyzer unavailable")
+        raise HTTPException(404, "Vehicle feed temporarily unavailable")
 
 
 @router.get("/analytics/anpr/annotated")
@@ -896,14 +900,14 @@ async def anpr_annotated_frame(user: dict = Depends(get_current_user), drone_id:
     """
     try:
         params = {"drone_id": drone_id} if drone_id else {}
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(f"{ANPR_URL}/annotated/latest", params=params)
         if r.status_code == 200:
             headers = {
                 "Cache-Control": "no-cache, no-store, must-revalidate",
                 "Pragma":        "no-cache",
             }
-            for h in ["X-Drone-ID", "X-Frame-Age", "X-Mission-ID"]:
+            for h in ["X-Drone-ID", "X-Frame-Age", "X-Mission-ID", "X-Feed-Status", "X-Stream-Status"]:
                 if h in r.headers:
                     headers[h] = r.headers[h]
             return Response(
@@ -913,7 +917,7 @@ async def anpr_annotated_frame(user: dict = Depends(get_current_user), drone_id:
             )
         raise HTTPException(r.status_code, "No live annotated frame available")
     except httpx.RequestError:
-        raise HTTPException(503, "ANPR analyzer unavailable")
+        raise HTTPException(404, "ANPR feed temporarily unavailable")
 
 
 # ── ANPR Analytics ────────────────────────────────────────────────────────────
@@ -1039,6 +1043,7 @@ async def mission_vehicles(
     sort: str = "newest",
     limit: int = 24,
     offset: int = 0,
+    has_plate: Optional[bool] = None,
 ):
     """
     Retrieve vehicle/plate detection history for a specific mission.
@@ -1075,6 +1080,8 @@ async def mission_vehicles(
         qs_parts.append(f"vehicle_type={quote(vehicle_type)}")
     if sort:
         qs_parts.append(f"sort={sort}")
+    if has_plate is not None:
+        qs_parts.append(f"has_plate={'true' if has_plate else 'false'}")
 
     url = f"{ANPR_URL}/plates/by-mission?{'&'.join(qs_parts)}"
     result = await _analytics_get(url, timeout=15.0)
@@ -1623,3 +1630,139 @@ async def clear_all_model_suggestions(
     return {"status": "ok", "deleted_count": count}
 
 
+
+
+# ── Maritime Vessel Analytics Proxies ────────────────────────────────────────
+
+@router.get("/analytics/vessel/health")
+async def vessel_health(user: dict = Depends(get_current_user)):
+    """Proxy health status from vessel-analyzer."""
+    return await _analytics_get(f"{VESSEL_URL}/health")
+
+
+@router.get("/analytics/vessel/stream/start")
+async def vessel_stream_start(user: dict = Depends(get_current_user)):
+    """Start maritime vessel detection stream loop."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{VESSEL_URL}/stream/start")
+
+
+@router.get("/analytics/vessel/stream/stop")
+async def vessel_stream_stop(user: dict = Depends(get_current_user)):
+    """Stop maritime vessel detection stream loop."""
+    if user["role"] == "drone_operator":
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{VESSEL_URL}/stream/stop")
+
+
+@router.get("/analytics/vessel/annotated")
+async def vessel_annotated_frame(user: dict = Depends(get_current_user), drone_id: str = ""):
+    """
+    Proxy the latest annotated JPEG frame (vessel bounding boxes, classes, tactical HUD)
+    from vessel-analyzer. Returns binary JPEG — NOT JSON.
+    """
+    try:
+        params = {"drone_id": drone_id} if drone_id else {}
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{VESSEL_URL}/annotated/latest", params=params)
+        if r.status_code == 200:
+            headers = {
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Access-Control-Expose-Headers": "X-Drone-ID, X-Frame-Age, X-Vessel-Count, X-Feed-Status, X-Stream-Status",
+            }
+            for h in ["X-Drone-ID", "X-Frame-Age", "X-Vessel-Count", "X-Feed-Status", "X-Stream-Status"]:
+                if h in r.headers:
+                    headers[h] = r.headers[h]
+            return Response(
+                content=r.content,
+                media_type="image/jpeg",
+                headers=headers,
+            )
+        raise HTTPException(r.status_code, "No live maritime frame available")
+    except httpx.RequestError:
+        raise HTTPException(503, "Vessel analyzer temporarily unavailable")
+
+
+@router.get("/analytics/vessel/tracks")
+async def vessel_tracks(
+    user: dict = Depends(get_current_user),
+    drone_id: str = "",
+    mission_id: str = "",
+    limit: int = 100
+):
+    """Retrieve active vessel tracks from vessel-analyzer."""
+    url = f"{VESSEL_URL}/tracks/active?limit={limit}"
+    if drone_id:
+        url += f"&drone_id={drone_id}"
+    if mission_id:
+        url += f"&mission_id={mission_id}"
+    return await _analytics_get(url)
+
+
+@router.get("/analytics/vessel/stats")
+async def vessel_stats(
+    user: dict = Depends(get_current_user),
+    drone_id: str = "",
+    mission_id: str = ""
+):
+    """Retrieve maritime summary KPIs from vessel-analyzer."""
+    url = f"{VESSEL_URL}/stats/summary"
+    params = []
+    if drone_id:
+        params.append(f"drone_id={drone_id}")
+    if mission_id:
+        params.append(f"mission_id={mission_id}")
+    if params:
+        url += "?" + "&".join(params)
+    return await _analytics_get(url)
+
+
+@router.get("/analytics/vessel/stats/by-class")
+async def vessel_by_class(
+    user: dict = Depends(get_current_user),
+    drone_id: str = "",
+    mission_id: str = ""
+):
+    """Retrieve vessel count by taxonomy class from vessel-analyzer."""
+    url = f"{VESSEL_URL}/stats/by-class"
+    params = []
+    if drone_id:
+        params.append(f"drone_id={drone_id}")
+    if mission_id:
+        params.append(f"mission_id={mission_id}")
+    if params:
+        url += "?" + "&".join(params)
+    return await _analytics_get(url)
+
+
+@router.get("/analytics/vessel/events")
+async def vessel_events(
+    user: dict = Depends(get_current_user),
+    drone_id: str = "",
+    mission_id: str = "",
+    event_type: str = "",
+    limit: int = 50
+):
+    """Retrieve maritime alert events from vessel-analyzer."""
+    url = f"{VESSEL_URL}/events/recent?limit={limit}"
+    if drone_id:
+        url += f"&drone_id={drone_id}"
+    if mission_id:
+        url += f"&mission_id={mission_id}"
+    if event_type:
+        url += f"&event_type={event_type}"
+    return await _analytics_get(url)
+
+
+@router.get("/analytics/vessel/heatmap")
+async def vessel_heatmap(
+    user: dict = Depends(get_current_user),
+    drone_id: str = ""
+):
+    """Retrieve spatial heatmap density coordinates from vessel-analyzer."""
+    url = f"{VESSEL_URL}/heatmap/data"
+    if drone_id:
+        url += f"?drone_id={drone_id}"
+    return await _analytics_get(url)

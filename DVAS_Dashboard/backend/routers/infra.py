@@ -12,7 +12,7 @@ from database import async_session_factory
 from models import Drone, ModelConfig
 from core.security import get_current_user, require_roles, _row_to_dict
 from core.config import (
-    CROWD_URL, PERSON_URL, VEHICLE_URL, ANPR_URL, INTRUSION_URL,
+    CROWD_URL, PERSON_URL, VEHICLE_URL, ANPR_URL, INTRUSION_URL, VESSEL_URL,
     MINIO_PROXY_ENDPOINT, MINIO_PROXY_ACCESS, MINIO_PROXY_SECRET, MINIO_PROXY_SECURE,
     limiter,
 )
@@ -120,18 +120,20 @@ AVAILABLE_MODELS = [
     {"key": "crowd",        "label": "CSRNet Crowd Density",          "gpu_pct": 20, "throughput_fps": 8,  "default": True},
     {"key": "plate",        "label": "Number-Plate (ANPR)",          "gpu_pct": 20, "throughput_fps": 40, "default": False},
     {"key": "intrusion",    "label": "GeoTrax Intrusion Detection",  "gpu_pct": 15, "throughput_fps": 45, "default": False},
+    {"key": "vessel",       "label": "SeaDrone Maritime Tracking",   "gpu_pct": 15, "throughput_fps": 60, "default": False},
 ]
 
 
 def _build_service_map():
     """Build SERVICE_MAP after analytics URL constants are defined."""
     return {
-        "person":  PERSON_URL,
-        "face":    PERSON_URL,   # face detection runs inside person-analyzer
-        "vehicle": VEHICLE_URL,
-        "crowd":   CROWD_URL,
-        "plate":   ANPR_URL,
+        "person":    PERSON_URL,
+        "face":      PERSON_URL,   # face detection runs inside person-analyzer
+        "vehicle":   VEHICLE_URL,
+        "crowd":     CROWD_URL,
+        "plate":     ANPR_URL,
         "intrusion": INTRUSION_URL,
+        "vessel":    VESSEL_URL,
     }
 
 
@@ -147,7 +149,7 @@ async def _fetch_single_status(client: httpx.AsyncClient, key: str, url: str) ->
 async def _get_service_stream_status() -> dict:
     """
     Query each analytics service health endpoint concurrently and return
-    {model_key: stream_running bool} for all 5 services.
+    {model_key: stream_running bool} for all services.
     face shares person-analyzer status.
     """
     urls = {
@@ -156,6 +158,7 @@ async def _get_service_stream_status() -> dict:
         "vehicle":   f"{VEHICLE_URL}/health",
         "plate":     f"{ANPR_URL}/health",
         "intrusion": f"{INTRUSION_URL}/health",
+        "vessel":    f"{VESSEL_URL}/health",
     }
     status = {}
     async with httpx.AsyncClient() as client:
@@ -438,7 +441,7 @@ async def minio_image_proxy(bucket: str, key: str, _user=Depends(get_current_use
         raise HTTPException(status_code=400, detail="bucket and key are required")
 
     # Security: only allow known buckets
-    ALLOWED_BUCKETS = {"dvas-plates", "dvas-vehicles", "dvas-evidence", "dvas-faces", "dvas-heatmaps", "dvas-intrusion", "dvas-watchlist"}
+    ALLOWED_BUCKETS = {"dvas-plates", "dvas-vehicles", "dvas-evidence", "dvas-faces", "dvas-heatmaps", "dvas-intrusion", "dvas-watchlist", "dvas-vessels-maritime"}
     if bucket not in ALLOWED_BUCKETS:
         raise HTTPException(status_code=403, detail=f"Bucket '{bucket}' not allowed")
 

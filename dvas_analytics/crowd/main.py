@@ -197,84 +197,94 @@ async def _stream_loop():
             except Exception as exc:
                 log.warning("Crowd stream scanner warning: %s", exc)
 
-        for drone_id in active_drones:
+        any_frames_received = False
+        for drone_id in list(active_drones):
             if drone_id not in last_ids:
                 last_ids[drone_id] = "0"
             try:
                 frames = await xreadgroup_frames(
-                    "analytics", "crowd-analyzer", drone_id, ">", count=4, block_ms=100
+                    "crowd-group", "crowd-analyzer", drone_id, ">", count=5, block_ms=0
                 )
-                
-                processed_ids = []
-                for entry_id, f in frames:
-                    raw = f.get("jpeg_b64", "")
-                    if not raw:
-                        processed_ids.append(entry_id)
-                        continue
+                if not frames:
+                    continue
+
+                any_frames_received = True
+
+                # If multiple frames arrived, ACK earlier frames immediately to stay realtime
+                processed_ids = [entry_id for entry_id, _ in frames[:-1]]
+
+                # Process only the latest frame
+                entry_id, f = frames[-1]
+                raw = f.get("jpeg_b64", "")
+                if not raw:
+                    processed_ids.append(entry_id)
+                else:
                     img_bytes = base64.b64decode(raw)
                     nparr = np.frombuffer(img_bytes, np.uint8)
                     frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     if frame is None:
                         processed_ids.append(entry_id)
-                        continue
-
-                    # Run inference in worker thread pool so FastAPI event loop is never blocked
-                    result = await asyncio.to_thread(
-                        analyzer.analyze_frame, frame, drone_id=drone_id, include_heatmap=True
-                    )
-                    ts = datetime.now(timezone.utc)
-
-                    heatmap_key = None
-                    # Upload heatmap every 10 frames to save bandwidth
-                    if _frames_processed % 10 == 0 and result.get("heatmap_b64"):
-                        heatmap_bytes = base64.b64decode(result["heatmap_b64"])
-                        key = minio.make_key("heatmaps", drone_id,
-                                             f"heatmap_{int(ts.timestamp()*1000)}.png")
-                        heatmap_key = await minio.upload_bytes(
-                            cfg.BUCKET_HEATMAPS, key, heatmap_bytes, "image/png"
+                    else:
+                        # Run inference in worker thread pool so FastAPI event loop is never blocked
+                        result = await asyncio.to_thread(
+                            analyzer.analyze_frame, frame, drone_id=drone_id, include_heatmap=True
                         )
+                        ts = datetime.now(timezone.utc)
 
-                    await write_crowd_reading(
-                        drone_id=drone_id,
-                        ts=ts,
-                        estimated_count=result["estimated_count"],
-                        heatmap_object_key=heatmap_key,
-                    )
+                        heatmap_key = None
+                        # Upload heatmap every 10 frames to save bandwidth
+                        if _frames_processed % 10 == 0 and result.get("heatmap_b64"):
+                            heatmap_bytes = base64.b64decode(result["heatmap_b64"])
+                            key = minio.make_key("heatmaps", drone_id,
+                                                 f"heatmap_{int(ts.timestamp()*1000)}.png")
+                            heatmap_key = await minio.upload_bytes(
+                                cfg.BUCKET_HEATMAPS, key, heatmap_bytes, "image/png"
+                            )
 
-                    if result["alert_triggered"]:
-                        event_id = await write_confirmed_event(
+                        await write_crowd_reading(
                             drone_id=drone_id,
-                            event_type="crowd_threshold",
-                            confidence=min(result["estimated_count"] / 200, 1.0),
                             ts=ts,
-                            attributes={
-                                "estimated_count": result["estimated_count"],
-                                "density_label":   result["density_label"],
-                            },
+                            estimated_count=result["estimated_count"],
+                            heatmap_object_key=heatmap_key,
                         )
-                        await publish_confirmed_event({
-                            "event_id":   event_id,
-                            "event_type": "crowd_threshold",
-                            "drone_id":   drone_id,
-                            "ts":         ts.isoformat(),
-                            "count":      result["estimated_count"],
-                        })
 
-                    # Publish to SSE stream — strip heavy binary fields
-                    sse_result = {k: v for k, v in result.items()
-                                  if k not in ("heatmap_b64", "peak_frame")}
-                    await publish_analytics_result("crowd", sse_result)
-                    _frames_processed += 1
-                    processed_ids.append(entry_id)
+                        if result["alert_triggered"]:
+                            event_id = await write_confirmed_event(
+                                drone_id=drone_id,
+                                event_type="crowd_threshold",
+                                confidence=min(result["estimated_count"] / 200, 1.0),
+                                ts=ts,
+                                attributes={
+                                    "estimated_count": result["estimated_count"],
+                                    "density_label":   result["density_label"],
+                                },
+                            )
+                            await publish_confirmed_event({
+                                "event_id":   event_id,
+                                "event_type": "crowd_threshold",
+                                "drone_id":   drone_id,
+                                "ts":         ts.isoformat(),
+                                "count":      result["estimated_count"],
+                            })
+
+                        # Publish to SSE stream — strip heavy binary fields
+                        sse_result = {k: v for k, v in result.items()
+                                      if k not in ("heatmap_b64", "peak_frame")}
+                        await publish_analytics_result("crowd", sse_result)
+                        _frames_processed += 1
+                        processed_ids.append(entry_id)
 
                 if processed_ids:
-                    await ack_frames(drone_id, "analytics", *processed_ids)
+                    await ack_frames(drone_id, "crowd-group", *processed_ids)
 
             except asyncio.CancelledError:
                 return
             except Exception as exc:
                 log.warning("Stream loop error for %s: %s", drone_id, exc)
                 await asyncio.sleep(1)
+
+        if not any_frames_received:
+            await asyncio.sleep(0.05)
 
 
 @app.get("/stream/start")

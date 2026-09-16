@@ -16,7 +16,7 @@ import {
 
 import { useJpegPoller } from '../hooks/useJpegPoller';
 import { useActiveStreams } from '../hooks/useActiveStreams';
-import { api } from '../lib/api';
+import { api, getAuthToken } from '../lib/api';
 
 /* ─── constants ─────────────────────────────────────────────────── */
 const POLL_TRACKS    = 5000;
@@ -37,6 +37,14 @@ const CHART_TOOLTIP = {
     background: 'var(--dvas-surface)', border: '1px solid var(--dvas-border)',
     fontSize: 11, color: 'var(--dvas-text)', borderRadius: 8,
   },
+};
+
+const resolveMinioUrl = (bucket, key, fallbackUrl = null) => {
+  if (!key) return fallbackUrl || null;
+  const cleanKey = String(key).replace(/^\/+/, '');
+  const token = getAuthToken();
+  const tokenParam = token ? `&token=${encodeURIComponent(token)}` : '';
+  return `/api/minio/image?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(cleanKey)}${tokenParam}`;
 };
 
 function fmtAge(ts) {
@@ -147,7 +155,7 @@ function AnnotatedFrameViewer({ droneId, mode = 'vehicle', streamRunning, isLive
   const { blobUrl: rawSrc, ok: rawOk } = useJpegPoller(rawUrl, 1500, hasDrone);
 
   // Layer 2: annotated overlay — polls when stream is running or drone is known
-  const { blobUrl: annotatedSrc, ok: annotatedOk } = useJpegPoller(
+  const { blobUrl: annotatedSrc, ok: annotatedOk, meta: annotatedMeta } = useJpegPoller(
     annotatedUrl, FRAME_INTERVAL, hasDrone && streamRunning
   );
 
@@ -213,9 +221,9 @@ function AnnotatedFrameViewer({ droneId, mode = 'vehicle', streamRunning, isLive
 
       {/* ── HUD: top-right status pill ─────────────────── */}
       {isAnnotated ? (
-        <div className="absolute top-3 right-3 z-10 pointer-events-none flex items-center gap-1 mono text-[10px] bg-black/85 px-2 py-1 rounded text-emerald-400">
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 dvas-live-dot" />
-          ANNOTATED{fps > 0 ? ` · ${fps}fps` : ''}
+        <div className={`absolute top-3 right-3 z-10 pointer-events-none flex items-center gap-1 mono text-[10px] bg-black/85 px-2 py-1 rounded ${annotatedMeta?.feedStatus === 'offline' ? 'text-amber-300' : 'text-emerald-400'}`}>
+          <span className={`w-1.5 h-1.5 rounded-full ${annotatedMeta?.feedStatus === 'offline' ? 'bg-amber-400' : 'bg-emerald-400 dvas-live-dot'}`} />
+          {annotatedMeta?.feedStatus === 'offline' ? 'ANNOTATED · OFFLINE' : `ANNOTATED${fps > 0 ? ` · ${fps}fps` : ''}`}
         </div>
       ) : rawOk ? (
         <div className="absolute top-3 right-3 z-10 pointer-events-none flex items-center gap-1 mono text-[10px] bg-black/85 px-2 py-1 rounded text-slate-400">
@@ -533,10 +541,7 @@ function ANPRWindow({ plates, activeDrone, activeMissionId, anprStreamRunning })
   }
 
   // Build image URL: prefer proxy (key-based), fallback to b64, then to presigned URL
-  const proxyUrl = (bucket, key) => {
-    if (!key) return null;
-    return `/api/minio/image?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(key)}`;
-  };
+  const proxyUrl = (bucket, key) => resolveMinioUrl(bucket, key);
   const imgSrc = (bucket, key, url, b64) => {
     if (key) return proxyUrl(bucket, key);
     if (b64) return `data:image/jpeg;base64,${b64}`;
@@ -829,7 +834,7 @@ function WatchlistPanel({ alerts, watchlist, onAdd, onRemove, adding }) {
                 <div className="flex gap-1 px-2 pb-2">
                   {(a.vehicle_image_key || a.vehicle_image_url) && (
                     <div className="relative rounded overflow-hidden bg-black" style={{ flex:'2', paddingTop:'40%' }}>
-                      <img src={a.vehicle_image_key ? `/api/minio/image?bucket=dvas-vehicles&key=${encodeURIComponent(a.vehicle_image_key)}` : a.vehicle_image_url} alt="vehicle" loading="lazy"
+                      <img src={resolveMinioUrl('dvas-vehicles', a.vehicle_image_key, a.vehicle_image_url)} alt="vehicle" loading="lazy"
                         className="absolute inset-0 w-full h-full object-cover" />
                       <span className="absolute bottom-0.5 left-0.5 mono text-[7px] px-1 rounded"
                         style={{ background:'rgba(0,0,0,0.7)', color:'#94a3b8' }}>VEHICLE</span>
@@ -837,7 +842,7 @@ function WatchlistPanel({ alerts, watchlist, onAdd, onRemove, adding }) {
                   )}
                   {(a.plate_image_key || a.plate_image_url) && (
                     <div className="relative rounded overflow-hidden bg-black" style={{ flex:'1', paddingTop:'40%' }}>
-                      <img src={a.plate_image_key ? `/api/minio/image?bucket=dvas-plates&key=${encodeURIComponent(a.plate_image_key)}` : a.plate_image_url} alt="plate" loading="lazy"
+                      <img src={resolveMinioUrl('dvas-plates', a.plate_image_key, a.plate_image_url)} alt="plate" loading="lazy"
                         className="absolute inset-0 w-full h-full object-contain" />
                       <span className="absolute bottom-0.5 left-0.5 mono text-[7px] px-1 rounded"
                         style={{ background:'rgba(0,0,0,0.7)', color:'#94a3b8' }}>PLATE</span>
@@ -899,14 +904,14 @@ function WatchlistPanel({ alerts, watchlist, onAdd, onRemove, adding }) {
                 <div className="flex gap-1 p-1.5">
                   {(r.vehicle_image_key || r.vehicle_image_url) && (
                     <div className="relative rounded overflow-hidden bg-black" style={{ flex:'2', paddingTop:'40%' }}>
-                      <img src={r.vehicle_image_key ? `/api/minio/image?bucket=dvas-vehicles&key=${encodeURIComponent(r.vehicle_image_key)}` : r.vehicle_image_url} alt="vehicle" className="absolute inset-0 w-full h-full object-cover" />
+                      <img src={resolveMinioUrl('dvas-vehicles', r.vehicle_image_key, r.vehicle_image_url)} alt="vehicle" className="absolute inset-0 w-full h-full object-cover" />
                       <span className="absolute bottom-0.5 left-0.5 mono text-[7px] px-1 rounded"
                         style={{ background:'rgba(0,0,0,0.7)', color:'#94a3b8' }}>VEHICLE</span>
                     </div>
                   )}
                   {(r.plate_image_key || r.plate_image_url) && (
                     <div className="relative rounded overflow-hidden bg-black" style={{ flex:'1', paddingTop:'40%' }}>
-                      <img src={r.plate_image_key ? `/api/minio/image?bucket=dvas-plates&key=${encodeURIComponent(r.plate_image_key)}` : r.plate_image_url} alt="plate" className="absolute inset-0 w-full h-full object-contain" />
+                      <img src={resolveMinioUrl('dvas-plates', r.plate_image_key, r.plate_image_url)} alt="plate" className="absolute inset-0 w-full h-full object-contain" />
                       <span className="absolute bottom-0.5 left-0.5 mono text-[7px] px-1 rounded"
                         style={{ background:'rgba(0,0,0,0.7)', color:'#94a3b8' }}>PLATE</span>
                     </div>
@@ -1001,7 +1006,8 @@ function MissionHistory() {
   const [plateSearch, setPlateSearch] = useState('');
   const [debouncedPlateSearch, setDebouncedPlateSearch] = useState('');
   const [vehicleType, setVehicleType] = useState('all');
-  const [sortBy, setSortBy] = useState('newest');
+  const [filterOnlyPlates, setFilterOnlyPlates] = useState(false);
+  const [sortBy, setSortBy] = useState('plates_first');
   const [offset, setOffset] = useState(0);
   const limit = 24;
 
@@ -1022,13 +1028,17 @@ function MissionHistory() {
     const fetchVehicles = async () => {
       setLoading(true);
       try {
-        const query = new URLSearchParams({
+        const params = {
           plate_search: debouncedPlateSearch,
           vehicle_type: vehicleType,
           sort: sortBy,
           limit,
           offset
-        }).toString();
+        };
+        if (filterOnlyPlates) {
+          params.has_plate = 'true';
+        }
+        const query = new URLSearchParams(params).toString();
         const res = await api.get(`/analytics/mission/${selectedMission.mission_id}/vehicles?${query}`);
         if (mounted) setMissionData(res.data);
       } catch (err) {
@@ -1039,7 +1049,7 @@ function MissionHistory() {
     };
     fetchVehicles();
     return () => { mounted = false; };
-  }, [selectedMission, debouncedPlateSearch, vehicleType, sortBy, offset]);
+  }, [selectedMission, debouncedPlateSearch, vehicleType, filterOnlyPlates, sortBy, offset]);
 
   // Click outside to close dropdown
   useEffect(() => {
@@ -1082,15 +1092,16 @@ function MissionHistory() {
     ];
     missionData.vehicles.forEach(v => {
       rows.push([
-        v.created_at || '',
+        v.created_at ? new Date(v.created_at).toLocaleString() : '',
         v.tracker_id || '',
         v.vehicle_type || '',
         v.colour || '',
         v.speed_kph || '',
         v.plate_text || '',
-        v.ocr_confidence || ''
+        v.ocr_confidence ? `${(v.ocr_confidence * 100).toFixed(1)}%` : ''
       ]);
     });
+
     const csvContent = rows.map(r => r.map(c => `"${c}"`).join(',')).join('\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -1213,6 +1224,24 @@ function MissionHistory() {
           />
         </div>
 
+        {/* Filter Toggle: All vs Plates Only */}
+        <div className="flex items-center rounded overflow-hidden" style={{ border: '1px solid var(--dvas-border)', background: 'var(--dvas-surface-2)' }}>
+          <button
+            type="button"
+            onClick={() => { setFilterOnlyPlates(false); setOffset(0); }}
+            className={`mono text-[11px] px-2.5 py-1.5 transition-colors font-bold ${!filterOnlyPlates ? 'bg-cyan-500/20 text-cyan-300' : 'text-slate-400 hover:text-slate-200'}`}
+          >
+            All Vehicles ({missionData?.total != null ? missionData.total : '—'})
+          </button>
+          <button
+            type="button"
+            onClick={() => { setFilterOnlyPlates(true); setOffset(0); }}
+            className={`mono text-[11px] px-2.5 py-1.5 transition-colors font-bold ${filterOnlyPlates ? 'bg-emerald-500/20 text-emerald-300' : 'text-slate-400 hover:text-slate-200'}`}
+          >
+            Plates Detected ({missionData?.total_plates_read != null ? missionData.total_plates_read : '—'})
+          </button>
+        </div>
+
         {/* Vehicle Type */}
         <select
           className="mono text-xs px-2 py-1.5 rounded outline-none cursor-pointer"
@@ -1234,6 +1263,7 @@ function MissionHistory() {
           value={sortBy}
           onChange={(e) => { setSortBy(e.target.value); setOffset(0); }}
         >
+          <option value="plates_first">Sort: Plates First</option>
           <option value="newest">Sort: Newest</option>
           <option value="oldest">Sort: Oldest</option>
           <option value="confidence">Sort: Confidence</option>
@@ -1309,16 +1339,12 @@ function MissionHistory() {
             }}
           >
             {missionData.vehicles.map((p, i) => {
-              const vSrc = p.vehicle_image_key
-                ? `/api/minio/image?bucket=dvas-vehicles&key=${encodeURIComponent(p.vehicle_image_key)}`
-                : p.vehicle_image_url || null;
-              const pSrc = p.plate_image_key
-                ? `/api/minio/image?bucket=dvas-plates&key=${encodeURIComponent(p.plate_image_key)}`
-                : p.plate_image_url || null;
+              const vSrc = resolveMinioUrl('dvas-vehicles', p.vehicle_image_key, p.vehicle_image_url);
+              const pSrc = resolveMinioUrl('dvas-plates', p.plate_image_key, p.plate_image_url);
               const vType = (p.vehicle_type || 'VEHICLE').toUpperCase();
               
               return (
-                <div key={p.id || i}
+                <div key={p.id || p.track_id || i}
                   className="flex flex-col h-auto rounded-lg overflow-hidden transition-all duration-300"
                   style={{
                     background: 'rgba(15, 23, 42, 0.9)',
@@ -1337,7 +1363,7 @@ function MissionHistory() {
                     </span>
                     <span className="text-slate-500 font-mono flex items-center gap-1" style={{ fontSize: 9 }}>
                       <Clock size={9} className="opacity-60" />
-                      {new Date(p.created_at).toLocaleTimeString()}
+                      {p.created_at ? new Date(p.created_at).toLocaleTimeString() : '—'}
                     </span>
                   </div>
 
@@ -1362,37 +1388,43 @@ function MissionHistory() {
                     </div>
                   </div>
 
-                  {/* Plate Crop */}
-                  <div className="w-full flex flex-col items-center" style={{ background: 'rgba(15,23,42,0.95)', borderTop: '1px solid rgba(51,65,85,0.5)', padding: '6px 8px' }}>
-                    <div className="w-full mb-1">
-                      <span className="font-mono font-bold uppercase text-slate-500" style={{ fontSize: 8, letterSpacing: '0.08em' }}>PLATE CROP</span>
+                  {/* Plate Crop Section (Adaptive) */}
+                  {pSrc ? (
+                    <div className="w-full flex flex-col items-center" style={{ background: 'rgba(15,23,42,0.95)', borderTop: '1px solid rgba(51,65,85,0.5)', padding: '6px 8px' }}>
+                      <div className="w-full mb-1 flex items-center justify-between">
+                        <span className="font-mono font-bold uppercase text-slate-400" style={{ fontSize: 8, letterSpacing: '0.08em' }}>PLATE CROP</span>
+                        {p.is_reliable && (
+                          <span className="font-mono px-1 py-0.5 rounded text-[7px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                            CONFIRMED
+                          </span>
+                        )}
+                      </div>
+                      <div className="relative w-full rounded border border-slate-700/70 bg-black overflow-hidden" style={{ paddingTop: '30%' /* 3.3:1 */ }}>
+                        <img src={pSrc} alt="" aria-hidden="true"
+                          className="absolute inset-0 w-full h-full object-cover block"
+                          style={{ filter: 'blur(10px) brightness(0.5)', transform: 'scale(1.15)' }} />
+                        <img src={pSrc} alt="plate" loading="lazy"
+                          className="absolute inset-0 w-full h-full object-contain block" />
+                      </div>
                     </div>
-                    <div className="relative w-full rounded border border-slate-700/70 bg-black overflow-hidden" style={{ paddingTop: '33.33%' /* 3:1 */ }}>
-                      {pSrc ? (
-                        <>
-                          <img src={pSrc} alt="" aria-hidden="true"
-                            className="absolute inset-0 w-full h-full object-cover block"
-                            style={{ filter: 'blur(10px) brightness(0.5)', transform: 'scale(1.15)' }} />
-                          <img src={pSrc} alt="plate" loading="lazy"
-                            className="absolute inset-0 w-full h-full object-contain block" />
-                        </>
-                      ) : (
-                        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 font-mono text-slate-600" style={{ fontSize: 8 }}>
-                          <span>NO PLATE IMAGE</span>
-                        </div>
-                      )}
+                  ) : (
+                    <div className="w-full flex items-center justify-between px-2.5 py-2.5" style={{ background: 'rgba(15,23,42,0.6)', borderTop: '1px solid rgba(51,65,85,0.3)' }}>
+                      <span className="font-mono text-slate-500" style={{ fontSize: 9 }}>Plate Detection:</span>
+                      <span className="font-mono px-1.5 py-0.5 rounded text-[8px] text-slate-400 bg-slate-800/80 border border-slate-700/60">
+                        Not visible in aerial angle
+                      </span>
                     </div>
-                  </div>
+                  )}
 
                   {/* Footer */}
-                  <div className="flex items-center justify-between px-2.5 py-2" style={{ background: 'rgba(30,41,59,0.5)', borderTop: '1px solid rgba(51,65,85,0.5)' }}>
+                  <div className="flex items-center justify-between px-2.5 py-2 mt-auto" style={{ background: 'rgba(30,41,59,0.5)', borderTop: '1px solid rgba(51,65,85,0.5)' }}>
                     <div className="flex flex-col">
                       {p.plate_text ? (
                         <span className="font-mono font-black tracking-wider text-cyan-300" style={{ fontSize: 11 }}>
                           {p.plate_text}
                         </span>
                       ) : (
-                        <span className="font-mono font-bold text-slate-500" style={{ fontSize: 9 }}>No Plate</span>
+                        <span className="font-mono font-semibold text-slate-500" style={{ fontSize: 9 }}>No Plate Read</span>
                       )}
                     </div>
                     <div className="flex items-center gap-3">

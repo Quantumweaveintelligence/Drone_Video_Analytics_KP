@@ -6,6 +6,7 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import { authFetch } from "@/lib/api";
 
 const FEED_BACKOFF = [600, 1200, 2400, 5000, 10000, 20000, 30000];
 const FEED_WATCHDOG_MS = 6000;
@@ -47,15 +48,11 @@ export function useJpegPoller(url, intervalMs = 600, enabled = true) {
     fetchIdRef.current += 1;
     const currentFetchId = fetchIdRef.current;
     
-    const token = localStorage.getItem("dvas_token") || localStorage.getItem("token") || "";
     const sep = url.includes("?") ? "&" : "?";
     const fetchUrl = `${url}${sep}_t=${Date.now()}`;
 
     try {
-      const res = await fetch(fetchUrl, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-        credentials: "include",
-      });
+      const res = await authFetch(fetchUrl);
 
       if (!mountedRef.current || fetchIdRef.current !== currentFetchId) return;
 
@@ -85,19 +82,21 @@ export function useJpegPoller(url, intervalMs = 600, enabled = true) {
         
         // Extract meta if any
         const crowdCount = res.headers.get('X-Crowd-Count');
+        const vesselCount = res.headers.get('X-Vessel-Count');
         const densityLabel = res.headers.get('X-Density-Label');
         const droneId = res.headers.get('X-Drone-ID');
-        if (crowdCount != null) {
-          const parsed = parseFloat(crowdCount);
-          if (!isNaN(parsed)) {
-            setMeta({
-              crowdCount: parsed,
-              densityLabel: densityLabel || '',
-              droneId: droneId || '',
-              _ts: Date.now(),
-            });
-          }
-        }
+        const feedStatus = res.headers.get('X-Feed-Status') || res.headers.get('X-Stream-Status') || '';
+        const frameAge = res.headers.get('X-Frame-Age') || '';
+
+        setMeta({
+          crowdCount: crowdCount != null ? parseFloat(crowdCount) : undefined,
+          vesselCount: vesselCount != null ? parseInt(vesselCount, 10) : undefined,
+          densityLabel: densityLabel || '',
+          droneId: droneId || '',
+          feedStatus,
+          frameAge,
+          _ts: Date.now(),
+        });
 
         // FPS Calculation
         fpsCountRef.current += 1;
@@ -116,20 +115,20 @@ export function useJpegPoller(url, intervalMs = 600, enabled = true) {
           }
         }, FEED_WATCHDOG_MS);
 
-        timerRef.current = setTimeout(doFetch, intervalMs);
+        const isOffline = feedStatus === 'offline' || feedStatus === 'completed';
+        const nextDelay = isOffline ? Math.max(intervalMs, 5000) : intervalMs;
+        timerRef.current = setTimeout(doFetch, nextDelay);
       } else if (res.status === 404) {
-        setBlobUrl((prev) => {
-          if (prev) URL.revokeObjectURL(prev);
-          prevBlobRef.current = null;
-          return null;
-        });
-        setHasFrame(false);
-        setFeedDead(true);
-        feedDeadRef.current = true;
-        setMeta({});
+        if (!prevBlobRef.current) {
+          setBlobUrl(null);
+          setHasFrame(false);
+          setFeedDead(true);
+          feedDeadRef.current = true;
+          setMeta({});
+        }
         
-        // Enter 5s slow-retry mode
-        timerRef.current = setTimeout(doFetch, 5000);
+        // Enter 8s slow-retry mode to avoid log spamming
+        timerRef.current = setTimeout(doFetch, 8000);
       } else {
         throw new Error(`HTTP ${res.status}`);
       }

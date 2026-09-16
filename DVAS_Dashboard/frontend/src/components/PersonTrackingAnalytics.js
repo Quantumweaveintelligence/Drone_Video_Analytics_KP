@@ -637,7 +637,7 @@ function ActivePersonTracks({ persons, loading }) {
 /* ───────────────────────────────────────────────────────────────
    SECTION 4 — Detection Chart (SSE rolling window)
    ────────────────────────────────────────────────────────────── */
-function DetectionChart({ sseWindow }) {
+function DetectionChart({ sseWindow, sseConnected }) {
   const data = sseWindow.length > 0
     ? sseWindow
     : Array.from({ length: 20 }, (_, i) => ({ t: String(i), count: 0, faces: 0 }));
@@ -649,12 +649,15 @@ function DetectionChart({ sseWindow }) {
   return (
     <div className="relative">
       {sseWindow.length === 0 && (
-        <div className="absolute inset-0 flex items-center justify-center z-10">
-          <span className="mono text-xs text-slate-500">Waiting for person detection events…</span>
+        <div className="absolute inset-0 flex items-center justify-center z-10 pointer-events-none">
+          <span className="mono text-xs text-slate-500 flex items-center gap-1.5">
+            <Radio size={12} className={sseConnected ? "text-teal-400 animate-pulse" : "text-slate-500"} />
+            {sseConnected ? "Listening for real-time person detections…" : "Connecting to detection stream…"}
+          </span>
         </div>
       )}
-      {sseWindow.length > 0 && (
-        <div className="flex items-center gap-4 mb-2 px-1">
+      <div className="flex items-center justify-between mb-2 px-1">
+        <div className="flex items-center gap-4">
           <div className="flex items-center gap-1.5">
             <span className="w-2.5 h-2.5 rounded-sm" style={{ background: '#2dd4bf' }} />
             <span className="mono text-[10px]" style={{ color: 'var(--dvas-text-muted)' }}>Persons</span>
@@ -666,7 +669,11 @@ function DetectionChart({ sseWindow }) {
             <span className="mono text-xs font-bold text-amber-400">{currentFaces}</span>
           </div>
         </div>
-      )}
+        <span className={`mono text-[9px] flex items-center gap-1 ${sseConnected ? 'text-teal-400' : 'text-slate-500'}`}>
+          <span className={`w-1.5 h-1.5 rounded-full ${sseConnected ? 'bg-teal-400 dvas-live-dot' : 'bg-slate-500'}`} />
+          {sseWindow.length > 0 ? `${sseWindow.length}s window` : (sseConnected ? 'Live' : 'Offline')}
+        </span>
+      </div>
       <ResponsiveContainer width="100%" height={180}>
         <AreaChart data={data} margin={{ top: 8, right: 8, left: -24, bottom: 0 }}>
           <defs>
@@ -2333,6 +2340,26 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
   const { data: watchlistData, loading: watchlistLoading, refetch: refreshWatchlist } = usePersonWatchlist(watchlistCategoryFilter, 15000);
   const { data: alertsData } = usePersonWatchlistAlerts(activeDrone || '', 20, 5000);
 
+  // Normalise arrays
+  const tracks     = Array.isArray(tracksData)            ? tracksData
+    : Array.isArray(tracksData?.tracks)                   ? tracksData.tracks : [];
+  const identities = Array.isArray(identitiesData)        ? identitiesData
+    : Array.isArray(identitiesData?.identities)           ? identitiesData.identities : [];
+  const faces      = Array.isArray(facesData)             ? facesData
+    : Array.isArray(facesData?.gallery)                   ? facesData.gallery
+    : Array.isArray(facesData?.faces)                     ? facesData.faces : [];
+  const watchlist  = Array.isArray(watchlistData)         ? watchlistData
+    : Array.isArray(watchlistData?.watchlist)             ? watchlistData.watchlist : [];
+
+  // Live persons from in-memory buffer (has crop_b64 pairs)
+  const livePersons = Array.isArray(liveData?.persons)
+    ? liveData.persons
+    : Array.isArray(liveData?.entries)
+    ? liveData.entries
+    : Array.isArray(liveData)
+    ? liveData
+    : [];
+
   useEffect(() => {
     const arr = Array.isArray(alertsData?.alerts) ? alertsData.alerts
       : Array.isArray(alertsData) ? alertsData : [];
@@ -2358,10 +2385,35 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
     }
   }, []);
 
+  // Clear SSE detection window and live counter on active drone switch
+  useEffect(() => {
+    setSseWindow([]);
+    setLiveFaceCount(0);
+  }, [activeDrone]);
+
+  // Seed baseline point in sseWindow from liveData or countData if sseWindow is empty
+  useEffect(() => {
+    if (sseWindow.length === 0) {
+      const initPersons = livePersons.length > 0 ? livePersons.length : (countData?.active_persons ?? 0);
+      const initFaces = livePersons.filter(p => p.face_crop_b64 || p.face_b64).length;
+      if (initPersons > 0 || initFaces > 0) {
+        const ts = new Date().toISOString().slice(11, 19);
+        setSseWindow([{ t: ts, count: Number(initPersons), faces: Number(initFaces) }]);
+      }
+    }
+  }, [livePersons.length, countData?.active_persons]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // SSE handler with real-time watchlist match support & audio chime
   const handleSSEEvent = useCallback((evt) => {
-    if (evt?.service === 'person_alert' || evt?.data?.type === 'watchlist_match') {
-      const alertData = evt.data;
+    if (!evt) return;
+
+    // Normalise envelope: Analytics Gateway sends { stream, service, payload, data, drone_id }
+    const stream = evt.stream || evt.service;
+    const payload = evt.payload || evt.data || evt;
+
+    // ── Watchlist match alert ──────────────────────────────────────
+    if (stream === 'person_alert' || payload?.type === 'watchlist_match') {
+      const alertData = payload;
       if (alertData) {
         setAlertsList(prev => [
           {
@@ -2384,11 +2436,25 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
       }
       return;
     }
-    if (evt?.service !== 'person') return;
-    if (activeDrone && evt.drone_id && evt.drone_id !== activeDrone) return;
-    const pCount = evt.data?.person_count ?? evt.data?.count ?? 0;
-    const fCount = evt.data?.face_count ?? 0;
-    const ts     = new Date().toISOString().slice(11, 19);
+
+    // ── Person detection event ─────────────────────────────────────
+    if (stream !== 'person') return;
+
+    const eventDroneId = payload?.drone_id || evt.drone_id;
+    if (activeDrone && eventDroneId) {
+      const matches = eventDroneId === activeDrone ||
+                      eventDroneId.includes(activeDrone) ||
+                      activeDrone.includes(eventDroneId);
+      if (!matches) return;
+    }
+
+    const pCount = payload?.person_count ?? payload?.persons?.length ?? payload?.count ?? 0;
+    const fCount = payload?.face_count ?? payload?.faces?.length ?? 0;
+    const rawTs = payload?.ts;
+    const ts = typeof rawTs === 'string' && rawTs.length >= 19
+      ? rawTs.slice(11, 19)
+      : new Date().toISOString().slice(11, 19);
+
     setSseWindow(w => [...w.slice(-59), { t: ts, count: Number(pCount), faces: Number(fCount) }]);
     setLiveFaceCount(fc => fc + Number(fCount));
   }, [activeDrone]);
@@ -2464,26 +2530,6 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
       setTimeout(() => setReidLoading(false), 3000);
     }
   };
-
-  // Normalise arrays
-  const tracks     = Array.isArray(tracksData)            ? tracksData
-    : Array.isArray(tracksData?.tracks)                   ? tracksData.tracks : [];
-  const identities = Array.isArray(identitiesData)        ? identitiesData
-    : Array.isArray(identitiesData?.identities)           ? identitiesData.identities : [];
-  const faces      = Array.isArray(facesData)             ? facesData
-    : Array.isArray(facesData?.gallery)                   ? facesData.gallery
-    : Array.isArray(facesData?.faces)                     ? facesData.faces : [];
-  const watchlist  = Array.isArray(watchlistData)         ? watchlistData
-    : Array.isArray(watchlistData?.watchlist)             ? watchlistData.watchlist : [];
-
-  // Live persons from in-memory buffer (has crop_b64 pairs)
-  const livePersons = Array.isArray(liveData?.persons)
-    ? liveData.persons
-    : Array.isArray(liveData?.entries)
-    ? liveData.entries
-    : Array.isArray(liveData)
-    ? liveData
-    : [];
 
   return (
     <div className="flex flex-col gap-5" style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }}>
@@ -2573,8 +2619,9 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
         </div>
         <div className="col-span-12 lg:col-span-4">
           <Panel title="Detections (Real-time)" icon={Radio} iconClass="text-violet-400"
+            badge={sseWindow.length > 0 ? `${sseWindow[sseWindow.length - 1].count} live` : null}
             right={<span className="mono text-[10px]" style={{ color: 'var(--dvas-text-dim)' }}>SSE rolling window</span>}>
-            <DetectionChart sseWindow={sseWindow} />
+            <DetectionChart sseWindow={sseWindow} sseConnected={sseConnected} />
           </Panel>
         </div>
       </div>

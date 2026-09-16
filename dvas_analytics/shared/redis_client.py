@@ -64,10 +64,11 @@ async def xread_frames(
     """
     raw_client = _get_raw_client()
     stream_key = f"drone:frames:{drone_id}"
+    block_val = block_ms if block_ms and block_ms > 0 else None
     results = await raw_client.xread(
         {stream_key.encode(): last_id.encode()},
         count=count,
-        block=block_ms,
+        block=block_val,
     )
     if not results:
         return last_id, []
@@ -99,16 +100,57 @@ async def xread_frames(
     return new_last_id, frames
 
 
+async def get_latest_stream_frame(drone_id: str) -> Optional[Any]:
+    """Retrieve and decode the most recent frame from drone:frames:{drone_id}.
+    
+    Checks both the binary 'frame' field and the base64 'jpeg_b64' field.
+    Returns a BGR numpy image (as decoded by cv2.imdecode), or None if no frames exist.
+    """
+    import base64
+    import cv2
+    import numpy as np
+
+    try:
+        raw_client = _get_raw_client()
+        stream_key = f"drone:frames:{drone_id}"
+        entries = await raw_client.xrevrange(stream_key, max="+", min="-", count=1)
+        if not entries:
+            return None
+        _entry_id, fields = entries[0]
+        raw_bytes = fields.get(b"frame") or fields.get("frame")
+        if raw_bytes:
+            if isinstance(raw_bytes, str):
+                raw_bytes = raw_bytes.encode("latin-1")
+            nparr = np.frombuffer(raw_bytes, np.uint8)
+            decoded = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if decoded is not None:
+                return decoded
+
+        b64_val = fields.get(b"jpeg_b64") or fields.get("jpeg_b64")
+        if b64_val:
+            if isinstance(b64_val, bytes):
+                b64_val = b64_val.decode("utf-8")
+            raw_bytes = base64.b64decode(b64_val)
+            nparr = np.frombuffer(raw_bytes, np.uint8)
+            decoded = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if decoded is not None:
+                return decoded
+    except Exception as exc:
+        log.warning("get_latest_stream_frame failed for %s: %s", drone_id, exc)
+    return None
+
+
 async def xreadgroup_frames(group: str, consumer: str, drone_id: str,
                             last_id: str = ">", count: int = 1, block_ms: int = 100):
     """Read frames using consumer group. Returns list of (entry_id, fields) tuples."""
     client = _get_raw_client()
     stream_key = f"drone:frames:{drone_id}"
+    block_val = block_ms if block_ms and block_ms > 0 else None
     try:
         result = await client.xreadgroup(
             groupname=group, consumername=consumer,
             streams={stream_key: last_id},
-            count=count, block=block_ms
+            count=count, block=block_val
         )
         if not result:
             return []
