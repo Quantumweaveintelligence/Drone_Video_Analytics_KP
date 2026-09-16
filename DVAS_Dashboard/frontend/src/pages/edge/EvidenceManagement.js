@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import AppShell from '@/components/layout/AppShell';
-import { api, authFetch } from '@/lib/api';
+import { api, authFetch, getAuthToken } from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
 import { 
   Package, Download, Database, CheckCircle2, Clock, UploadCloud, 
@@ -40,6 +40,65 @@ export default function EvidenceManagement() {
 
   // Live IST Clock
   const [clockIst, setClockIst] = useState("");
+
+  // Video Stream Blob Loader
+  const [videoBlobUrl, setVideoBlobUrl] = useState(null);
+  const [videoLoading, setVideoLoading] = useState(false);
+  const [videoError, setVideoError] = useState(null);
+
+  useEffect(() => {
+    if (!activeModalClip) {
+      if (videoBlobUrl) {
+        URL.revokeObjectURL(videoBlobUrl);
+        setVideoBlobUrl(null);
+      }
+      setVideoError(null);
+      setVideoLoading(false);
+      return;
+    }
+
+    let isMounted = true;
+    const loadVideoBlob = async () => {
+      setVideoLoading(true);
+      setVideoError(null);
+      if (videoBlobUrl) {
+        URL.revokeObjectURL(videoBlobUrl);
+        setVideoBlobUrl(null);
+      }
+
+      try {
+        const token = getAuthToken();
+        const streamUrl = `/edge-api/api/edge/evidence/${encodeURIComponent(activeModalClip.filename)}/stream${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+        const res = await authFetch(streamUrl);
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}: Failed to stream video from edge storage`);
+        }
+        const blob = await res.blob();
+        if (isMounted) {
+          const url = URL.createObjectURL(blob);
+          setVideoBlobUrl(url);
+        }
+      } catch (err) {
+        console.error("Evidence video stream error:", err);
+        if (isMounted) {
+          setVideoError(err.message || "Failed to load video stream");
+        }
+      } finally {
+        if (isMounted) {
+          setVideoLoading(false);
+        }
+      }
+    };
+
+    loadVideoBlob();
+
+    return () => {
+      isMounted = false;
+      if (videoBlobUrl) {
+        URL.revokeObjectURL(videoBlobUrl);
+      }
+    };
+  }, [activeModalClip]);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -827,7 +886,13 @@ export default function EvidenceManagement() {
                 </div>
               </div>
               <button 
-                onClick={() => setActiveModalClip(null)}
+                onClick={() => {
+                  if (videoBlobUrl) {
+                    URL.revokeObjectURL(videoBlobUrl);
+                    setVideoBlobUrl(null);
+                  }
+                  setActiveModalClip(null);
+                }}
                 className="p-1 text-slate-400 hover:text-slate-200 rounded hover:bg-slate-800 transition-colors"
               >
                 <X size={18} />
@@ -835,19 +900,40 @@ export default function EvidenceManagement() {
             </div>
 
             {/* Video Player Container */}
-            <div className="bg-black p-1 flex items-center justify-center">
-              <video 
-                controls 
-                autoPlay 
-                className="w-full max-h-[55vh] object-contain rounded"
-                key={activeModalClip.filename}
-              >
-                <source 
-                  src={`/edge-api/api/edge/evidence/${encodeURIComponent(activeModalClip.filename)}/stream`} 
-                  type="video/mp4" 
-                />
-                Your browser does not support the video tag.
-              </video>
+            <div className="bg-black p-1 min-h-[280px] flex items-center justify-center relative">
+              {videoLoading && (
+                <div className="flex flex-col items-center justify-center gap-2.5 text-slate-400 py-20">
+                  <RefreshCw size={26} className="animate-spin text-sky-400" />
+                  <span className="text-xs font-mono">Loading evidence video stream...</span>
+                </div>
+              )}
+
+              {videoError && !videoLoading && (
+                <div className="flex flex-col items-center justify-center gap-2 text-rose-400 py-16 px-6 text-center">
+                  <AlertTriangle size={32} />
+                  <span className="text-sm font-bold uppercase tracking-wider">Playback Error</span>
+                  <span className="text-xs text-slate-400 font-mono max-w-md">{videoError}</span>
+                  <button
+                    onClick={() => handleDownload(activeModalClip.filename)}
+                    className="mt-3 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded text-xs flex items-center gap-1.5 border border-slate-700 transition-colors"
+                  >
+                    <Download size={13} /> Download File For Offline Playback
+                  </button>
+                </div>
+              )}
+
+              {videoBlobUrl && !videoLoading && (
+                <video 
+                  controls 
+                  autoPlay 
+                  playsInline
+                  className="w-full max-h-[55vh] object-contain rounded"
+                  src={videoBlobUrl}
+                  key={videoBlobUrl}
+                >
+                  Your browser does not support the video tag.
+                </video>
+              )}
             </div>
 
             {/* Video Metadata Drawer */}
