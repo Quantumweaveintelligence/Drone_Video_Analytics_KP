@@ -53,6 +53,10 @@ services:
       - ADMIN_CLIENT_ID=dvas-admin-service
       - ADMIN_CLIENT_SECRET=MvusAlJk9DMnfe6GVOwuni8ODQbES938
       - ANALYTICS_SERVICE_KEY=${ANALYTICS_SERVICE_KEY}
+      # Peer DVAS backend (friend's laptop command side) — set this to the friend's dashboard URL
+      # The nginx proxy on port 3000 routes /api/ to their backend, so no need to know their internal port
+      - DVAS_PEER_URL=${DVAS_PEER_URL:-http://10.10.55.115:3000}
+      - DVAS_SERVICE_KEY=${DVAS_SERVICE_KEY:-dvas-inter-service-2026}
     depends_on:
       postgres:
         condition: service_healthy

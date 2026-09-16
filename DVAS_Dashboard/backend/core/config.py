@@ -30,6 +30,13 @@ MINIO_PROXY_SECURE = os.getenv("MINIO_SECURE", "false").lower() == "true"
 # ---------- Ingest ----------
 INGEST_URL = os.environ.get("INGEST_SERVER_URL", "http://drone_nginx")
 
+# ---------- Peer DVAS Dashboard (friend's laptop command side) ----------
+# URL of the peer DVAS dashboard backend (e.g. http://10.10.55.115:3000 using nginx proxy)
+# Set this env var on the edge-operator side laptop to forward incidents/suggestions to the command side
+DVAS_PEER_URL = os.environ.get("DVAS_PEER_URL", "").rstrip("/")
+# Shared inter-service secret — must match on both laptops
+DVAS_SERVICE_KEY = os.environ.get("DVAS_SERVICE_KEY", "dvas-inter-service-2026")
+
 # ---------- CORS ----------
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
 
@@ -37,3 +44,4 @@ CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 limiter = Limiter(key_func=get_remote_address)
+

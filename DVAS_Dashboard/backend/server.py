@@ -27,7 +27,7 @@ from services.audit_sync import start_audit_sync_service
 from services.evidence_sync import start_evidence_sync
 from ingest_proxy import ingest_api
 
-from routers import auth, drones, alerts, audit, analytics, edge, infra, ws, incidents, reports
+from routers import auth, drones, alerts, audit, analytics, edge, infra, ws, incidents, reports, push
 
 # ---------- App ----------
 logging.basicConfig(level=logging.INFO)
@@ -84,6 +84,7 @@ app.include_router(ws.router)
 app.include_router(ingest_api)
 app.include_router(incidents.router)
 app.include_router(reports.router)
+app.include_router(push.router)
 
 # ---------- CORS ----------
 cors_origins = [o.strip() for o in CORS_ORIGINS if o.strip() and o.strip() != "*"]

@@ -1482,6 +1482,36 @@ class EvidenceExtractRequest(BaseModel):
     event_ts: Optional[str] = None
 
 
+def _ensure_h264(video_path: Path) -> Path:
+    """Ensure MP4 clip is encoded with standard H.264 (AVC1) + faststart for HTML5 browser playback."""
+    if not video_path.exists() or video_path.stat().st_size == 0:
+        return video_path
+    try:
+        probe_cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1",
+            str(video_path)
+        ]
+        res = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=5)
+        codec = res.stdout.strip().lower()
+        if codec == "h264":
+            return video_path
+
+        tmp_target = video_path.with_name(f"{video_path.stem}_h264.mp4")
+        conv_cmd = [
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            str(tmp_target)
+        ]
+        res_conv = subprocess.run(conv_cmd, capture_output=True, timeout=30)
+        if res_conv.returncode == 0 and tmp_target.exists() and tmp_target.stat().st_size > 0:
+            tmp_target.replace(video_path)
+            log.info(f"Converted evidence video to browser-compliant H.264: {video_path.name}")
+    except Exception as e:
+        log.warning(f"Could not check/convert {video_path.name} to H.264: {e}")
+    return video_path
+
+
 def _extract_and_save_evidence_clip(
     pre_event_s: int = 15,
     post_event_s: int = 15,
@@ -1571,6 +1601,9 @@ def _extract_and_save_evidence_clip(
             frames_written += 1
 
     writer.release()
+
+    # Ensure the newly written clip is converted to web-compliant H.264 (AVC1)
+    _ensure_h264(video_path)
 
     size_bytes = video_path.stat().st_size if video_path.exists() else 0
     size_mb = round(size_bytes / (1024 * 1024), 2)
@@ -1675,6 +1708,7 @@ def list_edge_evidence(auth: dict = Depends(verify_edge_auth)):
 @app.get("/api/edge/evidence/{filename}/stream")
 def stream_edge_evidence_video(
     filename: str,
+    token: Optional[str] = None,
     auth: dict = Depends(verify_edge_auth)
 ):
     """Stream video clip for browser playback."""
@@ -1682,6 +1716,10 @@ def stream_edge_evidence_video(
     video_path = (evidence_dir / filename).resolve()
     if not str(video_path).startswith(str(evidence_dir.resolve())) or not video_path.exists():
         raise HTTPException(status_code=404, detail="Evidence video not found")
+    
+    # Auto-convert legacy/unconverted clips to H.264 for instant browser playback
+    _ensure_h264(video_path)
+
     return FileResponse(
         path=str(video_path),
         media_type="video/mp4",
@@ -1692,6 +1730,7 @@ def stream_edge_evidence_video(
 @app.get("/api/edge/evidence/{filename}/download")
 def download_edge_evidence_video(
     filename: str,
+    token: Optional[str] = None,
     auth: dict = Depends(verify_edge_auth)
 ):
     """Download video clip for USB or external media transfer."""
@@ -1699,6 +1738,9 @@ def download_edge_evidence_video(
     video_path = (evidence_dir / filename).resolve()
     if not str(video_path).startswith(str(evidence_dir.resolve())) or not video_path.exists():
         raise HTTPException(status_code=404, detail="Evidence video not found")
+    
+    _ensure_h264(video_path)
+
     return FileResponse(
         path=str(video_path),
         media_type="video/mp4",

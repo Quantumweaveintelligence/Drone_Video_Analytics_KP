@@ -192,7 +192,26 @@ function NotificationBell() {
             }
             return;
           }
-          if (a.id && (a.id.startsWith("INC-") || a.id.startsWith("SUGG-"))) {
+          // SUGG- alerts: convert into model_suggestion fallback item if not already in map
+          if (a.id && a.id.startsWith("SUGG-")) {
+            const title = a.type || a.title || "AI Model Suggestion";
+            const missionPrefix = a.mission_id && a.mission_id !== "EDGE" ? `${a.mission_id}: ` : "";
+            itemMap.set(a.id, {
+              id: a.id,
+              type: "model_suggestion",
+              title: missionPrefix ? title : title,
+              subtitle: `${a.drone_id || "Edge Operator"} · ${a.zone || "Ground Station"}`,
+              ts: a.ts,
+              severity: a.severity === "critical" ? "critical" : a.severity === "warning" ? "warning" : "info",
+              badge: "AI SUGGESTION",
+              badgeClass: "bg-sky-500/10 text-sky-400 border-sky-500/30",
+              status: a.acknowledged_by ? "ACKNOWLEDGED" : "PENDING",
+              icon: "cpu",
+            });
+            return;
+          }
+          // INC- prefixed alerts are handled by the incidents section above
+          if (a.id && a.id.startsWith("INC-")) {
             return;
           }
 
@@ -230,8 +249,9 @@ function NotificationBell() {
       items.sort((a, b) => new Date(b.ts || 0).getTime() - new Date(a.ts || 0).getTime());
       setNotifications(items.slice(0, 50));
 
-      // Calculate unread count against last read timestamp
-      const lastReadTime = Number(localStorage.getItem("dvas_bell_last_read") || 0);
+      // Calculate unread count against last read timestamp (scoped per user to prevent cross-user suppression)
+      const bellKey = `dvas_bell_last_read_${user?.id || user?.email || user?.role || "global"}`;
+      const lastReadTime = Number(localStorage.getItem(bellKey) || 0);
       const pendingCount = items.filter(x => {
         if (x.status === "ACKNOWLEDGED") return false;
         if (!lastReadTime) return true;
@@ -308,10 +328,35 @@ function NotificationBell() {
       setToast({ ...newNotif, duration: 6000 });
     }
 
-    // C. Standard Vision Detection Alert
+    // C. Standard Vision Detection Alert (or SUGG- fallback real-time delivery)
     else if (eventType === "alert" && msg.alert) {
       const a = msg.alert;
-      if (a.id && (a.id.startsWith("INC-") || a.id.startsWith("SUGG-"))) return;
+      // INC- duplicates already handled via incident event — skip
+      if (a.id && a.id.startsWith("INC-")) return;
+      // SUGG- alert: convert to model_suggestion notification for real-time delivery
+      // (backend broadcasts both "model_suggestion" and "alert" for a suggestion,
+      //  so if the former was missed this "alert" acts as a fallback)
+      if (a.id && a.id.startsWith("SUGG-")) {
+        const title = a.type || a.title || "AI Model Suggestion";
+        const newNotif = {
+          id: a.id,
+          type: "model_suggestion",
+          title,
+          subtitle: `${a.drone_id || "Edge Operator"} · ${a.zone || "Ground Station"}`,
+          ts: a.ts || new Date().toISOString(),
+          severity: "info",
+          badge: "AI SUGGESTION",
+          badgeClass: "bg-sky-500/10 text-sky-400 border-sky-500/30",
+          status: "PENDING",
+          icon: "cpu",
+        };
+        setNotifications((prev) => [newNotif, ...prev.filter(x => x.id !== newNotif.id)].slice(0, 50));
+        setUnread((c) => c + 1);
+        setFlash(true);
+        setTimeout(() => setFlash(false), 1200);
+        setToast({ ...newNotif, duration: 6000 });
+        return;
+      }
       const inScope =
         user.role === "system_administrator" ||
         user.role === "senior_officer" ||
@@ -369,7 +414,8 @@ function NotificationBell() {
   if (!user) return null;
 
   const markAllAsRead = () => {
-    localStorage.setItem("dvas_bell_last_read", String(Date.now()));
+    const bellKey = `dvas_bell_last_read_${user?.id || user?.email || user?.role || "global"}`;
+    localStorage.setItem(bellKey, String(Date.now()));
     setUnread(0);
   };
 

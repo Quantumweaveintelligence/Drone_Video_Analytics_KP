@@ -42,6 +42,29 @@ async def _forward_incident_to_ingest(incident_dict: dict) -> bool:
         return False
 
 
+async def _forward_incident_to_peer(incident_dict: dict) -> None:
+    """
+    Forward incident to the peer DVAS dashboard backend (command side / friend's laptop).
+    Uses the /api/push/receive endpoint with X-DVAS-Service-Key authentication.
+    Runs silently — failures are logged but never raise exceptions.
+    """
+    from core.config import DVAS_PEER_URL, DVAS_SERVICE_KEY
+    if not DVAS_PEER_URL:
+        return
+    try:
+        url = f"{DVAS_PEER_URL}/api/push/receive"
+        headers = {"X-DVAS-Service-Key": DVAS_SERVICE_KEY, "Content-Type": "application/json"}
+        payload = {"type": "incident", "data": incident_dict}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.is_success:
+                logger.info(f"Incident {incident_dict.get('id')} forwarded to peer DVAS at {DVAS_PEER_URL}")
+            else:
+                logger.warning(f"Peer DVAS rejected incident: {resp.status_code} — {resp.text[:200]}")
+    except Exception as exc:
+        logger.warning(f"Could not forward incident to peer DVAS ({DVAS_PEER_URL}): {exc}")
+
+
 @router.get("")
 async def list_incidents(
     limit: int = 100,
@@ -215,6 +238,10 @@ async def create_incident(
         }
     }
     await hub.broadcast(ws_alert)
+
+    # Forward to peer DVAS backend (command side / friend's laptop) so their bell shows it
+    import asyncio as _asyncio
+    _asyncio.create_task(_forward_incident_to_peer(incident_record))
 
     return {
         "status": "ok",
