@@ -22,6 +22,14 @@ const en = {
   "nav.ingest": "Ingest Ops",
   "nav.admin": "Admin & Audit",
 
+  /* nav sections */
+  "nav.section.surveillance": "Surveillance & Feeds",
+  "nav.section.analytics": "AI Analytics",
+  "nav.section.evidence": "Evidence & Cases",
+  "nav.section.oversight": "Command & Oversight",
+  "nav.section.sysops": "System Operations",
+  "nav.section.edge": "Flight & Stream Console",
+
   /* topbar */
   "topbar.ingest": "INGEST",
   "topbar.online": "Online",
@@ -218,6 +226,14 @@ const ml = {
   "nav.edge": "എഡ്ജ് ഓപ്പറേറ്റർ",
   "nav.ingest": "ഇൻജസ്റ്റ്",
   "nav.admin": "അഡ്മിൻ & ഓഡിറ്റ്",
+
+  /* nav sections */
+  "nav.section.surveillance": "നിരീക്ഷണ ഫീഡുകൾ",
+  "nav.section.analytics": "എഐ അനലിറ്റിക്സ്",
+  "nav.section.evidence": "തെളിവുകളും കേസുകളും",
+  "nav.section.oversight": "കമാൻഡ് & മേൽനോട്ടം",
+  "nav.section.sysops": "സിസ്റ്റം ഓപ്പറേഷൻസ്",
+  "nav.section.edge": "ഫ്ലൈറ്റ് & സ്ട്രീം കൺസോൾ",
 
   "topbar.ingest": "ഇൻജസ്റ്റ്",
   "topbar.online": "ഓൺലൈൻ",

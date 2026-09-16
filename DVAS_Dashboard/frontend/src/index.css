@@ -14,64 +14,74 @@
 }
 
 /* =========================================================
-   DVAS Design System v2 — "Soft SaaS"
+   DVAS Design System v2 — "Soft SaaS" (Sneat Visual Language)
    Default = LIGHT.  Dark = elegant slate.
    ========================================================= */
 
 :root, html.light {
   /* Canvas / surfaces */
-  --dvas-root: #F8F9FA;            /* Brighter white / light gray */
+  --dvas-root: #f5f5f9;            /* Sneat body background */
   --dvas-surface: #FFFFFF;         /* Module Cards */
-  --dvas-surface-2: #F1F5F9;       /* Inset areas */
-  --dvas-elev: #E2E8F0;            /* hover / active highlight */
-  --dvas-border: #D1D5DB;          /* Sharper borders (gray-300) */
-  --dvas-border-strong: #9CA3AF;   /* Strong borders (gray-400) */
+  --dvas-surface-2: #f5f5f9;       /* Flat Sneat feel */
+  --dvas-elev: rgba(67, 89, 113, 0.08); /* Sneat hover/active highlight */
+  --dvas-border: rgba(67, 89, 113, 0.2); /* Sneat border */
+  --dvas-border-strong: rgba(67, 89, 113, 0.3); /* Sneat border strong */
 
-  --dvas-text: #0F172A;            /* Slate 900 for high contrast titles */
-  --dvas-text-muted: #475569;      /* Slate 600 for clear secondary text */
-  --dvas-text-dim: #64748B;        /* Slate 500 for tertiary text */
+  --dvas-text: rgba(67, 89, 113, 0.9);   /* Sneat heading/body text */
+  --dvas-text-muted: rgba(67, 89, 113, 0.5); /* Sneat text-muted */
+  --dvas-text-dim: rgba(67, 89, 113, 0.4);   /* Sneat text-light */
   --dvas-topbar: #FFFFFF;
 
-  /* Accents - Darkened for Light Mode Text Visibility */
-  --dvas-blue: #2563EB;            /* Strong Blue */
-  --dvas-cyan: #0F766E;            /* Dark Teal */
-  --dvas-safe: #059669;            /* Strong Emerald */
-  --dvas-warn: #D97706;            /* Deep Amber */
-  --dvas-crit: #E11D48;            /* Strong Rose/Coral */
+  /* Sneat primary accent */
+  --dvas-accent: #696cff;
+  --dvas-accent-soft: rgba(105, 108, 255, 0.08);
+
+  /* Accents - Retain operational status tokens */
+  --dvas-blue: #696cff;            /* Sneat primary accent for CTAs */
+  --dvas-cyan: #696cff;            /* Aligned to accent */
+  --dvas-safe: #059669;            /* Strong Emerald - Untouchable */
+  --dvas-warn: #D97706;            /* Deep Amber - Untouchable */
+  --dvas-crit: #E11D48;            /* Strong Rose/Coral - Untouchable */
 
   /* Soft-badge backgrounds */
-  --dvas-safe-bg: rgba(52, 195, 143, 0.15); /* Soft Teal bg */
+  --dvas-safe-bg: rgba(52, 195, 143, 0.15);
   --dvas-warn-bg: rgba(245, 158, 11, 0.15);
-  --dvas-crit-bg: rgba(255, 123, 132, 0.15); /* Bright Coral bg */
-  --dvas-info-bg: rgba(162, 216, 235, 0.35); /* Light Steel Blue bg */
+  --dvas-crit-bg: rgba(255, 123, 132, 0.15);
+  --dvas-info-bg: rgba(162, 216, 235, 0.35);
 
-  /* Radius & shadows */
-  --dvas-radius: 14px;
-  --dvas-radius-sm: 10px;
-  --dvas-shadow: 0 4px 20px rgba(15, 23, 42, 0.05);
-  --dvas-shadow-lg: 0 12px 40px rgba(15, 23, 42, 0.08);
+  /* Radius & shadows - Sneat tokens */
+  --dvas-radius: 0.5rem;
+  --dvas-radius-sm: 0.375rem;
+  --dvas-shadow: 0 2px 6px 0 rgba(67, 89, 113, 0.12);
+  --dvas-shadow-lg: 0 0.25rem 1rem rgba(67, 89, 113, 0.45);
+
+  /* Shell layout dimensions */
+  --dvas-sidebar-width: 16.25rem;
+  --dvas-sidebar-collapsed: 5.25rem;
+  --dvas-navbar-height: 3.875rem;
+  --dvas-content-padding: 1.625rem;
 
   /* Shadcn HSL sync */
-  --background: 220 25% 96%;
-  --foreground: 222 47% 11%;
+  --background: 240 14% 97%;
+  --foreground: 215 25% 35%;
   --card: 0 0% 100%;
-  --card-foreground: 222 47% 11%;
+  --card-foreground: 215 25% 35%;
   --popover: 0 0% 100%;
-  --popover-foreground: 222 47% 11%;
-  --primary: 217 91% 54%;
+  --popover-foreground: 215 25% 35%;
+  --primary: 239 100% 71%;
   --primary-foreground: 0 0% 100%;
   --secondary: 220 15% 94%;
-  --secondary-foreground: 222 47% 11%;
+  --secondary-foreground: 215 25% 35%;
   --muted: 220 15% 94%;
   --muted-foreground: 215 20% 45%;
-  --accent: 220 15% 94%;
-  --accent-foreground: 222 47% 11%;
+  --accent: 239 100% 97%;
+  --accent-foreground: 239 100% 71%;
   --destructive: 0 74% 55%;
   --destructive-foreground: 0 0% 100%;
-  --border: 220 15% 90%;
-  --input: 220 15% 90%;
-  --ring: 217 91% 54%;
-  --radius: 12px;
+  --border: 215 25% 85%;
+  --input: 215 25% 85%;
+  --ring: 239 100% 71%;
+  --radius: 0.5rem;
 }
 
 html.dark {
@@ -87,8 +97,11 @@ html.dark {
   --dvas-text-dim: #64748B;
   --dvas-topbar: #1E293B;
 
-  --dvas-blue: #3B82F6;
-  --dvas-cyan: #3B82F6;
+  --dvas-accent: #696cff;
+  --dvas-accent-soft: rgba(105, 108, 255, 0.15);
+
+  --dvas-blue: #696cff;
+  --dvas-cyan: #696cff;
   --dvas-safe: #10B981;
   --dvas-warn: #F59E0B;
   --dvas-crit: #EF4444;
@@ -98,8 +111,15 @@ html.dark {
   --dvas-crit-bg: rgba(239, 68, 68, 0.15);
   --dvas-info-bg: rgba(59, 130, 246, 0.15);
 
-  --dvas-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+  --dvas-radius: 0.5rem;
+  --dvas-radius-sm: 0.375rem;
+  --dvas-shadow: 0 2px 6px 0 rgba(0, 0, 0, 0.35);
   --dvas-shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.45);
+
+  --dvas-sidebar-width: 16.25rem;
+  --dvas-sidebar-collapsed: 5.25rem;
+  --dvas-navbar-height: 3.875rem;
+  --dvas-content-padding: 1.625rem;
 
   --background: 222 47% 11%;
   --foreground: 210 40% 96%;
@@ -107,19 +127,20 @@ html.dark {
   --card-foreground: 210 40% 96%;
   --popover: 217 33% 17%;
   --popover-foreground: 210 40% 96%;
-  --primary: 217 91% 60%;
+  --primary: 239 100% 71%;
   --primary-foreground: 0 0% 100%;
   --secondary: 217 33% 20%;
   --secondary-foreground: 210 40% 96%;
   --muted: 217 33% 20%;
   --muted-foreground: 215 20% 65%;
-  --accent: 217 33% 20%;
+  --accent: 239 100% 25%;
   --accent-foreground: 210 40% 96%;
   --destructive: 0 74% 55%;
   --destructive-foreground: 210 40% 96%;
   --border: 217 33% 25%;
   --input: 217 33% 25%;
-  --ring: 217 91% 60%;
+  --ring: 239 100% 71%;
+  --radius: 0.5rem;
 }
 
 /* --------- Base --------- */
@@ -314,7 +335,7 @@ html.dark .text-blue-400 { color: #60A5FA !important; }
 .border.border-slate-800 {
   border-radius: var(--dvas-radius);
   box-shadow: var(--dvas-shadow);
-  border-color: transparent !important;
+  border-color: var(--dvas-border) !important;
 }
 
 html.dark .border.border-slate-800.bg-slate-900,
@@ -486,3 +507,26 @@ textarea:focus-visible {
   animation: mapMarkerPulse 2s ease-in-out infinite;
 }
 
+
+/* Sneat Menu Navigation Classes */
+.dvas-menu-link {
+  position: relative;
+  transition: all 0.2s ease-in-out;
+  border-radius: 0.375rem;
+}
+.dvas-menu-link.active {
+  background-color: var(--dvas-accent-soft) !important;
+  color: var(--dvas-accent) !important;
+  font-weight: 600;
+}
+.dvas-menu-link.active::before {
+  content: '';
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 0.25rem;
+  height: 2rem;
+  background-color: var(--dvas-accent);
+  border-radius: 0.375rem 0 0 0.375rem;
+}

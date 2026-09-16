@@ -44,6 +44,10 @@ module.exports = {
           DEFAULT: 'hsl(var(--accent))',
           foreground: 'hsl(var(--accent-foreground))'
         },
+        'dvas-accent': {
+          DEFAULT: 'var(--dvas-accent)',
+          soft: 'var(--dvas-accent-soft)',
+        },
         destructive: {
           DEFAULT: 'hsl(var(--destructive))',
           foreground: 'hsl(var(--destructive-foreground))'
@@ -80,6 +84,16 @@ module.exports = {
       animation: {
         'accordion-down': 'accordion-down 0.2s ease-out',
         'accordion-up': 'accordion-up 0.2s ease-out'
+      },
+      width: {
+        'sidebar': 'var(--dvas-sidebar-width)',
+        'sidebar-collapsed': 'var(--dvas-sidebar-collapsed)',
+      },
+      height: {
+        'navbar': 'var(--dvas-navbar-height)',
+      },
+      spacing: {
+        'content': 'var(--dvas-content-padding)',
       }
     }
   },

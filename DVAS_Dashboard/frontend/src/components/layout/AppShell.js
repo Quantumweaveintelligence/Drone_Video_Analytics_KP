@@ -1,3 +1,6 @@
+import AppSidebar from "./AppSidebar";
+import AppTopbar from "./AppTopbar";
+import { NAV_MANIFEST } from "@/lib/navManifest";
 import { useEffect, useRef, useState } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
@@ -429,9 +432,7 @@ function NotificationBell() {
     } else if (user?.role === "drone_operator") {
       nav("/edge/incidents");
     } else {
-      nav("/command");
-      try { localStorage.setItem("dvas_cmd_tab", "alerts"); } catch (e) { /* noop */ }
-      window.dispatchEvent(new CustomEvent("dvas:cmd-tab", { detail: "alerts" }));
+      nav("/command/alerts");
     }
   };
 
@@ -454,9 +455,11 @@ function NotificationBell() {
       }
       return;
     }
-    nav("/command");
-    try { localStorage.setItem("dvas_cmd_tab", "alerts"); } catch (e) {}
-    window.dispatchEvent(new CustomEvent("dvas:cmd-tab", { detail: "alerts" }));
+    if (item.type === "model_suggestion") {
+      nav("/command/models");
+    } else {
+      nav("/command/alerts");
+    }
   };
 
   const filtered = notifications.filter((n) => {
@@ -792,9 +795,8 @@ function UserMenu({ onLogout }) {
 /* ---------- App Shell ---------- */
 export default function AppShell({ children, title, subtitle }) {
   const { user, logout } = useAuth();
-  const { t } = useI18n();
   const nav = useNavigate();
-  const items = NAV[user?.role] || [];
+  const sections = NAV_MANIFEST[user?.role] || [];
 
   const [collapsed, setCollapsed] = useState(() => {
     try { return localStorage.getItem(SB_KEY) === "1"; } catch (e) { return false; }
@@ -803,124 +805,53 @@ export default function AppShell({ children, title, subtitle }) {
     try { localStorage.setItem(SB_KEY, collapsed ? "1" : "0"); } catch (e) { /* noop */ }
   }, [collapsed]);
 
+  const [mobileOpen, setMobileOpen] = useState(false);
+
   const doLogout = async () => {
     await logout();
     nav("/login");
   };
 
-  const sidebarW = collapsed ? "w-16" : "w-64";
+  const sidebarClass = mobileOpen ? "fixed inset-y-0 left-0 z-40 shadow-2xl" : "hidden lg:flex";
 
   return (
     <div
       className="h-screen overflow-hidden flex"
       style={{ background: "var(--dvas-root)", color: "var(--dvas-text)" }}
     >
-      {/* Sidebar */}
-      <aside
-        className={`${sidebarW} shrink-0 flex flex-col transition-all duration-200 ease-out`}
-        style={{
-          background: "var(--dvas-surface)",
-          borderRight: "1px solid var(--dvas-border)",
-        }}
-        data-testid="app-sidebar"
-        data-collapsed={collapsed}
-      >
+      {/* Mobile Backdrop */}
+      {mobileOpen && (
         <div
-          className={`h-16 px-4 flex items-center ${collapsed ? "justify-center" : "gap-2.5"}`}
-        >
-          <div
-            className="w-10 h-10 flex items-center justify-center"
-          >
-            <img src="/kerala-police-logo.png" alt="Kerala Police Logo" className="max-w-full max-h-full object-contain" />
-          </div>
-          {!collapsed && (
-            <div className="min-w-0">
-              <div className="text-base font-bold tracking-tight" style={{ color: "var(--dvas-text)" }}>
-                {t("app.title")}
-              </div>
-              <div className="text-[10px] font-medium" style={{ color: "var(--dvas-text-muted)" }}>
-                {t("app.subtitle")}
-              </div>
-            </div>
-          )}
-        </div>
+          className="fixed inset-0 bg-black/40 z-30 lg:hidden backdrop-blur-sm"
+          onClick={() => setMobileOpen(false)}
+        />
+      )}
 
-        <nav className="flex-1 px-3 py-2 flex flex-col gap-1">
-          {items.map(({ to, labelKey, labelFallback, Icon }) => (
-            <NavLink
-              key={to}
-              to={to}
-              data-testid={`nav-${to.slice(1)}`}
-              title={collapsed ? (labelFallback || t(labelKey)) : undefined}
-              className={({ isActive }) =>
-                `px-3 py-2.5 rounded-lg flex items-center ${collapsed ? "justify-center" : "gap-3"} text-sm font-medium transition-colors ${
-                  isActive ? "font-semibold shadow-sm" : ""
-                }`
-              }
-              style={({ isActive }) => ({
-                background: isActive ? "var(--dvas-elev)" : "transparent",
-                color: isActive ? "var(--dvas-blue)" : "var(--dvas-text-muted)",
-              })}
-            >
-              <Icon size={18} />
-              {!collapsed && <span>{labelFallback || t(labelKey)}</span>}
-            </NavLink>
-          ))}
-        </nav>
-
-        <div className="p-3 border-t" style={{ borderColor: "var(--dvas-border)" }}>
-          <button
-            data-testid="sidebar-toggle"
-            onClick={() => setCollapsed((c) => !c)}
-            className="w-full flex items-center justify-center gap-2 h-9 rounded-lg text-xs font-medium transition-colors hover:bg-[color:var(--dvas-elev)]"
-            style={{ color: "var(--dvas-text-muted)" }}
-            title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-          >
-            {collapsed ? <PanelLeftOpen size={14} /> : <><PanelLeftClose size={14} /> Collapse</>}
-          </button>
-        </div>
-      </aside>
+      {/* Sidebar */}
+      <div className={`${sidebarClass} h-full shrink-0`}>
+        <AppSidebar
+          sections={sections}
+          collapsed={collapsed}
+          onToggleCollapse={() => setCollapsed((c) => !c)}
+        />
+      </div>
 
       {/* Main column */}
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0 h-full overflow-hidden">
         {/* Top bar */}
-        <header
-          className="h-16 flex items-center gap-4 px-6"
-          style={{
-            background: "var(--dvas-surface)",
-            borderBottom: "1px solid var(--dvas-border)",
-          }}
-          data-testid="top-app-bar"
+        <AppTopbar
+          title={title}
+          subtitle={subtitle}
+          onMobileMenuToggle={() => setMobileOpen((m) => !m)}
         >
-          <div className="min-w-0 hidden sm:block">
-            <h1
-              className="text-lg font-bold tracking-tight truncate"
-              data-testid="page-title"
-              style={{ color: "var(--dvas-text)" }}
-            >
-              {title}
-            </h1>
-            {subtitle && (
-              <div
-                className="text-[11px] mt-0.5 truncate font-medium"
-                data-testid="page-subtitle"
-                style={{ color: "var(--dvas-text-muted)" }}
-              >
-                {subtitle}
-              </div>
-            )}
-          </div>
+          <HealthDot />
+          {user?.role !== "drone_operator" && <NotificationBell />}
+          <LanguageToggle />
+          <ThemeToggle />
+          <UserMenu onLogout={doLogout} />
+        </AppTopbar>
 
-          <div className="ml-auto flex items-center gap-2">
-            <HealthDot />
-            {user?.role !== "drone_operator" && <NotificationBell />}
-            <LanguageToggle />
-            <ThemeToggle />
-            <UserMenu onLogout={doLogout} />
-          </div>
-        </header>
-
-        <main className="flex-1 overflow-auto p-8 dvas-fade-in">{children}</main>
+        <main className="flex-1 overflow-auto p-content dvas-fade-in">{children}</main>
       </div>
     </div>
   );

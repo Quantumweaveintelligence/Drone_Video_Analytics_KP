@@ -245,18 +245,18 @@ export default function IntrusionReview({ activeDrone }) {
               {timelineData.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={timelineData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
-                    <XAxis dataKey="time" stroke="#475569" fontSize={12} tickLine={false} axisLine={false} />
-                    <YAxis stroke="#475569" fontSize={12} tickLine={false} axisLine={false} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--dvas-border)" vertical={false} />
+                    <XAxis dataKey="time" stroke="var(--dvas-text-muted)" fontSize={12} tickLine={false} axisLine={false} />
+                    <YAxis stroke="var(--dvas-text-muted)" fontSize={12} tickLine={false} axisLine={false} />
                     <Tooltip 
-                      contentStyle={{ backgroundColor: '#0f172a', borderColor: '#1e293b', color: '#e2e8f0' }}
-                      itemStyle={{ color: '#e2e8f0' }}
-                      cursor={{fill: '#1e293b', opacity: 0.4}}
+                      contentStyle={{ backgroundColor: 'var(--dvas-surface)', borderColor: 'var(--dvas-border)', color: 'var(--dvas-text)', borderRadius: 'var(--dvas-radius)' }}
+                      itemStyle={{ color: 'var(--dvas-text)' }}
+                      cursor={{ fill: 'var(--dvas-elev)', opacity: 0.5 }}
                     />
-                    <Bar dataKey="ENTERING" stackId="a" fill="#f59e0b" name="Entering" />
-                    <Bar dataKey="INSIDE" stackId="a" fill="#3b82f6" name="Inside" />
-                    <Bar dataKey="DWELLING" stackId="a" fill="#ef4444" name="Dwelling" />
-                    <Bar dataKey="EXITED" stackId="a" fill="#10b981" name="Exited" />
+                    <Bar dataKey="ENTERING" stackId="a" fill="var(--dvas-warn)" name="Entering" />
+                    <Bar dataKey="INSIDE" stackId="a" fill="var(--dvas-blue)" name="Inside" />
+                    <Bar dataKey="DWELLING" stackId="a" fill="var(--dvas-crit)" name="Dwelling" />
+                    <Bar dataKey="EXITED" stackId="a" fill="var(--dvas-safe)" name="Exited" />
                   </BarChart>
                 </ResponsiveContainer>
               ) : (
