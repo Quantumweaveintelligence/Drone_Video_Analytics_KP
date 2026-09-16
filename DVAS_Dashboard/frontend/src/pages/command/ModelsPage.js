@@ -81,7 +81,7 @@ export default function ModelsPage() {
     setMsg({ text: "", ok: true });
     setActions(null);
     try {
-      const res = await api.post("/models/deploy", { active: selected });
+      const res = await api.post("/models", { active: selected });
       setMsg({ text: "Deployment applied to GPU cluster.", ok: true });
       if (res.data?.stream_actions) {
         setActions(res.data.stream_actions);

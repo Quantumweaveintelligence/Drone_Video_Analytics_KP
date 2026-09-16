@@ -274,6 +274,7 @@ async def list_models(user: dict = Depends(get_current_user)):
 
 
 @router.post("/models")
+@router.post("/models/deploy")
 async def update_models(
     body: ModelUpdateIn,
     user: dict = Depends(require_roles("control_room_officer", "senior_officer", "system_administrator")),
