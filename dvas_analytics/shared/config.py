@@ -79,6 +79,7 @@ class Config:
     ANPR_URL:    str = os.getenv("ANPR_URL",    "http://anpr-analyzer:8104")
     INTRUSION_URL: str = os.getenv("INTRUSION_URL", "http://intrusion-analyzer:8105")
     VESSEL_URL:  str = os.getenv("VESSEL_URL",   "http://vessel-analyzer:8106")
+    ANOMALY_URL: str = os.getenv("ANOMALY_URL",  "http://anomaly-analyzer:8107")
 
     # ── Maritime Vessel Tracking ───────────────────────────────────────────
     VESSEL_CONFIDENCE:              float = float(os.getenv("VESSEL_CONFIDENCE", "0.50"))
@@ -91,6 +92,12 @@ class Config:
     INTRUSION_CONFIRM_FRAMES:    int   = int(os.getenv("INTRUSION_CONFIRM_FRAMES", "3"))
     INTRUSION_DWELL_THRESHOLD_S: float = float(os.getenv("INTRUSION_DWELL_THRESHOLD_S", "3.0"))
     INTRUSION_DEFAULT_PRESET:    str   = os.getenv("INTRUSION_DEFAULT_PRESET", "default")
+
+    # ── Anomaly & Suspicious Activity ─────────────────────────────────────
+    BUCKET_ANOMALY: str = os.getenv("BUCKET_ANOMALY", "dvas-anomaly")
+    ANOMALY_CONFIDENCE: float = float(os.getenv("ANOMALY_CONFIDENCE", "0.35"))
+    ANOMALY_ALERT_HYSTERESIS_ENTER: float = float(os.getenv("ANOMALY_ALERT_HYSTERESIS_ENTER", "0.72"))
+    ANOMALY_COOLDOWN_S: float = float(os.getenv("ANOMALY_COOLDOWN_S", "45"))
 
     # ── Logging ────────────────────────────────────────────────────────────
     LOG_LEVEL: str  = os.getenv("LOG_LEVEL", "INFO")

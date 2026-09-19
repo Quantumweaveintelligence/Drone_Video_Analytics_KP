@@ -669,6 +669,54 @@ services:
       retries:      3
       start_period: 90s
 
+  anomaly-analyzer:
+    build:
+      context:    ../dvas_analytics
+      dockerfile: anomaly/Dockerfile
+    container_name: drone_anomaly_analyzer
+    networks: [drone-net]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8107:8107"   # REST API — Anomaly & suspicious activity (localhost only)
+    environment:
+      DATABASE_URL: postgresql://dvas:${DVAS_DB_PASSWORD:-dvas_secret}@postgres:5432/dvas?sslmode=disable
+      REDIS_URL:    redis://valkey:6379/0
+      DRONE_IDS:    "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005,DRN-001,DRN-002,DRN-003,DRN-004,DRN-005}"
+      ANOMALY_MODEL_PRIMARY:   /analytics/anomaly/models/weights/visdrone-yolov11x.pt
+      ANOMALY_MODEL_SECONDARY: /analytics/anomaly/models/weights/yolo11n.pt
+      ANOMALY_CONFIDENCE:      "0.35"
+      ANOMALY_ALERT_HYSTERESIS_ENTER: "0.72"
+      ANOMALY_COOLDOWN_S:      "45"
+      LOG_LEVEL:    INFO
+      ANALYTICS_SERVICE_KEY: "${ANALYTICS_SERVICE_KEY}"
+      MINIO_ENDPOINT:   minio:9000
+      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-minioadmin}"
+      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-minioadmin}"
+      MINIO_SECURE:     "false"
+      BUCKET_ANOMALY:   dvas-anomaly
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver:       nvidia
+              count:        1
+              capabilities: [gpu]
+    volumes:
+      - analytics_evidence:/data/evidence
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test:         ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8107/health')"]
+      interval:     30s
+      timeout:      10s
+      retries:      3
+      start_period: 120s
+
   # ════════════════════════════════════════════════════════════════════════════
   # OBJECT STORAGE — MinIO (S3-compatible)
   # Stores: face crops, vehicle crops, plate images, crowd heatmaps, evidence
@@ -716,8 +764,10 @@ services:
         mc mb --ignore-existing local/dvas-vehicles &&
         mc mb --ignore-existing local/dvas-intrusion &&
         mc mb --ignore-existing local/dvas-vessels-maritime &&
+        mc mb --ignore-existing local/dvas-anomaly &&
         mc anonymous set download local/dvas-evidence &&
         mc anonymous set download local/dvas-vessels-maritime &&
+        mc anonymous set download local/dvas-anomaly &&
         echo '[minio-init] All buckets ready.'
       "
     environment:
@@ -748,6 +798,7 @@ services:
       ANPR_URL:     http://anpr-analyzer:8104
       INTRUSION_URL: http://intrusion-analyzer:8105
       VESSEL_URL:   http://vessel-analyzer:8106
+      ANOMALY_URL:  http://anomaly-analyzer:8107
       MINIO_ENDPOINT:   minio:9000
       MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-minioadmin}"
       MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-minioadmin}"
@@ -770,6 +821,8 @@ services:
       intrusion-analyzer:
         condition: service_healthy
       vessel-analyzer:
+        condition: service_healthy
+      anomaly-analyzer:
         condition: service_healthy
     healthcheck:
       test:         ["CMD", "curl", "-f", "http://localhost:8100/health"]

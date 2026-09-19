@@ -4,9 +4,13 @@ const ThemeContext = createContext({ theme: "dark", toggle: () => {} });
 
 const applyTheme = (t) => {
   const root = document.documentElement;
-  root.classList.remove("light", "dark");
-  root.classList.add(t);
-  root.setAttribute("data-theme", t);
+  if (!root.classList.contains(t)) {
+    root.classList.remove("light", "dark");
+    root.classList.add(t);
+  }
+  if (root.getAttribute("data-theme") !== t) {
+    root.setAttribute("data-theme", t);
+  }
 };
 
 export function ThemeProvider({ children }) {

@@ -744,7 +744,7 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
 
             {/* Class color tags grid */}
             <div className="grid grid-cols-2 gap-1.5 mt-2 pt-2 border-t border-slate-800/80 text-[11px]">
-              {classStats.slice(0, 6).map((cs, idx) => (
+              {classStats.map((cs, idx) => (
                 <div key={idx} className="flex items-center gap-1.5 truncate">
                   <span
                     className="w-2.5 h-2.5 rounded-full flex-shrink-0"

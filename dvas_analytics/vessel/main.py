@@ -28,7 +28,7 @@ sys.path.insert(0, "/analytics/vessel")
 
 from shared.config import cfg, get_drone_aliases
 from shared.db import (
-    close_pool, get_pool,
+    close_pool, get_pool, ensure_drone,
     upsert_vessel_track, write_vessel_event,
     get_active_vessel_tracks, get_vessel_class_stats,
     get_vessel_events, get_vessel_summary_stats
@@ -96,6 +96,7 @@ _heatmap_points: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
 
 # Proximity cooldown: {(drone_id, trk1, trk2): last_alert_ts}
 _proximity_cooldown: Dict[Tuple[str, int, int], float] = {}
+_ensured_drones: set = set()
 
 
 # ── Motion & Analytics Helpers ────────────────────────────────────────────────
@@ -189,7 +190,7 @@ def _draw_hud_overlay(annotated: np.ndarray, drone_id: str, count: int, fps: flo
 # ── Background Stream Processing Loop ─────────────────────────────────────────
 
 async def _stream_loop():
-    global _stream_running, _frames_processed
+    global _stream_running, _frames_processed, _ensured_drones
     active_drones: List[str] = []
     log.info("Maritime vessel stream loop started (dynamic ingest stream discovery mode)")
 
@@ -203,6 +204,12 @@ async def _stream_loop():
                     if d not in active_drones:
                         active_drones.append(d)
                         log.info("Discovered active ingest stream for vessel analysis: %s", d)
+                    if d not in _ensured_drones:
+                        try:
+                            await ensure_drone(d)
+                            _ensured_drones.add(d)
+                        except Exception as ex:
+                            log.warning("Failed to ensure drone %s in drones table: %s", d, ex)
             except Exception as e:
                 log.debug("Stream scan error: %s", e)
 
@@ -212,6 +219,13 @@ async def _stream_loop():
 
         for drone_id in list(active_drones):
             try:
+                if drone_id not in _ensured_drones:
+                    try:
+                        await ensure_drone(drone_id)
+                        _ensured_drones.add(drone_id)
+                    except Exception as ex:
+                        log.warning("Failed to ensure drone %s: %s", drone_id, ex)
+
                 frames = await xreadgroup_frames(
                     "vessel-group", "vessel-analyzer", drone_id, ">", count=3, block_ms=100
                 )
@@ -545,11 +559,11 @@ async def get_latest_annotated_frame(drone_id: str = ""):
 
 
 @app.get("/tracks/active")
-async def list_active_tracks(drone_id: str = "", mission_id: str = "", limit: int = 100):
+async def list_active_tracks(drone_id: str = "", mission_id: str = "", limit: int = 100, window: int = 60):
     """List active vessel tracks from PostgreSQL."""
     pool = await get_pool()
     tracks = await get_active_vessel_tracks(
-        pool, drone_id=drone_id or None, mission_id=mission_id or None, limit=limit
+        pool, drone_id=drone_id or None, mission_id=mission_id or None, limit=limit, active_window_minutes=window
     )
     # Serialize datetime and JSON objects
     for t in tracks:

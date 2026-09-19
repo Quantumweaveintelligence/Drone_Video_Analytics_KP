@@ -62,12 +62,11 @@ import {
   useTheftAlerts,
   useModelsStatus,
 } from "@/lib/useAnalytics";
+import { resolveMinioImageUrl } from "@/lib/api";
 
 function toProxiedUrl(objectKeyOrUrl, bucket = "dvas-faces") {
   if (!objectKeyOrUrl) return null;
   if (objectKeyOrUrl.startsWith("data:image")) return objectKeyOrUrl;
-  if (objectKeyOrUrl.startsWith("/api/minio/")) return objectKeyOrUrl;
-  if (objectKeyOrUrl.startsWith("/api/infra/proxy-image")) return objectKeyOrUrl;
   if (objectKeyOrUrl.startsWith("http://minio") || objectKeyOrUrl.startsWith("http://localhost") || objectKeyOrUrl.startsWith("http://127.0.0.1")) {
     try {
       const u = new URL(objectKeyOrUrl);
@@ -75,11 +74,11 @@ function toProxiedUrl(objectKeyOrUrl, bucket = "dvas-faces") {
       if (parts.length >= 2) {
         const b = parts[0];
         const k = parts.slice(1).join("/");
-        return `/api/minio/image?bucket=${encodeURIComponent(b)}&key=${encodeURIComponent(k)}`;
+        return resolveMinioImageUrl(k, b);
       }
     } catch (_) {}
   }
-  return `/api/minio/image?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(objectKeyOrUrl)}`;
+  return resolveMinioImageUrl(objectKeyOrUrl, bucket);
 }
 
 /* ─────────────────────────────────────────────

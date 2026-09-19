@@ -1,6 +1,7 @@
-import React, { useRef } from "react";
+import React, { useRef, useState, useMemo } from "react";
 import { useCommand } from "@/context/CommandContext";
 import { useAuth } from "@/context/AuthContext";
+import { resolveMinioImageUrl } from "@/lib/api";
 import {
   Film,
   UserSearch,
@@ -10,26 +11,19 @@ import {
   Play,
   Download,
   RefreshCw,
-  Image as ImageIcon
+  Image as ImageIcon,
+  Layers,
+  LayoutGrid,
+  ChevronDown,
+  ChevronRight
 } from "lucide-react";
 
 const EVIDENCE_CATEGORIES = [
   { key: "all", label: "All Evidence", Icon: Film, desc: "All detections & alerts", countKey: "all", dedupKey: "all_dedup" },
   { key: "person", label: "Person Evidence", Icon: UserSearch, desc: "Face Re-ID & Tracks", countKey: "person", dedupKey: "person_dedup" },
-  { key: "vehicle", label: "Vehicle & ANPR", Icon: Car, desc: "Plates & Vehicle Tracks", countKey: "vehicle", dedupKey: "vehicle_dedup" },
+  { key: "vehicle", label: "Vehicle & Vessel", Icon: Car, desc: "Plates, Vehicles & Marine", countKey: "vehicle", dedupKey: "vehicle_dedup" },
   { key: "crowd", label: "Crowd & Heatmaps", Icon: Users, desc: "Density & Congestion", countKey: "crowd", dedupKey: "crowd_dedup" },
 ];
-
-const resolveMinioBucket = (key, bucket) => {
-  if (bucket && bucket.trim()) return bucket.trim();
-  if (!key) return "dvas-faces";
-  if (key.startsWith("vehicles/")) return "dvas-vehicles";
-  if (key.startsWith("plates/")) return "dvas-plates";
-  if (key.startsWith("intrusion/")) return "dvas-intrusion";
-  if (key.startsWith("heatmaps/")) return "dvas-heatmaps";
-  if (key.startsWith("persons/") || key.startsWith("faces/") || key.startsWith("alerts/")) return "dvas-faces";
-  return "dvas-faces";
-};
 
 export default function EvidencePage() {
   const { user } = useAuth();
@@ -57,8 +51,169 @@ export default function EvidencePage() {
     openEvidenceDetail
   } = useCommand();
 
+  const [viewMode, setViewMode] = useState("mission"); // "mission" | "flat"
+  const [collapsedMissions, setCollapsedMissions] = useState(new Set());
+
   const evidenceFiltersRef = useRef(evidenceFilters);
   evidenceFiltersRef.current = evidenceFilters;
+
+  const groupedEvidence = useMemo(() => {
+    const groups = {};
+    evidence.forEach((ev) => {
+      const mId = ev.mission_id || "UNASSIGNED";
+      if (!groups[mId]) {
+        groups[mId] = {
+          missionId: mId,
+          items: [],
+          drones: new Set(),
+          minTs: ev.ts,
+          maxTs: ev.ts,
+        };
+      }
+      groups[mId].items.push(ev);
+      if (ev.drone_id) groups[mId].drones.add(ev.drone_id);
+      if (new Date(ev.ts) < new Date(groups[mId].minTs)) groups[mId].minTs = ev.ts;
+      if (new Date(ev.ts) > new Date(groups[mId].maxTs)) groups[mId].maxTs = ev.ts;
+    });
+
+    return Object.values(groups).sort((a, b) => new Date(b.maxTs) - new Date(a.maxTs));
+  }, [evidence]);
+
+  const toggleMissionCollapse = (missionId) => {
+    setCollapsedMissions(prev => {
+      const next = new Set(prev);
+      if (next.has(missionId)) {
+        next.delete(missionId);
+      } else {
+        next.add(missionId);
+      }
+      return next;
+    });
+  };
+
+  const expandAll = () => setCollapsedMissions(new Set());
+  const collapseAll = () => setCollapsedMissions(new Set(groupedEvidence.map(g => g.missionId)));
+
+  const renderEvidenceCard = (ev) => (
+    <div
+      key={ev.id}
+      data-testid={`evidence-card-${ev.id}`}
+      className="rounded-lg overflow-hidden flex flex-col transition-all"
+      style={{
+        background: "var(--dvas-surface)",
+        border: "1px solid var(--dvas-border)",
+        boxShadow: "var(--dvas-shadow)"
+      }}
+    >
+      <div className="relative aspect-video bg-slate-950 overflow-hidden">
+        {(ev.thumbnail || ev.primary_image_key) ? (
+          <img
+            src={resolveMinioImageUrl(ev.thumbnail || ev.primary_image_key, ev.image_bucket)}
+            alt=""
+            className="w-full h-full object-cover opacity-90 transition-opacity hover:opacity-100"
+            onError={(e) => {
+              e.target.onerror = null;
+              e.target.style.display = "none";
+              const fb = e.target.parentElement.querySelector(".thumbnail-fallback");
+              if (fb) fb.style.display = "flex";
+            }}
+          />
+        ) : null}
+        <div
+          className="thumbnail-fallback w-full h-full flex flex-col items-center justify-center text-slate-500 gap-1.5"
+          style={{ display: (ev.thumbnail || ev.primary_image_key) ? "none" : "flex" }}
+        >
+          <ImageIcon size={28} className="text-slate-600" />
+          <span className="mono text-[10px] text-slate-500 uppercase tracking-wider">{ev.event_type?.replace(/_/g, " ")}</span>
+        </div>
+        <button
+          data-testid={`play-${ev.id}`}
+          onClick={() => setPlaying(ev)}
+          className="absolute inset-0 flex items-center justify-center bg-black/20 hover:bg-black/40 transition-colors text-white"
+        >
+          <div className="border border-white/70 px-3 py-1 text-xs bg-black/60 rounded flex items-center gap-1.5">
+            <Play size={11} fill="currentColor" /> View Evidence
+          </div>
+        </button>
+        {ev.legal_hold && (
+          <span className="absolute top-2 left-2 mono text-[10px] px-1.5 py-0.5 border border-red-500/50 bg-white/90 text-red-500 uppercase flex items-center gap-1 shadow-sm rounded-sm">
+            <FolderLock size={10} /> hold
+          </span>
+        )}
+        {ev.secondary_image_key && (
+          <span
+            className="absolute bottom-2 right-2 mono text-[9px] px-1.5 py-0.5 rounded bg-amber-950/90 text-amber-300 border border-amber-500/70 flex items-center gap-1 font-semibold backdrop-blur-sm shadow-md"
+            title="ANPR License Plate crop available"
+          >
+            <Car size={9} /> ANPR PLATE
+          </span>
+        )}
+        {ev.duplicate_count > 1 && (
+          <span
+            className="absolute bottom-2 left-2 mono text-[10px] px-2 py-0.5 rounded bg-sky-950/90 text-sky-300 border border-sky-600/70 flex items-center gap-1 font-semibold backdrop-blur-sm shadow-md"
+            title={`${ev.duplicate_count} detections share this visual capture`}
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-sky-400"></span>
+            {ev.duplicate_count} detections
+          </span>
+        )}
+        <button
+          onClick={() => openEvidenceDetail(ev.id)}
+          className="absolute top-2 right-2 mono text-[10px] px-1.5 py-0.5 border border-slate-400/50 bg-black/60 text-slate-200 hover:bg-black/80 rounded-sm"
+        >
+          Details
+        </button>
+      </div>
+
+      <div className="p-3 flex-1 flex flex-col justify-between">
+        <div>
+          <div className="text-xs font-semibold truncate" style={{ color: "var(--dvas-text)" }}>{ev.label}</div>
+          <div className="mono text-[10px] text-slate-500 mt-1 flex flex-wrap gap-2">
+            <span>{ev.event_type}</span><span>·</span><span>conf {ev.confidence}</span><span>·</span><span>{ev.duration_s}s</span>
+          </div>
+          <div className="mono text-[10px] text-slate-500">{new Date(ev.ts).toLocaleString()}</div>
+          <div className="mono text-[10px] text-slate-500">{ev.drone_id} · {ev.mission_id || "Unassigned"}</div>
+        </div>
+
+        <div className="mt-2.5 flex flex-wrap gap-1">
+          {user?.role === "control_room_officer" && (
+            <button
+              data-testid={`request-${ev.id}`}
+              onClick={() => setRequestOn(ev)}
+              className="text-[10px] px-2 py-1 border border-slate-700 hover:border-sky-500 text-slate-300 rounded"
+            >
+              Request Export
+            </button>
+          )}
+          {user?.role === "senior_officer" && (
+            <button
+              onClick={() => directExport(ev)}
+              className="text-[10px] px-2 py-1 border border-emerald-600/60 text-emerald-300 hover:bg-emerald-500/10 rounded"
+            >
+              Direct Export
+            </button>
+          )}
+          {user?.role === "senior_officer" && (
+            <button
+              onClick={() => toggleLegalHold(ev)}
+              className={`text-[10px] px-2 py-1 border rounded ${ev.legal_hold ? "border-red-500/60 text-red-300 hover:bg-red-500/10" : "border-amber-500/60 text-amber-300 hover:bg-amber-500/10"}`}
+            >
+              <FolderLock size={10} className="inline mr-1" />{ev.legal_hold ? "Release Hold" : "Legal Hold"}
+            </button>
+          )}
+          {ev.mission_id && (
+            <button
+              onClick={() => generateMissionReport(ev.mission_id)}
+              disabled={generatingReport === ev.mission_id}
+              className="text-[10px] px-2 py-1 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 disabled:opacity-40 flex items-center gap-1 rounded"
+            >
+              {generatingReport === ev.mission_id ? <><RefreshCw size={10} className="animate-spin" /> Generating...</> : <><Download size={10} /> AAR Report</>}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 
   return (
     <div className="space-y-4">
@@ -120,7 +275,55 @@ export default function EvidencePage() {
               · <span className="capitalize text-sky-400 font-medium">{evidenceCategory}</span>
             </span>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            {/* View Mode Toggle */}
+            <div className="flex items-center bg-slate-800/80 rounded border border-slate-700 p-0.5">
+              <button
+                type="button"
+                data-testid="view-mode-mission"
+                onClick={() => setViewMode("mission")}
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs transition-colors ${
+                  viewMode === "mission" ? "bg-sky-600 text-white font-medium shadow-sm" : "text-slate-400 hover:text-slate-200"
+                }`}
+                title="Group evidence by Mission ID"
+              >
+                <Layers size={13} />
+                <span>Mission Grouped</span>
+              </button>
+              <button
+                type="button"
+                data-testid="view-mode-flat"
+                onClick={() => setViewMode("flat")}
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs transition-colors ${
+                  viewMode === "flat" ? "bg-sky-600 text-white font-medium shadow-sm" : "text-slate-400 hover:text-slate-200"
+                }`}
+                title="View as flat grid"
+              >
+                <LayoutGrid size={13} />
+                <span>Flat Grid</span>
+              </button>
+            </div>
+
+            {viewMode === "mission" && groupedEvidence.length > 0 && (
+              <div className="hidden sm:flex items-center gap-1.5 text-[11px] mono">
+                <button
+                  type="button"
+                  onClick={expandAll}
+                  className="text-slate-400 hover:text-sky-300 transition-colors px-1.5 py-0.5 rounded hover:bg-slate-800"
+                >
+                  Expand All
+                </button>
+                <span className="text-slate-600">·</span>
+                <button
+                  type="button"
+                  onClick={collapseAll}
+                  className="text-slate-400 hover:text-sky-300 transition-colors px-1.5 py-0.5 rounded hover:bg-slate-800"
+                >
+                  Collapse All
+                </button>
+              </div>
+            )}
+
             <label className="flex items-center gap-2 cursor-pointer select-none bg-slate-800/80 px-2.5 py-1 rounded border border-slate-700 hover:border-slate-600 transition-colors">
               <input
                 type="checkbox"
@@ -182,7 +385,7 @@ export default function EvidencePage() {
             className="bg-slate-800 border border-slate-700 text-xs px-2 py-1.5 rounded text-slate-200"
           >
             <option value="">All Event Types</option>
-            {[...new Set([...(evidenceMeta.event_types || []), "person_detected", "vehicle_detected", "crowd_threshold", "crowd_surge", "vehicle_anomaly", "perimeter_intrusion", "unattended_object", "wrong_way", "theft_alert", "intrusion_alert"])].filter(Boolean).sort().map(t => (
+            {[...new Set([...(evidenceMeta.event_types || []), "person_detected", "vehicle_detected", "vessel_detected", "proximity_alert", "crowd_threshold", "crowd_surge", "vehicle_anomaly", "perimeter_intrusion", "unattended_object", "wrong_way", "theft_alert", "intrusion_alert", "abandoned_object", "suspicious_loitering", "person_fall", "suspicious_following", "crowd_dispersal", "vehicle_wrong_way", "vehicle_abrupt_stop", "suspicious_dropoff", "weapon_aiming"])].filter(Boolean).sort().map(t => (
               <option key={t} value={t}>{t.replace(/_/g, " ")}</option>
             ))}
           </select>
@@ -239,119 +442,102 @@ export default function EvidencePage() {
         </div>
       </div>
 
-      {/* Grid of Evidence Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-        {evidence.map(ev => (
-          <div
-            key={ev.id}
-            data-testid={`evidence-card-${ev.id}`}
-            className="rounded-lg overflow-hidden flex flex-col transition-all"
-            style={{
-              background: "var(--dvas-surface)",
-              border: "1px solid var(--dvas-border)",
-              boxShadow: "var(--dvas-shadow)"
-            }}
-          >
-            <div className="relative aspect-video bg-slate-950 overflow-hidden">
-              {ev.thumbnail ? (
-                <img
-                  src={ev.thumbnail.startsWith("http") ? ev.thumbnail : `/api/minio/image?bucket=${encodeURIComponent(resolveMinioBucket(ev.thumbnail, ev.image_bucket))}&key=${encodeURIComponent(ev.thumbnail)}`}
-                  alt=""
-                  className="w-full h-full object-cover opacity-90 transition-opacity hover:opacity-100"
-                  onError={(e) => {
-                    e.target.onerror = null;
-                    e.target.style.display = "none";
-                    const fb = e.target.parentElement.querySelector(".thumbnail-fallback");
-                    if (fb) fb.style.display = "flex";
-                  }}
-                />
-              ) : null}
+      {/* Main Evidence Content: Mission Grouped or Flat Grid */}
+      {viewMode === "mission" ? (
+        <div className="space-y-4">
+          {groupedEvidence.map(group => {
+            const isCollapsed = collapsedMissions.has(group.missionId);
+            const droneList = Array.from(group.drones);
+            return (
               <div
-                className="thumbnail-fallback w-full h-full flex flex-col items-center justify-center text-slate-500 gap-1.5"
-                style={{ display: ev.thumbnail ? "none" : "flex" }}
+                key={group.missionId}
+                className="rounded-lg overflow-hidden border border-slate-800 bg-slate-900/40 transition-all"
+                style={{
+                  boxShadow: "var(--dvas-shadow)"
+                }}
               >
-                <ImageIcon size={28} className="text-slate-600" />
-                <span className="mono text-[10px] text-slate-500 uppercase tracking-wider">{ev.event_type?.replace(/_/g, " ")}</span>
-              </div>
-              <button
-                data-testid={`play-${ev.id}`}
-                onClick={() => setPlaying(ev)}
-                className="absolute inset-0 flex items-center justify-center bg-black/20 hover:bg-black/40 transition-colors text-white"
-              >
-                <div className="border border-white/70 px-3 py-1 text-xs bg-black/60 rounded flex items-center gap-1.5">
-                  <Play size={11} fill="currentColor" /> View Evidence
-                </div>
-              </button>
-              {ev.legal_hold && (
-                <span className="absolute top-2 left-2 mono text-[10px] px-1.5 py-0.5 border border-red-500/50 bg-white/90 text-red-500 uppercase flex items-center gap-1 shadow-sm rounded-sm">
-                  <FolderLock size={10} /> hold
-                </span>
-              )}
-              {ev.duplicate_count > 1 && (
-                <span
-                  className="absolute bottom-2 left-2 mono text-[10px] px-2 py-0.5 rounded bg-sky-950/90 text-sky-300 border border-sky-600/70 flex items-center gap-1 font-semibold backdrop-blur-sm shadow-md"
-                  title={`${ev.duplicate_count} detections share this visual capture`}
+                {/* Mission Group Header */}
+                <div
+                  onClick={() => toggleMissionCollapse(group.missionId)}
+                  className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 bg-slate-800/90 hover:bg-slate-800 cursor-pointer border-b border-slate-700/60 transition-colors select-none"
                 >
-                  <span className="w-1.5 h-1.5 rounded-full bg-sky-400"></span>
-                  {ev.duplicate_count} detections
-                </span>
-              )}
-              <button
-                onClick={() => openEvidenceDetail(ev.id)}
-                className="absolute top-2 right-2 mono text-[10px] px-1.5 py-0.5 border border-slate-400/50 bg-black/60 text-slate-200 hover:bg-black/80 rounded-sm"
-              >
-                Details
-              </button>
-            </div>
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      className="text-slate-400 hover:text-white transition-colors"
+                      aria-label={isCollapsed ? "Expand mission" : "Collapse mission"}
+                    >
+                      {isCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+                    </button>
+                    <div className="p-1.5 rounded bg-sky-500/10 text-sky-400 border border-sky-500/20">
+                      <Layers size={15} />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="mono text-xs font-bold text-white tracking-wide">
+                          {group.missionId === "UNASSIGNED" ? "UNASSIGNED EVIDENCE" : `MISSION: ${group.missionId}`}
+                        </span>
+                        <span className="mono text-[10px] px-2 py-0.5 rounded-full bg-sky-950 text-sky-300 border border-sky-700/60 font-medium">
+                          {group.items.length} {group.items.length === 1 ? "capture" : "captures"}
+                        </span>
+                      </div>
+                      <div className="mono text-[10px] text-slate-400 flex items-center gap-2 mt-0.5">
+                        <span>
+                          Activity: {new Date(group.minTs).toLocaleDateString()} {new Date(group.minTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} – {new Date(group.maxTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                        {droneList.length > 0 && (
+                          <>
+                            <span>·</span>
+                            <span className="text-slate-300">Drones: {droneList.join(", ")}</span>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  </div>
 
-            <div className="p-3">
-              <div className="text-xs font-semibold truncate" style={{ color: "var(--dvas-text)" }}>{ev.label}</div>
-              <div className="mono text-[10px] text-slate-500 mt-1 flex flex-wrap gap-2">
-                <span>{ev.event_type}</span><span>·</span><span>conf {ev.confidence}</span><span>·</span><span>{ev.duration_s}s</span>
-              </div>
-              <div className="mono text-[10px] text-slate-500">{new Date(ev.ts).toLocaleString()}</div>
-              <div className="mono text-[10px] text-slate-500">{ev.drone_id} · {ev.mission_id}</div>
+                  <div className="flex items-center gap-2">
+                    {group.missionId !== "UNASSIGNED" && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          generateMissionReport(group.missionId);
+                        }}
+                        disabled={generatingReport === group.missionId}
+                        className="text-xs px-2.5 py-1 rounded bg-sky-600/20 hover:bg-sky-600/30 text-sky-300 border border-sky-500/40 flex items-center gap-1.5 transition-all disabled:opacity-40"
+                        title="Generate After-Action Review (AAR) PDF for this mission"
+                      >
+                        {generatingReport === group.missionId ? (
+                          <>
+                            <RefreshCw size={12} className="animate-spin" />
+                            <span>Generating AAR...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Download size={12} />
+                            <span>Mission AAR</span>
+                          </>
+                        )}
+                      </button>
+                    )}
+                  </div>
+                </div>
 
-              <div className="mt-2.5 flex flex-wrap gap-1">
-                {user?.role === "control_room_officer" && (
-                  <button
-                    data-testid={`request-${ev.id}`}
-                    onClick={() => setRequestOn(ev)}
-                    className="text-[10px] px-2 py-1 border border-slate-700 hover:border-sky-500 text-slate-300 rounded"
-                  >
-                    Request Export
-                  </button>
-                )}
-                {user?.role === "senior_officer" && (
-                  <button
-                    onClick={() => directExport(ev)}
-                    className="text-[10px] px-2 py-1 border border-emerald-600/60 text-emerald-300 hover:bg-emerald-500/10 rounded"
-                  >
-                    Direct Export
-                  </button>
-                )}
-                {user?.role === "senior_officer" && (
-                  <button
-                    onClick={() => toggleLegalHold(ev)}
-                    className={`text-[10px] px-2 py-1 border rounded ${ev.legal_hold ? "border-red-500/60 text-red-300 hover:bg-red-500/10" : "border-amber-500/60 text-amber-300 hover:bg-amber-500/10"}`}
-                  >
-                    <FolderLock size={10} className="inline mr-1" />{ev.legal_hold ? "Release Hold" : "Legal Hold"}
-                  </button>
-                )}
-                {ev.mission_id && (
-                  <button
-                    onClick={() => generateMissionReport(ev.mission_id)}
-                    disabled={generatingReport === ev.mission_id}
-                    className="text-[10px] px-2 py-1 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 disabled:opacity-40 flex items-center gap-1 rounded"
-                  >
-                    {generatingReport === ev.mission_id ? <><RefreshCw size={10} className="animate-spin" /> Generating...</> : <><Download size={10} /> AAR Report</>}
-                  </button>
+                {/* Evidence Grid within Mission */}
+                {!isCollapsed && (
+                  <div className="p-4 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                    {group.items.map(ev => renderEvidenceCard(ev))}
+                  </div>
                 )}
               </div>
-            </div>
-          </div>
-        ))}
-      </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+          {evidence.map(ev => renderEvidenceCard(ev))}
+        </div>
+      )}
 
       {evidence.length < evidenceTotal && (
         <div className="flex justify-center pt-2 pb-4">

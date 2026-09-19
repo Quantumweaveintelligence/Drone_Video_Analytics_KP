@@ -12,7 +12,9 @@ import {
   Car,
   Users as UsersIcon,
   Hash,
-  Shield
+  Shield,
+  Ship,
+  ShieldAlert
 } from "lucide-react";
 
 const MODEL_ICONS = {
@@ -21,7 +23,9 @@ const MODEL_ICONS = {
   vehicle: Car,
   crowd: UsersIcon,
   plate: Hash,
-  intrusion: Shield
+  intrusion: Shield,
+  vessel: Ship,
+  anomaly: ShieldAlert,
 };
 
 const actionColour = (a) => {

@@ -2425,7 +2425,7 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
             drone_id: alertData.drone_id,
             mission_id: alertData.mission_id,
             tracker_id: alertData.tracker_id,
-            face_crop_url: alertData.face_crop_key ? `/api/minio/image?bucket=dvas-faces&key=${encodeURIComponent(alertData.face_crop_key)}` : null,
+            face_crop_url: alertData.face_crop_key ? appendToken(`/api/minio/image?bucket=dvas-faces&key=${encodeURIComponent(alertData.face_crop_key)}`) : null,
             face_crop_key: alertData.face_crop_key,
             detected_at: alertData.ts || new Date().toISOString(),
             is_confirmed: false,

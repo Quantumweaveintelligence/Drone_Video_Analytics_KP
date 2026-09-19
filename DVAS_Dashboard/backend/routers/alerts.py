@@ -124,7 +124,7 @@ async def ack_alert(
 
 
 PERSON_EVENT_TYPES = ["person_detected", "perimeter_intrusion", "intrusion_alert"]
-VEHICLE_EVENT_TYPES = ["vehicle_detected", "vehicle_anomaly", "wrong_way", "theft_alert", "vessel_detected", "vessel_proximity", "vessel_loitering"]
+VEHICLE_EVENT_TYPES = ["vehicle_detected", "vehicle_anomaly", "wrong_way", "theft_alert", "vessel_detected", "vessel_proximity", "vessel_loitering", "proximity_alert"]
 CROWD_EVENT_TYPES = ["crowd_threshold", "crowd_surge", "unattended_object"]
 
 
@@ -279,7 +279,7 @@ async def get_evidence_meta(user: dict = Depends(get_current_user)):
 
 @router.get("/evidence/{evidence_id}")
 async def get_evidence(evidence_id: str, user: dict = Depends(get_current_user)):
-    if user["role"] not in ("control_room_officer", "senior_officer"):
+    if user["role"] not in ("control_room_officer", "senior_officer", "system_administrator"):
         raise HTTPException(403, "Not permitted")
     async with async_session_factory() as session:
         result = await session.execute(select(Evidence).where(Evidence.id == evidence_id))

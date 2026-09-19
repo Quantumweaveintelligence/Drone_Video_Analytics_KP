@@ -18,6 +18,7 @@ import CrowdPage from "@/pages/command/CrowdPage";
 import TrafficPage from "@/pages/command/TrafficPage";
 import PersonPage from "@/pages/command/PersonPage";
 import IntrusionPage from "@/pages/command/IntrusionPage";
+import AnomalyPage from "@/pages/command/AnomalyPage";
 import EvidencePage from "@/pages/command/EvidencePage";
 import MissionsPage from "@/pages/command/MissionsPage";
 import ModelsPage from "@/pages/command/ModelsPage";
@@ -68,6 +69,7 @@ export default function App() {
                 <Route path="traffic" element={<TrafficPage />} />
                 <Route path="person" element={<PersonPage />} />
                 <Route path="intrusion" element={<IntrusionPage />} />
+                <Route path="anomaly" element={<AnomalyPage />} />
                 <Route path="evidence" element={<EvidencePage />} />
                 <Route path="missions" element={<MissionsPage />} />
                 <Route path="models" element={<ModelsPage />} />

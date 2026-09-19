@@ -12,6 +12,8 @@ import {
   Image as ImageIcon
 } from "lucide-react";
 
+import { resolveMinioImageUrl } from "@/lib/api";
+
 function KPI({ label, value, tone = "text-sky-500" }) {
   return (
     <div
@@ -27,17 +29,6 @@ function KPI({ label, value, tone = "text-sky-500" }) {
     </div>
   );
 }
-
-const resolveMinioBucket = (key, bucket) => {
-  if (bucket && bucket.trim()) return bucket.trim();
-  if (!key) return "dvas-faces";
-  if (key.startsWith("vehicles/")) return "dvas-vehicles";
-  if (key.startsWith("plates/")) return "dvas-plates";
-  if (key.startsWith("intrusion/")) return "dvas-intrusion";
-  if (key.startsWith("heatmaps/")) return "dvas-heatmaps";
-  if (key.startsWith("persons/") || key.startsWith("faces/") || key.startsWith("alerts/")) return "dvas-faces";
-  return "dvas-faces";
-};
 
 function CommandInner() {
   const { user } = useAuth();
@@ -116,7 +107,7 @@ function CommandInner() {
               <div className="w-full aspect-video bg-slate-900 flex items-center justify-center gap-4 p-4">
                 <div className={`relative flex flex-col items-center justify-center h-full ${playing.secondary_image_key ? 'max-w-[48%]' : 'max-w-[85%]'}`}>
                   <img
-                    src={`/api/minio/image?bucket=${encodeURIComponent(resolveMinioBucket(playing.primary_image_key || playing.thumbnail, playing.image_bucket))}&key=${encodeURIComponent(playing.primary_image_key || playing.thumbnail)}`}
+                    src={resolveMinioImageUrl(playing.primary_image_key || playing.thumbnail, playing.image_bucket)}
                     alt="Primary Evidence"
                     className="max-h-[calc(100%-24px)] object-contain rounded border border-slate-700 shadow-md"
                     onError={(e) => {
@@ -134,10 +125,10 @@ function CommandInner() {
                     {playing.event_type === "vehicle_detected" ? "Vehicle Crop" : playing.event_type === "person_detected" ? "Full Body Crop" : playing.event_type?.includes("crowd") ? "Density Heatmap" : "Primary Capture"}
                   </span>
                 </div>
-                {playing.secondary_image_key && (
+                {playing.secondary_image_key ? (
                   <div className="relative flex flex-col items-center justify-center h-full max-w-[48%]">
                     <img
-                      src={`/api/minio/image?bucket=${encodeURIComponent(resolveMinioBucket(playing.secondary_image_key, playing.secondary_image_key.startsWith('plates/') ? 'dvas-plates' : (playing.image_bucket === 'dvas-vehicles' ? 'dvas-plates' : 'dvas-faces')))}&key=${encodeURIComponent(playing.secondary_image_key)}`}
+                      src={resolveMinioImageUrl(playing.secondary_image_key, playing.secondary_image_key.startsWith('plates/') ? 'dvas-plates' : (playing.image_bucket === 'dvas-vehicles' ? 'dvas-plates' : 'dvas-faces'))}
                       alt="Secondary Evidence"
                       className="max-h-[calc(100%-24px)] object-contain rounded border border-slate-700 shadow-md"
                       onError={(e) => {
@@ -155,8 +146,18 @@ function CommandInner() {
                       {playing.event_type === "vehicle_detected" ? "License Plate Crop" : "Secondary Detection"}
                     </span>
                   </div>
-                )}
+                ) : (playing.event_type === "vehicle_detected" || playing.label?.toLowerCase().includes("vehicle")) ? (
+                  <div className="relative flex flex-col items-center justify-center h-full max-w-[48%] border border-dashed border-slate-800 rounded bg-slate-950/60 p-6">
+                    <ImageIcon size={28} className="text-slate-600 mb-2" />
+                    <span className="text-[11px] mono font-semibold text-slate-400">PLATE CROP NOT CAPTURED</span>
+                    <span className="text-[9px] mono text-slate-500 mt-1 text-center">No license plate detected or readable in this vehicle frame</span>
+                    <span className="text-[10px] mono text-slate-500 mt-3 uppercase tracking-wider">
+                      License Plate Crop
+                    </span>
+                  </div>
+                ) : null}
               </div>
+
             ) : (
               <div className="p-8 text-center text-slate-500 mono text-xs">No media available for this detection</div>
             )}
@@ -177,6 +178,40 @@ function CommandInner() {
               </button>
             </div>
             <div className="p-4 space-y-4">
+              {(evidenceDetail.evidence?.primary_image_key || evidenceDetail.evidence?.thumbnail) && (
+                <div className="w-full bg-slate-900/80 rounded-lg p-3 flex items-center justify-center gap-4 border border-slate-800">
+                  <div className="relative flex flex-col items-center">
+                    <img
+                      src={resolveMinioImageUrl(evidenceDetail.evidence.primary_image_key || evidenceDetail.evidence.thumbnail, evidenceDetail.evidence.image_bucket)}
+                      alt="Primary Capture"
+                      className="max-h-48 object-contain rounded border border-slate-700 shadow"
+                      onError={(e) => { e.target.style.display = 'none'; }}
+                    />
+                    <span className="text-[9px] mono text-slate-400 mt-1 uppercase tracking-wider">
+                      {evidenceDetail.evidence.event_type === "vehicle_detected" ? "Vehicle Crop" : evidenceDetail.evidence.event_type === "person_detected" ? "Body Crop" : "Primary Capture"}
+                    </span>
+                  </div>
+                  {evidenceDetail.evidence?.secondary_image_key ? (
+                    <div className="relative flex flex-col items-center">
+                      <img
+                        src={resolveMinioImageUrl(evidenceDetail.evidence.secondary_image_key, evidenceDetail.evidence.secondary_image_key.startsWith('plates/') ? 'dvas-plates' : 'dvas-faces')}
+                        alt="Secondary Capture"
+                        className="max-h-48 object-contain rounded border border-slate-700 shadow"
+                        onError={(e) => { e.target.style.display = 'none'; }}
+                      />
+                      <span className="text-[9px] mono text-slate-400 mt-1 uppercase tracking-wider">
+                        {evidenceDetail.evidence.event_type === "vehicle_detected" ? "Plate Crop" : "Secondary Detection"}
+                      </span>
+                    </div>
+                  ) : (evidenceDetail.evidence?.event_type === "vehicle_detected" || evidenceDetail.evidence?.label?.toLowerCase().includes("vehicle")) ? (
+                    <div className="relative flex flex-col items-center justify-center p-4 border border-dashed border-slate-800 rounded bg-slate-950/60 min-w-[120px]">
+                      <ImageIcon size={20} className="text-slate-600 mb-1" />
+                      <span className="text-[9px] mono text-slate-500">Plate Not Captured</span>
+                    </div>
+                  ) : null}
+                </div>
+
+              )}
               <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-xs">
                 {[
                   ["Label", evidenceDetail.evidence?.label],

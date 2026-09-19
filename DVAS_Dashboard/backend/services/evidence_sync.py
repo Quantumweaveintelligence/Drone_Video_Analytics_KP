@@ -97,56 +97,104 @@ async def _resolve_image_keys(event_type, event_id, track_id, drone_id, ts, miss
                         bucket = "dvas-faces"
 
             elif event_type in ("vehicle_detected", "theft_alert", "vehicle_anomaly", "wrong_way"):
-                vrow = None
-                # Tier 1: Check plate_reads by track_id
+                bucket = "dvas-vehicles"
+                
+                # 1. Try track_id direct lookup in plate_reads (provides both vehicle & plate)
                 if track_id:
                     try:
-                        vrow = await conn.fetchrow(
+                        p_row = await conn.fetchrow(
                             "SELECT vehicle_image_key, plate_image_key FROM plate_reads WHERE track_id = $1::uuid LIMIT 1",
                             track_id
                         )
+                        if p_row:
+                            if not primary_key and p_row['vehicle_image_key']:
+                                primary_key = p_row['vehicle_image_key']
+                            if not secondary_key and p_row['plate_image_key']:
+                                secondary_key = p_row['plate_image_key']
                     except Exception:
                         pass
 
-                # Tier 2: Check plate_reads by event_id
-                if not vrow and event_id:
+                # 2. Try tracks table for vehicle_image_key
+                if track_id and not primary_key:
                     try:
-                        vrow = await conn.fetchrow(
+                        trow = await conn.fetchrow(
+                            "SELECT metadata->>'vehicle_image_key' AS vk FROM tracks WHERE track_id = $1::uuid AND metadata->>'vehicle_image_key' IS NOT NULL AND metadata->>'vehicle_image_key' != '' LIMIT 1",
+                            track_id
+                        )
+                        if trow and trow['vk']:
+                            primary_key = trow['vk']
+                    except Exception:
+                        pass
+
+                # 3. If primary_key is known, look up vehicle_plate_links or plate_reads by vehicle_image_key for plate
+                if primary_key and not secondary_key:
+                    try:
+                        vlink = await conn.fetchrow(
+                            "SELECT plate_image_key FROM vehicle_plate_links WHERE vehicle_image_key = $1 AND plate_image_key IS NOT NULL AND plate_image_key != '' LIMIT 1",
+                            primary_key
+                        )
+                        if vlink and vlink['plate_image_key']:
+                            secondary_key = vlink['plate_image_key']
+                    except Exception:
+                        pass
+
+                    if not secondary_key:
+                        try:
+                            pr_row = await conn.fetchrow(
+                                "SELECT plate_image_key FROM plate_reads WHERE vehicle_image_key = $1 AND plate_image_key IS NOT NULL AND plate_image_key != '' LIMIT 1",
+                                primary_key
+                            )
+                            if pr_row and pr_row['plate_image_key']:
+                                secondary_key = pr_row['plate_image_key']
+                        except Exception:
+                            pass
+
+                # 4. Check event_id in plate_reads
+                if (not primary_key or not secondary_key) and event_id:
+                    try:
+                        erow = await conn.fetchrow(
                             "SELECT vehicle_image_key, plate_image_key FROM plate_reads WHERE event_id = $1::uuid LIMIT 1",
                             event_id
                         )
+                        if erow:
+                            if not primary_key and erow['vehicle_image_key']:
+                                primary_key = erow['vehicle_image_key']
+                            if not secondary_key and erow['plate_image_key']:
+                                secondary_key = erow['plate_image_key']
                     except Exception:
                         pass
 
-                # Tier 3: Check plate_reads by mission_id & time proximity
-                if not vrow and mission_id:
-                    vrow = await conn.fetchrow(
-                        """SELECT vehicle_image_key, plate_image_key 
-                           FROM plate_reads 
-                           WHERE mission_id_str = $1 
-                           ORDER BY abs(extract(epoch from (created_at - $2))) ASC LIMIT 1""",
-                        mission_id, ts_dt
-                    )
+                # 5. Check mission_id & time proximity in plate_reads
+                if (not primary_key or not secondary_key) and mission_id:
+                    try:
+                        mrow = await conn.fetchrow(
+                            """SELECT vehicle_image_key, plate_image_key 
+                               FROM plate_reads 
+                               WHERE mission_id_str = $1 
+                               ORDER BY abs(extract(epoch from (created_at - $2))) ASC LIMIT 1""",
+                            mission_id, ts_dt
+                        )
+                        if mrow:
+                            if not primary_key and mrow['vehicle_image_key']:
+                                primary_key = mrow['vehicle_image_key']
+                            if not secondary_key and mrow['plate_image_key']:
+                                secondary_key = mrow['plate_image_key']
+                    except Exception:
+                        pass
 
-                # Tier 4: Check plate_reads by time proximity to ts_dt
-                if not vrow:
-                    vrow = await conn.fetchrow(
-                        """SELECT vehicle_image_key, plate_image_key 
-                           FROM plate_reads 
-                           ORDER BY abs(extract(epoch from (created_at - $1))) ASC LIMIT 1""",
-                        ts_dt
-                    )
+                # 6. Fallback from latest plate_reads or tracks
+                if not primary_key:
+                    try:
+                        fb = await conn.fetchrow(
+                            "SELECT vehicle_image_key, plate_image_key FROM plate_reads WHERE vehicle_image_key IS NOT NULL ORDER BY created_at DESC LIMIT 1"
+                        )
+                        if fb:
+                            primary_key = fb['vehicle_image_key'] or ""
+                            if not secondary_key:
+                                secondary_key = fb['plate_image_key'] or ""
+                    except Exception:
+                        pass
 
-                # Tier 5: General plate_reads fallback
-                if not vrow:
-                    vrow = await conn.fetchrow(
-                        "SELECT vehicle_image_key, plate_image_key FROM plate_reads ORDER BY created_at DESC LIMIT 1"
-                    )
-
-                if vrow:
-                    primary_key = vrow['vehicle_image_key'] or ""
-                    secondary_key = vrow['plate_image_key'] or ""
-                    bucket = "dvas-vehicles"
 
             elif event_type.startswith("intrusion") or event_type == "perimeter_intrusion":
                 irow = None
@@ -229,6 +277,43 @@ async def _resolve_image_keys(event_type, event_id, track_id, drone_id, ts, miss
                     primary_key = crow['heatmap_object_key']
                     bucket = "dvas-heatmaps"
 
+            elif event_type in (
+                "abandoned_object", "suspicious_loitering", "person_fall",
+                "suspicious_following", "crowd_dispersal", "vehicle_wrong_way",
+                "vehicle_abrupt_stop", "suspicious_dropoff", "weapon_aiming",
+                "anomaly_alert", "suspicious_activity"
+            ) or event_type.startswith("anomaly_"):
+                a_row = None
+                if event_id:
+                    try:
+                        a_row = await conn.fetchrow(
+                            "SELECT snapshot_key FROM anomaly_events WHERE event_id = $1::uuid LIMIT 1",
+                            event_id
+                        )
+                    except Exception:
+                        pass
+                if not a_row and track_id:
+                    try:
+                        t_row = await conn.fetchrow(
+                            "SELECT snapshot_key FROM anomaly_tracks WHERE track_id = $1::int LIMIT 1",
+                            int(track_id)
+                        )
+                        if t_row and t_row['snapshot_key']:
+                            primary_key = t_row['snapshot_key']
+                            bucket = "dvas-anomaly"
+                    except Exception:
+                        pass
+                if not a_row and not primary_key and drone_id:
+                    a_row = await conn.fetchrow(
+                        """SELECT snapshot_key FROM anomaly_events 
+                           WHERE drone_id = $1 AND snapshot_key IS NOT NULL AND snapshot_key != '' 
+                           ORDER BY abs(extract(epoch from (ts - $2))) ASC LIMIT 1""",
+                        drone_id, ts_dt
+                    )
+                if a_row and a_row['snapshot_key']:
+                    primary_key = a_row['snapshot_key']
+                    bucket = "dvas-anomaly"
+
         finally:
             await conn.close()
     except Exception as exc:
@@ -249,6 +334,15 @@ def _event_type_label(event_type: str) -> str:
         "theft_alert": "Stolen/watchlisted vehicle",
         "intrusion_alert": "Perimeter intrusion",
         "vehicle_detected": "Vehicle of interest",
+        "abandoned_object": "Unattended / Abandoned Object",
+        "suspicious_loitering": "Suspicious Loitering",
+        "person_fall": "Person Collapse / Fall",
+        "suspicious_following": "Suspicious Following Pattern",
+        "crowd_dispersal": "Rapid Crowd Dispersal",
+        "vehicle_wrong_way": "Vehicle Wrong-Way Flow",
+        "vehicle_abrupt_stop": "Vehicle Abrupt Stop",
+        "suspicious_dropoff": "Suspicious Vehicle Dropoff",
+        "weapon_aiming": "Weapon / Arm Aiming Gesture",
     }
     return labels.get(event_type, f"Confirmed {event_type.replace('_', ' ')}")
 

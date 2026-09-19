@@ -12,6 +12,32 @@ export const getAuthToken = () => {
   return localStorage.getItem("dvas_token") || localStorage.getItem("token") || "";
 };
 
+export const resolveMinioBucket = (key, explicitBucket = "") => {
+  if (explicitBucket && explicitBucket.trim()) return explicitBucket.trim();
+  if (!key) return "dvas-faces";
+  const clean = key.replace(/^\/+/, "");
+  if (clean.startsWith("vehicles/")) return "dvas-vehicles";
+  if (clean.startsWith("plates/")) return "dvas-plates";
+  if (clean.startsWith("vessels/")) return "dvas-vessels-maritime";
+  if (clean.startsWith("intrusion/")) return "dvas-intrusion";
+  if (clean.startsWith("heatmaps/")) return "dvas-heatmaps";
+  if (clean.startsWith("watchlist/")) return "dvas-watchlist";
+  if (clean.startsWith("evidence/")) return "dvas-evidence";
+  if (clean.startsWith("anomaly/") || clean.startsWith("anomalies/") || clean.startsWith("alerts/")) return "dvas-anomaly";
+  if (clean.startsWith("persons/") || clean.startsWith("faces/")) return "dvas-faces";
+  return "dvas-faces";
+};
+
+export const resolveMinioImageUrl = (key, explicitBucket = "") => {
+  if (!key) return "";
+  if (key.startsWith("http://") || key.startsWith("https://")) return key;
+  const cleanKey = key.replace(/^\/+/, "");
+  const bucket = resolveMinioBucket(cleanKey, explicitBucket);
+  const token = getAuthToken();
+  const tokenParam = token ? `&token=${encodeURIComponent(token)}` : "";
+  return `/api/minio/image?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(cleanKey)}${tokenParam}`;
+};
+
 export const getAuthHeaders = () => {
   const token = getAuthToken();
   return token ? { Authorization: `Bearer ${token}` } : {};

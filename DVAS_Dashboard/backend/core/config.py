@@ -21,6 +21,7 @@ VEHICLE_URL = os.getenv("VEHICLE_ANALYTICS_URL", "http://vehicle-analyzer:8103")
 ANPR_URL = os.getenv("ANPR_ANALYTICS_URL", "http://anpr-analyzer:8104")
 INTRUSION_URL = os.getenv("INTRUSION_ANALYTICS_URL", "http://intrusion-analyzer:8105")
 VESSEL_URL = os.getenv("VESSEL_ANALYTICS_URL", "http://vessel-analyzer:8106")
+ANOMALY_URL = os.getenv("ANOMALY_ANALYTICS_URL", "http://anomaly-analyzer:8107")
 
 # ---------- MinIO ----------
 MINIO_PROXY_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")

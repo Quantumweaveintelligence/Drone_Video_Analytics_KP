@@ -56,6 +56,7 @@ _SERVICES = {
     "anpr":      cfg.ANPR_URL,
     "intrusion": cfg.INTRUSION_URL,
     "vessel":    cfg.VESSEL_URL,
+    "anomaly":   cfg.ANOMALY_URL,
 }
 
 # Redis stream names for each service
@@ -67,6 +68,7 @@ _ANALYTICS_STREAMS = [
     "analytics:anpr:results",
     "analytics:intrusion:results",
     "analytics:vessel:results",
+    "analytics:anomaly:results",
     "drone:events:confirmed",
 ]
 

@@ -1,0 +1,31 @@
+# Class Definitions for Drone Suspicious Object Detection System
+
+# Phase 1: Reference VisDrone Classes (dronefreak/visdrone-yolov11x)
+visdrone_classes:
+  0: "pedestrian"
+  1: "people"
+  2: "bicycle"
+  3: "car"
+  4: "van"
+  5: "truck"
+  6: "tricycle"
+  7: "awning-tricycle"
+  8: "bus"
+  9: "motor"
+  10: "others"
+
+# Human classes used for ownership tracking
+human_classes:
+  - "pedestrian"
+  - "people"
+
+# Phase 2+ Custom Suspicious Object Target Taxonomy (to be fine-tuned)
+target_custom_classes:
+  - "person"
+  - "backpack"
+  - "handbag"
+  - "suitcase"
+  - "bag"
+  - "box"
+  - "package"
+  - "container"

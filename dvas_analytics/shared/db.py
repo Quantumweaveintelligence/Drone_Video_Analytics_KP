@@ -1610,9 +1610,10 @@ async def get_active_vessel_tracks(
     drone_id: Optional[str] = None,
     mission_id: Optional[str] = None,
     limit: int = 100,
+    active_window_minutes: int = 60,
 ) -> List[dict]:
-    """Retrieve active or recently seen vessel tracks (last 10 minutes)."""
-    where = "WHERE last_seen > now() - interval '10 minutes'"
+    """Retrieve active or recently seen vessel tracks (default last 60 minutes)."""
+    where = f"WHERE last_seen > now() - interval '{int(active_window_minutes)} minutes'"
     params = []
     if drone_id:
         params.append(drone_id)
@@ -1757,3 +1758,289 @@ async def get_vessel_summary_stats(
         "moving_count": total_row["moving_count"] if total_row else 0,
         "proximity_alerts_24h": events_row["proximity_alerts"] if events_row else 0,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Anomaly & Suspicious Activity
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def upsert_anomaly_track(
+    pool,
+    drone_id: str,
+    track_id: int,
+    class_name: str,
+    class_category: str,
+    suspicion_level: str,
+    suspicion_score: float,
+    pipeline_stage: str,
+    duration_s: float,
+    trajectory: list,
+    ground_trajectory: list,
+    attributes: dict,
+    bbox_xyxy: list,
+    is_stationary: bool = False,
+    stationary_seconds: float = 0.0,
+    owner_track_id: Optional[int] = None,
+    owner_distance_px: Optional[float] = None,
+    snapshot_key: str = "",
+    mission_id: Optional[str] = None,
+) -> None:
+    """Upsert an anomaly track record."""
+    await pool.execute(
+        """
+        INSERT INTO anomaly_tracks (
+            drone_id, track_id, mission_id, class_name, class_category,
+            suspicion_level, suspicion_score, pipeline_stage, duration_s,
+            trajectory, ground_trajectory, attributes, bbox_xyxy,
+            is_stationary, stationary_seconds, owner_track_id, owner_distance_px,
+            snapshot_key, first_seen, last_seen
+        )
+        VALUES (
+            $1, $2, $3, $4, $5,
+            $6, $7, $8, $9,
+            $10, $11, $12, $13,
+            $14, $15, $16, $17,
+            $18, now(), now()
+        )
+        ON CONFLICT (drone_id, track_id, COALESCE(mission_id, ''))
+        DO UPDATE SET
+            class_name = EXCLUDED.class_name,
+            class_category = EXCLUDED.class_category,
+            suspicion_level = EXCLUDED.suspicion_level,
+            suspicion_score = EXCLUDED.suspicion_score,
+            pipeline_stage = EXCLUDED.pipeline_stage,
+            duration_s = EXCLUDED.duration_s,
+            trajectory = EXCLUDED.trajectory,
+            ground_trajectory = EXCLUDED.ground_trajectory,
+            attributes = EXCLUDED.attributes,
+            bbox_xyxy = EXCLUDED.bbox_xyxy,
+            is_stationary = EXCLUDED.is_stationary,
+            stationary_seconds = EXCLUDED.stationary_seconds,
+            owner_track_id = COALESCE(EXCLUDED.owner_track_id, anomaly_tracks.owner_track_id),
+            owner_distance_px = COALESCE(EXCLUDED.owner_distance_px, anomaly_tracks.owner_distance_px),
+            snapshot_key = CASE WHEN EXCLUDED.snapshot_key != '' THEN EXCLUDED.snapshot_key ELSE anomaly_tracks.snapshot_key END,
+            last_seen = now()
+        """,
+        drone_id, track_id, mission_id, class_name, class_category,
+        suspicion_level, suspicion_score, pipeline_stage, duration_s,
+        trajectory, ground_trajectory, attributes, bbox_xyxy,
+        is_stationary, stationary_seconds, owner_track_id, owner_distance_px,
+        snapshot_key
+    )
+
+
+async def write_anomaly_event(
+    pool,
+    drone_id: str,
+    track_id: int,
+    event_type: str,
+    severity: str,
+    class_name: str,
+    confidence_detector: float,
+    confidence_rule: float,
+    confidence_event: float,
+    confidence_alert: float,
+    evidence_groups: list,
+    reasons: list,
+    summary: str,
+    snapshot_key: str,
+    bbox: list,
+    owner_track_id: Optional[int] = None,
+    owner_status: Optional[str] = None,
+    temporal: Optional[dict] = None,
+    gps_lat: Optional[float] = None,
+    gps_lon: Optional[float] = None,
+    details: Optional[dict] = None,
+    mission_id: Optional[str] = None,
+) -> str:
+    """Write an anomaly event. Returns event_id (UUID string)."""
+    row = await pool.fetchrow(
+        """
+        INSERT INTO anomaly_events (
+            drone_id, track_id, mission_id, event_type, severity, class_name,
+            confidence_detector, confidence_rule, confidence_event, confidence_alert,
+            evidence_groups, reasons, summary, snapshot_key, bbox,
+            owner_track_id, owner_status, temporal, gps_lat, gps_lon, details, ts
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6,
+            $7, $8, $9, $10,
+            $11, $12, $13, $14, $15,
+            $16, $17, $18, $19, $20, $21, now()
+        )
+        RETURNING event_id::text
+        """,
+        drone_id, track_id, mission_id, event_type, severity, class_name,
+        confidence_detector, confidence_rule, confidence_event, confidence_alert,
+        evidence_groups or [], reasons or [], summary or "", snapshot_key or "", bbox or [],
+        owner_track_id, owner_status, temporal or {}, gps_lat, gps_lon, details or {}
+    )
+    return row["event_id"] if row else ""
+
+
+async def get_active_anomaly_tracks(
+    pool,
+    drone_id: Optional[str] = None,
+    limit: int = 100,
+) -> List[dict]:
+    """Retrieve active anomaly tracks seen in the last 15 seconds."""
+    params = []
+    where = "WHERE last_seen > now() - interval '15 seconds'"
+    if drone_id:
+        params.append(drone_id)
+        where += f" AND drone_id = ${len(params)}"
+    params.append(min(limit, 200))
+    limit_idx = len(params)
+    rows = await pool.fetch(
+        f"""
+        SELECT id, track_id, drone_id, mission_id, class_name, class_category,
+               suspicion_level, suspicion_score, pipeline_stage, duration_s,
+               trajectory, ground_trajectory, attributes, bbox_xyxy,
+               is_stationary, stationary_seconds, owner_track_id, owner_distance_px,
+               snapshot_key, first_seen, last_seen
+        FROM anomaly_tracks
+        {where}
+        ORDER BY suspicion_score DESC, last_seen DESC
+        LIMIT ${limit_idx}
+        """,
+        *params
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_anomaly_events(
+    pool,
+    drone_id: Optional[str] = None,
+    mission_id: Optional[str] = None,
+    event_type: Optional[str] = None,
+    severity: Optional[str] = None,
+    limit: int = 50,
+) -> List[dict]:
+    """Retrieve recent anomaly events."""
+    conditions = []
+    params = []
+    if drone_id:
+        params.append(drone_id)
+        conditions.append(f"drone_id = ${len(params)}")
+    if mission_id:
+        params.append(mission_id)
+        conditions.append(f"mission_id = ${len(params)}")
+    if event_type:
+        params.append(event_type)
+        conditions.append(f"event_type = ${len(params)}")
+    if severity:
+        params.append(severity)
+        conditions.append(f"severity = ${len(params)}")
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(min(limit, 200))
+    limit_idx = len(params)
+
+    rows = await pool.fetch(
+        f"""
+        SELECT event_id::text, drone_id, mission_id, track_id,
+               event_type, severity, class_name,
+               confidence_detector, confidence_rule, confidence_event, confidence_alert,
+               evidence_groups, reasons, summary, snapshot_key, bbox,
+               owner_track_id, owner_status, temporal, gps_lat, gps_lon, details, ts
+        FROM anomaly_events
+        {where}
+        ORDER BY ts DESC
+        LIMIT ${limit_idx}
+        """,
+        *params
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_anomaly_summary_stats(
+    pool,
+    drone_id: Optional[str] = None,
+    mission_id: Optional[str] = None,
+) -> dict:
+    """Retrieve summary metrics for anomaly monitoring dashboard."""
+    params = []
+    filters = []
+    if drone_id:
+        params.append(drone_id)
+        filters.append(f"drone_id = ${len(params)}")
+    if mission_id:
+        params.append(mission_id)
+        filters.append(f"mission_id = ${len(params)}")
+
+    extra_and = (" AND " + " AND ".join(filters)) if filters else ""
+
+    live_row = await pool.fetchrow(
+        f"""
+        SELECT COUNT(*) as live_count,
+               COUNT(*) FILTER (WHERE class_category = 'person') as live_persons,
+               COUNT(*) FILTER (WHERE class_category = 'vehicle') as live_vehicles,
+               COUNT(*) FILTER (WHERE class_category = 'object') as live_objects,
+               COUNT(*) FILTER (WHERE suspicion_level IN ('MEDIUM', 'HIGH', 'CRITICAL')) as suspicious_count
+        FROM anomaly_tracks
+        WHERE last_seen > now() - interval '15 seconds' {extra_and}
+        """,
+        *params
+    )
+    total_row = await pool.fetchrow(
+        f"""
+        SELECT COUNT(*) as total_unique
+        FROM anomaly_tracks
+        WHERE 1=1 {extra_and}
+        """,
+        *params
+    )
+    events_row = await pool.fetchrow(
+        f"""
+        SELECT COUNT(*) as total_alerts,
+               COUNT(*) FILTER (WHERE severity = 'CRITICAL') as critical_alerts,
+               COUNT(*) FILTER (WHERE severity = 'HIGH') as high_alerts,
+               COUNT(*) FILTER (WHERE severity = 'MEDIUM') as medium_alerts,
+               ROUND(AVG(confidence_alert)::numeric, 2) as avg_confidence
+        FROM anomaly_events
+        WHERE ts > now() - interval '24 hours' {extra_and}
+        """,
+        *params
+    )
+    return {
+        "live_count": live_row["live_count"] if live_row else 0,
+        "live_persons": live_row["live_persons"] if live_row else 0,
+        "live_vehicles": live_row["live_vehicles"] if live_row else 0,
+        "live_objects": live_row["live_objects"] if live_row else 0,
+        "suspicious_count": live_row["suspicious_count"] if live_row else 0,
+        "cumulative_count": total_row["total_unique"] if total_row else 0,
+        "total_alerts_24h": events_row["total_alerts"] if events_row else 0,
+        "critical_alerts_24h": events_row["critical_alerts"] if events_row else 0,
+        "high_alerts_24h": events_row["high_alerts"] if events_row else 0,
+        "medium_alerts_24h": events_row["medium_alerts"] if events_row else 0,
+        "avg_alert_confidence": float(events_row["avg_confidence"]) if events_row and events_row["avg_confidence"] else 0.0,
+    }
+
+
+async def get_anomaly_stats_by_type(
+    pool,
+    drone_id: Optional[str] = None,
+    mission_id: Optional[str] = None,
+) -> List[dict]:
+    """Retrieve counts by anomaly event type."""
+    params = []
+    conditions = []
+    if drone_id:
+        params.append(drone_id)
+        conditions.append(f"drone_id = ${len(params)}")
+    if mission_id:
+        params.append(mission_id)
+        conditions.append(f"mission_id = ${len(params)}")
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    rows = await pool.fetch(
+        f"""
+        SELECT event_type, COUNT(*) as count,
+               ROUND(AVG(confidence_alert)::numeric, 2) as avg_confidence
+        FROM anomaly_events
+        {where}
+        GROUP BY event_type
+        ORDER BY count DESC
+        """,
+        *params
+    )
+    return [dict(r) for r in rows]

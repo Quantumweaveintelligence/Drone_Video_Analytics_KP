@@ -43,7 +43,8 @@ import { useJpegPoller } from '@/hooks/useJpegPoller';
 
 
 /* ─── Main IntrusionAnalytics Component ───────────────────────────── */
-export default function IntrusionAnalytics({ activeDrone: initialDrone, drones = [], missions: initialMissions = [], user = {}, onNavigateTab }) {
+export default function IntrusionAnalytics({ activeDrone: propActiveDrone, droneId, drones = [], missions: initialMissions = [], user = {}, onNavigateTab }) {
+  const initialDrone = propActiveDrone || droneId;
   const { streams, streamMap } = useActiveStreams();
 
   // Helper to detect legacy mock/placeholder drone or mission IDs
@@ -339,6 +340,7 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
 
   // ─── Post-Mission Review State & Data ──────────────────────────────
   const [missions, setMissions] = useState([]);
+  const [missionMeta, setMissionMeta] = useState({});
   const [selectedMission, setSelectedMission] = useState('');
   const [events, setEvents] = useState([]);
   const [analyticsData, setAnalyticsData] = useState(null);
@@ -347,19 +349,47 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
   const [page, setPage] = useState(0);
   const PAGE_SIZE = 10;
 
-  // Load distinct missions from BOTH /api/missions and /analytics/intrusion/events
+  // Load distinct missions from /api/missions, /analytics/intrusion/missions, and /analytics/intrusion/events
   useEffect(() => {
     let active = true;
     const fetchMissions = async () => {
       try {
-        const [missionsRes, eventsRes] = await Promise.allSettled([
+        const [missionsRes, eventsRes, intrusionMissionsRes] = await Promise.allSettled([
           api.get('/missions'),
           api.get('/analytics/intrusion/events?limit=200'),
+          api.get('/analytics/intrusion/missions'),
         ]);
 
         const discovered = new Set();
+        const eventCountsMap = {};
 
-        // 1. From /api/missions (exclude legacy mock missions like M-101..M-103)
+        // 1. From /analytics/intrusion/missions (has accurate per-mission event counts)
+        if (intrusionMissionsRes.status === 'fulfilled' && intrusionMissionsRes.value?.data) {
+          const iData = intrusionMissionsRes.value.data;
+          const iList = Array.isArray(iData?.missions) ? iData.missions : (Array.isArray(iData) ? iData : []);
+          iList.forEach(item => {
+            if (item.mission_id && !/^M-10[1-9]$/i.test(item.mission_id)) {
+              discovered.add(item.mission_id);
+              eventCountsMap[item.mission_id] = item.event_count || 0;
+            }
+          });
+        }
+
+        // 2. From /analytics/intrusion/events
+        if (eventsRes.status === 'fulfilled' && eventsRes.value?.data) {
+          const eData = eventsRes.value.data;
+          const eArray = Array.isArray(eData) ? eData : (Array.isArray(eData?.events) ? eData.events : []);
+          eArray.forEach(e => {
+            if (e.mission_id && !/^M-10[1-9]$/i.test(e.mission_id)) {
+              discovered.add(e.mission_id);
+              if (!eventCountsMap[e.mission_id]) {
+                eventCountsMap[e.mission_id] = (eventCountsMap[e.mission_id] || 0) + 1;
+              }
+            }
+          });
+        }
+
+        // 3. From /api/missions (exclude legacy mock missions like M-101..M-103)
         if (missionsRes.status === 'fulfilled' && missionsRes.value?.data) {
           const mData = missionsRes.value.data;
           const mArray = Array.isArray(mData) ? mData : (Array.isArray(mData?.missions) ? mData.missions : []);
@@ -369,7 +399,7 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
           });
         }
 
-        // 2. From initialMissions prop
+        // 4. From initialMissions prop
         if (Array.isArray(initialMissions)) {
           initialMissions.forEach(m => {
             const mId = typeof m === 'string' ? m : (m.mission_id || m.id || m.name);
@@ -377,7 +407,7 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
           });
         }
 
-        // 3. From active streams / active mission
+        // 5. From active streams / active mission
         if (activeMissionId && !/^M-10[1-9]$/i.test(activeMissionId)) discovered.add(activeMissionId);
         if (streams && streams.length > 0) {
           streams.forEach(s => {
@@ -385,24 +415,25 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
           });
         }
 
-        // 4. From /analytics/intrusion/events
-        if (eventsRes.status === 'fulfilled' && eventsRes.value?.data) {
-          const eData = eventsRes.value.data;
-          const eArray = Array.isArray(eData) ? eData : (Array.isArray(eData?.events) ? eData.events : []);
-          eArray.forEach(e => {
-            if (e.mission_id && !/^M-10[1-9]$/i.test(e.mission_id)) discovered.add(e.mission_id);
-          });
-        }
-
         if (!active) return;
-        const allMissions = Array.from(discovered);
-        setMissions(allMissions);
 
-        // Pre-select active mission or first mission if none selected
+        // Sort missions: missions with recorded breach events first (descending by count), then alphabetical
+        const allMissions = Array.from(discovered).sort((a, b) => {
+          const countA = eventCountsMap[a] || 0;
+          const countB = eventCountsMap[b] || 0;
+          if (countA !== countB) return countB - countA;
+          return b.localeCompare(a);
+        });
+
+        setMissions(allMissions);
+        setMissionMeta(eventCountsMap);
+
+        // Pre-select: preserve previous if still valid, or active mission, or first mission with recorded events!
         setSelectedMission(prev => {
           if (prev && discovered.has(prev)) return prev;
           if (activeMissionId && discovered.has(activeMissionId)) return activeMissionId;
-          return allMissions.length > 0 ? allMissions[0] : '';
+          const topWithEvents = allMissions.find(m => (eventCountsMap[m] || 0) > 0);
+          return topWithEvents || (allMissions.length > 0 ? allMissions[0] : '');
         });
       } catch (err) {
         console.error('Error fetching missions:', err);
@@ -424,10 +455,11 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
     if (!selectedMission || subTab !== 'review') return;
     let active = true;
     setLoadingReview(true);
+    setPage(0);
     const fetchMissionData = async () => {
       try {
         const [evRes, anRes] = await Promise.allSettled([
-          api.get(`/analytics/intrusion/events?mission_id=${encodeURIComponent(selectedMission)}&limit=200`),
+          api.get(`/analytics/intrusion/events?mission_id=${encodeURIComponent(selectedMission)}&limit=1000`),
           api.get(`/analytics/intrusion/analytics?mission_id=${encodeURIComponent(selectedMission)}`),
         ]);
 
@@ -438,13 +470,16 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
           const raw = evRes.value.data;
           evList = Array.isArray(raw) ? raw : (Array.isArray(raw?.events) ? raw.events : []);
         }
-        setEvents(evList);
 
         if (anRes.status === 'fulfilled' && anRes.value?.data) {
           setAnalyticsData(anRes.value.data);
+          if (Array.isArray(anRes.value.data.events) && anRes.value.data.events.length > evList.length) {
+            evList = anRes.value.data.events;
+          }
         } else {
           setAnalyticsData(null);
         }
+        setEvents(evList);
       } catch (err) {
         console.error('Error fetching mission review data:', err);
         if (active) {
@@ -462,34 +497,73 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
   // Review KPI calculations
   const kpis = useMemo(() => {
     const evArr = Array.isArray(events) ? events : [];
-    const totalEvents = evArr.length;
-    const uniqueTracks = new Set(evArr.map(e => e.track_id).filter(Boolean)).size;
-    const dwellTimes = evArr.map(e => Number(e.dwell_duration_s) || 0).filter(d => d > 0);
-    const avgDwell = dwellTimes.length > 0
-      ? (dwellTimes.reduce((a, b) => a + b, 0) / dwellTimes.length).toFixed(1)
-      : '0.0';
+    const totalEvents = analyticsData?.total_events != null ? analyticsData.total_events : evArr.length;
+    const uniqueTracks = analyticsData?.unique_tracks != null
+      ? analyticsData.unique_tracks
+      : new Set(evArr.map(e => String(e.track_id)).filter(Boolean)).size;
 
-    const classCounts = evArr.reduce((acc, e) => {
-      const cls = (e.track_class || 'UNKNOWN').toUpperCase();
-      acc[cls] = (acc[cls] || 0) + 1;
-      return acc;
-    }, {});
+    let avgDwell = '0.0';
+    if (analyticsData?.avg_dwell_time_s != null && !isNaN(analyticsData.avg_dwell_time_s)) {
+      avgDwell = Number(analyticsData.avg_dwell_time_s).toFixed(1);
+    } else {
+      const dwellTimes = evArr.map(e => Number(e.dwell_duration_s) || 0).filter(d => d > 0);
+      if (dwellTimes.length > 0) {
+        avgDwell = (dwellTimes.reduce((a, b) => a + b, 0) / dwellTimes.length).toFixed(1);
+      }
+    }
 
-    const topClass = Object.entries(classCounts).sort((a, b) => b[1] - a[1])[0];
+    // Class counts from analyticsData or events
+    let topClass = '—';
+    if (analyticsData?.detections_by_class && Object.keys(analyticsData.detections_by_class).length > 0) {
+      const sorted = Object.entries(analyticsData.detections_by_class).sort((a, b) => b[1] - a[1]);
+      if (sorted.length > 0) {
+        topClass = `${sorted[0][0]} (${sorted[0][1]})`;
+      }
+    } else if (evArr.length > 0) {
+      const classCounts = evArr.reduce((acc, e) => {
+        const cls = (e.track_class || 'UNKNOWN').toUpperCase();
+        acc[cls] = (acc[cls] || 0) + 1;
+        return acc;
+      }, {});
+      const sorted = Object.entries(classCounts).sort((a, b) => b[1] - a[1]);
+      if (sorted.length > 0) {
+        topClass = `${sorted[0][0]} (${sorted[0][1]})`;
+      }
+    }
+
+    // Active intruders: evaluate latest state per unique track
+    const latestStateByTrack = {};
+    const sortedEv = [...evArr].sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
+    sortedEv.forEach(e => {
+      if (e.track_id != null) {
+        latestStateByTrack[String(e.track_id)] = (e.state_to || '').toUpperCase();
+      }
+    });
+    const activeIntrusions = Object.values(latestStateByTrack).filter(
+      st => st === 'INSIDE' || st === 'DWELLING' || st === 'ENTERING'
+    ).length;
+
+    const hasGeofence = (zoneStatus?.is_loaded)
+      ? 'ARMED'
+      : (evArr.length > 0 || evArr.some(e => e.zone_id) ? 'RECORDED' : 'NONE');
 
     return {
       totalEvents,
       uniqueTracks,
       avgDwell: `${avgDwell}s`,
-      topClass: topClass ? `${topClass[0]} (${topClass[1]})` : '—',
-      activeIntrusions: evArr.filter(e => e.state_to === 'INSIDE' || e.state_to === 'DWELLING').length,
+      topClass,
+      activeIntrusions,
+      sessionGeofence: hasGeofence,
     };
-  }, [events]);
+  }, [events, analyticsData, zoneStatus]);
 
-  // Timeline chart data
+  // Timeline chart data (sorted chronologically ascending)
   const chartData = useMemo(() => {
-    const evArr = Array.isArray(events) ? events : [];
+    const evArr = Array.isArray(events) ? [...events] : [];
     if (evArr.length === 0) return [];
+    // Sort events ascending so timeline flows chronologically left-to-right
+    evArr.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
+
     // Group events into time buckets (minute intervals)
     const buckets = {};
     evArr.forEach(e => {
@@ -509,7 +583,7 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
         buckets[timeKey][st] += 1;
       }
     });
-    return Object.values(buckets).slice(-15);
+    return Object.values(buckets).slice(-20);
   }, [events]);
 
   // Filtered and paginated events table
@@ -529,7 +603,15 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
   // Export mission analytics JSON
   const handleExportJson = () => {
     if (!selectedMission) return;
-    const jsonStr = JSON.stringify(analyticsData || { mission_id: selectedMission, events }, null, 2);
+    const exportPayload = analyticsData || {
+      schema_version: '1.0',
+      mission_id: selectedMission,
+      total_events: kpis.totalEvents,
+      unique_tracks: kpis.uniqueTracks,
+      avg_dwell_time_s: parseFloat(kpis.avgDwell) || 0.0,
+      events,
+    };
+    const jsonStr = JSON.stringify(exportPayload, null, 2);
     const blob = new Blob([jsonStr], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1014,9 +1096,11 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
                   {missions && missions.length > 0 ? (
                     missions.map(m => {
                       const id = typeof m === 'string' ? m : (m.mission_id || m.id || m.name);
-                      const label = typeof m === 'string' ? m : `${m.mission_id || m.id}${m.name ? ` — ${m.name}` : ''}`;
+                      const count = missionMeta[id] || 0;
+                      const countLabel = count > 0 ? ` (${count} breach event${count > 1 ? 's' : ''})` : '';
+                      const baseLabel = typeof m === 'string' ? m : `${m.mission_id || m.id}${m.name ? ` — ${m.name}` : ''}`;
                       return (
-                        <option key={id} value={id}>{label}</option>
+                        <option key={id} value={id}>{baseLabel}{countLabel}</option>
                       );
                     })
                   ) : (
@@ -1044,7 +1128,7 @@ export default function IntrusionAnalytics({ activeDrone: initialDrone, drones =
               { label: 'AVG DWELL DURATION', val: kpis.avgDwell, tone: 'text-amber-400' },
               { label: 'TOP BREACH CLASS', val: kpis.topClass, tone: 'text-purple-400' },
               { label: 'ACTIVE INTRUDERS', val: kpis.activeIntrusions, tone: 'text-red-400' },
-              { label: 'SESSION GEOFENCE', val: zoneStatus?.is_loaded ? 'ARMED' : 'RECORDED', tone: 'text-sky-400' },
+              { label: 'SESSION GEOFENCE', val: kpis.sessionGeofence, tone: kpis.sessionGeofence === 'ARMED' ? 'text-emerald-400' : 'text-sky-400' },
             ].map((k, i) => (
               <div
                 key={i}

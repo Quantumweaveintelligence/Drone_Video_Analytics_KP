@@ -12,7 +12,7 @@ from database import async_session_factory
 from models import Drone, ModelConfig
 from core.security import get_current_user, require_roles, _row_to_dict
 from core.config import (
-    CROWD_URL, PERSON_URL, VEHICLE_URL, ANPR_URL, INTRUSION_URL, VESSEL_URL,
+    CROWD_URL, PERSON_URL, VEHICLE_URL, ANPR_URL, INTRUSION_URL, VESSEL_URL, ANOMALY_URL,
     MINIO_PROXY_ENDPOINT, MINIO_PROXY_ACCESS, MINIO_PROXY_SECRET, MINIO_PROXY_SECURE,
     limiter,
 )
@@ -121,6 +121,7 @@ AVAILABLE_MODELS = [
     {"key": "plate",        "label": "Number-Plate (ANPR)",          "gpu_pct": 20, "throughput_fps": 40, "default": False},
     {"key": "intrusion",    "label": "GeoTrax Intrusion Detection",  "gpu_pct": 15, "throughput_fps": 45, "default": False},
     {"key": "vessel",       "label": "SeaDrone Maritime Tracking",   "gpu_pct": 15, "throughput_fps": 60, "default": False},
+    {"key": "anomaly",      "label": "Anomaly & Suspicious Activity (VisDrone YOLO11x)", "gpu_pct": 30, "throughput_fps": 12, "default": False},
 ]
 
 
@@ -134,6 +135,7 @@ def _build_service_map():
         "plate":     ANPR_URL,
         "intrusion": INTRUSION_URL,
         "vessel":    VESSEL_URL,
+        "anomaly":   ANOMALY_URL,
     }
 
 
@@ -159,6 +161,7 @@ async def _get_service_stream_status() -> dict:
         "plate":     f"{ANPR_URL}/health",
         "intrusion": f"{INTRUSION_URL}/health",
         "vessel":    f"{VESSEL_URL}/health",
+        "anomaly":   f"{ANOMALY_URL}/health",
     }
     status = {}
     async with httpx.AsyncClient() as client:
@@ -441,7 +444,11 @@ async def minio_image_proxy(bucket: str, key: str, _user=Depends(get_current_use
         raise HTTPException(status_code=400, detail="bucket and key are required")
 
     # Security: only allow known buckets
-    ALLOWED_BUCKETS = {"dvas-plates", "dvas-vehicles", "dvas-evidence", "dvas-faces", "dvas-heatmaps", "dvas-intrusion", "dvas-watchlist", "dvas-vessels-maritime"}
+    ALLOWED_BUCKETS = {
+        "dvas-plates", "dvas-vehicles", "dvas-evidence", "dvas-faces",
+        "dvas-heatmaps", "dvas-intrusion", "dvas-watchlist", "dvas-vessels-maritime",
+        "dvas-anomaly"
+    }
     if bucket not in ALLOWED_BUCKETS:
         raise HTTPException(status_code=403, detail=f"Bucket '{bucket}' not allowed")
 

@@ -45,6 +45,7 @@ export const NAV_MANIFEST = {
         { key: "traffic", path: "/command/traffic", labelKey: "cmd.page.traffic", fallback: "Vehicle & Vessel", Icon: Car },
         { key: "person", path: "/command/person", labelKey: "cmd.page.person", fallback: "Person Tracking", Icon: UserSearch },
         { key: "intrusion", path: "/command/intrusion", labelKey: "cmd.page.intrusion", fallback: "Intrusion Detection", Icon: Shield },
+        { key: "anomaly", path: "/command/anomaly", labelKey: "cmd.page.anomaly", fallback: "Anomaly Monitor", Icon: AlertTriangle },
       ]
     },
     {
@@ -77,6 +78,7 @@ export const NAV_MANIFEST = {
         { key: "traffic", path: "/command/traffic", labelKey: "cmd.page.traffic", fallback: "Vehicle & Vessel", Icon: Car },
         { key: "person", path: "/command/person", labelKey: "cmd.page.person", fallback: "Person Tracking", Icon: UserSearch },
         { key: "intrusion", path: "/command/intrusion", labelKey: "cmd.page.intrusion", fallback: "Intrusion Detection", Icon: Shield },
+        { key: "anomaly", path: "/command/anomaly", labelKey: "cmd.page.anomaly", fallback: "Anomaly Monitor", Icon: AlertTriangle },
       ]
     },
     {

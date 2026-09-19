@@ -208,6 +208,7 @@ async def _stream_loop():
                 for d in discovered:
                     if d not in active_drones:
                         active_drones.append(d)
+                        await ensure_drone(d)
                         last_ids[d] = "0"
                         _geofence_managers[d] = GeofenceManager()
                         _state_machines[d] = None
@@ -552,6 +553,7 @@ async def _stream_loop():
 
                             # Write to intrusion_events table
                             try:
+                                await ensure_drone(drone_id)
                                 await pool.execute(
                                     """INSERT INTO intrusion_events (
                                         drone_id, mission_id, zone_id, track_id,
@@ -861,8 +863,10 @@ async def get_events(
         for k, v in event.items():
             if isinstance(v, datetime):
                 event[k] = v.isoformat()
-            elif hasattr(v, "hex"):  # UUID
+            elif isinstance(v, uuid.UUID):
                 event[k] = str(v)
+            elif isinstance(v, (float, int)):
+                event[k] = v
         events.append(event)
 
     return {"events": events, "count": len(events)}
@@ -888,8 +892,10 @@ async def get_analytics(mission_id: str):
         for k, v in event.items():
             if isinstance(v, datetime):
                 event[k] = v.isoformat()
-            elif hasattr(v, "hex"):
+            elif isinstance(v, uuid.UUID):
                 event[k] = str(v)
+            elif isinstance(v, (float, int)):
+                event[k] = v
         events.append(event)
         track_ids.add(event.get("track_id"))
         cls = event.get("track_class", "UNKNOWN")
@@ -897,7 +903,7 @@ async def get_analytics(mission_id: str):
 
     # Summary stats
     dwell_times = [
-        e.get("dwell_duration_s", 0.0) for e in events
+        float(e.get("dwell_duration_s") or 0.0) for e in events
         if e.get("dwell_duration_s") and e.get("state_to") in ("DWELLING", "EXITED")
     ]
 
@@ -910,3 +916,33 @@ async def get_analytics(mission_id: str):
         "avg_dwell_time_s": round(sum(dwell_times) / len(dwell_times), 2) if dwell_times else 0.0,
         "events": events,
     }
+
+
+# ── Intrusion Missions Summary ───────────────────────────────────────────────
+
+@app.get("/intrusion/missions")
+async def get_intrusion_missions():
+    """List missions with intrusion event counts and details."""
+    pool = await get_pool()
+    rows = await pool.fetch("""
+        SELECT 
+            mission_id,
+            COUNT(*)::int as event_count,
+            COUNT(DISTINCT track_id)::int as unique_tracks,
+            MIN(ts) as first_event,
+            MAX(ts) as last_event,
+            array_agg(DISTINCT track_class) as breach_classes
+        FROM intrusion_events
+        WHERE mission_id IS NOT NULL AND mission_id != ''
+        GROUP BY mission_id
+        ORDER BY MAX(ts) DESC
+    """)
+    missions = []
+    for r in rows:
+        d = dict(r)
+        if isinstance(d.get("first_event"), datetime):
+            d["first_event"] = d["first_event"].isoformat()
+        if isinstance(d.get("last_event"), datetime):
+            d["last_event"] = d["last_event"].isoformat()
+        missions.append(d)
+    return {"missions": missions, "count": len(missions)}

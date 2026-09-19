@@ -1,0 +1,31 @@
+# Drone Suspicious Object Detection System - Configuration
+# Phase 1: Aerial Object Detection Baseline (dronefreak/visdrone-yolov11x)
+
+source: "videoplayback_1080p.mp4"
+
+model:
+  name: "dronefreak/visdrone-yolov11x"
+  repo_id: "dronefreak/visdrone-yolov11x"
+  filename: "best.pt"
+  local_weights: "models/weights/visdrone-yolov11x.pt"
+  device: "cuda"  # 'cuda' or 'cpu'
+
+detection:
+  # Standard aerial inference resolution (640 is optimal for 4GB VRAM GPUs)
+  imgsz: 640
+  conf: 0.25
+  iou: 0.45
+  # Filter specific VisDrone classes if desired (empty list = all classes)
+  filter_classes: []
+
+tiled_inference:
+  enabled: false
+  tile_size: 640
+  overlap: 0.20
+
+output:
+  dir: "output"
+  save_video: true
+  output_video: "output/phase1_visdrone_aerial_test.mp4"
+  save_metrics: true
+  metrics_file: "output/phase1_metrics.json"

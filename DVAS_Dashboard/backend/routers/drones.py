@@ -9,7 +9,7 @@ from database import async_session_factory
 from models import Mission, Drone, Alert, Evidence, Export
 from core.security import get_current_user, scope_filter_for, _apply_scope_to_query, _row_to_dict
 from core.analytics_client import _analytics_get
-from core.config import ANPR_URL
+from core.config import ANPR_URL, INTRUSION_URL
 from audit_service import write_audit_v2
 
 """
@@ -62,7 +62,7 @@ async def list_drones(user: dict = Depends(get_current_user)):
 
 @router.get("/missions")
 async def list_missions(user: dict = Depends(get_current_user)):
-    # Synchronize missing missions from ANPR, drone_postgres flight telemetry (tracks), and evidence captures
+    # Synchronize missing missions from ANPR, Intrusion, drone_postgres flight telemetry (tracks), and evidence captures
     try:
         discovered_missions = set()
 
@@ -74,7 +74,19 @@ async def list_missions(user: dict = Depends(get_current_user)):
         except Exception:
             pass
 
-        # 2. Check drone_postgres tracks for all recorded flight missions
+        # 2. Check Intrusion microservice
+        try:
+            intrusion_res = await _analytics_get(f"{INTRUSION_URL}/intrusion/missions", timeout=3.0)
+            if intrusion_res and "missions" in intrusion_res:
+                for im in intrusion_res["missions"]:
+                    if isinstance(im, dict) and im.get("mission_id"):
+                        discovered_missions.add(im["mission_id"])
+                    elif isinstance(im, str):
+                        discovered_missions.add(im)
+        except Exception:
+            pass
+
+        # 3. Check drone_postgres tracks for all recorded flight missions
         try:
             import asyncpg
             conn = await asyncpg.connect("postgresql://dvas:dvas_secret@drone_postgres:5432/dvas")
@@ -91,7 +103,15 @@ async def list_missions(user: dict = Depends(get_current_user)):
             logger.debug(f"Could not read missions from drone_postgres: {exc}")
 
         async with async_session_factory() as session:
-            # 3. Check evidence table for distinct missions
+            # 4. Check drones table for distinct missions
+            drone_missions = await session.execute(
+                select(distinct(Drone.mission_id)).where(Drone.mission_id != "", Drone.mission_id.is_not(None))
+            )
+            for m in drone_missions.scalars().all():
+                if m:
+                    discovered_missions.add(m)
+
+            # 5. Check evidence table for distinct missions
             evi_res = await session.execute(
                 select(distinct(Evidence.mission_id)).where(Evidence.mission_id != "", Evidence.mission_id.is_not(None))
             )
@@ -121,14 +141,20 @@ async def list_missions(user: dict = Depends(get_current_user)):
                             except Exception:
                                 pass
                         
-                        drone_id = f"DRN-{mid}" if mid.startswith("MSN-") else ""
+                        # Lookup associated drone if available
+                        drone_stmt = select(Drone).where(Drone.mission_id == mid).limit(1)
+                        drone_match = (await session.execute(drone_stmt)).scalar_one_or_none()
+                        op_name = drone_match.operator_name if drone_match and drone_match.operator_name else "Safna S"
+                        juris = drone_match.jurisdiction if drone_match and drone_match.jurisdiction else "Thiruvananthapuram"
+                        drone_id = drone_match.id if drone_match else (f"DRN-{mid}" if mid.startswith("MSN-") else "")
+
                         session.add(Mission(
                             mission_id=mid,
                             name=f"Mission {mid}",
                             status="completed",
                             drone_id=drone_id,
-                            jurisdiction="Thiruvananthapuram",
-                            operator_name="System Recovered",
+                            jurisdiction=juris,
+                            operator_name=op_name,
                             operator_ids=[],
                             started_at=started_at
                         ))

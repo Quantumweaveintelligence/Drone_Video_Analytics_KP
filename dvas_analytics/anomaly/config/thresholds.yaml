@@ -1,0 +1,110 @@
+# Thresholds and Cognitive Reasoning Configuration
+# Drone Suspicious Object Detection System - Multi-Tier Architecture
+# Calibrated for Aerial Drone Feeds (VisDrone domain) to yield 2-5 high-quality alerts
+
+confidence:
+  detector:
+    person: 0.35           # Production calibrated
+    ordinary_object: 0.35  # Production calibrated
+    vehicle: 0.35          # Production calibrated
+    weapon_like: 0.65      # Production calibrated (higher certainty for weapons)
+  tracking:
+    minimum: 0.35
+  association:
+    minimum: 0.42
+    strong: 0.60
+  behavior:
+    observation: 0.42
+    candidate: 0.55
+    strong: 0.62
+  event:
+    candidate: 0.55
+    medium: 0.60
+    high: 0.68
+    critical: 0.75
+  alert:
+    minimum: 0.72          # Production calibrated
+    high_priority: 0.80
+    critical: 0.86
+
+rule_confidence_bands:
+  very_weak: 0.30          # < 0.30: Ignore
+  weak: 0.42               # 0.30 - 0.41: Record internally
+  moderate: 0.55           # 0.42 - 0.54: Monitor
+  strong: 0.65             # 0.55 - 0.64: Candidate event
+  very_strong: 0.75        # 0.65 - 0.74: Event evidence
+  extreme: 1.00            # >= 0.75: High-quality evidence
+
+temporal_confirmation:
+  ordinary_behavior:
+    window: 6
+    required: 4
+  important_behavior:
+    window: 10
+    required: 6
+  weapon_like:
+    window: 10
+    required: 6
+
+hysteresis:
+  enter_threshold: 0.72    # Production calibrated to prevent false alert flicker
+  maintain_threshold: 0.60 # Production calibrated
+  clear_threshold: 0.48    # Production calibrated
+  clear_frames: 10
+
+smoothing:
+  detector_alpha: 0.40
+
+evidence_groups:
+  min_groups_medium: 2     # 2/3 Rule: requires 2 independent evidence groups
+  min_groups_high: 2       # Allows corroborated multi-signal alerts
+
+abandoned_object:
+  observation_seconds: 4.0
+  candidate_seconds: 10.0
+  minimum_unattended_seconds: 20.0
+  high_confidence_seconds: 40.0
+  owner_departure_dist_px: 75.0
+  weights:
+    object_detection: 0.15
+    owner_association: 0.15
+    placement: 0.15
+    stationarity: 0.20
+    owner_departure: 0.15
+    owner_distance: 0.10
+    temporal_persistence: 0.10
+
+weapon:
+  detector_min: 0.58
+  temporal_persistence_frames: 4
+  track_confidence_min: 0.55
+  hand_association_min: 0.55
+  abandoned_stationarity_min: 0.55
+  abandoned_unattended_sec: 20.0
+  unknown_owner_persistence_sec: 10.0
+  unknown_owner_stationarity_min: 0.55
+
+behavior:
+  running_confidence_min: 0.55
+  running_duration_min: 2.0
+  loitering_duration_sec: 30.0
+  loitering_repetition_cycles: 2
+  following_trajectory_similarity: 0.58
+  following_distance_stability: 0.55
+  following_duration_sec: 8.0
+  opposing_flow_anomaly_min: 0.55
+  opposing_flow_persistence_sec: 4.0
+  sudden_stop_stationarity_sec: 2.5
+
+vehicle:
+  wrong_way_confidence_min: 0.58
+  wrong_way_speed_thresh_px: 25.0
+  pedestrian_proximity_threat_px: 110.0
+  abrupt_stop_decel_percent: 0.60
+  abrupt_stop_duration_sec: 2.5
+  dropoff_package_stationary_sec: 15.0
+
+cooldown:
+  default_seconds: 45.0
+  alert_evidence_snapshot: true
+

@@ -2,7 +2,7 @@ import asyncio
 import logging
 from typing import Optional, List, Dict, Any
 from urllib.parse import quote
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, Body
 from fastapi.responses import StreamingResponse
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,7 +13,7 @@ from core.security import get_current_user, _row_to_dict
 from core.analytics_client import _analytics_get, _analytics_post, _analytics_put, _analytics_delete, _service_headers
 from core.config import (
     ANALYTICS_BASE, CROWD_URL, PERSON_URL, VEHICLE_URL, ANPR_URL, INTRUSION_URL,
-    VESSEL_URL,
+    VESSEL_URL, ANOMALY_URL,
 )
 from audit_service import write_audit_v2
 from schemas.models import WatchlistAddIn
@@ -24,7 +24,7 @@ router = APIRouter(prefix="/api", tags=["Analytics"])
 # ── Analytics Health ──────────────────────────────────────────────────────────
 @router.get("/analytics/health")
 async def analytics_health(user: dict = Depends(get_current_user)):
-    """Aggregated health check across all 4 analytics services."""
+    """Aggregated health check across all analytics services."""
     return await _analytics_get(f"{ANALYTICS_BASE}/health/all")
 
 
@@ -47,6 +47,7 @@ async def analytics_models_status(user: dict = Depends(get_current_user)):
         _analytics_get(f"{ANPR_URL}/health"),
         _analytics_get(f"{INTRUSION_URL}/health"),
         _analytics_get(f"{VESSEL_URL}/health"),
+        _analytics_get(f"{ANOMALY_URL}/health"),
     )
     return {
         "crowd":     results[0],
@@ -55,6 +56,7 @@ async def analytics_models_status(user: dict = Depends(get_current_user)):
         "anpr":      results[3],
         "intrusion": results[4],
         "vessel":    results[5],
+        "anomaly":   results[6],
     }
 
 
@@ -1230,6 +1232,14 @@ async def intrusion_analytics(
     )
 
 
+@router.get("/analytics/intrusion/missions")
+async def intrusion_missions(
+    user: dict = Depends(get_current_user),
+):
+    """List missions with recorded intrusion events and summary counts."""
+    return await _analytics_get(f"{INTRUSION_URL}/intrusion/missions")
+
+
 @router.post("/analytics/intrusion/config")
 async def intrusion_config_update(
     request: Request,
@@ -1690,10 +1700,11 @@ async def vessel_tracks(
     user: dict = Depends(get_current_user),
     drone_id: str = "",
     mission_id: str = "",
-    limit: int = 100
+    limit: int = 100,
+    window: int = 60
 ):
     """Retrieve active vessel tracks from vessel-analyzer."""
-    url = f"{VESSEL_URL}/tracks/active?limit={limit}"
+    url = f"{VESSEL_URL}/tracks/active?limit={limit}&window={window}"
     if drone_id:
         url += f"&drone_id={drone_id}"
     if mission_id:
@@ -1766,3 +1777,147 @@ async def vessel_heatmap(
     if drone_id:
         url += f"?drone_id={drone_id}"
     return await _analytics_get(url)
+
+
+# ── Anomaly & Suspicious Activity Endpoints ─────────────────────────────────
+
+@router.get("/analytics/anomaly/health")
+async def anomaly_health(user: dict = Depends(get_current_user)):
+    """Health check from anomaly-analyzer."""
+    return await _analytics_get(f"{ANOMALY_URL}/health")
+
+
+@router.get("/analytics/anomaly/stream/start")
+async def anomaly_stream_start(user: dict = Depends(get_current_user)):
+    """Start anomaly analyzer stream consumer loop."""
+    return await _analytics_get(f"{ANOMALY_URL}/stream/start")
+
+
+@router.get("/analytics/anomaly/stream/stop")
+async def anomaly_stream_stop(user: dict = Depends(get_current_user)):
+    """Stop anomaly analyzer stream consumer loop."""
+    return await _analytics_get(f"{ANOMALY_URL}/stream/stop")
+
+
+@router.get("/analytics/anomaly/annotated")
+@router.get("/analytics/anomaly/annotated/latest")
+async def anomaly_annotated_latest(
+    user: dict = Depends(get_current_user),
+    drone_id: str = ""
+):
+    """Proxy latest annotated JPEG frame with tactical anomaly HUD."""
+    params = {}
+    if drone_id:
+        params["drone_id"] = drone_id
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            r = await client.get(f"{ANOMALY_URL}/annotated/latest", params=params)
+            if r.status_code == 200:
+                return Response(
+                    content=r.content,
+                    media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store, no-cache, must-revalidate"}
+                )
+            raise HTTPException(r.status_code, "Failed to retrieve annotated anomaly frame")
+        except httpx.RequestError as exc:
+            raise HTTPException(503, f"Anomaly service unreachable: {exc}")
+
+
+@router.get("/analytics/anomaly/tracks")
+@router.get("/analytics/anomaly/tracks/active")
+async def anomaly_tracks(
+    user: dict = Depends(get_current_user),
+    drone_id: str = "",
+    limit: int = 100
+):
+    """Retrieve active anomaly tracks."""
+    url = f"{ANOMALY_URL}/tracks/active?limit={limit}"
+    if drone_id:
+        url += f"&drone_id={drone_id}"
+    return await _analytics_get(url)
+
+
+@router.get("/analytics/anomaly/events")
+@router.get("/analytics/anomaly/alerts/recent")
+async def anomaly_alerts(
+    user: dict = Depends(get_current_user),
+    drone_id: str = "",
+    mission_id: str = "",
+    event_type: str = "",
+    severity: str = "",
+    limit: int = 50
+):
+    """Retrieve recent anomaly alerts."""
+    url = f"{ANOMALY_URL}/alerts/recent?limit={limit}"
+    if drone_id:
+        url += f"&drone_id={drone_id}"
+    if mission_id:
+        url += f"&mission_id={mission_id}"
+    if event_type:
+        url += f"&event_type={event_type}"
+    if severity:
+        url += f"&severity={severity}"
+    return await _analytics_get(url)
+
+
+@router.get("/analytics/anomaly/alerts/{alert_id}")
+async def anomaly_alert_detail(
+    alert_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Retrieve full detail for a single anomaly alert."""
+    return await _analytics_get(f"{ANOMALY_URL}/alerts/{alert_id}")
+
+
+@router.get("/analytics/anomaly/stats")
+@router.get("/analytics/anomaly/stats/summary")
+async def anomaly_stats_summary(
+    user: dict = Depends(get_current_user),
+    drone_id: str = "",
+    mission_id: str = ""
+):
+    """Retrieve summary metrics for anomaly monitoring."""
+    url = f"{ANOMALY_URL}/stats/summary"
+    params = []
+    if drone_id:
+        params.append(f"drone_id={drone_id}")
+    if mission_id:
+        params.append(f"mission_id={mission_id}")
+    if params:
+        url += "?" + "&".join(params)
+    return await _analytics_get(url)
+
+
+@router.get("/analytics/anomaly/stats/by-type")
+async def anomaly_stats_by_type(
+    user: dict = Depends(get_current_user),
+    drone_id: str = "",
+    mission_id: str = ""
+):
+    """Retrieve alert breakdown by anomaly event type."""
+    url = f"{ANOMALY_URL}/stats/by-type"
+    params = []
+    if drone_id:
+        params.append(f"drone_id={drone_id}")
+    if mission_id:
+        params.append(f"mission_id={mission_id}")
+    if params:
+        url += "?" + "&".join(params)
+    return await _analytics_get(url)
+
+
+@router.get("/analytics/anomaly/config")
+async def anomaly_config_get(user: dict = Depends(get_current_user)):
+    """Retrieve current runtime threshold config."""
+    return await _analytics_get(f"{ANOMALY_URL}/config")
+
+
+@router.put("/analytics/anomaly/config")
+async def anomaly_config_put(
+    user: dict = Depends(get_current_user),
+    body: dict = Body(...)
+):
+    """Update runtime threshold config."""
+    return await _analytics_put(f"{ANOMALY_URL}/config", body)
+
