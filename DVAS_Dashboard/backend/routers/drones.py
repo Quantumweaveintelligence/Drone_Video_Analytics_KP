@@ -341,6 +341,43 @@ async def end_mission_record(
     return {"status": "ended", "mission_id": mission_id}
 
 
+@router.delete("/missions/{mission_id}")
+async def delete_mission_record(
+    mission_id: str,
+    user: dict = Depends(get_current_user),
+    request: Request = None,
+):
+    """Delete a mission record from the database."""
+    mission_name = mission_id
+    async with async_session_factory() as session:
+        mission = await session.get(Mission, mission_id)
+        if not mission:
+            return {"status": "not_found", "mission_id": mission_id}
+        mission_name = mission.name
+        await session.delete(mission)
+        await session.commit()
+
+    try:
+        await write_audit_v2(
+            actor=user,
+            action="DELETE_MISSION",
+            action_type="delete",
+            category="operations",
+            severity="warn",
+            target=mission_id,
+            target_type="mission",
+            target_id=mission_id,
+            target_name=mission_name,
+            details=f"Mission record '{mission_name}' ({mission_id}) deleted",
+            source_module="edge",
+            request=request,
+        )
+    except Exception as audit_err:
+        logger.warning(f"Could not write audit for DELETE_MISSION: {audit_err}")
+
+    return {"status": "deleted", "mission_id": mission_id}
+
+
 # ---------- Command dashboard: aggregate KPIs ----------
 @router.get("/command/kpis")
 async def command_kpis(user: dict = Depends(get_current_user)):

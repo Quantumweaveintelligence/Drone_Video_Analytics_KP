@@ -842,6 +842,10 @@ class PipelineManager:
                         break
             return list(self.mission_history)
 
+    def delete_mission_history(self, mission_id: str):
+        with self.lock:
+            self.mission_history = [m for m in self.mission_history if m.get("mission_id") != mission_id]
+
     def _history_loop(self):
         while self._running:
             try:
@@ -990,6 +994,10 @@ class PipelineManager:
                         m["frames_selected"] = self.frames_selected
                         m["frames_discarded"] = max(0, self.pipeline_frames_in - self.frames_selected)
             return list(self.mission_history)
+
+    def delete_mission_history(self, mission_id: str):
+        with self.lock:
+            self.mission_history = [m for m in self.mission_history if m.get("mission_id") != mission_id]
 
 
 # ---------------------------------------------------------------------------
@@ -1311,6 +1319,13 @@ def get_active_mission(auth: dict = Depends(verify_edge_auth)):
 @app.get("/api/edge/mission/history")
 def get_edge_mission_history(auth: dict = Depends(verify_edge_auth)):
     return pipeline.get_mission_history()
+
+
+@app.delete("/api/edge/mission/history/{mission_id}")
+def delete_edge_mission_history(mission_id: str, auth: dict = Depends(verify_edge_auth)):
+    if hasattr(pipeline, "delete_mission_history"):
+        pipeline.delete_mission_history(mission_id)
+    return {"status": "deleted", "mission_id": mission_id}
 
 
 @app.get("/api/edge/system-logs")

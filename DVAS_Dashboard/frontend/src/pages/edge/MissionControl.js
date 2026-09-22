@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import AppShell from '@/components/layout/AppShell';
-import { Target, Play, Trash, XCircle, CheckCircle, Cpu } from 'lucide-react';
+import { Target, Play, Trash, Trash2, XCircle, CheckCircle, Cpu } from 'lucide-react';
 import { authFetch, getAuthToken } from '@/lib/api';
 
 export default function MissionControl() {
@@ -8,10 +8,29 @@ export default function MissionControl() {
   const [serverSend, setServerSend] = useState(false);
   const [pipelineEnabled, setPipelineEnabled] = useState(true);
 
-  const [form, setForm] = useState({ name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: 'ALPHA' });
+  const [defaultSquadron, setDefaultSquadron] = useState(() => {
+    return localStorage.getItem('dvas_default_squadron') || 'ALPHA';
+  });
+
+  const [form, setForm] = useState(() => {
+    const initSquadron = localStorage.getItem('dvas_default_squadron') || 'ALPHA';
+    return { name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: initSquadron };
+  });
   const [videoFile, setVideoFile] = useState(null);
   const [srtFile, setSrtFile] = useState(null);
   const [maxUploadMb, setMaxUploadMb] = useState(2048);
+
+  const generateMissionId = (squadron = form.squadron || defaultSquadron || 'ALPHA') => {
+    const now = new Date();
+    const yyyy = now.getFullYear();
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    const dd = String(now.getDate()).padStart(2, '0');
+    const hh = String(now.getHours()).padStart(2, '0');
+    const min = String(now.getMinutes()).padStart(2, '0');
+    const ss = String(now.getSeconds()).padStart(2, '0');
+    const sq = (squadron || defaultSquadron || 'ALPHA').toUpperCase();
+    return `MSN-${yyyy}${mm}${dd}-${hh}${min}-${ss}-${sq}`;
+  };
 
   const [missionLog, setMissionLog] = useState(() => {
     const saved = localStorage.getItem('dvas_mission_log');
@@ -28,22 +47,73 @@ export default function MissionControl() {
     return [];
   });
 
-  useEffect(() => {
-    const fetchSettings = async () => {
-      try {
-        const resp = await authFetch('/edge-api/api/edge/settings');
-        if (resp.ok) {
-          const data = await resp.json();
-          if (data?.storage?.max_upload_size_mb) {
-            setMaxUploadMb(data.storage.max_upload_size_mb);
-          }
+  const fetchSettings = async () => {
+    try {
+      const resp = await authFetch('/edge-api/api/edge/settings');
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data?.storage?.max_upload_size_mb) {
+          setMaxUploadMb(data.storage.max_upload_size_mb);
         }
-      } catch (err) {
-        console.warn('Failed to load edge settings:', err);
+        const savedSquadron = data?.operator_preferences?.default_squadron;
+        if (savedSquadron) {
+          setDefaultSquadron(savedSquadron);
+          localStorage.setItem('dvas_default_squadron', savedSquadron);
+          setForm(prev => {
+            const isUnchangedOrEmpty = !prev.name && (!prev.squadron || prev.squadron === 'ALPHA' || prev.squadron === defaultSquadron);
+            const updatedSquadron = isUnchangedOrEmpty ? savedSquadron : (prev.squadron || savedSquadron);
+            return {
+              ...prev,
+              squadron: updatedSquadron,
+              id: prev.id && !prev.id.startsWith('MSN-') ? prev.id : (prev.name ? generateMissionId(updatedSquadron) : prev.id)
+            };
+          });
+        }
       }
-    };
+    } catch (err) {
+      console.warn('Failed to load edge settings:', err);
+    }
+  };
+
+  useEffect(() => {
     fetchSettings();
   }, []);
+
+  useEffect(() => {
+    const handleStorageChange = (e) => {
+      if (e.key === 'dvas_default_squadron' && e.newValue) {
+        const newSq = e.newValue;
+        setDefaultSquadron(newSq);
+        setForm(prev => {
+          if (!prev.name) {
+            return { ...prev, squadron: newSq };
+          }
+          return prev;
+        });
+      }
+    };
+
+    const handleWindowFocus = () => {
+      const stored = localStorage.getItem('dvas_default_squadron');
+      if (stored) {
+        setDefaultSquadron(stored);
+        setForm(prev => {
+          if (!prev.name && prev.squadron !== stored) {
+            return { ...prev, squadron: stored };
+          }
+          return prev;
+        });
+      }
+      fetchSettings();
+    };
+
+    window.addEventListener('storage', handleStorageChange);
+    window.addEventListener('focus', handleWindowFocus);
+    return () => {
+      window.removeEventListener('storage', handleStorageChange);
+      window.removeEventListener('focus', handleWindowFocus);
+    };
+  }, [defaultSquadron]);
 
   useEffect(() => {
     const fetchHistoricalMissions = async () => {
@@ -83,17 +153,6 @@ export default function MissionControl() {
   const [loading, setLoading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
-
-  const generateMissionId = (squadron = form.squadron || 'ALPHA') => {
-    const now = new Date();
-    const yyyy = now.getFullYear();
-    const mm = String(now.getMonth() + 1).padStart(2, '0');
-    const dd = String(now.getDate()).padStart(2, '0');
-    const hh = String(now.getHours()).padStart(2, '0');
-    const min = String(now.getMinutes()).padStart(2, '0');
-    const ss = String(now.getSeconds()).padStart(2, '0');
-    return `MSN-${yyyy}${mm}${dd}-${hh}${min}-${ss}-${squadron.toUpperCase()}`;
-  };
 
   const handleNameChange = (e) => {
     const name = e.target.value;
@@ -233,7 +292,7 @@ export default function MissionControl() {
           end: '--:--:--',
           status: 'active',
         }, ...prev]);
-        setForm({ name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: 'ALPHA' });
+        setForm({ name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: defaultSquadron });
         setVideoFile(null);
         setSrtFile(null);
 
@@ -302,6 +361,47 @@ export default function MissionControl() {
     } catch (err) {
       console.error('Failed to end mission:', err);
       setActiveMission(null);
+    }
+  };
+
+  const handleDeleteMissionLog = async (missionId, designation) => {
+    if (!missionId) return;
+
+    if (activeMission && activeMission.id === missionId) {
+      const confirmActive = window.confirm(
+        `Mission "${designation || missionId}" is currently active. Are you sure you want to delete it from the log? (We recommend ending the mission first).`
+      );
+      if (!confirmActive) return;
+    } else {
+      const confirmDelete = window.confirm(
+        `Are you sure you want to delete the mission log for "${designation || missionId}"?`
+      );
+      if (!confirmDelete) return;
+    }
+
+    // Optimistically remove from state and update localStorage
+    setMissionLog(prev => {
+      const updated = prev.filter(m => (m.id || m.mission_id) !== missionId);
+      localStorage.setItem('dvas_mission_log', JSON.stringify(updated));
+      return updated;
+    });
+
+    // Delete from backend database
+    try {
+      await authFetch(`/api/missions/${encodeURIComponent(missionId)}`, {
+        method: 'DELETE',
+      });
+    } catch (err) {
+      console.warn('Backend mission deletion error:', err);
+    }
+
+    // Also delete from edge memory if applicable
+    try {
+      await authFetch(`/edge-api/api/edge/mission/history/${encodeURIComponent(missionId)}`, {
+        method: 'DELETE',
+      });
+    } catch (err) {
+      // Ignored if not implemented on edge
     }
   };
 
@@ -458,7 +558,7 @@ export default function MissionControl() {
                     </div>
                   )}
 
-                  {/* Pipeline Toggle */}
+                  {/* AI Analytics Toggle */}
                   <button 
                     onClick={handleTogglePipeline}
                     className={`w-full py-2.5 border text-sm font-semibold tracking-wide uppercase transition-colors rounded flex items-center justify-center gap-2 ${
@@ -468,11 +568,11 @@ export default function MissionControl() {
                     }`}
                   >
                     <Cpu size={16} />
-                    {pipelineEnabled ? 'Pipeline: ON' : 'Pipeline: OFF — Direct Send'}
+                    {pipelineEnabled ? 'AI Analytics: ON' : 'AI Analytics: OFF — Raw Feed'}
                   </button>
                   {!pipelineEnabled && (
                     <div className="text-[10px] text-amber-400/70 text-center font-mono tracking-wide">
-                      Change Detection & Cognitive Selection bypassed — sending frames continuously as fast as network permits
+                      AI analytics bypassed — streaming raw frames directly without motion or cognitive filtering
                     </div>
                   )}
                 </div>
@@ -567,12 +667,16 @@ export default function MissionControl() {
                 </div>
                 <div>
                   <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Squadron</label>
-                  <input 
-                    type="text" 
-                    value={form.squadron} onChange={handleSquadronChange}
-                    className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm font-mono text-slate-200 uppercase"
-                    placeholder="e.g. ALPHA"
-                  />
+                  <select
+                    value={form.squadron}
+                    onChange={handleSquadronChange}
+                    className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm font-mono text-slate-200 uppercase cursor-pointer"
+                  >
+                    <option value="ALPHA">ALPHA SQUADRON</option>
+                    <option value="BRAVO">BRAVO SQUADRON</option>
+                    <option value="CHARLIE">CHARLIE SQUADRON</option>
+                    <option value="DELTA">DELTA SQUADRON</option>
+                  </select>
                 </div>
               </div>
               <div>
@@ -597,7 +701,7 @@ export default function MissionControl() {
                   <Play size={16} fill="currentColor" /> {loading ? 'Starting...' : 'Start Mission'}
                 </button>
                 <button 
-                  onClick={() => setForm({ name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: 'ALPHA' })}
+                  onClick={() => setForm({ name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: defaultSquadron })}
                   className="px-6 border border-slate-700 hover:bg-slate-800 text-slate-300 py-2.5 text-sm font-semibold tracking-wide rounded transition-colors"
                 >
                   Clear
@@ -609,8 +713,9 @@ export default function MissionControl() {
 
         {/* Mission Log Table */}
         <div className="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden">
-          <div className="p-4 border-b border-slate-800">
+          <div className="p-4 border-b border-slate-800 flex justify-between items-center">
             <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-400">Mission Log</h2>
+            <span className="text-xs text-slate-500 font-mono">{missionLog.length} {missionLog.length === 1 ? 'Record' : 'Records'}</span>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm whitespace-nowrap">
@@ -624,11 +729,12 @@ export default function MissionControl() {
                   <th className="px-4 py-3">Start</th>
                   <th className="px-4 py-3">End</th>
                   <th className="px-4 py-3">Status</th>
+                  <th className="px-4 py-3 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/50 text-slate-300">
                 {missionLog.map((m, i) => (
-                  <tr key={i} className="hover:bg-slate-800/20 transition-colors">
+                  <tr key={m.id || i} className="hover:bg-slate-800/20 transition-colors">
                     <td className="px-4 py-3 font-mono text-sky-200">{m.id}</td>
                     <td className="px-4 py-3 font-medium">{m.designation}</td>
                     <td className="px-4 py-3 font-mono">{m.drone}</td>
@@ -647,8 +753,26 @@ export default function MissionControl() {
                         </span>
                       )}
                     </td>
+                    <td className="px-4 py-3 text-right">
+                      <button
+                        data-testid={`delete-mission-${m.id || i}`}
+                        onClick={() => handleDeleteMissionLog(m.id, m.designation)}
+                        title="Delete mission log"
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-rose-400 hover:text-rose-200 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 rounded transition-colors cursor-pointer"
+                      >
+                        <Trash2 size={13} />
+                        <span>Delete</span>
+                      </button>
+                    </td>
                   </tr>
                 ))}
+                {missionLog.length === 0 && (
+                  <tr>
+                    <td colSpan={9} className="px-4 py-8 text-center text-slate-500 text-xs">
+                      No mission logs recorded yet.
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>

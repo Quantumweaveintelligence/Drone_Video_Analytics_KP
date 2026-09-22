@@ -95,6 +95,9 @@ export default function Settings() {
           storage: { ...prev.storage, ...(data.storage || {}) },
           operator_preferences: { ...prev.operator_preferences, ...(data.operator_preferences || {}) }
         }));
+        if (data?.operator_preferences?.default_squadron) {
+          localStorage.setItem('dvas_default_squadron', data.operator_preferences.default_squadron);
+        }
       }
     } catch (err) {
       console.error('Failed to fetch settings:', err);
@@ -175,6 +178,9 @@ export default function Settings() {
       });
       if (resp.ok) {
         showToast('Settings successfully updated and applied to edge node.', 'success');
+        if (settings?.operator_preferences?.default_squadron) {
+          localStorage.setItem('dvas_default_squadron', settings.operator_preferences.default_squadron);
+        }
         fetchDiskUsage();
       } else {
         showToast('Failed to save settings. Please check server logs.', 'error');

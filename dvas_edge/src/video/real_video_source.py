@@ -66,13 +66,13 @@ log = get_logger(__name__)
 # SRT Telemetry Parser
 # ---------------------------------------------------------------------------
 
-def _parse_srt_telemetry(srt_content: str) -> Dict[int, dict]:
+def _parse_srt_telemetry(srt_content: str, fps: float = 30.0) -> Dict[int, dict]:
     """
-    Parse DJI-style SRT subtitle content into a dict keyed by FrameCnt.
+    Parse DJI-style or Autel-style SRT subtitle content into a dict keyed by FrameCnt.
 
-    Supports two DJI SRT formats:
+    Supports three drone SRT formats:
 
-    **Format A — Multi-line (one key per line):**
+    **Format A — Multi-line DJI (one key per line):**
         1
         00:00:00,000 --> 00:00:01,000
         FrameCnt: 0
@@ -80,7 +80,7 @@ def _parse_srt_telemetry(srt_content: str) -> Dict[int, dict]:
         latitude:   9.411869
         longitude: 77.073732
 
-    **Format B — Bracket-delimited (embedded subtitle track):**
+    **Format B — Bracket-delimited DJI (embedded subtitle track):**
         1
         00:00:00,000 --> 00:00:00,033
         FrameCnt: 0 2026-08-18 09:55:09.187
@@ -88,6 +88,14 @@ def _parse_srt_telemetry(srt_content: str) -> Dict[int, dict]:
         [latitude: 9.411869] [longitude: 77.073732]
         [rel_alt: 760.146 abs_alt: 852.991]
         [gb_yaw: -61.1 gb_pitch: -61.1 gb_roll: 0.0]
+
+    **Format C — Autel Robotics (e.g. EVO series embedded subtitles):**
+        1
+        00:00:01,000 --> 00:00:02,000
+        HOME(E: 75.769226, N: 11.257938) 2023-09-02 18:30:42
+        GPS(E: 75.768982, N: 11.257730, 5.64m) 
+        ISO:100 SHUTTER:80 EV:-1.0 F-NUM:1.9 
+        F.PRY (4.0°, 2.9°, 149.8°), G.PRY (-5.0°, 0.0°, 149.4°)
 
     Returns a dict: {frame_cnt_int: {telemetry_dict}}
     """
@@ -104,6 +112,13 @@ def _parse_srt_telemetry(srt_content: str) -> Dict[int, dict]:
     # Regex for individual "key: value" tokens inside a bracket group
     _KV_TOKEN_RE = re.compile(r'(\w[\w_]*):\s*([-+]?\d*\.?\d+(?:/\d*\.?\d+)?)')
 
+    # Regexes for Autel format and general timecode extraction
+    _SRT_TIMECODE_RE = re.compile(r'(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->')
+    _AUTEL_GPS_RE = re.compile(r'GPS\(E:\s*([-\d.]+),\s*N:\s*([-\d.]+)(?:,\s*([-\d.]+)m?)?\)')
+    _AUTEL_HOME_RE = re.compile(r'HOME\(E:\s*([-\d.]+),\s*N:\s*([-\d.]+)\)\s*([\d-]+ [\d:]+)?')
+    _AUTEL_G_PRY_RE = re.compile(r'G\.PRY\s*\(\s*([-\d.]+)°?,\s*([-\d.]+)°?,\s*([-\d.]+)°?\)')
+    _AUTEL_F_PRY_RE = re.compile(r'F\.PRY\s*\(\s*([-\d.]+)°?,\s*([-\d.]+)°?,\s*([-\d.]+)°?\)')
+
     # Split into SRT blocks (separated by blank lines)
     blocks = re.split(r'\n\s*\n', srt_content.strip())
 
@@ -115,16 +130,21 @@ def _parse_srt_telemetry(srt_content: str) -> Dict[int, dict]:
         telemetry: dict = {}
         frame_cnt: Optional[int] = None
         has_brackets = '[' in block
+        timecode_seconds: Optional[float] = None
 
         for line in lines:
             line = line.strip()
-            # Skip the SRT index line (just a number) and timestamp line
+            # Skip the SRT index line (just a number)
             if re.match(r'^\d+$', line):
                 continue
             if '-->' in line:
+                tc_m = _SRT_TIMECODE_RE.search(line)
+                if tc_m:
+                    h, m, s, ms = map(int, tc_m.groups())
+                    timecode_seconds = h * 3600 + m * 60 + s + ms / 1000.0
                 continue
 
-            # ── Try FrameCnt line (both formats) ──────────────────────
+            # ── 1. Try DJI FrameCnt line (both formats) ───────────────
             # Format A: "FrameCnt: 0"
             # Format B: "FrameCnt: 0 2026-08-18 09:55:09.187"
             fc_match = re.match(r'^[Ff]rame[Cc]nt:\s*(\d+)', line)
@@ -137,7 +157,7 @@ def _parse_srt_telemetry(srt_content: str) -> Dict[int, dict]:
                     telemetry['srt_timestamp'] = ts_match.group(1)
                 continue
 
-            # ── Format B: bracket-delimited fields ────────────────────
+            # ── 2. DJI Format B: bracket-delimited fields ─────────────
             if has_brackets:
                 for bracket_match in _BRACKET_RE.finditer(line):
                     bracket_content = bracket_match.group(1)
@@ -151,7 +171,39 @@ def _parse_srt_telemetry(srt_content: str) -> Dict[int, dict]:
                                 telemetry[key] = 0.0
                 continue
 
-            # ── Format A: plain "key: value" lines ────────────────────
+            # ── 3. Autel Robotics format: GPS, HOME, G.PRY, F.PRY ─────
+            gps_match = _AUTEL_GPS_RE.search(line)
+            if gps_match:
+                telemetry['longitude'] = float(gps_match.group(1))
+                telemetry['latitude'] = float(gps_match.group(2))
+                if gps_match.group(3):
+                    alt = float(gps_match.group(3))
+                    telemetry['rel_alt'] = alt
+                    telemetry['altitude_m'] = alt
+                continue
+
+            home_match = _AUTEL_HOME_RE.search(line)
+            if home_match:
+                telemetry['home_longitude'] = float(home_match.group(1))
+                telemetry['home_latitude'] = float(home_match.group(2))
+                if home_match.group(3):
+                    telemetry['srt_timestamp'] = home_match.group(3)
+                continue
+
+            gpry_match = _AUTEL_G_PRY_RE.search(line)
+            if gpry_match:
+                telemetry['gb_pitch'] = float(gpry_match.group(1))
+                telemetry['gb_roll'] = float(gpry_match.group(2))
+                telemetry['gb_yaw'] = float(gpry_match.group(3))
+                # Also check if F.PRY is on the same line
+                fpry_match = _AUTEL_F_PRY_RE.search(line)
+                if fpry_match:
+                    telemetry['flight_pitch'] = float(fpry_match.group(1))
+                    telemetry['flight_roll'] = float(fpry_match.group(2))
+                    telemetry['flight_yaw'] = float(fpry_match.group(3))
+                continue
+
+            # ── 4. DJI Format A: plain "key: value" lines ─────────────
             match = re.match(r'^(\w[\w_]*):\s*(.+)$', line)
             if match:
                 key = match.group(1).strip().lower()
@@ -164,6 +216,12 @@ def _parse_srt_telemetry(srt_content: str) -> Dict[int, dict]:
                         telemetry[key] = float(value_str)
                     except ValueError:
                         telemetry[key] = 0.0
+
+        # If frame_cnt was not explicitly provided by DJI FrameCnt, derive from timecode
+        if frame_cnt is None and timecode_seconds is not None and ('latitude' in telemetry or 'longitude' in telemetry):
+            effective_fps = fps if (fps and fps > 0) else 30.0
+            frame_cnt = int(round(timecode_seconds * effective_fps))
+            telemetry['frame_cnt'] = frame_cnt
 
         if frame_cnt is not None:
             # Map rel_alt -> altitude_m for downstream compatibility
@@ -243,7 +301,21 @@ def _extract_srt_from_video(video_path: str) -> Optional[str]:
         return None
 
 
-def _load_telemetry(video_source: str) -> Dict[int, dict]:
+def _probe_fps(video_path: str) -> float:
+    """Probe video FPS using cv2.VideoCapture; fallback to 30.0."""
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened():
+            val = cap.get(cv2.CAP_PROP_FPS)
+            cap.release()
+            if val and val > 0:
+                return float(val)
+    except Exception:
+        pass
+    return 30.0
+
+
+def _load_telemetry(video_source: str, fps: Optional[float] = None) -> Dict[int, dict]:
     """
     Load SRT telemetry from a sidecar file or embedded subtitle track.
     Returns an empty dict if no telemetry is found.
@@ -252,11 +324,14 @@ def _load_telemetry(video_source: str) -> Dict[int, dict]:
     if video_source.startswith('rtmp://') or video_source.startswith('rtsp://'):
         return {}
 
+    if fps is None or fps <= 0:
+        fps = _probe_fps(video_source)
+
     # Try sidecar .srt first
     srt_content = _load_srt_from_sidecar(video_source)
     if srt_content:
         log.info("srt_sidecar_loaded", video=video_source, size=len(srt_content))
-        parsed = _parse_srt_telemetry(srt_content)
+        parsed = _parse_srt_telemetry(srt_content, fps=fps)
         log.info("srt_telemetry_parsed", frames_with_telemetry=len(parsed))
         return parsed
 
@@ -264,7 +339,7 @@ def _load_telemetry(video_source: str) -> Dict[int, dict]:
     srt_content = _extract_srt_from_video(video_source)
     if srt_content:
         log.info("srt_embedded_extracted", video=video_source, size=len(srt_content))
-        parsed = _parse_srt_telemetry(srt_content)
+        parsed = _parse_srt_telemetry(srt_content, fps=fps)
         log.info("srt_telemetry_parsed", frames_with_telemetry=len(parsed))
         return parsed
 
