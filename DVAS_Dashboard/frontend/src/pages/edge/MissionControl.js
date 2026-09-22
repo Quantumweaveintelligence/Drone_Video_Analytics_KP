@@ -85,7 +85,8 @@ export default function MissionControl() {
         const newSq = e.newValue;
         setDefaultSquadron(newSq);
         setForm(prev => {
-          if (!prev.name) {
+          const isUnchangedOrEmpty = !prev.name && (!prev.squadron || prev.squadron === defaultSquadron);
+          if (isUnchangedOrEmpty) {
             return { ...prev, squadron: newSq };
           }
           return prev;
@@ -95,10 +96,11 @@ export default function MissionControl() {
 
     const handleWindowFocus = () => {
       const stored = localStorage.getItem('dvas_default_squadron');
-      if (stored) {
+      if (stored && stored !== defaultSquadron) {
         setDefaultSquadron(stored);
         setForm(prev => {
-          if (!prev.name && prev.squadron !== stored) {
+          const isUnchangedOrEmpty = !prev.name && (!prev.squadron || prev.squadron === defaultSquadron);
+          if (isUnchangedOrEmpty) {
             return { ...prev, squadron: stored };
           }
           return prev;
@@ -106,6 +108,7 @@ export default function MissionControl() {
       }
       fetchSettings();
     };
+
 
     window.addEventListener('storage', handleStorageChange);
     window.addEventListener('focus', handleWindowFocus);
@@ -159,7 +162,7 @@ export default function MissionControl() {
     setForm(prev => ({
       ...prev,
       name,
-      id: prev.id && !prev.id.startsWith('MSN-') ? prev.id : generateMissionId(prev.squadron)
+      id: name ? (prev.id && !prev.id.startsWith('MSN-') ? prev.id : generateMissionId(prev.squadron)) : ''
     }));
   };
 
@@ -168,9 +171,10 @@ export default function MissionControl() {
     setForm(prev => ({
       ...prev,
       squadron,
-      id: prev.id && !prev.id.startsWith('MSN-') ? prev.id : generateMissionId(squadron)
+      id: prev.name ? generateMissionId(squadron) : ''
     }));
   };
+
 
   const handleVideoFileChange = (e) => {
     const file = e.target.files[0];
@@ -667,17 +671,15 @@ export default function MissionControl() {
                 </div>
                 <div>
                   <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Squadron</label>
-                  <select
-                    value={form.squadron}
+                  <input 
+                    type="text" 
+                    value={form.squadron} 
                     onChange={handleSquadronChange}
-                    className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm font-mono text-slate-200 uppercase cursor-pointer"
-                  >
-                    <option value="ALPHA">ALPHA SQUADRON</option>
-                    <option value="BRAVO">BRAVO SQUADRON</option>
-                    <option value="CHARLIE">CHARLIE SQUADRON</option>
-                    <option value="DELTA">DELTA SQUADRON</option>
-                  </select>
+                    className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm font-mono text-slate-200 uppercase"
+                    placeholder="e.g. ALPHA"
+                  />
                 </div>
+
               </div>
               <div>
                 <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Location / Grid</label>
