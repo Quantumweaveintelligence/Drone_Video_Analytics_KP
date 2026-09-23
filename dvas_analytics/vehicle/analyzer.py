@@ -98,6 +98,15 @@ class VehicleAnalyzer:
             log.error("Failed to load vehicle model: %s", exc)
             self.model = None
 
+    def to_device(self, target_device: str):
+        self.device = target_device
+        if self.model is not None:
+            try:
+                self.model.to(target_device)
+                log.info("Vehicle YOLO model moved to %s", target_device)
+            except Exception as e:
+                log.warning("Failed to move vehicle model to %s: %s", target_device, e)
+
     def _get_colour_classifier(self):
         if self._colour_classifier is None:
             try:

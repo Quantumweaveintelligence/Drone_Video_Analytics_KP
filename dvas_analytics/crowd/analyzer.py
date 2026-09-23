@@ -126,6 +126,13 @@ class CrowdAnalyzer:
         "eb4329b111da5d752db0502f2d1bb450728e63490753607bb31e361fc25c9b97",  # partBmodel_best.pth (static surveillance / CCTV)
     })
 
+    def to_device(self, target_device: str):
+        """Move CSRNet model and internal device reference to CPU or CUDA."""
+        self.device = torch.device(target_device)
+        if self.model is not None:
+            self.model.to(self.device)
+            logger.info(f"CrowdAnalyzer CSRNet moved to {self.device}")
+
     def _load_model(self, path):
         try:
             logger.info(f"Loading CSRNet model from {path} to {self.device}")

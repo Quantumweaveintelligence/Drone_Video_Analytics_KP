@@ -36,13 +36,14 @@ from association.hand_association import HandAssociationEngine
 from behavior import TrajectoryAnalyzer, PersonBehaviorAnalyzer, InteractionAnalyzer
 from vehicle_behavior import (
     VehicleTrajectoryAnalyzer, VehicleSpeedAnalyzer,
-    LaneTrafficAnalyzer, VehicleInteractionAnalyzer
+    LaneTrafficAnalyzer, VehicleInteractionAnalyzer, VehicleCirclingDetector
 )
 from scene import SceneContextEngine
 from suspicious.stationary import GroundStationarityEvaluator
 from suspicious.rules_engine import SuspiciousEventRulesEngine
 from alerts.manager import AlertManager
 from visualization.renderer import ExplainableVisualizer
+import yaml
 
 log = logging.getLogger("anomaly.analyzer")
 
@@ -114,6 +115,19 @@ class AnomalyAnalyzer:
                 device="cpu",
             )
 
+        # Load parsed thresholds configuration
+        cfg = {}
+        if os.path.exists(thresholds_path):
+            try:
+                with open(thresholds_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+            except Exception as e:
+                log.warning("[%s] Failed to load thresholds from %s: %s", drone_id, thresholds_path, e)
+
+        beh_cfg = cfg.get("behavior", {})
+        veh_cfg = cfg.get("vehicle", {})
+        enable_wrong_way = veh_cfg.get("enable_wrong_way", False)
+
         # 2. Core Subsystems
         self.motion_estimator = CameraMotionEstimator(max_features=800)
         self.tracker = DroneMultiObjectTracker(
@@ -126,13 +140,26 @@ class AnomalyAnalyzer:
             max_ground_speed_px=10.0,
             stationary_min_seconds=1.5
         )
-        self.rules_engine = SuspiciousEventRulesEngine(config_path=thresholds_path)
+        self.rules_engine = SuspiciousEventRulesEngine(
+            config_path=thresholds_path,
+            enable_wrong_way=enable_wrong_way,
+        )
         self.trajectory_analyzer = TrajectoryAnalyzer()
-        self.person_behavior_analyzer = PersonBehaviorAnalyzer()
-        self.interaction_analyzer = InteractionAnalyzer()
+        self.person_behavior_analyzer = PersonBehaviorAnalyzer(
+            loiter_dwell_thresh_sec=beh_cfg.get("loitering_duration_sec", 15.0),
+            running_speed_thresh=beh_cfg.get("running_speed_thresh_px", 90.0),
+        )
+        self.interaction_analyzer = InteractionAnalyzer(
+            min_following_duration_sec=beh_cfg.get("following_duration_sec", 4.0),
+        )
         self.vehicle_trajectory_analyzer = VehicleTrajectoryAnalyzer()
-        self.vehicle_speed_analyzer = VehicleSpeedAnalyzer()
-        self.lane_traffic_analyzer = LaneTrafficAnalyzer()
+        self.vehicle_speed_analyzer = VehicleSpeedAnalyzer(
+            abrupt_stop_decel_thresh=-veh_cfg.get("abrupt_stop_decel_percent", 0.60) * 75.0,
+        )
+        self.lane_traffic_analyzer = LaneTrafficAnalyzer(enabled=enable_wrong_way)
+        self.vehicle_circling_detector = VehicleCirclingDetector(
+            min_revisits=veh_cfg.get("circling_min_passes", 3)
+        )
         self.vehicle_interaction_analyzer = VehicleInteractionAnalyzer()
         self.scene_context_engine = SceneContextEngine()
 
@@ -210,11 +237,17 @@ class AnomalyAnalyzer:
         # Step 6: Multi-Entity Behavior Analysis
         for p in active_persons:
             self.person_behavior_analyzer.analyze(p, timestamp, fps=30.0)
-        self.interaction_analyzer.update_interactions(active_persons, timestamp, fps=30.0)
+            if self.trajectory_analyzer.is_repetitive_trajectory(p):
+                if EventType.LOITERING_EVENT not in p.active_events:
+                    p.active_events.append(EventType.LOITERING_EVENT)
+        self.interaction_analyzer.update_interactions(
+            active_persons, timestamp, fps=30.0, objects=active_objects
+        )
         self.trajectory_analyzer.evaluate_crowd_flow(active_persons, timestamp)
 
         for v in active_vehicles:
             self.vehicle_trajectory_analyzer.analyze(v, timestamp)
+            self.vehicle_circling_detector.analyze(v, timestamp)
         self.lane_traffic_analyzer.evaluate_traffic_flow(active_vehicles)
         self.vehicle_speed_analyzer.analyze(active_vehicles, timestamp, fps=30.0)
         self.vehicle_interaction_analyzer.update_interactions(

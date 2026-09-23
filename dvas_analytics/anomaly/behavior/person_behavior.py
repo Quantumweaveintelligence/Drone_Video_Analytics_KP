@@ -139,3 +139,18 @@ class PersonBehaviorAnalyzer:
             person.is_loitering = False
             if EventType.LOITERING in person.active_events:
                 person.active_events.remove(EventType.LOITERING)
+
+        # 5. Erratic / Zigzag Movement Detection
+        # High direction reversals while moving briskly within a confined or oscillating zone
+        if getattr(person, "direction_reversals", 0) >= 4 and speed >= self.walking_min_speed and len(history) >= 15:
+            xs = [p[0] for p in history]
+            ys = [p[1] for p in history]
+            spatial_extent = float(np.hypot(max(xs) - min(xs), max(ys) - min(ys)))
+            if spatial_extent <= 220.0:
+                if EventType.ERRATIC_MOVEMENT not in person.active_events:
+                    person.active_events.append(EventType.ERRATIC_MOVEMENT)
+            elif EventType.ERRATIC_MOVEMENT in person.active_events and spatial_extent > 260.0:
+                person.active_events.remove(EventType.ERRATIC_MOVEMENT)
+        elif EventType.ERRATIC_MOVEMENT in person.active_events and getattr(person, "direction_reversals", 0) < 2:
+            person.active_events.remove(EventType.ERRATIC_MOVEMENT)
+

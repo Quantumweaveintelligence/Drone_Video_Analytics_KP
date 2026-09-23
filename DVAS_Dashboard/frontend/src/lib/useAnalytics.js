@@ -73,41 +73,92 @@ export function useAnalyticsSSE(onEvent, droneId = '') {
   const [connected, setConnected] = useState(false);
   const [lastEvent, setLastEvent] = useState(null);
   const esRef = useRef(null);
+  const retriesRef = useRef(0);
+  const reconnectTimerRef = useRef(null);
+  const onEventRef = useRef(onEvent);
 
   useEffect(() => {
-    const token = localStorage.getItem('dvas_token');
-    let url = '/api/analytics/events/stream';
-    if (droneId) url += `?drone_id=${droneId}`;
-    if (token) url += `${droneId ? '&' : '?'}token=${token}`;
+    onEventRef.current = onEvent;
+  }, [onEvent]);
 
-    const connect = () => {
-      if (esRef.current) esRef.current.close();
+  useEffect(() => {
+    let cancelled = false;
+
+    const buildUrl = () => {
+      const token = localStorage.getItem('dvas_token') || localStorage.getItem('token') || '';
+      let url = '/api/analytics/events/stream';
+      if (droneId) url += `?drone_id=${encodeURIComponent(droneId)}`;
+      if (token) url += `${droneId ? '&' : '?'}token=${encodeURIComponent(token)}`;
+      return url;
+    };
+
+    const connect = async () => {
+      if (cancelled) return;
+      if (esRef.current) {
+        esRef.current.close();
+        esRef.current = null;
+      }
+
+      const url = buildUrl();
       const es = new EventSource(url, { withCredentials: true });
       esRef.current = es;
 
-      es.onopen = () => setConnected(true);
+      es.onopen = () => {
+        if (cancelled) return;
+        setConnected(true);
+        retriesRef.current = 0; // Reset backoff on success
+      };
 
       es.onmessage = (evt) => {
+        if (cancelled) return;
         try {
           const parsed = JSON.parse(evt.data);
           setLastEvent(parsed);
-          if (onEvent) onEvent(parsed);
+          if (onEventRef.current) onEventRef.current(parsed);
         } catch (_) {
           // non-JSON heartbeat — ignore
         }
       };
 
-      es.onerror = () => {
+      es.onerror = async () => {
+        if (cancelled) return;
         setConnected(false);
-        es.close();
-        // Reconnect after 5s
-        setTimeout(connect, 5000);
+        if (esRef.current) {
+          esRef.current.close();
+          esRef.current = null;
+        }
+
+        // Attempt silent token refresh before reconnect
+        try {
+          const refreshRes = await api.post('/auth/refresh');
+          if (refreshRes?.data?.access_token) {
+            localStorage.setItem('dvas_token', refreshRes.data.access_token);
+            retriesRef.current = 0; // Fresh token acquired, reset backoff
+          }
+        } catch (_) {
+          // Refresh failed — will retry with existing token or back off
+        }
+
+        if (cancelled) return;
+        // Exponential backoff: 5s, 10s, 20s, 40s, max 60s
+        const delay = Math.min(5000 * Math.pow(2, retriesRef.current), 60000);
+        retriesRef.current += 1;
+        reconnectTimerRef.current = setTimeout(connect, delay);
       };
     };
 
     connect();
+
     return () => {
-      if (esRef.current) esRef.current.close();
+      cancelled = true;
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      if (esRef.current) {
+        esRef.current.close();
+        esRef.current = null;
+      }
     };
   }, [droneId]); // eslint-disable-line react-hooks/exhaustive-deps
 

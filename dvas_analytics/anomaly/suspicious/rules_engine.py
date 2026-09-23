@@ -50,6 +50,7 @@ class SuspiciousEventRulesEngine:
         self.unattended_duration_thresh_sec = 16.0
         self.loiter_dwell_thresh_sec = 24.0
         self.wrong_direction_speed_thresh = 20.0
+        self.speed_hazard_thresh = 250.0
         self.cooldown_seconds = 28.0
         self.enable_wrong_way = enable_wrong_way
         self.min_groups_medium = 2
@@ -124,6 +125,11 @@ class SuspiciousEventRulesEngine:
         ab = cfg.get("abandoned_object", {})
         self.unattended_duration_thresh_sec = ab.get("minimum_unattended_seconds", self.unattended_duration_thresh_sec)
         self.owner_departure_dist_px = ab.get("owner_departure_dist_px", self.owner_departure_dist_px)
+
+        veh_cfg = cfg.get("vehicle", {})
+        self.speed_hazard_thresh = veh_cfg.get("speed_hazard_thresh_px", self.speed_hazard_thresh)
+        if "enable_wrong_way" in veh_cfg:
+            self.enable_wrong_way = veh_cfg["enable_wrong_way"]
 
         ev_grp = cfg.get("evidence_groups", {})
         self.min_groups_medium = ev_grp.get("min_groups_medium", self.min_groups_medium)
@@ -293,6 +299,14 @@ class SuspiciousEventRulesEngine:
                     reasons.append("person_returned_to_vehicle")
                     reasons.append("vehicle_departed_scene")
                     reasons.append("package_remained_stationary_on_ground")
+                elif EventType.OBJECT_TRANSFER in track.active_events:
+                    level = SuspicionLevel.MEDIUM
+                    primary_event = EventType.OBJECT_TRANSFER
+                    pipeline_stage = AlertPipelineStage.CANDIDATE
+                    is_suspicious = True
+                    rule_conf = 0.75
+                    active_groups.update(["A", "D"])
+                    reasons.append("object_transferred_between_persons_in_close_proximity")
                 elif track.is_stationary:
                     active_groups.add("C")  # Object Behavior (Stationarity)
                     track.timeline["t_stationary"] = track.timeline["t_stationary"] or timestamp
@@ -413,7 +427,67 @@ class SuspiciousEventRulesEngine:
                 reasons.append("ground_level_posture_assumed")
                 reasons.append("potential_safety_incident_monitoring")
 
-            # 2B. Persistent Following
+            # 2B. Boundary Crossing into Restricted Zone
+            elif EventType.BOUNDARY_CROSSING in track.active_events:
+                level = SuspicionLevel.HIGH
+                primary_event = EventType.BOUNDARY_CROSSING
+                pipeline_stage = AlertPipelineStage.CONFIRMATION
+                is_suspicious = True
+                rule_conf = 0.85
+                active_groups.update(["B", "F"])
+                reasons.append(f"unauthorized_boundary_crossing_into_restricted_zone_{track.context_zone}")
+
+            # 2C. Vehicle-Pedestrian Near Miss Hazard
+            elif EventType.VEHICLE_PEDESTRIAN_NEAR_MISS in track.active_events:
+                level = SuspicionLevel.HIGH
+                primary_event = EventType.VEHICLE_PEDESTRIAN_NEAR_MISS
+                pipeline_stage = AlertPipelineStage.CONFIRMATION
+                is_suspicious = True
+                rule_conf = 0.86
+                active_groups.update(["B", "E"])
+                reasons.append("pedestrian_involved_in_hazardous_vehicle_near_miss")
+
+            # 2D. Rapid Crowd Dispersal
+            elif EventType.RAPID_CROWD_DISPERSAL in track.active_events:
+                level = SuspicionLevel.HIGH
+                primary_event = EventType.RAPID_CROWD_DISPERSAL
+                pipeline_stage = AlertPipelineStage.CONFIRMATION
+                is_suspicious = True
+                rule_conf = 0.88
+                active_groups.update(["B", "G"])
+                reasons.append("rapid_crowd_dispersal_detected_high_speed_outward_movement")
+
+            # 2E. Group Convergence
+            elif EventType.GROUP_CONVERGENCE in track.active_events:
+                level = SuspicionLevel.MEDIUM
+                primary_event = EventType.GROUP_CONVERGENCE
+                pipeline_stage = AlertPipelineStage.CANDIDATE
+                is_suspicious = False
+                rule_conf = 0.72
+                active_groups.update(["B", "G"])
+                reasons.append("multiple_persons_converging_toward_common_centroid")
+
+            # 2F. Coordinated Multi-Person Arrival
+            elif EventType.COORDINATED_ARRIVAL in track.active_events:
+                level = SuspicionLevel.MEDIUM
+                primary_event = EventType.COORDINATED_ARRIVAL
+                pipeline_stage = AlertPipelineStage.CANDIDATE
+                is_suspicious = False
+                rule_conf = 0.72
+                active_groups.update(["B", "D", "G"])
+                reasons.append("coordinated_multi_person_arrival_from_diverse_origins")
+
+            # 2G. Object Transfer between Persons
+            elif EventType.OBJECT_TRANSFER in track.active_events:
+                level = SuspicionLevel.MEDIUM
+                primary_event = EventType.OBJECT_TRANSFER
+                pipeline_stage = AlertPipelineStage.CANDIDATE
+                is_suspicious = False
+                rule_conf = 0.75
+                active_groups.update(["B", "D"])
+                reasons.append("person_involved_in_close_proximity_object_transfer")
+
+            # 2H. Persistent Following
             elif EventType.PERSISTENT_FOLLOWING in track.active_events and track.following_target_id is not None:
                 level = SuspicionLevel.MEDIUM
                 primary_event = EventType.PERSISTENT_FOLLOWING
@@ -425,7 +499,7 @@ class SuspiciousEventRulesEngine:
                 reasons.append(f"consistent_inter_distance_maintained_{track.following_duration:.1f}s")
                 reasons.append("behavioral_monitoring_active")
 
-            # 2C. Loitering in Area
+            # 2I. Loitering in Area
             elif EventType.LOITERING in track.active_events or EventType.LOITERING_EVENT in track.active_events:
                 is_restricted = track.context_anomaly_score >= 0.50
                 level = SuspicionLevel.MEDIUM if is_restricted else SuspicionLevel.LOW
@@ -441,7 +515,20 @@ class SuspiciousEventRulesEngine:
                 if is_restricted:
                     reasons.append(f"loitering_inside_sensitive_zone_{track.context_zone}")
 
-            # 2D. Opposing Crowd Flow
+            # 2J. Erratic / Zigzag Movement
+            elif EventType.ERRATIC_MOVEMENT in track.active_events:
+                is_restricted = track.context_anomaly_score >= 0.50
+                level = SuspicionLevel.HIGH if is_restricted else SuspicionLevel.MEDIUM
+                primary_event = EventType.ERRATIC_MOVEMENT
+                pipeline_stage = AlertPipelineStage.CONFIRMATION if is_restricted else AlertPipelineStage.CANDIDATE
+                is_suspicious = is_restricted
+                rule_conf = 0.82 if is_restricted else 0.72
+                active_groups.add("B")
+                if is_restricted:
+                    active_groups.add("F")
+                reasons.append("chaotic_oscillating_trajectory_frequent_direction_reversals")
+
+            # 2K. Opposing Crowd Flow
             elif EventType.OPPOSING_CROWD_FLOW in track.active_events:
                 is_sustained = track_dur >= 2.0
                 level = SuspicionLevel.MEDIUM if is_sustained else SuspicionLevel.OBSERVE
@@ -453,16 +540,31 @@ class SuspiciousEventRulesEngine:
                 reasons.append("movement_direction_opposes_prevailing_crowd_flow")
                 reasons.append("directional_anomaly_confirmed")
 
-            # 2E. Running (Zero Alerts Alone)
+            # 2L. Running (Zero Alerts Alone, Escalate if Near Incident)
             elif track.person_action == PersonAction.RUNNING:
-                level = SuspicionLevel.NORMAL
-                primary_event = EventType.RUNNING_EVENT
-                pipeline_stage = AlertPipelineStage.OBSERVATION
-                rule_conf = 0.80
-                reasons.append("person_running_detected")
-                reasons.append("ordinary_activity_or_transit_exercise_zero_alerts")
+                has_nearby_incident = any(
+                    other.track_id != track.track_id
+                    and (getattr(other, "is_alert_active", False) or other.suspicion_level in {SuspicionLevel.HIGH, SuspicionLevel.CRITICAL})
+                    and float(np.hypot(track.center[0] - other.center[0], track.center[1] - other.center[1])) <= 250.0
+                    for other in all_tracks
+                )
+                if has_nearby_incident:
+                    level = SuspicionLevel.MEDIUM
+                    primary_event = EventType.RUNNING_EVENT
+                    pipeline_stage = AlertPipelineStage.CANDIDATE
+                    is_suspicious = True
+                    rule_conf = 0.78
+                    active_groups.update(["B", "G"])
+                    reasons.append("person_running_away_from_active_incident_area")
+                else:
+                    level = SuspicionLevel.NORMAL
+                    primary_event = EventType.RUNNING_EVENT
+                    pipeline_stage = AlertPipelineStage.OBSERVATION
+                    rule_conf = 0.80
+                    reasons.append("person_running_detected")
+                    reasons.append("ordinary_activity_or_transit_exercise_zero_alerts")
 
-            # 2F. Sudden Stop
+            # 2M. Sudden Stop
             elif EventType.SUDDEN_STOP in track.active_events:
                 level = SuspicionLevel.NORMAL
                 primary_event = EventType.SUDDEN_STOP
@@ -470,12 +572,13 @@ class SuspiciousEventRulesEngine:
                 rule_conf = 0.70
                 reasons.append("sudden_deceleration_to_stop_detected")
 
-            # 2G. Normal Walking / Standing
+            # 2N. Normal Walking / Standing
             else:
                 level = SuspicionLevel.NORMAL
                 pipeline_stage = AlertPipelineStage.OBSERVATION
                 rule_conf = 0.10
                 reasons.append("normal_pedestrian_trajectory")
+
 
         # -------------------------------------------------------------------
         # Branch 3: Vehicles (Speed, Direction, Interactions)
@@ -490,8 +593,41 @@ class SuspiciousEventRulesEngine:
                     if d < pedestrian_dist:
                         pedestrian_dist = d
 
-            # 3A. Wrong-Way Vehicle Travel
-            if self.enable_wrong_way and (
+            # 3A. Vehicle-Pedestrian Near Miss Hazard
+            if EventType.VEHICLE_PEDESTRIAN_NEAR_MISS in track.active_events:
+                level = SuspicionLevel.HIGH
+                is_suspicious = True
+                primary_event = EventType.VEHICLE_PEDESTRIAN_NEAR_MISS
+                pipeline_stage = AlertPipelineStage.CONFIRMATION
+                rule_conf = 0.88
+                active_groups.update(["E", "B"])
+                reasons.append(f"vehicle_high_speed_near_miss_with_pedestrian_{pedestrian_dist:.1f}px")
+
+            # 3B. Vehicle Approach and Flee
+            elif EventType.VEHICLE_APPROACH_FLEE in track.active_events:
+                has_ped_threat = pedestrian_dist <= 120.0
+                level = SuspicionLevel.HIGH if has_ped_threat else SuspicionLevel.MEDIUM
+                is_suspicious = has_ped_threat
+                primary_event = EventType.VEHICLE_APPROACH_FLEE
+                pipeline_stage = AlertPipelineStage.CONFIRMATION if has_ped_threat else AlertPipelineStage.CANDIDATE
+                rule_conf = 0.85 if has_ped_threat else 0.75
+                active_groups.update(["E", "G"])
+                if has_ped_threat:
+                    active_groups.update(["B", "D"])
+                reasons.append("vehicle_brief_stop_followed_by_rapid_escape_acceleration")
+
+            # 3C. Vehicle Circling / Area Patrol
+            elif EventType.VEHICLE_CIRCLING in track.active_events:
+                level = SuspicionLevel.MEDIUM
+                is_suspicious = False
+                primary_event = EventType.VEHICLE_CIRCLING
+                pipeline_stage = AlertPipelineStage.CANDIDATE
+                rule_conf = 0.74
+                active_groups.update(["E", "G"])
+                reasons.append("repetitive_spatial_circling_or_patrol_pattern_detected")
+
+            # 3D. Wrong-Way Vehicle Travel
+            elif self.enable_wrong_way and (
                 track.is_wrong_direction
                 or EventType.WRONG_DIRECTION_VEHICLE in track.active_events
                 or EventType.WRONG_DIRECTION_EVENT in track.active_events
@@ -526,9 +662,9 @@ class SuspiciousEventRulesEngine:
                 if has_pedestrian_threat:
                     reasons.append(f"pedestrian_proximity_threat_{pedestrian_dist:.1f}px")
 
-            # 3B. Abnormal Speed
+            # 3E. Abnormal Speed
             elif EventType.ABNORMAL_VEHICLE_SPEED in track.active_events:
-                is_speed_hazard = track.speed >= 450.0
+                is_speed_hazard = track.speed >= self.speed_hazard_thresh
                 level = SuspicionLevel.MEDIUM if is_speed_hazard else SuspicionLevel.LOW
                 primary_event = EventType.ABNORMAL_VEHICLE_SPEED
                 pipeline_stage = AlertPipelineStage.CANDIDATE if is_speed_hazard else AlertPipelineStage.OBSERVATION
@@ -540,7 +676,7 @@ class SuspiciousEventRulesEngine:
                 if is_speed_hazard:
                     reasons.append(f"elevated_speed_hazard_{track.speed:.1f}px_s")
 
-            # 3C. Abrupt Stop or Stoppage Hazard
+            # 3F. Abrupt Stop or Stoppage Hazard
             elif EventType.ABRUPT_VEHICLE_STOP in track.active_events or EventType.ABRUPT_STOP in track.active_events:
                 is_sustained = getattr(track, "stationary_duration", 0.0) >= 2.0 or getattr(track, "vehicle_stop_duration", 0.0) >= 2.0
                 level = SuspicionLevel.MEDIUM if is_sustained else SuspicionLevel.OBSERVE
@@ -554,7 +690,18 @@ class SuspiciousEventRulesEngine:
                     active_groups.add("G")
                     reasons.append(f"prolonged_stationary_road_stoppage_{track.stationary_duration:.1f}s")
 
-            # 3D. Trajectory Anomaly / U-Turn (DISABLED per user instruction)
+            # 3G. Vehicle-Person Interaction
+            elif EventType.VEHICLE_PERSON_INTERACTION in track.active_events:
+                is_sustained = getattr(track, "vehicle_stop_duration", 0.0) >= 5.0
+                level = SuspicionLevel.MEDIUM if is_sustained and track.context_anomaly_score >= 0.50 else SuspicionLevel.LOW
+                primary_event = EventType.VEHICLE_PERSON_INTERACTION
+                pipeline_stage = AlertPipelineStage.CANDIDATE if level == SuspicionLevel.MEDIUM else AlertPipelineStage.OBSERVATION
+                rule_conf = 0.70 if level == SuspicionLevel.MEDIUM else 0.50
+                is_suspicious = level == SuspicionLevel.MEDIUM
+                active_groups.update(["E", "B", "D"])
+                reasons.append("stopped_vehicle_in_close_proximity_to_pedestrian")
+
+            # 3H. Trajectory Anomaly / U-Turn (DISABLED per user instruction)
             elif EventType.VEHICLE_TRAJECTORY_ANOMALY in track.active_events:
                 # Per user instruction, vehicle U-turns and trajectory reversals are normal maneuvers, NOT alerts
                 level = SuspicionLevel.NORMAL
@@ -747,7 +894,8 @@ class SuspiciousEventRulesEngine:
 
         # 3B. Running alone never alerts
         if track.primary_event == EventType.RUNNING_EVENT or track.person_action == PersonAction.RUNNING:
-            return False, "Hard Gate: Running alone is non-suspicious baseline activity", meta
+            if "person_running_away_from_active_incident_area" not in track.explainability_reasons:
+                return False, "Hard Gate: Running alone is non-suspicious baseline activity", meta
 
         # 3C. Weapon Carried Normally
         if track.primary_event == EventType.WEAPON_HELD and track.aiming_target_id is None:
@@ -776,6 +924,13 @@ class SuspiciousEventRulesEngine:
             EventType.SUDDEN_ACCELERATION,
             EventType.ABRUPT_STOP,
             EventType.ABNORMAL_VEHICLE_SPEED,
+            EventType.ERRATIC_MOVEMENT,
+            EventType.GROUP_CONVERGENCE,
+            EventType.COORDINATED_ARRIVAL,
+            EventType.OBJECT_TRANSFER,
+            EventType.VEHICLE_CIRCLING,
+            EventType.VEHICLE_APPROACH_FLEE,
+            EventType.VEHICLE_PERSON_INTERACTION,
         }:
             # Require multi-group evidence corroboration (2/3 rule) or contextual anomaly
             if track.context_anomaly_score < 0.50 and len(track.evidence_groups) < 2:

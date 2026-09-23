@@ -864,17 +864,38 @@ async def _run_reid_clustering():
 
 @app.get("/stream/start")
 async def stream_start():
-    global _stream_running, _stream_task
+    global _stream_running, _stream_task, analyzer, resnet_model, resnet_device
+    if torch.cuda.is_available():
+        if analyzer:
+            if analyzer.person_model:
+                try:
+                    analyzer.person_model.to("cuda:0")
+                except Exception as e:
+                    log.warning("Failed to move person model to CUDA: %s", e)
+            if analyzer.face_model:
+                try:
+                    analyzer.face_model.to("cuda:0")
+                except Exception as e:
+                    log.warning("Failed to move face model to CUDA: %s", e)
+            analyzer.device = 0
+        if resnet_model:
+            try:
+                resnet_model.to(torch.device("cuda:0"))
+                resnet_device = torch.device("cuda:0")
+            except Exception as e:
+                log.warning("Failed to move resnet model to CUDA: %s", e)
+
     if _stream_running:
-        return {"status": "already_running"}
+        return {"status": "already_running", "device": "cuda:0" if torch.cuda.is_available() else "cpu"}
     _stream_running = True
     _stream_task = asyncio.create_task(_stream_loop())
-    return {"status": "started"}
+    log.info("Person stream loop started")
+    return {"status": "started", "device": "cuda:0" if torch.cuda.is_available() else "cpu"}
 
 
 @app.get("/stream/stop")
 async def stream_stop():
-    global _stream_running, _stream_task
+    global _stream_running, _stream_task, analyzer, resnet_model, resnet_device
     _stream_running = False
     if _stream_task:
         _stream_task.cancel()
@@ -885,7 +906,34 @@ async def stream_stop():
     _last_annotated_ts.clear()
     _person_trajectories.clear()
     _tracker_last_seen.clear()
-    return {"status": "stopped"}
+
+    # Offload models from GPU VRAM to CPU
+    if analyzer:
+        if analyzer.person_model:
+            try:
+                analyzer.person_model.to("cpu")
+            except Exception:
+                pass
+        if analyzer.face_model:
+            try:
+                analyzer.face_model.to("cpu")
+            except Exception:
+                pass
+        analyzer.device = "cpu"
+    if resnet_model:
+        try:
+            resnet_model.to(torch.device("cpu"))
+            resnet_device = torch.device("cpu")
+        except Exception:
+            pass
+
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    log.info("Person stream loop stopped and GPU VRAM released")
+    return {"status": "stopped", "device": "cpu"}
 
 
 @app.get("/annotated/latest")

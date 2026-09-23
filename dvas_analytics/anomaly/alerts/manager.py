@@ -67,7 +67,7 @@ class AlertManager:
             "level": obj.suspicion_level.value,
             "pipeline_stage": obj.pipeline_stage.value,
             "event": evt_name,
-            "event_type": "SUSPICIOUS_OBJECT_DETECTED",
+            "event_type": evt_name,
             "reasons": obj.explainability_reasons,
             "evidence_groups": obj.evidence_groups,
             "alert_id": alert_id,

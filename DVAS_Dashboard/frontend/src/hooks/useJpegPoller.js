@@ -119,16 +119,18 @@ export function useJpegPoller(url, intervalMs = 600, enabled = true) {
         const nextDelay = isOffline ? Math.max(intervalMs, 5000) : intervalMs;
         timerRef.current = setTimeout(doFetch, nextDelay);
       } else if (res.status === 404) {
-        if (!prevBlobRef.current) {
-          setBlobUrl(null);
-          setHasFrame(false);
-          setFeedDead(true);
-          feedDeadRef.current = true;
-          setMeta({});
+        if (prevBlobRef.current) {
+          URL.revokeObjectURL(prevBlobRef.current);
+          prevBlobRef.current = null;
         }
+        setBlobUrl(null);
+        setHasFrame(false);
+        setFeedDead(true);
+        feedDeadRef.current = true;
+        setMeta({});
         
-        // Enter 8s slow-retry mode to avoid log spamming
-        timerRef.current = setTimeout(doFetch, 8000);
+        // Enter 3s slow-retry mode to avoid log spamming
+        timerRef.current = setTimeout(doFetch, 3000);
       } else {
         throw new Error(`HTTP ${res.status}`);
       }
@@ -150,13 +152,15 @@ export function useJpegPoller(url, intervalMs = 600, enabled = true) {
     clearTimeout(timerRef.current);
     clearTimeout(watchRef.current);
     
+    // Always revoke and clear previous blob when URL changes so old drone frame doesn't linger
+    if (prevBlobRef.current) {
+      URL.revokeObjectURL(prevBlobRef.current);
+      prevBlobRef.current = null;
+    }
+    setBlobUrl(null);
+    setHasFrame(false);
+
     if (!enabled || !url) {
-      if (prevBlobRef.current) {
-        URL.revokeObjectURL(prevBlobRef.current);
-        prevBlobRef.current = null;
-      }
-      setBlobUrl(null);
-      setHasFrame(false);
       setFeedDead(!enabled);
       feedDeadRef.current = !enabled;
       errRef.current = 0;

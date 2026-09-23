@@ -211,19 +211,48 @@ async def _stream_loop():
 
                     # Handle Triggered Alerts (Evidence Capture & Escalation)
                     for alert in triggered_alerts:
-                        event_type = alert.get("event_type", "suspicious_activity").lower()
+                        event_type = (alert.get("event") or alert.get("event_type") or "suspicious_activity").lower()
                         # Normalise to standard DVAS event types
                         type_map = {
                             "suspicious_object_detected": "abandoned_object",
                             "abandoned_object": "abandoned_object",
-                            "loitering": "suspicious_loitering",
-                            "fall_collapse": "person_fall",
-                            "following": "suspicious_following",
-                            "crowd_dispersal": "crowd_dispersal",
-                            "wrong_way": "vehicle_wrong_way",
-                            "abrupt_stop": "vehicle_abrupt_stop",
-                            "suspicious_dropoff": "suspicious_dropoff",
+                            "unknown_owner_object": "abandoned_object",
+                            "unknown_owner_weapon": "weapon_abandoned",
+                            "weapon_like_object": "weapon_detected",
+                            "weapon_held": "weapon_held",
+                            "weapon_aiming_candidate": "weapon_aiming",
                             "weapon_aiming": "weapon_aiming",
+                            "suspicious_package": "abandoned_object",
+                            "unusual_object_placement": "unusual_placement",
+                            "object_transfer": "object_transfer",
+                            "loitering": "suspicious_loitering",
+                            "loitering_event": "suspicious_loitering",
+                            "fall_event": "person_fall",
+                            "fall_collapse": "person_fall",
+                            "persistent_following": "suspicious_following",
+                            "following": "suspicious_following",
+                            "opposing_crowd_flow": "opposing_crowd_flow",
+                            "group_convergence": "group_convergence",
+                            "rapid_crowd_dispersal": "rapid_crowd_dispersal",
+                            "crowd_dispersal": "rapid_crowd_dispersal",
+                            "erratic_movement": "erratic_movement",
+                            "coordinated_arrival": "coordinated_arrival",
+                            "boundary_crossing": "boundary_crossing",
+                            "running_event": "running_flight",
+                            "wrong_direction_vehicle": "vehicle_wrong_way",
+                            "wrong_direction_event": "vehicle_wrong_way",
+                            "wrong_way": "vehicle_wrong_way",
+                            "high_risk_traffic_event": "vehicle_wrong_way",
+                            "abnormal_vehicle_speed": "abnormal_vehicle_speed",
+                            "abrupt_vehicle_stop": "vehicle_abrupt_stop",
+                            "abrupt_stop": "vehicle_abrupt_stop",
+                            "vehicle_person_interaction": "vehicle_person_interaction",
+                            "vehicle_object_interaction": "suspicious_dropoff",
+                            "vehicle_object_abandonment": "suspicious_dropoff",
+                            "suspicious_dropoff": "suspicious_dropoff",
+                            "vehicle_circling": "vehicle_circling",
+                            "vehicle_approach_flee": "vehicle_approach_flee",
+                            "vehicle_pedestrian_near_miss": "vehicle_pedestrian_near_miss",
                         }
                         canonical_type = type_map.get(event_type, event_type)
                         severity = alert.get("level", "HIGH")
@@ -422,8 +451,8 @@ async def stream_start():
 
 @app.get("/stream/stop")
 async def stream_stop():
-    """Stop background Redis stream consumer loop."""
-    global _stream_running, _stream_task
+    """Stop background Redis stream consumer loop and release GPU VRAM."""
+    global _stream_running, _stream_task, _analyzers
     if _stream_running:
         _stream_running = False
         if _stream_task:
@@ -432,7 +461,28 @@ async def stream_stop():
                 await _stream_task
             except asyncio.CancelledError:
                 pass
-        log.info("Anomaly stream loop stopped via API")
+            _stream_task = None
+    # Release dual models from GPU VRAM
+    try:
+        for d_id, analyzer in list(_analyzers.items()):
+            if hasattr(analyzer, 'detector') and hasattr(analyzer.detector, 'model'):
+                try:
+                    analyzer.detector.model.to("cpu")
+                except Exception:
+                    pass
+        _analyzers.clear()
+    except Exception as e:
+        log.warning("Error releasing anomaly models: %s", e)
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    log.info("Anomaly stream loop stopped and GPU VRAM released")
     return {"status": "stopped", "stream_running": False}
 
 

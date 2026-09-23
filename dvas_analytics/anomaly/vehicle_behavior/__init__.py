@@ -7,10 +7,13 @@ from .trajectory import VehicleTrajectoryAnalyzer
 from .speed_analysis import VehicleSpeedAnalyzer
 from .lane_analysis import LaneTrafficAnalyzer
 from .interaction import VehicleInteractionAnalyzer
+from .circling import VehicleCirclingDetector
 
 __all__ = [
     "VehicleTrajectoryAnalyzer",
     "VehicleSpeedAnalyzer",
     "LaneTrafficAnalyzer",
     "VehicleInteractionAnalyzer",
+    "VehicleCirclingDetector",
 ]
+

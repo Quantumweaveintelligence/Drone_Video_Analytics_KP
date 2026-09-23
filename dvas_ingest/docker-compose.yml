@@ -413,6 +413,8 @@ services:
               capabilities: [gpu]
     volumes:
       - analytics_evidence:/data/evidence
+      - ../dvas_analytics/crowd:/analytics/crowd
+      - ../dvas_analytics/shared:/analytics/shared
     depends_on:
       postgres:
         condition: service_healthy
@@ -462,6 +464,8 @@ services:
               capabilities: [gpu]
     volumes:
       - analytics_evidence:/data/evidence
+      - ../dvas_analytics/person:/analytics/person
+      - ../dvas_analytics/shared:/analytics/shared
     depends_on:
       postgres:
         condition: service_healthy
@@ -509,6 +513,8 @@ services:
               capabilities: [gpu]
     volumes:
       - analytics_evidence:/data/evidence
+      - ../dvas_analytics/vehicle:/analytics/vehicle
+      - ../dvas_analytics/shared:/analytics/shared
     depends_on:
       postgres:
         condition: service_healthy
@@ -562,6 +568,8 @@ services:
     volumes:
       - analytics_evidence:/data/evidence
       - paddleocr_models:/root/.paddleocr
+      - ../dvas_analytics/anpr:/analytics/anpr
+      - ../dvas_analytics/shared:/analytics/shared
     depends_on:
       postgres:
         condition: service_healthy
@@ -610,6 +618,8 @@ services:
               capabilities: [gpu]
     volumes:
       - analytics_evidence:/data/evidence
+      - ../dvas_analytics/intrusion:/analytics/intrusion
+      - ../dvas_analytics/shared:/analytics/shared
     depends_on:
       postgres:
         condition: service_healthy
@@ -655,6 +665,8 @@ services:
               capabilities: [gpu]
     volumes:
       - analytics_evidence:/data/evidence
+      - ../dvas_analytics/vessel:/analytics/vessel
+      - ../dvas_analytics/shared:/analytics/shared
     depends_on:
       postgres:
         condition: service_healthy
@@ -703,6 +715,8 @@ services:
               capabilities: [gpu]
     volumes:
       - analytics_evidence:/data/evidence
+      - ../dvas_analytics/anomaly:/analytics/anomaly
+      - ../dvas_analytics/shared:/analytics/shared
     depends_on:
       postgres:
         condition: service_healthy

@@ -177,16 +177,23 @@ async def _get_service_stream_status() -> dict:
 async def _apply_single_change(client: httpx.AsyncClient, svc_key: str, base_url: str, should_run: bool, is_running: bool) -> tuple:
     if should_run and not is_running:
         try:
-            r = await client.get(f"{base_url}/stream/start", timeout=8.0)
+            r = await client.get(f"{base_url}/stream/start", timeout=12.0)
             return svc_key, ("started" if r.status_code == 200 else f"start_failed({r.status_code})")
         except Exception as e:
             return svc_key, f"start_error({e})"
     elif not should_run and is_running:
         try:
-            r = await client.get(f"{base_url}/stream/stop", timeout=8.0)
+            r = await client.get(f"{base_url}/stream/stop", timeout=12.0)
             return svc_key, ("stopped" if r.status_code == 200 else f"stop_failed({r.status_code})")
         except Exception as e:
             return svc_key, f"stop_error({e})"
+    elif not should_run and not is_running:
+        # Guarantee GPU VRAM is released on deselected service
+        try:
+            await client.get(f"{base_url}/stream/stop", timeout=5.0)
+        except Exception:
+            pass
+        return svc_key, "already_stopped"
     else:
         return svc_key, ("already_running" if is_running else "already_stopped")
 
@@ -194,6 +201,7 @@ async def _apply_single_change(client: httpx.AsyncClient, svc_key: str, base_url
 async def _apply_stream_changes(requested_active: list) -> dict:
     """
     Start/stop analytics stream loops concurrently based on the requested active model list.
+    Enforces that only selected models hold GPU memory; deselected models release VRAM.
     Returns dict of {model_key: action_taken} e.g. {"crowd": "started", "plate": "already_stopped"}
     """
     effective_active = set(requested_active)
@@ -207,6 +215,8 @@ async def _apply_stream_changes(requested_active: list) -> dict:
         "vehicle":   VEHICLE_URL,
         "plate":     ANPR_URL,
         "intrusion": INTRUSION_URL,
+        "vessel":    VESSEL_URL,
+        "anomaly":   ANOMALY_URL,
     }
 
     results = {}
@@ -267,12 +277,28 @@ async def list_models(user: dict = Depends(get_current_user)):
         for m in AVAILABLE_MODELS
     ]
 
+    # Fetch real system hardware telemetry
+    gpu_metrics = {"gpu_pct": 0, "used_gb": 0.0, "total_gb": 4.0, "free_gb": 4.0}
+    try:
+        infra = await collect_system_hardware()
+        used = infra.get("gpu_used_gb", 0.0)
+        tot = infra.get("gpu_total_gb", 4.0)
+        gpu_metrics = {
+            "gpu_pct": infra.get("gpu_pct", 0),
+            "used_gb": used,
+            "total_gb": tot,
+            "free_gb": max(0.0, round(tot - used, 1)),
+        }
+    except Exception:
+        pass
+
     return {
         "available": available_with_status,
         "active": cfg["active"],
         "stream_status": stream_status,
         "scope": CLUSTER_SCOPE,
         "gpu_total_pct": gpu_total,
+        "gpu_metrics": gpu_metrics,
         "updated_at": cfg.get("updated_at"),
         "updated_by": cfg.get("updated_by"),
         "read_only": False,
@@ -346,12 +372,28 @@ async def update_models(
         for m in AVAILABLE_MODELS
     ]
 
+    # Fetch real system hardware telemetry
+    gpu_metrics = {"gpu_pct": 0, "used_gb": 0.0, "total_gb": 4.0, "free_gb": 4.0}
+    try:
+        infra = await collect_system_hardware()
+        used = infra.get("gpu_used_gb", 0.0)
+        tot = infra.get("gpu_total_gb", 4.0)
+        gpu_metrics = {
+            "gpu_pct": infra.get("gpu_pct", 0),
+            "used_gb": used,
+            "total_gb": tot,
+            "free_gb": max(0.0, round(tot - used, 1)),
+        }
+    except Exception:
+        pass
+
     return {
         **updated_cfg,
         "available": available_with_status,
         "stream_status": stream_status,
         "stream_actions": stream_results,
         "gpu_total_pct": gpu_total,
+        "gpu_metrics": gpu_metrics,
         "deploy_ok": True,
         "read_only": False,
     }

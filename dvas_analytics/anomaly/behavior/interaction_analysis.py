@@ -32,14 +32,21 @@ class InteractionAnalyzer:
         # History of persistent following pairs: (follower_id, target_id) -> duration_sec
         self.following_pairs: Dict[Tuple[int, int], float] = {}
 
+        # Pair meeting history: (min_id, max_id) -> {"start_time": float, "duration": float, "pos": (x,y)}
+        self.pair_meetings: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+        # Historical owner tracking for objects: obj_id -> last_known_owner_id
+        self.prior_object_owners: Dict[int, int] = {}
+
     def update_interactions(
         self,
         persons: List[TrackState],
         timestamp: float,
         fps: float = 30.0,
+        objects: Optional[List[TrackState]] = None,
     ) -> List[EventType]:
         """
-        Updates pairwise person interactions and collective crowd dynamics.
+        Updates pairwise person interactions, object transfers, and collective crowd dynamics.
         Returns newly triggered collective event types for this frame.
         """
         dt = 1.0 / max(fps, 1.0)
@@ -149,4 +156,62 @@ class InteractionAnalyzer:
                         if EventType.RAPID_CROWD_DISPERSAL not in p.active_events:
                             p.active_events.append(EventType.RAPID_CROWD_DISPERSAL)
 
+        # 3. Object Handoff / Transfer Detection
+        if objects and len(persons) >= 2:
+            for obj in objects:
+                oid = obj.track_id
+                curr_owner = obj.owner_id
+                prev_owner = self.prior_object_owners.get(oid)
+
+                if curr_owner is not None:
+                    if prev_owner is not None and prev_owner != curr_owner:
+                        # Direct owner change detected
+                        p_prev = person_map.get(prev_owner)
+                        p_curr = person_map.get(curr_owner)
+                        if p_prev and p_curr:
+                            dist_between = float(np.hypot(p_prev.center[0] - p_curr.center[0], p_prev.center[1] - p_curr.center[1]))
+                            if dist_between <= 90.0:
+                                active_events.append(EventType.OBJECT_TRANSFER)
+                                for entity in [obj, p_prev, p_curr]:
+                                    if EventType.OBJECT_TRANSFER not in entity.active_events:
+                                        entity.active_events.append(EventType.OBJECT_TRANSFER)
+                    self.prior_object_owners[oid] = curr_owner
+
+        # 4. Coordinated Multi-Person Arrival
+        if len(persons) >= 3:
+            for i, p1 in enumerate(persons):
+                cluster = [p1]
+                pos1 = p1.bottom_center
+                for j, p2 in enumerate(persons):
+                    if i != j:
+                        pos2 = p2.bottom_center
+                        if float(np.hypot(pos1[0] - pos2[0], pos1[1] - pos2[1])) <= 85.0:
+                            cluster.append(p2)
+
+                if len(cluster) >= 3:
+                    # Check historical separation: were they separated (>130px) in earlier frames?
+                    diverse_origins = True
+                    for c_idx1 in range(len(cluster)):
+                        for c_idx2 in range(c_idx1 + 1, len(cluster)):
+                            cp1, cp2 = cluster[c_idx1], cluster[c_idx2]
+                            h1 = cp1.ground_history if cp1.ground_history else cp1.history
+                            h2 = cp2.ground_history if cp2.ground_history else cp2.history
+                            if len(h1) >= 15 and len(h2) >= 15:
+                                hist_dist = float(np.hypot(h1[0][0] - h2[0][0], h1[0][1] - h2[0][1]))
+                                if hist_dist < 110.0:
+                                    diverse_origins = False
+                                    break
+                            else:
+                                diverse_origins = False
+                                break
+                        if not diverse_origins:
+                            break
+
+                    if diverse_origins:
+                        active_events.append(EventType.COORDINATED_ARRIVAL)
+                        for member in cluster:
+                            if EventType.COORDINATED_ARRIVAL not in member.active_events:
+                                member.active_events.append(EventType.COORDINATED_ARRIVAL)
+
         return active_events
+

@@ -51,6 +51,14 @@ class MaritimePerceptionEngine:
         self.model = YOLO(str(weights_file))
         self.tracker = MaritimeVesselTracker()
 
+    def to_device(self, target_device: str):
+        self.device = target_device
+        if self.model is not None:
+            try:
+                self.model.to(target_device)
+            except Exception:
+                pass
+
     def process_frame(self, frame: np.ndarray):
         img_h, img_w = frame.shape[:2]
         water_mask, dilated_mask = get_water_domain_mask(frame)

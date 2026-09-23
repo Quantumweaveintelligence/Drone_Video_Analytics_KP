@@ -80,18 +80,43 @@ class VehicleInteractionAnalyzer:
                 if pair in self.vehicle_following_pairs:
                     self.vehicle_following_pairs[pair] = max(0.0, self.vehicle_following_pairs[pair] - (dt * 0.5))
 
-        # 2. Vehicle-Person Interaction
+        # 2. Vehicle-Person Interaction & Near-Miss Detection
         for v in vehicles:
             v_pos = v.bottom_center
             for p in persons:
                 p_pos = p.bottom_center
                 dist = float(np.hypot(v_pos[0] - p_pos[0], v_pos[1] - p_pos[1]))
+
+                # 2A. Slow/Stopped Vehicle-Person Interaction
                 if dist <= self.interaction_dist_thresh and v.speed <= 10.0:
                     if EventType.VEHICLE_PERSON_INTERACTION not in v.active_events:
                         v.active_events.append(EventType.VEHICLE_PERSON_INTERACTION)
                     if EventType.VEHICLE_PERSON_INTERACTION not in p.active_events:
                         p.active_events.append(EventType.VEHICLE_PERSON_INTERACTION)
                     p.timeline["t_interaction"] = timestamp
+                elif dist > self.interaction_dist_thresh * 1.5:
+                    if EventType.VEHICLE_PERSON_INTERACTION in v.active_events:
+                        v.active_events.remove(EventType.VEHICLE_PERSON_INTERACTION)
+                    if EventType.VEHICLE_PERSON_INTERACTION in p.active_events:
+                        p.active_events.remove(EventType.VEHICLE_PERSON_INTERACTION)
+
+                # 2B. High-Speed Vehicle-Pedestrian Near-Miss Hazard
+                if dist <= 65.0 and v.speed >= 35.0:
+                    if EventType.VEHICLE_PEDESTRIAN_NEAR_MISS not in v.active_events:
+                        v.active_events.append(EventType.VEHICLE_PEDESTRIAN_NEAR_MISS)
+                    if EventType.VEHICLE_PEDESTRIAN_NEAR_MISS not in p.active_events:
+                        p.active_events.append(EventType.VEHICLE_PEDESTRIAN_NEAR_MISS)
+                    events_triggered.append((
+                        v.track_id,
+                        EventType.VEHICLE_PEDESTRIAN_NEAR_MISS,
+                        f"Vehicle #{v.track_id} dangerous near-miss with Pedestrian #{p.track_id} at {v.speed:.1f}px/s (dist: {dist:.1f}px)",
+                    ))
+                elif dist > 110.0:
+                    if EventType.VEHICLE_PEDESTRIAN_NEAR_MISS in v.active_events:
+                        v.active_events.remove(EventType.VEHICLE_PEDESTRIAN_NEAR_MISS)
+                    if EventType.VEHICLE_PEDESTRIAN_NEAR_MISS in p.active_events:
+                        p.active_events.remove(EventType.VEHICLE_PEDESTRIAN_NEAR_MISS)
+
 
         # 3. Vehicle-Object Interaction & Dropoff Sequence
         # Sequence: Vehicle + Person near each other -> Object appears/placed -> Vehicle departs -> Object remains stationary

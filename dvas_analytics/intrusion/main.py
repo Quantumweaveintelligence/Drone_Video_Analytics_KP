@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Tuple
 import uuid
 
 import cv2
+import gc
 import numpy as np
 import torch
 import yaml
@@ -32,6 +33,7 @@ from shared.db import close_pool, ensure_drone, get_pool
 from shared.redis_client import (
     close_client, publish_analytics_result, publish_confirmed_event,
     xread_frames, xreadgroup_frames, ack_frames, scan_active_stream_drones, get_client,
+    get_latest_stream_frame,
 )
 from shared import minio_client as minio
 
@@ -68,11 +70,27 @@ INTRUSION_MODEL = os.getenv(
 )
 INTRUSION_DEFAULT_PRESET = os.getenv("INTRUSION_DEFAULT_PRESET", "default")
 
-# YOLOv8s geotrax class mapping
-CLASS_NAMES = {
+# YOLOv8s geotrax class mapping (fallback)
+CLASS_NAMES: Dict[int, str] = {
     0: "CAR", 1: "BUS", 2: "TRUCK", 3: "MOTORCYCLE",
-    4: "AUTO", 5: "BICYCLE", 6: "PEOPLE",
+    4: "PEOPLE", 5: "BICYCLE",
 }
+
+
+def resolve_model_class_names(model) -> Dict[int, str]:
+    """Resolve class names from YOLO model weights with pedestrian/people normalization."""
+    fallback = {0: "CAR", 1: "BUS", 2: "TRUCK", 3: "MOTORCYCLE", 4: "PEOPLE", 5: "BICYCLE"}
+    if model and hasattr(model, "names") and model.names:
+        cleaned = {}
+        for k, v in model.names.items():
+            name_str = str(v).upper()
+            if name_str in ("PEDESTRIAN", "PEDESTRIANS", "PERSON", "PEOPLE"):
+                cleaned[int(k)] = "PEOPLE"
+            else:
+                cleaned[int(k)] = name_str
+        log.info("Resolved class mapping from model weights: %s", cleaned)
+        return cleaned
+    return fallback
 
 # ── Service state ──────────────────────────────────────────────────────────────
 yolo_model = None
@@ -139,7 +157,9 @@ async def startup():
     # Load YOLOv8s model
     log.info("Loading YOLO model: %s", INTRUSION_MODEL)
     yolo_model = YOLO(INTRUSION_MODEL)
-    log.info("Intrusion Analyzer ready")
+    global CLASS_NAMES
+    CLASS_NAMES = resolve_model_class_names(yolo_model)
+    log.info("Intrusion Analyzer ready with class mapping: %s", CLASS_NAMES)
 
     # Auto-start stream consumer
     _stream_running = True
@@ -384,9 +404,13 @@ async def _stream_loop():
                     frame_seq = _frames_processed
 
                     # ── YOLOv8s inference ──────────────────────────────
-                    results = await asyncio.to_thread(
-                        _run_yolo_track, frame, ic.min_confidence, ic.imgsz,
-                    )
+                    try:
+                        results = await asyncio.to_thread(
+                            _run_yolo_track, frame, ic.min_confidence, ic.imgsz,
+                        )
+                    except Exception as yolo_err:
+                        log.warning("YOLO tracking error for %s: %s", drone_id, yolo_err)
+                        results = None
 
                     # ── Process detections ────────────────────────────
                     frame_detections: List[dict] = []
@@ -657,22 +681,43 @@ async def _stream_loop():
 
 @app.get("/stream/start")
 async def stream_start():
-    global _stream_running, _stream_task
+    global _stream_running, _stream_task, yolo_model
+    # Allocate model to CUDA if available
+    if yolo_model is not None and torch.cuda.is_available():
+        try:
+            yolo_model.to("cuda:0")
+            log.info("Intrusion YOLO model moved to CUDA:0")
+        except Exception as e:
+            log.warning("Failed to move Intrusion model to CUDA: %s", e)
+
     if _stream_running:
-        return {"status": "already_running"}
+        return {"status": "already_running", "device": "cuda:0" if torch.cuda.is_available() else "cpu"}
     _stream_running = True
     _stream_task = asyncio.create_task(_stream_loop())
-    return {"status": "started"}
+    log.info("Intrusion stream loop started")
+    return {"status": "started", "device": "cuda:0" if torch.cuda.is_available() else "cpu"}
 
 
 @app.get("/stream/stop")
 async def stream_stop():
-    global _stream_running, _stream_task
+    global _stream_running, _stream_task, yolo_model
     _stream_running = False
     if _stream_task:
         _stream_task.cancel()
         _stream_task = None
-    return {"status": "stopped"}
+    # Release model from GPU VRAM to CPU and empty CUDA cache
+    if yolo_model is not None:
+        try:
+            yolo_model.to("cpu")
+            log.info("Intrusion YOLO model offloaded to CPU")
+        except Exception as e:
+            log.warning("Failed to offload Intrusion model to CPU: %s", e)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    log.info("Intrusion stream stopped and GPU VRAM released")
+    return {"status": "stopped", "device": "cpu"}
 
 
 # ── Live intrusion tracks ─────────────────────────────────────────────────────
@@ -700,7 +745,7 @@ async def intrusion_live(drone_id: str = ""):
 
 @app.get("/intrusion/annotated/latest")
 async def annotated_latest(drone_id: str = ""):
-    """Return the latest annotated JPEG frame with geofence + bounding boxes."""
+    """Return the latest annotated JPEG frame with geofence + bounding boxes for requested drone."""
     now = time.monotonic()
     frame_bytes = None
     matched_drone_id = None
@@ -715,17 +760,50 @@ async def annotated_latest(drone_id: str = ""):
                 frame_age = now - _last_annotated_ts.get(alias, now)
                 break
 
-    if not frame_bytes and _last_annotated_frames:
+    # If no fresh annotated frame (<3.0s) in memory, recover latest raw frame from Redis on demand
+    if (not frame_bytes or frame_age > 3.0) and drone_id:
+        raw_bgr = await get_latest_stream_frame(drone_id)
+        if raw_bgr is not None:
+            try:
+                ann_frame = raw_bgr.copy()
+                gm = _geofence_managers.get(drone_id)
+                cam = _cameras.get(drone_id)
+                if gm and gm.is_loaded() and cam:
+                    poly = gm.polygon
+                    d_lat, d_lon = (poly.coordinates[0][1], poly.coordinates[0][0]) if (poly and poly.coordinates) else (0.0, 0.0)
+                    pixel_pts, vis_flags = gm.project_to_frame(
+                        camera=cam,
+                        drone_lat=d_lat, drone_lon=d_lon, drone_alt=50.0,
+                        gimbal_yaw=0.0, gimbal_pitch=-45.0, gimbal_roll=0.0,
+                    )
+                    annotator.draw_geofence(ann_frame, pixel_pts, vis_flags, gm.polygon)
+                    sm = _state_machines.get(drone_id)
+                    active_intrusions = sm.get_active_intrusion_count() if sm else 0
+                    annotator.draw_hud(
+                        ann_frame,
+                        {"frame_idx": _frames_processed, "latitude": d_lat, "longitude": d_lon, "rel_alt_m": 50.0},
+                        gm.polygon,
+                        active_intrusions,
+                    )
+                _, ann_buf = cv2.imencode(".jpg", ann_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                frame_bytes = bytes(ann_buf)
+                matched_drone_id = drone_id
+                frame_age = 0.1
+                _last_annotated_frames[drone_id] = frame_bytes
+                _last_annotated_ts[drone_id] = now
+            except Exception as e:
+                log.warning("On-demand annotation failed for %s: %s", drone_id, e)
+
+    # Strictly isolated: if drone_id was requested, NEVER fall back to another drone!
+    if not frame_bytes and not drone_id and _last_annotated_frames:
         best = max(_last_annotated_ts, key=_last_annotated_ts.get, default=None)
         if best:
             frame_bytes = _last_annotated_frames.get(best)
             matched_drone_id = best
             frame_age = now - _last_annotated_ts.get(best, now)
-        if not frame_bytes:
-            matched_drone_id, frame_bytes = next(iter(_last_annotated_frames.items()))
 
     if not frame_bytes:
-        raise HTTPException(404, "No live annotated frame available yet")
+        raise HTTPException(404, f"No live annotated frame available for {drone_id or 'any drone'}")
 
     return Response(
         content=frame_bytes,

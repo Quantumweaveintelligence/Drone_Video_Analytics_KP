@@ -47,7 +47,7 @@ temporal_confirmation:
     required: 6
 
 hysteresis:
-  enter_threshold: 0.72    # Production calibrated to prevent false alert flicker
+  enter_threshold: 0.70    # Production calibrated to prevent false alert flicker
   maintain_threshold: 0.60 # Production calibrated
   clear_threshold: 0.48    # Production calibrated
   clear_frames: 10
@@ -62,7 +62,7 @@ evidence_groups:
 abandoned_object:
   observation_seconds: 4.0
   candidate_seconds: 10.0
-  minimum_unattended_seconds: 20.0
+  minimum_unattended_seconds: 16.0
   high_confidence_seconds: 40.0
   owner_departure_dist_px: 75.0
   weights:
@@ -87,24 +87,29 @@ weapon:
 behavior:
   running_confidence_min: 0.55
   running_duration_min: 2.0
-  loitering_duration_sec: 30.0
+  loitering_duration_sec: 25.0
   loitering_repetition_cycles: 2
   following_trajectory_similarity: 0.58
   following_distance_stability: 0.55
-  following_duration_sec: 8.0
+  following_duration_sec: 6.0
   opposing_flow_anomaly_min: 0.55
   opposing_flow_persistence_sec: 4.0
   sudden_stop_stationarity_sec: 2.5
 
 vehicle:
+  enable_wrong_way: false
   wrong_way_confidence_min: 0.58
   wrong_way_speed_thresh_px: 25.0
   pedestrian_proximity_threat_px: 110.0
+  speed_hazard_thresh_px: 250.0
   abrupt_stop_decel_percent: 0.60
   abrupt_stop_duration_sec: 2.5
   dropoff_package_stationary_sec: 15.0
+  circling_min_passes: 3
+  approach_flee_accel_thresh: 75.0
 
 cooldown:
-  default_seconds: 45.0
+  default_seconds: 35.0
   alert_evidence_snapshot: true
+
 

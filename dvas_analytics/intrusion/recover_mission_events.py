@@ -73,6 +73,8 @@ async def main():
             m = TRACK_LINE_RE.search(line)
             if m:
                 ts_str, tid_str, cls_name, s_from, s_to = m.groups()
+                if cls_name.upper() in ("AUTO", "PEDESTRIAN", "PEDESTRIANS", "PERSON"):
+                    cls_name = "PEOPLE"
                 events.append({
                     "ts_str": ts_str,
                     "track_id": int(tid_str),

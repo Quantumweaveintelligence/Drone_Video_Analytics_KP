@@ -67,6 +67,19 @@ async def _start_sync():
 async def _start_evidence_sync():
     start_evidence_sync()
 
+@app.on_event("startup")
+async def _sync_models_on_startup():
+    async def _do_sync():
+        await asyncio.sleep(5)
+        try:
+            from routers.infra import _get_model_config, _apply_stream_changes, CLUSTER_SCOPE
+            cfg = await _get_model_config(CLUSTER_SCOPE)
+            if cfg and "active" in cfg:
+                await _apply_stream_changes(cfg["active"])
+        except Exception as e:
+            logging.getLogger("dvas").warning("Model startup sync deferred: %s", e)
+    asyncio.create_task(_do_sync())
+
 # ---------- Root ----------
 @app.get("/api/")
 async def root():

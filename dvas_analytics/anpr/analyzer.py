@@ -528,6 +528,22 @@ class ANPRAnalyzer:
             self.enable_reid, reid_match_threshold, reid_max_lost_frames,
         )
 
+    def to_device(self, target_device: str):
+        self.device = target_device
+        self.use_gpu = target_device != "cpu"
+        if self.vehicle_model is not None:
+            try:
+                self.vehicle_model.to(target_device)
+                log.info("ANPR vehicle model moved to %s", target_device)
+            except Exception:
+                pass
+        if self.lp_model is not None:
+            try:
+                self.lp_model.to(target_device)
+                log.info("ANPR LP model moved to %s", target_device)
+            except Exception:
+                pass
+
     @property
     def ready(self) -> bool:
         return self.vehicle_model is not None

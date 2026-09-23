@@ -432,12 +432,15 @@ async def _stream_loop():
 @app.get("/stream/start")
 async def stream_start():
     global _stream_running, _stream_task
+    import torch
+    if analyzer and hasattr(analyzer, 'to_device') and torch.cuda.is_available():
+        analyzer.to_device("cuda:0")
     if _stream_running:
-        return {"status": "already_running", "frames_processed": _frames_processed}
+        return {"status": "already_running", "device": analyzer.device if analyzer else "cpu", "frames_processed": _frames_processed}
     _stream_running = True
     _stream_task = asyncio.create_task(_stream_loop())
     log.info("Vehicle stream loop STARTED")
-    return {"status": "started"}
+    return {"status": "started", "device": analyzer.device if analyzer else "cpu"}
 
 
 @app.get("/stream/stop")
@@ -447,8 +450,15 @@ async def stream_stop():
     if _stream_task:
         _stream_task.cancel()
         _stream_task = None
-    log.info("Vehicle stream loop STOPPED")
-    return {"status": "stopped", "frames_processed": _frames_processed}
+    if analyzer and hasattr(analyzer, 'to_device'):
+        analyzer.to_device("cpu")
+    import gc, torch
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    log.info("Vehicle stream loop STOPPED and GPU VRAM released")
+    return {"status": "stopped", "device": "cpu", "frames_processed": _frames_processed}
 
 
 # ── Annotated frame endpoint ───────────────────────────────────────────────────

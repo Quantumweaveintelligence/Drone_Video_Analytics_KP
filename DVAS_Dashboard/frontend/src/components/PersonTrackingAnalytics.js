@@ -104,22 +104,26 @@ function fmtIST(isoTs) {
 }
 
 /**
- * Rewrite an internal MinIO URL (http://minio:9000/BUCKET/KEY?...)
- * into a proxied URL (/api/minio/image?bucket=BUCKET&key=KEY) that the
- * browser can actually reach.  Also handles raw object_key strings.
+ * Append authentication token to an image URL if not already present.
  */
-function toProxiedUrl(objectKeyOrUrl, bucket = 'dvas-faces') {
-  if (!objectKeyOrUrl) return null;
-
+export function appendToken(url) {
+  if (!url) return url;
   const token = typeof window !== 'undefined'
     ? (localStorage.getItem('dvas_token') || localStorage.getItem('token') || '')
     : '';
   const tokenParam = token ? `token=${encodeURIComponent(token)}` : '';
+  if (!tokenParam || url.includes('token=')) return url;
+  return url.includes('?') ? `${url}&${tokenParam}` : `${url}?${tokenParam}`;
+}
 
-  const appendToken = (url) => {
-    if (!tokenParam || url.includes('token=')) return url;
-    return url.includes('?') ? `${url}&${tokenParam}` : `${url}?${tokenParam}`;
-  };
+/**
+ * Rewrite an internal MinIO URL (http://minio:9000/BUCKET/KEY?...)
+ * into a proxied URL (/api/minio/image?bucket=BUCKET&key=KEY) that the
+ * browser can actually reach.  Also handles raw object_key strings.
+ */
+export function toProxiedUrl(objectKeyOrUrl, bucket = 'dvas-faces') {
+  if (!objectKeyOrUrl) return null;
+  if (objectKeyOrUrl.startsWith('data:image')) return objectKeyOrUrl;
 
   // Already a proxied URL — pass through (ensure token is attached)
   if (objectKeyOrUrl.startsWith('/api/minio/')) {
@@ -2425,7 +2429,9 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
             drone_id: alertData.drone_id,
             mission_id: alertData.mission_id,
             tracker_id: alertData.tracker_id,
-            face_crop_url: alertData.face_crop_key ? appendToken(`/api/minio/image?bucket=dvas-faces&key=${encodeURIComponent(alertData.face_crop_key)}`) : null,
+            face_crop_url: alertData.face_crop_key
+              ? toProxiedUrl(alertData.face_crop_key, 'dvas-faces')
+              : (alertData.face_crop_url ? toProxiedUrl(alertData.face_crop_url, 'dvas-faces') : null),
             face_crop_key: alertData.face_crop_key,
             detected_at: alertData.ts || new Date().toISOString(),
             is_confirmed: false,

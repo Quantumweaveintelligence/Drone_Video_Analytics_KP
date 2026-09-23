@@ -81,6 +81,12 @@ CREATE TABLE IF NOT EXISTS anomaly_events_2026_11 PARTITION OF anomaly_events
     FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
 CREATE TABLE IF NOT EXISTS anomaly_events_2026_12 PARTITION OF anomaly_events
     FOR VALUES FROM ('2026-12-01') TO ('2027-01-01');
+CREATE TABLE IF NOT EXISTS anomaly_events_2027_01 PARTITION OF anomaly_events
+    FOR VALUES FROM ('2027-01-01') TO ('2027-02-01');
+CREATE TABLE IF NOT EXISTS anomaly_events_2027_02 PARTITION OF anomaly_events
+    FOR VALUES FROM ('2027-02-01') TO ('2027-03-01');
+CREATE TABLE IF NOT EXISTS anomaly_events_2027_03 PARTITION OF anomaly_events
+    FOR VALUES FROM ('2027-03-01') TO ('2027-04-01');
 CREATE TABLE IF NOT EXISTS anomaly_events_default PARTITION OF anomaly_events DEFAULT;
 
 CREATE INDEX IF NOT EXISTS idx_anomaly_events_drone
@@ -91,6 +97,9 @@ CREATE INDEX IF NOT EXISTS idx_anomaly_events_severity
     ON anomaly_events (severity);
 CREATE INDEX IF NOT EXISTS idx_anomaly_events_mission
     ON anomaly_events (mission_id);
+CREATE INDEX IF NOT EXISTS idx_anomaly_events_evidence_groups
+    ON anomaly_events USING GIN (evidence_groups);
+
 
 
 -- ─── Anomaly Mission Summaries (per-mission aggregate) ────────────────────

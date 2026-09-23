@@ -59,6 +59,8 @@ class SceneContextEngine:
         # Dynamic heatmap memory when zones are not predefined
         self.vehicle_occupancy_centroids: List[Tuple[float, float]] = []
         self.pedestrian_occupancy_centroids: List[Tuple[float, float]] = []
+        # Previous zone history for boundary crossing detection: track_id -> zone_name
+        self.track_prev_zones: Dict[int, str] = {}
 
     def add_zone(self, zone: SceneZone):
         self.zones.append(zone)
@@ -99,13 +101,23 @@ class SceneContextEngine:
                     zone_name = z.name
                     break
 
+            prev_zone = self.track_prev_zones.get(t.track_id)
+            self.track_prev_zones[t.track_id] = zone_name
             t.context_zone = zone_name
 
             if matched_zone is not None:
-                # Rule 1: Restricted Zone
+                # Rule 1: Restricted Zone & Boundary Crossing
                 if matched_zone.is_restricted:
                     score += 0.50
                     reasons.append(f"Entity present inside restricted zone '{matched_zone.name}'")
+                    if prev_zone is not None and prev_zone != zone_name:
+                        score += 0.35
+                        reasons.append(f"Boundary crossing: entity transitioned from '{prev_zone}' into restricted zone '{zone_name}'")
+                        if EventType.BOUNDARY_CROSSING not in t.active_events:
+                            t.active_events.append(EventType.BOUNDARY_CROSSING)
+                elif EventType.BOUNDARY_CROSSING in t.active_events:
+                    t.active_events.remove(EventType.BOUNDARY_CROSSING)
+
 
                 # Rule 2: Unattended Object in Vehicle Road
                 if not t.is_person and not t.is_vehicle and matched_zone.zone_type == "road":

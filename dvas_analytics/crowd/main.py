@@ -290,14 +290,21 @@ async def _stream_loop():
 @app.get("/stream/start")
 async def stream_start():
     global _stream_running, _stream_task
+    import torch
+    if analyzer and hasattr(analyzer, 'to_device') and torch.cuda.is_available():
+        try:
+            analyzer.to_device("cuda:0")
+            log.info("Crowd CSRNet model moved to CUDA:0")
+        except Exception as e:
+            log.warning("Failed to move crowd model to CUDA: %s", e)
     if _stream_running:
-        return {"status": "already_running"}
-    # Reset session for new stream
+        return {"status": "already_running", "device": str(analyzer.device) if analyzer else "cpu"}
     if analyzer:
         analyzer.reset_session()
     _stream_running = True
     _stream_task = asyncio.create_task(_stream_loop())
-    return {"status": "started", "model_type": _current_model_type}
+    log.info("Crowd stream loop started")
+    return {"status": "started", "device": str(analyzer.device) if analyzer else "cpu", "model_type": _current_model_type}
 
 
 @app.get("/stream/stop")
@@ -307,7 +314,18 @@ async def stream_stop():
     if _stream_task:
         _stream_task.cancel()
         _stream_task = None
-    return {"status": "stopped"}
+    if analyzer and hasattr(analyzer, 'to_device'):
+        try:
+            analyzer.to_device("cpu")
+        except Exception as e:
+            log.warning("Failed to move crowd model to CPU: %s", e)
+    import gc, torch
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    log.info("Crowd stream loop stopped and GPU VRAM released")
+    return {"status": "stopped", "device": "cpu"}
 
 
 @app.get("/stream/status", response_model=StreamStatus)

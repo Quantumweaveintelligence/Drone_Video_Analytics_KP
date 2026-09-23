@@ -602,8 +602,12 @@ async def stream_start():
                 log.error("ANPR stream loop CRASHED: %s", exc, exc_info=exc)
     _stream_task.add_done_callback(_task_done_cb)
 
+    import torch
+    if analyzer and hasattr(analyzer, 'to_device') and torch.cuda.is_available():
+        analyzer.to_device("cuda:0")
+
     log.info("ANPR stream loop STARTED")
-    return {"status": "started"}
+    return {"status": "started", "device": analyzer.device if analyzer else "cpu"}
 
 
 @app.get("/stream/stop")
@@ -613,8 +617,15 @@ async def stream_stop():
     if _stream_task:
         _stream_task.cancel()
         _stream_task = None
-    log.info("ANPR stream loop STOPPED")
-    return {"status": "stopped", "frames_processed": _frames_processed}
+    if analyzer and hasattr(analyzer, 'to_device'):
+        analyzer.to_device("cpu")
+    import gc, torch
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    log.info("ANPR stream loop STOPPED and GPU VRAM released")
+    return {"status": "stopped", "device": "cpu", "frames_processed": _frames_processed}
 
 
 @app.post("/stream/reset")

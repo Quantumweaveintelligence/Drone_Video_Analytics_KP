@@ -464,10 +464,13 @@ async def health():
 @app.get("/stream/start")
 async def start_stream():
     global _stream_running, _stream_task
+    import torch
+    if engine and hasattr(engine, 'to_device') and torch.cuda.is_available():
+        engine.to_device("cuda:0")
     if not _stream_running:
         _stream_running = True
         _stream_task = asyncio.create_task(_stream_loop())
-    return {"status": "started", "stream_running": True}
+    return {"status": "started", "device": engine.device if engine else "cpu", "stream_running": True}
 
 
 @app.get("/stream/stop")
@@ -477,7 +480,14 @@ async def stop_stream():
     if _stream_task:
         _stream_task.cancel()
         _stream_task = None
-    return {"status": "stopped", "stream_running": False}
+    if engine and hasattr(engine, 'to_device'):
+        engine.to_device("cpu")
+    import gc, torch
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    return {"status": "stopped", "device": "cpu", "stream_running": False}
 
 
 FRAME_CACHE_TTL_SEC = 6.0

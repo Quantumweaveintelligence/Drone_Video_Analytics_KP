@@ -79,3 +79,32 @@ class VehicleSpeedAnalyzer:
                 else:
                     if EventType.ABNORMAL_VEHICLE_SPEED in v.active_events:
                         v.active_events.remove(EventType.ABNORMAL_VEHICLE_SPEED)
+
+            # Approach-and-Flee Detection (Brief stop/slowdown followed by rapid escape acceleration)
+            if not hasattr(self, "stop_episodes"):
+                self.stop_episodes: Dict[int, Dict[str, float]] = {}
+
+            if tid not in self.stop_episodes:
+                self.stop_episodes[tid] = {"stopped_duration": 0.0, "departed_time": 0.0}
+
+            ep = self.stop_episodes[tid]
+            if speed <= 15.0:
+                ep["stopped_duration"] += dt
+                ep["departed_time"] = 0.0
+            else:
+                if ep["stopped_duration"] >= 1.5 and ep["stopped_duration"] <= 12.0:
+                    if ep["departed_time"] == 0.0:
+                        ep["departed_time"] = timestamp
+                    # Check if rapid acceleration happened within 3.5s of departure
+                    if (timestamp - ep["departed_time"]) <= 3.5 and speed >= 75.0:
+                        if EventType.VEHICLE_APPROACH_FLEE not in v.active_events:
+                            v.active_events.append(EventType.VEHICLE_APPROACH_FLEE)
+                    elif (timestamp - ep["departed_time"]) > 6.0:
+                        ep["stopped_duration"] = 0.0
+                        if EventType.VEHICLE_APPROACH_FLEE in v.active_events:
+                            v.active_events.remove(EventType.VEHICLE_APPROACH_FLEE)
+                elif speed > 30.0:
+                    ep["stopped_duration"] = 0.0
+                    if EventType.VEHICLE_APPROACH_FLEE in v.active_events:
+                        v.active_events.remove(EventType.VEHICLE_APPROACH_FLEE)
+
