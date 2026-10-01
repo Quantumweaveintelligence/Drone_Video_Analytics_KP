@@ -51,14 +51,20 @@ export function AuthProvider({ children }) {
           });
           
           // Update the local storage mission log so it reflects the change when logging back in
-          const savedLog = localStorage.getItem('dvas_mission_log');
-          if (savedLog) {
-            try {
-              let logs = JSON.parse(savedLog);
-              logs = logs.map(m => m.id === activeData.mission_id ? { ...m, status: 'completed', end: new Date().toLocaleTimeString('en-GB') } : m);
-              localStorage.setItem('dvas_mission_log', JSON.stringify(logs));
-            } catch(e) {}
+          const keysToUpdate = ['dvas_mission_log'];
+          if (user?.email) {
+            keysToUpdate.push(`dvas_mission_log_${user.email}`);
           }
+          keysToUpdate.forEach(k => {
+            const savedLog = localStorage.getItem(k);
+            if (savedLog) {
+              try {
+                let logs = JSON.parse(savedLog);
+                logs = logs.map(m => m.id === activeData.mission_id ? { ...m, status: 'completed', end: new Date().toLocaleTimeString('en-GB') } : m);
+                localStorage.setItem(k, JSON.stringify(logs));
+              } catch(e) {}
+            }
+          });
         }
       }
     } catch (e) {

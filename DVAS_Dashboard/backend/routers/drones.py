@@ -182,7 +182,25 @@ async def list_missions(user: dict = Depends(get_current_user)):
         # All roles (drone_operator, senior_officer, control_room_officer, system_administrator)
         # can view missions — filtered by jurisdiction if set for control_room_officer
         stmt = select(Mission).where(~Mission.mission_id.like("M-10%"))
-        if user.get("role") == "control_room_officer":
+        if user.get("role") == "drone_operator":
+            op_name = (user.get("name") or "").strip()
+            op_email = (user.get("email") or "").strip()
+            op_id = (user.get("id") or "").strip()
+            conds = []
+            if op_name:
+                conds.append(Mission.operator_name.ilike(f"%{op_name}%"))
+            if op_email:
+                conds.append(Mission.operator_name.ilike(f"%{op_email}%"))
+                prefix = op_email.split("@")[0]
+                if prefix:
+                    conds.append(Mission.operator_name.ilike(f"%{prefix}%"))
+            if op_id:
+                conds.append(Mission.operator_ids.contains([op_id]))
+            if conds:
+                stmt = stmt.where(or_(*conds))
+            else:
+                stmt = stmt.where(Mission.operator_name == op_name)
+        elif user.get("role") == "control_room_officer":
             jur = user.get("jurisdiction")
             if jur:
                 # Show missions in their jurisdiction, State HQ, statewide, or with no jurisdiction set

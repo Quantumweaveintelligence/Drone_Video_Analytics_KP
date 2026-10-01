@@ -2,8 +2,10 @@ import React, { useState, useEffect } from 'react';
 import AppShell from '@/components/layout/AppShell';
 import { Target, Play, Trash, Trash2, XCircle, CheckCircle, Cpu } from 'lucide-react';
 import { authFetch, getAuthToken } from '@/lib/api';
+import { useAuth } from '@/context/AuthContext';
 
 export default function MissionControl() {
+  const { user } = useAuth();
   const [activeMission, setActiveMission] = useState(null);
   const [serverSend, setServerSend] = useState(false);
   const [pipelineEnabled, setPipelineEnabled] = useState(true);
@@ -14,7 +16,7 @@ export default function MissionControl() {
 
   const [form, setForm] = useState(() => {
     const initSquadron = localStorage.getItem('dvas_default_squadron') || 'ALPHA';
-    return { name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: initSquadron };
+    return { name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: user?.name || user?.email || '', location: '', squadron: initSquadron };
   });
   const [videoFile, setVideoFile] = useState(null);
   const [srtFile, setSrtFile] = useState(null);
@@ -33,19 +35,32 @@ export default function MissionControl() {
   };
 
   const [missionLog, setMissionLog] = useState(() => {
-    const saved = localStorage.getItem('dvas_mission_log');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (parsed.length > 2 || (parsed.length > 0 && parsed[0].id !== "MSN-9941-BRAVO")) {
-          return parsed;
+    if (user?.email) {
+      const saved = localStorage.getItem(`dvas_mission_log_${user.email}`);
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved);
+          if (Array.isArray(parsed)) {
+            return parsed.filter(m => m.id !== "MSN-9941-BRAVO" && m.id !== "MSN-9940-CHARLIE");
+          }
+        } catch (e) {
+          console.error("Failed to parse saved mission log", e);
         }
-      } catch (e) {
-        console.error("Failed to parse saved mission log", e);
       }
     }
     return [];
   });
+
+  useEffect(() => {
+    if (user && (user.name || user.email)) {
+      setForm(prev => {
+        if (!prev.operator) {
+          return { ...prev, operator: user.name || user.email || '' };
+        }
+        return prev;
+      });
+    }
+  }, [user]);
 
   const fetchSettings = async () => {
     try {
@@ -119,13 +134,51 @@ export default function MissionControl() {
   }, [defaultSquadron]);
 
   useEffect(() => {
+    if (!user) return;
+
+    const storageKey = user.email ? `dvas_mission_log_${user.email}` : null;
+    let cached = [];
+    if (storageKey) {
+      const saved = localStorage.getItem(storageKey);
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved);
+          if (Array.isArray(parsed)) {
+            cached = parsed.filter(m => m.id !== "MSN-9941-BRAVO" && m.id !== "MSN-9940-CHARLIE");
+          }
+        } catch (e) {}
+      }
+    }
+
+    if (cached.length > 0) {
+      setMissionLog(cached);
+    }
+
     const fetchHistoricalMissions = async () => {
       try {
         const resp = await authFetch('/api/missions');
         if (resp.ok) {
           const data = await resp.json();
-          if (data && data.length > 0) {
-            setMissionLog(data.map(m => ({
+          if (Array.isArray(data)) {
+            let filtered = data;
+            const opName = (user.name || '').toLowerCase().trim();
+            const opEmail = (user.email || '').toLowerCase().trim();
+            const opEmailPrefix = opEmail ? opEmail.split('@')[0] : '';
+
+            if (user.role === 'drone_operator') {
+              filtered = data.filter(m => {
+                const mOp = (m.operator_name || '').toLowerCase().trim();
+                const opIds = Array.isArray(m.operator_ids) ? m.operator_ids : [];
+                return (
+                  (opName && (mOp === opName || mOp.includes(opName))) ||
+                  (opEmail && (mOp === opEmail || mOp.includes(opEmail))) ||
+                  (opEmailPrefix && (mOp === opEmailPrefix || mOp.includes(opEmailPrefix))) ||
+                  opIds.includes(user.id)
+                );
+              });
+            }
+
+            const mapped = filtered.map(m => ({
               id: m.mission_id,
               designation: m.name,
               drone: m.drone_id,
@@ -134,24 +187,31 @@ export default function MissionControl() {
               start: m.started_at ? (m.started_at.includes('T') ? new Date(m.started_at).toLocaleTimeString('en-GB') : m.started_at) : '',
               end: m.ended_at ? new Date(m.ended_at).toLocaleTimeString('en-GB') : '',
               status: m.status
-            })));
+            }));
+
+            setMissionLog(mapped);
+            if (storageKey) {
+              localStorage.setItem(storageKey, JSON.stringify(mapped));
+            }
             return;
           }
         }
-      } catch (err) {}
+      } catch (err) {
+        console.warn('Failed to fetch historical missions:', err);
+      }
       
-      // Fallback mock data if DB is completely empty and we have no local cache
-      setMissionLog(prev => prev.length > 0 ? prev : [
-        { id: "MSN-9941-BRAVO", designation: "Traffic Monitoring", drone: "DRN-002", operator: "A. Sharma", location: "Junction 12", start: "11:15:00", end: "13:45:00", status: "completed" },
-        { id: "MSN-9940-CHARLIE", designation: "VIP Route Sweep", drone: "DRN-001", operator: "K. Kumar", location: "Airport Road", start: "08:30:00", end: "10:15:00", status: "completed" },
-      ]);
+      // Fallback only to operator's own cached logs, never mock logs
+      setMissionLog(cached);
     };
+
     fetchHistoricalMissions();
-  }, []);
+  }, [user]);
 
   useEffect(() => {
-    localStorage.setItem('dvas_mission_log', JSON.stringify(missionLog));
-  }, [missionLog]);
+    if (user?.email && missionLog) {
+      localStorage.setItem(`dvas_mission_log_${user.email}`, JSON.stringify(missionLog));
+    }
+  }, [missionLog, user?.email]);
 
   const [loading, setLoading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState('');
@@ -296,7 +356,7 @@ export default function MissionControl() {
           end: '--:--:--',
           status: 'active',
         }, ...prev]);
-        setForm({ name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: defaultSquadron });
+        setForm({ name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: user?.name || user?.email || '', location: '', squadron: defaultSquadron });
         setVideoFile(null);
         setSrtFile(null);
 
@@ -389,7 +449,9 @@ export default function MissionControl() {
     // Optimistically remove from state and update localStorage
     setMissionLog(prev => {
       const updated = prev.filter(m => (m.id || m.mission_id) !== missionId);
-      localStorage.setItem('dvas_mission_log', JSON.stringify(updated));
+      if (user?.email) {
+        localStorage.setItem(`dvas_mission_log_${user.email}`, JSON.stringify(updated));
+      }
       return updated;
     });
 
@@ -706,7 +768,7 @@ export default function MissionControl() {
                   <Play size={16} fill="currentColor" /> {loading ? 'Starting...' : 'Start Mission'}
                 </button>
                 <button 
-                  onClick={() => setForm({ name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: defaultSquadron })}
+                  onClick={() => setForm({ name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: user?.name || user?.email || '', location: '', squadron: defaultSquadron })}
                   className="px-6 border border-slate-700 hover:bg-slate-800 text-slate-300 py-2.5 text-sm font-semibold tracking-wide rounded transition-colors"
                 >
                   Clear
