@@ -321,6 +321,9 @@ export default function MissionControl() {
         } catch (backendErr) {
           console.error("Failed to save mission to backend:", backendErr);
         }
+      } else {
+        const msg = data?.error || data?.detail || `Failed to start mission (HTTP ${resp.status})`;
+        setErrorMsg(msg);
       }
     } catch (err) {
       console.error('Failed to start mission:', err);

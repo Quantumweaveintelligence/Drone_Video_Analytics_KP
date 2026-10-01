@@ -35,7 +35,7 @@ services:
       - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://dvas:dvas_secret@postgres:5432/dvas}
       - EDGE_SYNC_HOSTS=${EDGE_SYNC_HOSTS:-10.10.55.112}
       - JWT_SECRET=super-secret-dvas-key-change-in-prod
-      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://10.10.55.115:3000}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://10.253.110.250:3000}
       - INGEST_SERVER_URL=${INGEST_SERVER_URL:-http://drone_nginx}
       - EDGE_SERVER_URL=http://edge:8765
       - ANALYTICS_GATEWAY_URL=${ANALYTICS_GATEWAY_URL:-http://analytics-gateway:8100}
@@ -58,7 +58,7 @@ services:
       - ANALYTICS_SERVICE_KEY=${ANALYTICS_SERVICE_KEY}
       # Peer DVAS backend (friend's laptop command side) — set this to the friend's dashboard URL
       # The nginx proxy on port 3000 routes /api/ to their backend, so no need to know their internal port
-      - DVAS_PEER_URL=${DVAS_PEER_URL:-http://10.10.55.115:3000}
+      - DVAS_PEER_URL=${DVAS_PEER_URL:-http://10.253.110.250:3000}
       - DVAS_SERVICE_KEY=${DVAS_SERVICE_KEY:-dvas-inter-service-2026}
     depends_on:
       postgres:
@@ -99,8 +99,6 @@ services:
     restart: unless-stopped
     ports:
       - "3000:80"
-    volumes:
-      - ./frontend/build:/usr/share/nginx/html:ro
     depends_on:
       - backend
       - edge

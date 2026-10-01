@@ -32,9 +32,9 @@ export default function Settings() {
   // Settings state
   const [settings, setSettings] = useState({
     transmission: {
-      ingest_url: 'http://10.10.55.115:8000/ingest/frame',
-      mission_start_url: 'http://10.10.55.115:8000/ingest/mission/start',
-      mission_end_url: 'http://10.10.55.115:8000/ingest/mission/end',
+      ingest_url: 'http://10.253.110.250:8000/ingest/frame',
+      mission_start_url: 'http://10.253.110.250:8000/ingest/mission/start',
+      mission_end_url: 'http://10.253.110.250:8000/ingest/mission/end',
       bypass_target_fps: 10,
       jpeg_quality: 80,
       max_resolution: '1080p',
@@ -195,9 +195,9 @@ export default function Settings() {
   const handleResetDefaults = () => {
     setSettings({
       transmission: {
-        ingest_url: 'http://10.10.55.115:8000/ingest/frame',
-        mission_start_url: 'http://10.10.55.115:8000/ingest/mission/start',
-        mission_end_url: 'http://10.10.55.115:8000/ingest/mission/end',
+        ingest_url: 'http://10.253.110.250:8000/ingest/frame',
+        mission_start_url: 'http://10.253.110.250:8000/ingest/mission/start',
+        mission_end_url: 'http://10.253.110.250:8000/ingest/mission/end',
         bypass_target_fps: 10,
         jpeg_quality: 80,
         max_resolution: '1080p',
@@ -350,7 +350,7 @@ export default function Settings() {
                         transmission: { ...settings.transmission, ingest_url: e.target.value }
                       })}
                       className="flex-1 bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-xs font-mono text-slate-200 rounded"
-                      placeholder="http://10.10.55.115:8000/ingest/frame"
+                      placeholder="http://10.253.110.250:8000/ingest/frame"
                     />
                     <button
                       onClick={handleTestConnection}

@@ -216,7 +216,7 @@ async def create_mission(
     operator_name = payload.get("operator_name") or payload.get("operator", "")
     location = payload.get("location", "")
     started_at = payload.get("started_at", "")
-    video_source = payload.get("video_source", "rtmp://10.10.55.115:1935/live/stream")
+    video_source = payload.get("video_source", "rtmp://10.253.110.250:1935/live/stream")
     login_ts_ist = payload.get("login_ts_ist") or datetime.now(timezone.utc).isoformat()
     frames_sent = payload.get("frames_sent", 0)
     frames_ingested = payload.get("frames_ingested", 0)

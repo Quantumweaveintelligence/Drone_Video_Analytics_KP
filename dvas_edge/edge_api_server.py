@@ -23,6 +23,7 @@ log = get_logger(__name__)
 
 # ── Standard library ─────────────────────────────────────────────────────────
 import os
+import ntpath
 import time
 import datetime
 import asyncio
@@ -32,6 +33,7 @@ import collections
 import subprocess
 import json
 import copy
+import re
 from typing import Optional, Union
 
 # ── Third party ──────────────────────────────────────────────────────────────
@@ -80,7 +82,7 @@ def emit_system_log(source: str, level: str, message: str, metric: str = ""):
 
 # Pre-seed realistic initial operational engine events
 _init_events = [
-    ("stream-mgr", "INFO", "RTMP connected to rtmp://10.10.55.115:1935/live/stream", "ONLINE"),
+    ("stream-mgr", "INFO", "RTMP connected to rtmp://10.253.110.250:1935/live/stream", "ONLINE"),
     ("stream-mgr", "INFO", "Encoding metrics verified: 1920x1080 @ 30 FPS, Bitrate: 4500 kbps, Codec: H.264", "1080p@30FPS"),
     ("stream-mgr", "INFO", "Stream health nominal; 0 frames dropped; uplink latency: 18ms", "0 drops / 18ms"),
     ("buffer-svc", "INFO", "Local ring buffer 68% full (12.4 GB / 18 GB slab storage)", "68% (12.4 GB)"),
@@ -88,7 +90,7 @@ _init_events = [
     ("telemetry", "INFO", "GPS Lock 3D acquired (14 satellites, HDOP: 0.8)", "14 SATS (3D)"),
     ("telemetry", "INFO", "Flight telemetry nominal: Battery: 78%, Speed: 12.4 m/s, Altitude: 45.2 m AGL", "78% Bat / 45.2m"),
     ("telemetry", "INFO", "Control input active; RC Operator authenticated: Govind", "Operator: Govind"),
-    ("ingest", "INFO", "WebSocket telemetry sync active: Connected to ws://10.10.55.115:8000/ws/status", "WS CONNECTED"),
+    ("ingest", "INFO", "WebSocket telemetry sync active: Connected to ws://10.253.110.250:8000/ws/status", "WS CONNECTED"),
     ("ingest", "INFO", "Frame queue ACK received from central dvas_ingest node", "ACK OK"),
     ("system", "INFO", "Jetson / Edge device health nominal: CPU: 42%, GPU: 65%, Temp: 54°C", "CPU 42% / 54°C"),
     ("system", "INFO", "/data partition health: 52% used (94 GB available space)", "52% (94 GB free)"),
@@ -235,6 +237,8 @@ class MissionStartRequest(BaseModel):
     operator: str = ""
     location: str = ""
     geofence: Optional[dict] = None
+    drone_id: Optional[str] = None
+
 
 
 class MissionGeofenceRequest(BaseModel):
@@ -374,11 +378,44 @@ class EdgeSenderThread(threading.Thread):
                     lat = tel.get("latitude") if tel.get("latitude") is not None else tel.get("lat")
                     lon = tel.get("longitude") if tel.get("longitude") is not None else tel.get("lon")
                     alt = tel.get("altitude_m") if tel.get("altitude_m") is not None else tel.get("alt")
+
+                    # Sanitize telemetry to strictly comply with Ingest Server Pydantic schema
+                    if lat is not None:
+                        try:
+                            lat = max(-90.0, min(90.0, float(lat)))
+                        except (ValueError, TypeError):
+                            lat = None
+                    if lon is not None:
+                        try:
+                            lon = max(-180.0, min(180.0, float(lon)))
+                        except (ValueError, TypeError):
+                            lon = None
+                    if alt is not None:
+                        try:
+                            alt = max(0.0, min(10000.0, float(alt)))
+                        except (ValueError, TypeError):
+                            alt = None
+                    if speed is not None:
+                        try:
+                            speed = max(0.0, float(speed))
+                        except (ValueError, TypeError):
+                            speed = None
+                    if battery is not None:
+                        try:
+                            battery = max(0.0, min(100.0, float(battery)))
+                        except (ValueError, TypeError):
+                            battery = None
+
+                    score = tel.get("change_score", 0.0)
+                    try:
+                        score = max(0.0, min(1.0, float(score)))
+                    except (ValueError, TypeError):
+                        score = 0.0
                     
                     if kind == "selected":
                         await self._client.send_frame_bytes(
                             frame_bytes  = jpeg_bytes,
-                            change_score = tel.get("change_score", 0.0),
+                            change_score = score,
                             lat          = lat,
                             lon          = lon,
                             alt          = alt,
@@ -401,7 +438,8 @@ class EdgeSenderThread(threading.Thread):
                     # Success! Remove from buffer
                     self._buffer.commit(frame_id)
                 except Exception as exc:
-                    log.error(f"edge_sender_frame_failed_buffering id={frame_id} error={exc}")
+                    err_msg = getattr(getattr(exc, "response", None), "text", None) or str(exc)
+                    log.error(f"edge_sender_frame_failed_buffering id={frame_id} error={err_msg}")
                     # Do NOT commit, meaning it will be retried on next loop.
                     await asyncio.sleep(2.0)
                 finally:
@@ -481,8 +519,22 @@ class PipelineManager:
             self.pipeline_frames_in = 0
             self.geofence = req.geofence
 
-            # ── Auto-generate drone_id from mission_id ────────────────────
-            drone_id = f"DRN-{req.mission_id}"
+            # ── Resolve and validate drone_id (strictly 3-30 uppercase alphanumeric/underscore/hyphen for Ingest schema) ────
+            configured_drone = getattr(req, "drone_id", None) or os.getenv("INGEST__DRONE_ID")
+            if configured_drone and configured_drone.strip():
+                drone_id = configured_drone.strip().upper()
+            elif req.mission_id.startswith("MSN-"):
+                drone_id = f"DRN-{req.mission_id[4:]}"
+            else:
+                drone_id = f"DRN-{req.mission_id}"
+
+            # Clean and strictly enforce Ingest API constraint: ^[A-Z0-9_\-]{3,30}$
+            drone_id = re.sub(r"[^A-Z0-9_\-]", "-", drone_id.upper())
+            if len(drone_id) > 30:
+                drone_id = drone_id[:30].rstrip("-_")
+            if len(drone_id) < 3:
+                drone_id = f"DRN-{drone_id}"[:30]
+
 
             # ── Rolling frame buffer ──────────────────────────────────────
             self.buffer = RollingFrameBuffer(
@@ -626,8 +678,6 @@ class PipelineManager:
             
             # Auto-translate Windows file paths or basenames to the /data/ volume
             if not clean_video_source.startswith("rtmp://") and not clean_video_source.startswith("rtsp://"):
-                import ntpath
-                import os
                 basename = ntpath.basename(clean_video_source)
                 if not basename:
                     basename = os.path.basename(clean_video_source)
@@ -2000,7 +2050,7 @@ async def stream_live(request: Request, auth: dict = Depends(verify_edge_auth)):
 # ---------------------------------------------------------------------------
 # Ingest Server Proxy
 # ---------------------------------------------------------------------------
-INGEST_BASE_URL = os.getenv("INGEST_URL", "http://10.10.55.115/ingest").replace("/frame", "")
+INGEST_BASE_URL = os.getenv("INGEST_URL", "http://10.253.110.250/ingest").replace("/frame", "")
 
 @app.get("/api/ingest-server/status")
 async def proxy_ingest_status(auth: dict = Depends(verify_edge_auth)):

@@ -36,7 +36,7 @@ const GOVIND_DEFAULT_AUDIT = [
     target: "MSN-08092026-1014-ALPHA",
     ip: "192.168.1.45",
     actor_session_id: "sid-78a9c1",
-    details: "Mission started; Drone: DRN-001; Video source: rtmp://10.10.55.115:1935/live/stream; Login Date: 08-09-2026",
+    details: "Mission started; Drone: DRN-001; Video source: rtmp://10.253.110.250:1935/live/stream; Login Date: 08-09-2026",
     status: "success",
     prev_hash: "a1f8c49e7b2d5801c3e98214fa76b0559d3324ce9b8e1903e30129bc7801a24d",
     hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852a98b"

@@ -98,7 +98,15 @@ class IngestClient:
         username:   str,
         password:   str,
     ) -> None:
-        self.drone_id      = drone_id
+        if drone_id:
+            import re
+            cleaned_drone = re.sub(r"[^A-Z0-9_\-]", "-", str(drone_id).upper())
+            if len(cleaned_drone) > 30:
+                cleaned_drone = cleaned_drone[:30].rstrip("-_")
+            self.drone_id = cleaned_drone
+        else:
+            self.drone_id = "DRONE_KL_001"
+
         self.mission_id    = mission_id
         self.username      = username
         self.password      = password
@@ -213,6 +221,8 @@ class IngestClient:
 
                 if resp.status_code < 500:
                     # Client errors (4xx) — do not retry
+                    if resp.is_error:
+                        log.error(f"ingest_frame_client_error status={resp.status_code} body={resp.text}")
                     resp.raise_for_status()
                     data = resp.json()
                     log.info(
@@ -322,6 +332,8 @@ class IngestClient:
                 )
 
                 if resp.status_code < 500:
+                    if resp.is_error:
+                        log.error(f"ingest_frame_client_error status={resp.status_code} body={resp.text}")
                     resp.raise_for_status()
                     data = resp.json()
                     log.info(

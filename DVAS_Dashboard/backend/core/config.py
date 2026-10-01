@@ -33,7 +33,7 @@ MINIO_PROXY_SECURE = os.getenv("MINIO_SECURE", "false").lower() == "true"
 INGEST_URL = os.environ.get("INGEST_SERVER_URL", "http://drone_nginx")
 
 # ---------- Peer DVAS Dashboard (friend's laptop command side) ----------
-# URL of the peer DVAS dashboard backend (e.g. http://10.10.55.115:3000 using nginx proxy)
+# URL of the peer DVAS dashboard backend (e.g. http://10.253.110.250:3000 using nginx proxy)
 # Set this env var on the edge-operator side laptop to forward incidents/suggestions to the command side
 DVAS_PEER_URL = os.environ.get("DVAS_PEER_URL", "").rstrip("/")
 # Shared inter-service secret — must match on both laptops
