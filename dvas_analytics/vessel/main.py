@@ -67,18 +67,24 @@ app.add_middleware(
 )
 
 # ── Configuration Constants ───────────────────────────────────────────────────
+VESSEL_MODEL_TYPE = os.getenv("VESSEL_MODEL_TYPE", "yolov8").lower()
 VESSEL_MODEL_PATH = os.getenv(
     "VESSEL_MODEL_PATH",
     "/analytics/vessel/models/yolov8s.pt"
+    if os.path.exists("/analytics/vessel/models/yolov8s.pt")
+    else "D:/POLICE_DRONE/dvas_analytics/vessel/models/yolov8s.pt"
+    if os.path.exists("D:/POLICE_DRONE/dvas_analytics/vessel/models/yolov8s.pt")
+    else "models/yolov8s.pt"
 )
 BUCKET_VESSELS = getattr(cfg, "BUCKET_VESSELS_MARITIME", "dvas-vessels-maritime")
 CONF_THRESH = getattr(cfg, "VESSEL_CONFIDENCE", 0.50)
-PERSON_CONF_THRESH = getattr(cfg, "VESSEL_PERSON_CONFIDENCE", 0.25)
+PERSON_CONF_THRESH = getattr(cfg, "VESSEL_PERSON_CONFIDENCE", 0.20)
 STATIONARY_THRESH_PX = getattr(cfg, "VESSEL_STATIONARY_THRESHOLD_PX", 6.0)
 PROXIMITY_THRESH_PX = getattr(cfg, "VESSEL_PROXIMITY_THRESHOLD_PX", 90.0)
 
 # ── Service State ─────────────────────────────────────────────────────────────
-engine: Optional[MaritimePerceptionEngine] = None
+engine: Optional[object] = None
+
 _stream_task: Optional[asyncio.Task] = None
 _stream_running = False
 _frames_processed = 0
@@ -407,7 +413,13 @@ async def _stream_loop():
                 log.info("Maritime vessel stream cancelled")
                 return
             except Exception as e:
-                log.error("Maritime stream loop error: %s", e, exc_info=True)
+                err_str = str(e)
+                if "CUDA" in err_str:
+                    log.warning("CUDA error in vessel stream loop — falling back engine to CPU: %s", e)
+                    if engine:
+                        engine._fallback_to_cpu()
+                else:
+                    log.error("Maritime stream loop error: %s", e, exc_info=True)
                 await asyncio.sleep(0.5)
 
         await asyncio.sleep(0.02)
@@ -418,7 +430,7 @@ async def _stream_loop():
 @app.on_event("startup")
 async def startup():
     global engine, _stream_task, _stream_running
-    log.info("Initializing Maritime Perception Engine with weights: %s", VESSEL_MODEL_PATH)
+    log.info("Initializing SeaDrone YOLOv8s Maritime Perception Engine with weights: %s", VESSEL_MODEL_PATH)
     engine = MaritimePerceptionEngine(
         weights_path=VESSEL_MODEL_PATH,
         global_imgsz=1280,
@@ -466,7 +478,10 @@ async def start_stream():
     global _stream_running, _stream_task
     import torch
     if engine and hasattr(engine, 'to_device') and torch.cuda.is_available():
-        engine.to_device("cuda:0")
+        try:
+            engine.to_device("cuda:0")
+        except Exception as e:
+            log.warning("Failed to move vessel engine to CUDA, staying on CPU: %s", e)
     if not _stream_running:
         _stream_running = True
         _stream_task = asyncio.create_task(_stream_loop())

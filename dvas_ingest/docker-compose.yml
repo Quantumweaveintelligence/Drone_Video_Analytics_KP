@@ -761,7 +761,7 @@ services:
 
   # One-shot bucket initializer — runs once, creates all required buckets, then exits
   minio-init:
-    image: minio/mc:latest
+    image: minio/minio:latest
     container_name: drone_minio_init
     networks: [drone-net]
     restart: on-failure

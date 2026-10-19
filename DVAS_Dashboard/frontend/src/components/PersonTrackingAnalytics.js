@@ -1767,7 +1767,7 @@ function WatchlistCard({ entry, onRemove, onOpenPreview }) {
   );
 }
 
-function EnrollmentModal({ isOpen, onClose, onEnrolled }) {
+function EnrollmentModal({ isOpen, onClose, onEnrolled, arcfaceLoaded = true, arcfaceProvider = '' }) {
   const [name, setName] = useState('');
   const [category, setCategory] = useState('wanted');
   const [caseRef, setCaseRef] = useState('');
@@ -1854,6 +1854,16 @@ function EnrollmentModal({ isOpen, onClose, onEnrolled }) {
           <div className="flex items-center gap-2">
             <Shield className="text-amber-400" size={18} />
             <span className="font-bold text-white text-sm tracking-wide">Enroll Person to Face Watchlist</span>
+            <span
+              className={`mono text-[9px] px-2 py-0.5 rounded-full flex items-center gap-1 border ${
+                arcfaceLoaded
+                  ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                  : 'bg-red-500/10 text-red-400 border-red-500/30'
+              }`}
+            >
+              <span className={`w-1.5 h-1.5 rounded-full ${arcfaceLoaded ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'}`} />
+              <span>{arcfaceLoaded ? `ArcFace (${arcfaceProvider.replace('ExecutionProvider', '')})` : 'ArcFace Inactive'}</span>
+            </span>
           </div>
           <button onClick={handleClose} disabled={submitting} className="text-slate-400 hover:text-white transition-colors cursor-pointer">
             <X size={18} />
@@ -1861,6 +1871,12 @@ function EnrollmentModal({ isOpen, onClose, onEnrolled }) {
         </div>
 
         <form onSubmit={handleSubmit} className="p-5 flex flex-col gap-4">
+          {!arcfaceLoaded && (
+            <div className="p-3 rounded-lg bg-amber-500/15 border border-amber-500/30 text-amber-300 mono text-xs flex items-center gap-2">
+              <AlertTriangle size={15} className="shrink-0 text-amber-400" />
+              <span>Face recognition model (ArcFace R100) is not loaded on the server. Enrollment is temporarily unavailable.</span>
+            </div>
+          )}
           {errorMsg && (
             <div className="p-3 rounded-lg bg-red-500/15 border border-red-500/30 text-red-300 mono text-xs flex items-center gap-2">
               <AlertTriangle size={15} className="shrink-0 text-red-400" />
@@ -1982,7 +1998,7 @@ function EnrollmentModal({ isOpen, onClose, onEnrolled }) {
             </button>
             <button
               type="submit"
-              disabled={submitting}
+              disabled={submitting || !arcfaceLoaded}
               className="px-5 py-2 rounded-lg mono text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 flex items-center gap-2 transition-all cursor-pointer shadow-lg shadow-amber-500/20 disabled:opacity-50"
             >
               {submitting ? (
@@ -2295,9 +2311,11 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
 
   // Health
   const { data: healthData } = useAnalyticsFetch('/analytics/person/health', 5000);
-  const streamRunning  = healthData?.stream_running ?? false;
-  const modelActive    = healthData?.model_loaded  ?? false;
-  const activeMissions = healthData?.active_missions ?? {};
+  const streamRunning   = healthData?.stream_running ?? false;
+  const modelActive     = healthData?.model_loaded  ?? false;
+  const arcfaceLoaded   = healthData?.arcface_loaded ?? false;
+  const arcfaceProvider = healthData?.arcface_provider ?? 'none';
+  const activeMissions  = healthData?.active_missions ?? {};
 
   // Annotation config sync from backend
   const { data: serverAnnotationConfig } = usePersonAnnotationConfig(10000);
@@ -2640,6 +2658,21 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
         badge={watchlist.length > 0 ? `${watchlist.length}${watchlistCategoryFilter ? ` (${watchlistCategoryFilter})` : ''} enrolled` : null}
         right={
           <div className="flex items-center gap-2">
+            <span
+              className={`mono text-[9px] px-2 py-0.5 rounded-full flex items-center gap-1 border ${
+                arcfaceLoaded
+                  ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                  : 'bg-red-500/10 text-red-400 border-red-500/30'
+              }`}
+              title={
+                arcfaceLoaded
+                  ? `ArcFace Recognition Active (${arcfaceProvider})`
+                  : 'ArcFace model not loaded — enrollments disabled'
+              }
+            >
+              <span className={`w-1.5 h-1.5 rounded-full ${arcfaceLoaded ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'}`} />
+              <span>{arcfaceLoaded ? `ArcFace ${arcfaceProvider.replace('ExecutionProvider', '')}` : 'ArcFace Inactive'}</span>
+            </span>
             <select
               value={watchlistCategoryFilter}
               onChange={e => setWatchlistCategoryFilter(e.target.value)}
@@ -2653,7 +2686,13 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
             </select>
             <button
               onClick={() => setShowEnrollModal(true)}
-              className="mono text-[10px] font-bold px-3 py-1 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 transition-all flex items-center gap-1.5 cursor-pointer shadow-sm shadow-amber-500/10"
+              disabled={!arcfaceLoaded}
+              title={!arcfaceLoaded ? 'ArcFace model not loaded' : 'Enroll a person into the face watchlist'}
+              className={`mono text-[10px] font-bold px-3 py-1 rounded-lg border transition-all flex items-center gap-1.5 shadow-sm ${
+                arcfaceLoaded
+                  ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 hover:bg-amber-500/30 cursor-pointer shadow-amber-500/10'
+                  : 'bg-slate-800/40 text-slate-500 border-slate-700/50 cursor-not-allowed opacity-60'
+              }`}
             >
               <Plus size={11} />
               <span>Enroll Person</span>
@@ -2792,6 +2831,8 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
       <EnrollmentModal
         isOpen={showEnrollModal}
         onClose={() => setShowEnrollModal(false)}
+        arcfaceLoaded={arcfaceLoaded}
+        arcfaceProvider={arcfaceProvider}
         onEnrolled={() => {
           refreshWatchlist && refreshWatchlist();
         }}

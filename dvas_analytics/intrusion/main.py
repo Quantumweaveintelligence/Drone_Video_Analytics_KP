@@ -673,7 +673,15 @@ async def _stream_loop():
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                log.warning("Stream error for %s: %s", drone_id, exc)
+                err_str = str(exc)
+                if "CUDA" in err_str and yolo_model is not None:
+                    log.warning("CUDA error in intrusion stream — falling back to CPU: %s", exc)
+                    try:
+                        yolo_model.to("cpu")
+                    except Exception:
+                        pass
+                else:
+                    log.warning("Stream error for %s: %s", drone_id, exc)
                 await asyncio.sleep(1)
 
 
@@ -714,8 +722,11 @@ async def stream_stop():
             log.warning("Failed to offload Intrusion model to CPU: %s", e)
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception as e:
+            log.warning("Failed to clear CUDA cache (non-fatal): %s", e)
     log.info("Intrusion stream stopped and GPU VRAM released")
     return {"status": "stopped", "device": "cpu"}
 

@@ -440,16 +440,28 @@ async def write_audit_v2(
                         "actor_email": entry_dict["actor_email"],
                         "actor_name": entry_dict["actor_name"],
                         "actor_role": entry_dict["actor_role"],
+                        "actor_session_id": entry_dict.get("actor_session_id"),
+                        "actor_device_id": entry_dict.get("actor_device_id"),
                         "action": entry_dict["action"],
                         "action_type": entry_dict["action_type"],
                         "category": entry_dict["category"],
                         "severity": entry_dict["severity"],
                         "target": entry_dict["target"],
                         "target_type": entry_dict["target_type"],
+                        "target_id": entry_dict.get("target_id"),
                         "target_name": entry_dict["target_name"],
+                        "details": entry_dict.get("details", ""),
+                        "before_values": safe_before,
+                        "after_values": safe_after,
                         "status": entry_dict["status"],
                         "error_code": entry_dict["error_code"],
+                        "source_module": entry_dict.get("source_module"),
+                        "source_endpoint": entry_dict.get("source_endpoint"),
+                        "request_id": entry_dict.get("request_id"),
+                        "correlation_id": entry_dict.get("correlation_id"),
                         "ip": entry_dict["ip"],
+                        "prev_hash": entry_dict.get("prev_hash"),
+                        "hash": entry_dict.get("hash"),
                         "compliance_tags": compliance_tags,
                         "is_legal_hold": False,
                     }
@@ -817,7 +829,13 @@ async def get_related_events(
 
 async def verify_chain_integrity(limit: int = 1000) -> dict:
     """
-    Verify sequential cryptographic hash-chain integrity from Genesis.
+    Graph-aware cryptographic hash-chain integrity verification.
+
+    Validates two properties for each audit record:
+      1. Self-integrity: SHA-256(canonical fields) == stored hash.
+      2. Parent-link integrity: prev_hash is either 'GENESIS' or matches a
+         known hash that exists in the database — accommodating multiple
+         genesis roots, timestamp collisions, and edge-synced branches.
     """
     async with async_session_factory() as session:
         result = await session.execute(
@@ -825,26 +843,50 @@ async def verify_chain_integrity(limit: int = 1000) -> dict:
         )
         chain = [_row_to_dict(r) for r in result.scalars().all()]
 
+    # Build a set of all known hashes in the checked window
+    known_hashes = {entry.get("hash") for entry in chain if entry.get("hash")}
+
     tampered_ids = []
-    prev_hash = "GENESIS"
     verified_count = 0
 
     for entry in chain:
-        expected = _audit_hash({**entry, "prev_hash": prev_hash})
-        is_tampered = (entry.get("hash") != expected or entry.get("prev_hash") != prev_hash)
-        if is_tampered:
+        stored_hash = entry.get("hash")
+        prev = entry.get("prev_hash")
+
+        # 1. Self-integrity: recompute hash from canonical fields
+        if not stored_hash:
             tampered_ids.append({
                 "id": entry["id"],
                 "ts": entry["ts"],
-                "action": entry["action"],
-                "expected_hash": expected,
-                "actual_hash": entry.get("hash"),
-                "expected_prev_hash": prev_hash,
-                "actual_prev_hash": entry.get("prev_hash"),
+                "action": entry.get("action"),
+                "reason": "missing_hash",
             })
-        else:
-            verified_count += 1
-        prev_hash = entry.get("hash", prev_hash)
+            continue
+
+        expected_hash = _audit_hash(entry)
+        if stored_hash != expected_hash:
+            tampered_ids.append({
+                "id": entry["id"],
+                "ts": entry["ts"],
+                "action": entry.get("action"),
+                "reason": "hash_mismatch",
+                "expected_hash": expected_hash,
+                "actual_hash": stored_hash,
+            })
+            continue
+
+        # 2. Parent-link integrity: prev_hash must be GENESIS or a known hash
+        if prev != "GENESIS" and prev not in known_hashes:
+            tampered_ids.append({
+                "id": entry["id"],
+                "ts": entry["ts"],
+                "action": entry.get("action"),
+                "reason": "broken_parent_link",
+                "prev_hash": prev,
+            })
+            continue
+
+        verified_count += 1
 
     return {
         "total_checked": len(chain),

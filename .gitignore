@@ -21,6 +21,7 @@ dist/
 # model weights — do NOT commit these to git directly
 *.pt
 *.pth
+*.onnx
 weights/
 
 # large video files

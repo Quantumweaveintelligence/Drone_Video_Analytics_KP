@@ -791,7 +791,22 @@ async def _stream_loop():
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                log.warning("Person stream error for %s: %s", drone_id, exc)
+                err_str = str(exc)
+                if "CUDA" in err_str and analyzer and hasattr(analyzer, 'device'):
+                    log.warning("CUDA error in person stream — falling back to CPU: %s", exc)
+                    analyzer.device = "cpu"
+                    if analyzer.person_model:
+                        try:
+                            analyzer.person_model.to("cpu")
+                        except Exception:
+                            pass
+                    if analyzer.face_model:
+                        try:
+                            analyzer.face_model.to("cpu")
+                        except Exception:
+                            pass
+                else:
+                    log.warning("Person stream error for %s: %s", drone_id, exc)
                 await asyncio.sleep(1)
 
 
@@ -930,8 +945,11 @@ async def stream_stop():
     import gc
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception as e:
+            log.warning("Failed to clear CUDA cache (non-fatal): %s", e)
     log.info("Person stream loop stopped and GPU VRAM released")
     return {"status": "stopped", "device": "cpu"}
 

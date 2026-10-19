@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
+import logging
 
 from .water_domain import get_water_domain_mask, generate_water_slices
 from .classifier import classify_maritime_object
@@ -59,6 +60,17 @@ class MaritimePerceptionEngine:
             except Exception:
                 pass
 
+    def _fallback_to_cpu(self):
+        """Fall back to CPU when CUDA is unavailable or errored."""
+        if self.device != "cpu":
+            _log = logging.getLogger("vessel-engine")
+            _log.warning("CUDA error detected — falling back vessel engine to CPU")
+            self.device = "cpu"
+            try:
+                self.model.to("cpu")
+            except Exception:
+                pass
+
     def process_frame(self, frame: np.ndarray):
         img_h, img_w = frame.shape[:2]
         water_mask, dilated_mask = get_water_domain_mask(frame)
@@ -70,7 +82,14 @@ class MaritimePerceptionEngine:
         # 1. Global Context Inference (imgsz=1280)
         # 1. Global Context Inference (detect candidates down to min threshold)
         infer_conf = min(self.conf_thresh, self.person_conf)
-        res_global = self.model.predict(source=frame, imgsz=self.global_imgsz, conf=infer_conf, device=self.device, verbose=False)[0]
+        try:
+            res_global = self.model.predict(source=frame, imgsz=self.global_imgsz, conf=infer_conf, device=self.device, verbose=False)[0]
+        except RuntimeError as e:
+            if "CUDA" in str(e):
+                self._fallback_to_cpu()
+                res_global = self.model.predict(source=frame, imgsz=self.global_imgsz, conf=infer_conf, device=self.device, verbose=False)[0]
+            else:
+                raise
         if res_global.boxes is not None and len(res_global.boxes) > 0:
             for b, conf, cls_id in zip(res_global.boxes.xyxy.cpu().numpy(), res_global.boxes.conf.cpu().numpy(), res_global.boxes.cls.cpu().numpy()):
                 name = self.model.names[int(cls_id)].lower()
@@ -98,7 +117,14 @@ class MaritimePerceptionEngine:
             slices = generate_water_slices(img_h, img_w, water_mask, slice_size=self.slice_size, overlap_ratio=self.overlap_ratio)
             if slices:
                 slice_crops = [frame[ymin:ymax, xmin:xmax] for (xmin, ymin, xmax, ymax) in slices]
-                slice_res = self.model.predict(source=slice_crops, imgsz=self.slice_size, conf=infer_conf, device=self.device, verbose=False)
+                try:
+                    slice_res = self.model.predict(source=slice_crops, imgsz=self.slice_size, conf=infer_conf, device=self.device, verbose=False)
+                except RuntimeError as e:
+                    if "CUDA" in str(e):
+                        self._fallback_to_cpu()
+                        slice_res = self.model.predict(source=slice_crops, imgsz=self.slice_size, conf=infer_conf, device=self.device, verbose=False)
+                    else:
+                        raise
                 for idx, sres in enumerate(slice_res):
                     if sres.boxes is None or len(sres.boxes) == 0:
                         continue

@@ -23,7 +23,8 @@ const STALE_THRESHOLD = 20000; // 20 s — last_seen older than this → treat a
 /** True if ISO timestamp is recent enough to be considered "live" */
 function isRecentlySeen(lastSeen) {
   if (!lastSeen) return false;
-  return Date.now() - new Date(lastSeen).getTime() < STALE_THRESHOLD;
+  const diff = Date.now() - new Date(lastSeen).getTime();
+  return diff >= 0 && diff < STALE_THRESHOLD;
 }
 
 /** Determine stream status: live vs draining vs offline */
@@ -32,8 +33,9 @@ function resolveDroneStatus(stream, fallbackStatus = "offline") {
   
   if (stream.status === "draining") return "draining";  // draining takes priority
   const recent = isRecentlySeen(stream.last_seen);
-  if (recent) return "live";
-  if ((stream.messages_ready ?? 0) > 0) return "draining";
+  const frames = stream.frame_count ?? stream.frames_received ?? 0;
+  if (recent && frames > 0) return "live";
+  if ((stream.messages_ready ?? 0) > 0 || frames > 0) return "draining";
   return "offline";
 }
 
@@ -102,7 +104,8 @@ export function useActiveStreams() {
   const droneIsLive = useCallback(
     (id) => {
       const s = streamMap.get(id);
-      return !!s && isRecentlySeen(s.last_seen) && s.status !== "offline";
+      const frames = s?.frame_count ?? s?.frames_received ?? 0;
+      return !!s && isRecentlySeen(s.last_seen) && s.status !== "offline" && frames > 0;
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [streams]
@@ -125,9 +128,11 @@ export function useActiveStreams() {
       const combined = [...dbDrones.map((d) => ({ ...d }))];
       for (const stream of streams) {
         if (!dbById.has(stream.drone_id)) {
+          const st = resolveDroneStatus(stream, "offline");
+          if (st === "offline") continue;
           combined.push({
             id:            stream.drone_id,
-            status:        resolveDroneStatus(stream, "offline"),
+            status:        st,
             battery_pct:   stream.battery_pct ?? null,
             lat:           stream.latitude  ?? null,
             lng:           stream.longitude ?? null,

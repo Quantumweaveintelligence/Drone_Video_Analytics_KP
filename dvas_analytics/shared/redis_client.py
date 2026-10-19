@@ -179,7 +179,8 @@ async def xreadgroup_frames(group: str, consumer: str, drone_id: str,
     except Exception as e:
         if "NOGROUP" in str(e):
             try:
-                await client.xgroup_create(stream_key, group, id="0", mkstream=True)
+                # Do NOT recreate empty streams with mkstream=True if the stream was deleted/purged
+                await client.xgroup_create(stream_key, group, id="0", mkstream=False)
             except Exception:
                 pass
             return []

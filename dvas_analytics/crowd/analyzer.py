@@ -127,11 +127,47 @@ class CrowdAnalyzer:
     })
 
     def to_device(self, target_device: str):
-        """Move CSRNet model and internal device reference to CPU or CUDA."""
-        self.device = torch.device(target_device)
-        if self.model is not None:
-            self.model.to(self.device)
-            logger.info(f"CrowdAnalyzer CSRNet moved to {self.device}")
+        """Safely move CSRNet model between CPU and CUDA."""
+        with self._infer_lock:
+            target = torch.device(target_device)
+            if target.type == "cpu":
+                self.device = target
+                if self._model_path:
+                    try:
+                        self.model = self._load_model(self._model_path)
+                        self.ready = True
+                        logger.info("CrowdAnalyzer cleanly reloaded on CPU from disk")
+                    except Exception as e:
+                        logger.error(f"Failed to reload model on CPU: {e}")
+                        if self.model is not None:
+                            try:
+                                self.model = self.model.to(target)
+                            except Exception:
+                                pass
+                elif self.model is not None:
+                    try:
+                        self.model = self.model.to(target)
+                    except Exception:
+                        pass
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            else:
+                try:
+                    if self.model is not None:
+                        self.model = self.model.to(target)
+                    self.device = target
+                    logger.info(f"CrowdAnalyzer moved to {target}")
+                except Exception as e:
+                    logger.warning(f"Failed moving to {target}: {e}. Falling back to clean CPU reload.")
+                    self.device = torch.device("cpu")
+                    if self._model_path:
+                        try:
+                            self.model = self._load_model(self._model_path)
+                            self.ready = True
+                        except Exception as reload_err:
+                            logger.error(f"Failed to reload model on CPU during fallback: {reload_err}")
 
     def _load_model(self, path):
         try:
@@ -244,8 +280,13 @@ class CrowdAnalyzer:
             }
 
     def _infer(self, frame_bgr, max_dim=None):
+        model_device = (
+            next(self.model.parameters()).device
+            if (self.model is not None and list(self.model.parameters()))
+            else self.device
+        )
         if max_dim is None:
-            max_dim = 1280 if self.device.type == "cuda" else 640
+            max_dim = 1280 if model_device.type == "cuda" else 640
         h, w = frame_bgr.shape[:2]
         
         # Resize if longer side > max_dim
@@ -267,7 +308,7 @@ class CrowdAnalyzer:
             frame_padded = frame_resized
             
         frame_rgb = cv2.cvtColor(frame_padded, cv2.COLOR_BGR2RGB)
-        tensor_img = self.transform(frame_rgb).unsqueeze(0).to(self.device)
+        tensor_img = self.transform(frame_rgb).unsqueeze(0).to(model_device)
         
         with torch.no_grad():
             output = self.model(tensor_img)

@@ -424,7 +424,15 @@ async def _stream_loop():
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                log.warning("Vehicle stream error for %s: %s", drone_id, exc)
+                err_str = str(exc)
+                if "CUDA" in err_str and analyzer and hasattr(analyzer, 'to_device'):
+                    log.warning("CUDA error in vehicle stream — falling back to CPU: %s", exc)
+                    try:
+                        analyzer.to_device("cpu")
+                    except Exception:
+                        pass
+                else:
+                    log.warning("Vehicle stream error for %s: %s", drone_id, exc)
                 await asyncio.sleep(1)
 
 
@@ -434,7 +442,10 @@ async def stream_start():
     global _stream_running, _stream_task
     import torch
     if analyzer and hasattr(analyzer, 'to_device') and torch.cuda.is_available():
-        analyzer.to_device("cuda:0")
+        try:
+            analyzer.to_device("cuda:0")
+        except Exception as e:
+            log.warning("Failed to move vehicle model to CUDA, staying on CPU: %s", e)
     if _stream_running:
         return {"status": "already_running", "device": analyzer.device if analyzer else "cpu", "frames_processed": _frames_processed}
     _stream_running = True
@@ -451,12 +462,18 @@ async def stream_stop():
         _stream_task.cancel()
         _stream_task = None
     if analyzer and hasattr(analyzer, 'to_device'):
-        analyzer.to_device("cpu")
+        try:
+            analyzer.to_device("cpu")
+        except Exception as e:
+            log.warning("Failed to move vehicle model to CPU: %s", e)
     import gc, torch
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception as e:
+            log.warning("Failed to clear CUDA cache (non-fatal): %s", e)
     log.info("Vehicle stream loop STOPPED and GPU VRAM released")
     return {"status": "stopped", "device": "cpu", "frames_processed": _frames_processed}
 

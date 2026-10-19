@@ -274,15 +274,16 @@ async def ingest_streams_active():
     # ── 1. New Valkey-scan endpoint ───────────────────────────────────────────
     try:
         result = await _proxy_get("/ingest/streams/active", timeout=5.0)
-        if result.get("count", 0) > 0:
-            # Fetch status to inject messages_ready
-            try:
-                status_data = await _proxy_get("/ingest/status", timeout=3.0)
-                status_map = {d["drone_id"]: d.get("queue", {}).get("messages_ready", 0) for d in status_data.get("drones", [])}
-                for d in result.get("drones", []):
-                    d["messages_ready"] = status_map.get(d["drone_id"], 0)
-            except Exception:
-                pass
+        if isinstance(result, dict) and "drones" in result:
+            if result.get("count", 0) > 0:
+                # Fetch status to inject messages_ready
+                try:
+                    status_data = await _proxy_get("/ingest/status", timeout=3.0)
+                    status_map = {d["drone_id"]: d.get("queue", {}).get("messages_ready", 0) for d in status_data.get("drones", [])}
+                    for d in result.get("drones", []):
+                        d["messages_ready"] = status_map.get(d["drone_id"], 0)
+                except Exception:
+                    pass
             return result
     except HTTPException:
         pass
@@ -291,12 +292,10 @@ async def ingest_streams_active():
     try:
         status_data = await _proxy_get("/ingest/status", timeout=3.0)
         all_drones  = status_data.get("drones", [])
-        # Filter by online=True (Valkey-backed) OR frames_received>0 (in-memory).
-        # online=True is more reliable across multiple uvicorn workers since it
-        # reflects Valkey stream existence rather than per-worker in-memory stats.
+        # Only include drones that are online AND have unconsumed messages or live frames
         active = [
             d for d in all_drones
-            if d.get("online") is True or (d.get("ingest_stats", {}).get("frames_received") or d.get("frames_received") or 0) > 0
+            if d.get("online") is True and ((d.get("queue", {}).get("messages_ready", 0) > 0) or (d.get("ingest_stats", {}).get("frames_received") or 0) > 0)
         ]
         if active:
             drones = []

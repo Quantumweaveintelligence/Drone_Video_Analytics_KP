@@ -206,7 +206,45 @@ class PersonFaceAnalyzer:
                             "crop_bytes": crop_bytes,   # kept for MinIO upload
                         })
             except Exception as exc:
-                log.warning("Person tracking error: %s", exc)
+                if "CUDA" in str(exc) and self.device != "cpu":
+                    log.warning("CUDA error in person tracking — falling back to CPU: %s", exc)
+                    self.device = "cpu"
+                    try:
+                        self.person_model.to("cpu")
+                    except Exception:
+                        pass
+                    # Retry on CPU
+                    try:
+                        results = self.person_model.track(
+                            frame_bgr, persist=True, imgsz=640, conf=CONF_PERSON,
+                            classes=[0], device=self.device, verbose=False,
+                        )
+                        if results and results[0].boxes:
+                            for box in results[0].boxes:
+                                if box.id is not None:
+                                    tracker_id = int(box.id[0])
+                                else:
+                                    _untracked_counter += 1
+                                    tracker_id = -_untracked_counter
+                                conf = float(box.conf[0])
+                                x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
+                                crop_b64 = None
+                                crop_bytes = None
+                                if save_crops and self._frame_count % SAVE_EVERY_N == 0:
+                                    crop_bytes = _crop_to_bytes(frame_bgr, x1, y1, x2, y2)
+                                    if crop_bytes:
+                                        crop_b64 = base64.b64encode(crop_bytes).decode()
+                                persons.append({
+                                    "tracker_id": tracker_id,
+                                    "bbox": _bbox_dict(x1, y1, x2, y2),
+                                    "confidence": round(conf, 4),
+                                    "crop_b64": crop_b64,
+                                    "crop_bytes": crop_bytes,
+                                })
+                    except Exception as retry_exc:
+                        log.warning("Person tracking CPU retry also failed: %s", retry_exc)
+                else:
+                    log.warning("Person tracking error: %s", exc)
 
         # ── Face detection (tile-based) ───────────────────────────────────────
         if self.face_model:
@@ -269,7 +307,15 @@ class PersonFaceAnalyzer:
                         })
 
             except Exception as exc:
-                log.warning("Face detection error: %s", exc)
+                if "CUDA" in str(exc) and self.device != "cpu":
+                    log.warning("CUDA error in face detection — falling back to CPU: %s", exc)
+                    self.device = "cpu"
+                    try:
+                        self.face_model.to("cpu")
+                    except Exception:
+                        pass
+                else:
+                    log.warning("Face detection error: %s", exc)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
         return {

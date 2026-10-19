@@ -937,12 +937,15 @@ async def _auto_cleanup_consumed_streams(min_drain_sec: float = 20.0):
                         valkey = getattr(_qm, "_client", None) or getattr(_qm, "_redis", None)
                         if valkey:
                             await valkey.delete(f"mission:active:{drone_id}")
+                            await valkey.delete(f"drone:frames:{drone_id}")
                     except Exception as e:
                         log.warning(f"Failed to clean mission from Valkey: {e}")
                     mid = mission.get("mission_id", "unknown")
                     _active_missions.pop(drone_id, None)
-                    for key in ("mission_id", "mission_name", "operator", "location", "mission_status", "drain_started_at"):
-                        _latest_metadata.get(drone_id, {}).pop(key, None)
+                    _latest_metadata.pop(drone_id, None)
+                    _ingest_stats.pop(drone_id, None)
+                    if drone_id in _qm._stats:
+                        del _qm._stats[drone_id]
                     await ws_manager.broadcast({"event": "mission_drained", "drone_id": drone_id, "mission_id": mid})
         except Exception as e:
             log.warning(f"[AUTO-CLEANUP] Error: {e}")
@@ -971,11 +974,14 @@ async def _monitor_queue_drain(drone_id: str, mission_id: str, max_wait_sec: flo
                     valkey = getattr(_qm, "_client", None) or getattr(_qm, "_redis", None)
                     if valkey:
                         await valkey.delete(f"mission:active:{drone_id}")
+                        await valkey.delete(f"drone:frames:{drone_id}")
                 except Exception as e:
                     log.warning(f"Failed to clean mission from Valkey: {e}")
                 _active_missions.pop(drone_id, None)
-                for key in ("mission_id", "mission_name", "operator", "location", "mission_status", "drain_started_at"):
-                    _latest_metadata.get(drone_id, {}).pop(key, None)
+                _latest_metadata.pop(drone_id, None)
+                _ingest_stats.pop(drone_id, None)
+                if drone_id in _qm._stats:
+                    del _qm._stats[drone_id]
                 await ws_manager.broadcast({
                     "event": "mission_drained",
                     "drone_id": drone_id,
@@ -1127,12 +1133,18 @@ async def get_active_streams():
                     import datetime
                     last_seen_dt = datetime.datetime.strptime(last_seen_str, "%Y-%m-%dT%H:%M:%S.%fZ")
                     age_sec = (datetime.datetime.utcnow() - last_seen_dt).total_seconds()
-                    recently_seen = age_sec < 15.0
+                    # Strictly ensure age is non-negative and within 15 seconds
+                    recently_seen = 0.0 <= age_sec < 15.0
                 except Exception:
                     pass
             
             # If 0 frames exist in stream, skip reporting as active UNLESS mission is draining or active
             if frame_count == 0 and not is_active_mission and not recently_seen:
+                if drone_id not in KNOWN_DRONES:
+                    try:
+                        await client.delete(key_str)
+                    except Exception:
+                        pass
                 continue
 
             stream_status = "live"
@@ -1140,6 +1152,17 @@ async def get_active_streams():
                 stream_status = "draining"
             elif not is_active_mission and not recently_seen:
                 stream_status = "draining" if frame_count > 0 else "offline"
+            elif frame_count == 0 and not recently_seen:
+                stream_status = "offline"
+
+            # Do not report offline streams with 0 frames in the active streams list
+            if stream_status == "offline" and frame_count == 0:
+                if drone_id not in KNOWN_DRONES:
+                    try:
+                        await client.delete(key_str)
+                    except Exception:
+                        pass
+                continue
 
             drones.append({
                 "drone_id":        drone_id,
@@ -1223,7 +1246,7 @@ async def get_latest_frame(
                 ls = meta.get("last_seen", "")
                 if ls:
                     age = (datetime.datetime.utcnow() - datetime.datetime.strptime(ls, "%Y-%m-%dT%H:%M:%S.%fZ")).total_seconds()
-                    _is_live = age < 15.0
+                    _is_live = 0.0 <= age < 15.0
             except Exception:
                 pass
 
@@ -1275,17 +1298,29 @@ async def purge_drone_stream(
         valkey = getattr(_qm, "_client", None) or getattr(_qm, "_redis", None)
         if valkey:
             await valkey.delete(f"mission:active:{drone_id}")
+            await valkey.delete(f"drone:frames:{drone_id}")
     except Exception as e:
         log.warning(f"Failed to clean mission from Valkey: {e}")
     _qm.end_mission(drone_id, "")
+    if drone_id in _qm._stats:
+        del _qm._stats[drone_id]
     _active_missions.pop(drone_id, None)
-    if drone_id in _latest_metadata:
-        _latest_metadata[drone_id].pop("mission_id", None)
-        _latest_metadata[drone_id].pop("mission_name", None)
+    _latest_metadata.pop(drone_id, None)
+    _ingest_stats.pop(drone_id, None)
+    if drone_id in _drain_tasks:
+        try:
+            _drain_tasks.pop(drone_id).cancel()
+        except Exception:
+            pass
     
     ACTIVE_MISSIONS.set(len(_active_missions))
     await ws_manager.broadcast({
         "event":       "mission_drained",
+        "drone_id":    drone_id,
+        "timestamp":   time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+    })
+    await ws_manager.broadcast({
+        "event":       "drone_offline",
         "drone_id":    drone_id,
         "timestamp":   time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
     })

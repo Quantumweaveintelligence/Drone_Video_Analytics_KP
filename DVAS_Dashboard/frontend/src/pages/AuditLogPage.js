@@ -1649,7 +1649,7 @@ export default function AuditLogPage() {
   const [timezone, setTimezone] = useState('IST');
 
   // Real-time Live Tail Mode
-  const [liveTailActive, setLiveTailActive] = useState(false);
+  const [liveTailActive, setLiveTailActive] = useState(true);
   const [liveTailPaused, setLiveTailPaused] = useState(false);
   const [newLogIds, setNewLogIds] = useState(new Set());
 
@@ -1858,6 +1858,25 @@ export default function AuditLogPage() {
   useDvasSocket((msg) => {
     const incoming = msg?.event || msg?.data;
     if (msg?.type === 'audit_event' && liveTailActive && !liveTailPaused && incoming) {
+      // Filter incoming event against active filter criteria
+      if (debouncedSearch) {
+        const term = debouncedSearch.toLowerCase();
+        const searchable = [
+          incoming.action, incoming.action_type, incoming.target,
+          incoming.target_name, incoming.details, incoming.ip,
+          incoming.actor_email, incoming.actor_name,
+        ].filter(Boolean).join(' ').toLowerCase();
+        if (!searchable.includes(term)) return;
+      }
+      if (selectedCategories.length && !selectedCategories.includes(incoming.category)) return;
+      if (selectedSeverities.length && !selectedSeverities.includes(incoming.severity)) return;
+      if (selectedActionTypes.length && !selectedActionTypes.includes(incoming.action_type)) return;
+      if (selectedStatuses.length && !selectedStatuses.includes(incoming.status)) return;
+      if (sourceModuleFilter && incoming.source_module !== sourceModuleFilter) return;
+      if (targetTypeFilter && incoming.target_type !== targetTypeFilter) return;
+      if (actorFilter && incoming.actor_id !== actorFilter) return;
+      if (roleFilter && incoming.actor_role !== roleFilter) return;
+
       setLogs((prev) => [incoming, ...prev.slice(0, pageSize - 1)]);
       setTotalLogs((t) => t + 1);
       setNewLogIds((prev) => new Set([...prev, incoming.id]));
@@ -1871,12 +1890,12 @@ export default function AuditLogPage() {
     }
   });
 
-  // Polling fallback when Live Tail is ON
+  // Background auto-sync fallback when Live Tail is ON (10s interval)
   useEffect(() => {
     if (!liveTailActive || liveTailPaused) return;
     const interval = setInterval(() => {
       fetchAuditLogs();
-    }, 4000);
+    }, 10000);
     return () => clearInterval(interval);
   }, [liveTailActive, liveTailPaused, fetchAuditLogs]);
 
@@ -2312,6 +2331,27 @@ export default function AuditLogPage() {
               </button>
             )}
           </div>
+
+          {/* Refresh Logs Button */}
+          <button
+            data-testid="refresh-logs"
+            onClick={fetchAuditLogs}
+            title="Refresh logs from server"
+            style={{
+              width: 36,
+              height: 36,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              borderRadius: 8,
+              background: 'var(--dvas-elev)',
+              border: '1px solid var(--dvas-border)',
+              color: loading ? 'var(--dvas-blue)' : 'var(--dvas-text-muted)',
+              cursor: 'pointer',
+            }}
+          >
+            <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
+          </button>
 
           {/* Retention Policy Pill */}
           <button
