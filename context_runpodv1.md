@@ -488,3 +488,22 @@ Ubuntu 24.04 (above). Not run: a full image build (no registry access / weights 
   - `nginx -t` warns `4096 worker_connections exceed open file resource limit: 1024` — build-time only; supervisord
     sets `minfds=65536` at runtime.
 - Next: A2d (NVIDIA runtime) → A7 local test → A8 push → A9 package private → Part B.
+- **A7 first boot (27 Oct 17:06) looks clean:** secrets generated, PG16 cluster + 13 analytics migrations applied,
+  supervisord started all 18 programs, bootstrap exited 0 within 25 s, container `healthy`. `CREATE EXTENSION vector`
+  fails (pgvector isn't installed in the image) and `003_minio_reid.sql` falls back to `FLOAT4[]` as designed. The code
+  stores embeddings encrypted (`encrypt_vector` → bytea) and matches in Python, so no pgvector operator is used. An
+  optional later improvement: `postgresql-16-pgvector` from PGDG.
+- **A7 restart test found a real bug (27 Oct 17:21):** after `docker restart` the backend went FATAL (exit 3):
+  `seed_data()` re-seeded the demo data → `duplicate key … missions_pkey (M-101)`. Its "already seeded" guard only
+  counted **User** rows, but seeding never creates users, so the guard never fired. Worse: before crashing, each
+  restart ran `DELETE` on drones, alerts, **evidence** and exports and committed. On a pod that would wipe live
+  evidence on every restart. (Locally it never showed because the old DB had user rows.)
+  **Fix — `DVAS_Dashboard/backend/services/seed_service.py`:** seed only when users, missions, drones, alerts, evidence
+  and exports are all empty; the startup deletes are removed. New `DVAS_SEED_DEMO=0` leaves an empty DB empty (no demo
+  missions/evidence/fake audit chain). The default stays `1` (unchanged behaviour). Tested here on PostgreSQL 16:
+  two runs → same counts (3 missions, 4 drones, 14 evidence, 4 exports, 25 audit); with `DVAS_SEED_DEMO=0` → all zero.
+  → **Decision for you before go-live:** set `DVAS_SEED_DEMO=0` in the RunPod template so the production pod doesn't
+  get demo missions, fake evidence and a seeded audit chain.
+- Login in A7 worked once the right `users.json` password was used (the first "Invalid email or password" was a copy
+  mistake). `tools/diagnose_login.sh` was added for future login problems.
+- Guide A7 restart step: `dvas-ctl` through `docker exec` (it exists only in the container).

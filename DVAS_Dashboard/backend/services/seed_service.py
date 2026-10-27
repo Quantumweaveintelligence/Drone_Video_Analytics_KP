@@ -1,7 +1,7 @@
 """
 Seed service for populating the database.
 """
-import uuid, random, logging
+import os, uuid, random, logging
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import select, delete, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -62,6 +62,11 @@ SEED_USERS = [
 ]
 
 
+def _seed_demo_enabled() -> bool:
+    """Demo missions/drones/evidence/audit rows on an empty DB. DVAS_SEED_DEMO=0 disables them."""
+    return os.environ.get("DVAS_SEED_DEMO", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 async def seed_data():
     # Create all tables (including the new missions schema)
     async with engine.begin() as conn:
@@ -82,24 +87,24 @@ async def seed_data():
     async with async_session_factory() as session:
         user_ids_by_email = {u["email"]: "seed-id" for u in SEED_USERS}
 
-        # If users already exist, ensure audit chain exists then return
-        user_count = (await session.execute(
-            select(func.count()).select_from(User)
-        )).scalar() or 0
-        if user_count > 0:
-            audit_count = (await session.execute(
-                select(func.count()).select_from(AuditLog)
-            )).scalar() or 0
-            if audit_count == 0:
-                await _seed_audit_chain(session, user_ids_by_email)
-            return  # already seeded
+        # Seed only an EMPTY dashboard database. Seeding never creates User rows, so "users exist"
+        # alone never stopped a re-seed: on the second start the deletes below wiped drones, alerts,
+        # evidence and exports, then the mission insert hit missions_pkey and the backend crashed
+        # (found in the RunPod A7 restart test, 27 Oct 2026). Any existing row → skip.
+        async def _count(model) -> int:
+            return (await session.execute(select(func.count()).select_from(model))).scalar() or 0
 
-        # Clean slate for dependent seed tables to prevent IntegrityError on re-seed
-        await session.execute(delete(Drone))
-        await session.execute(delete(Alert))
-        await session.execute(delete(Evidence))
-        await session.execute(delete(Export))
-        await session.commit()
+        existing = {m.__tablename__: await _count(m) for m in (User, Mission, Drone, Alert, Evidence, Export)}
+        if any(existing.values()):
+            if await _count(AuditLog) == 0 and _seed_demo_enabled():
+                await _seed_audit_chain(session, user_ids_by_email)
+            logger.info("Seed skipped — database already has data: %s",
+                        {k: v for k, v in existing.items() if v})
+            return  # already seeded / live data
+
+        if not _seed_demo_enabled():
+            logger.info("Seed skipped — DVAS_SEED_DEMO=0 (empty database left empty)")
+            return
 
         now = datetime.now(timezone.utc)
         op_id = user_ids_by_email["operator@dvas.kp"]

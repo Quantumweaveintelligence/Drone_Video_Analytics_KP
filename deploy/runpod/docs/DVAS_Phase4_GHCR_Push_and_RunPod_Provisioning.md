@@ -317,10 +317,20 @@ Make sure nothing else uses port 8088 (`ss -ltnp | grep 8088` prints nothing). T
 
 ```bash
 deploy/runpod/tools/run_local_test.sh ghcr.io/quantumweaveintelligence/dvas-runpod:$(cat deploy/runpod/.last_build_tag)
-docker exec -it dvas-pod-test tail -f /var/log/dvas/bootstrap.log
+docker logs -f dvas-pod-test
 ```
 
-Wait until the log says **`bootstrap complete`** (first boot: 5–10 min), press Ctrl-C, then:
+The first boot runs in two parts. First `dvas-init` creates the secrets and the Postgres cluster, and you watch it in
+`docker logs` (lines start with `[dvas-init]`). It ends with `starting supervisord`. Only then does
+`/var/log/dvas/bootstrap.log` exist; a `tail` before that fails with *No such file or directory*, which is harmless.
+Press Ctrl-C (the container keeps running), then follow the bootstrap. `tail -F` waits until the file appears:
+
+```bash
+docker ps --filter name=dvas-pod-test        # STATUS must be "Up …" (if "Exited": docker logs dvas-pod-test | tail -50)
+docker exec -it dvas-pod-test tail -F /var/log/dvas/bootstrap.log
+```
+
+Wait until it says **`bootstrap complete`** (first boot: 5–10 min), press Ctrl-C, then:
 
 ```bash
 docker exec -it dvas-pod-test dvas-ctl status       # every program RUNNING, bootstrap EXITED
@@ -331,8 +341,14 @@ sudo cat ~/dvas-pod-test-volume/dvas/secrets/users.json   # test passwords (file
 
 1. Browser → http://localhost:8088 → log in as `control@dvas.kp` with the `control_001` password from `users.json`.
    You should land on the command dashboard.
-2. Restart test: `docker restart dvas-pod-test`, wait ~3 min, run `dvas-ctl status` again. `docker logs dvas-pod-test`
-   must **not** show `first boot: creating roles, databases and schema` a second time.
+2. Restart test (`dvas-ctl` only exists *inside* the container — always via `docker exec`):
+   ```bash
+   docker restart dvas-pod-test && sleep 180
+   docker exec -it dvas-pod-test dvas-ctl status          # backend RUNNING, bootstrap EXITED
+   docker logs dvas-pod-test 2>&1 | grep -c "first boot: creating roles"     # must print 1
+   ```
+   If `backend` is FATAL: save `docker exec dvas-pod-test tail -300 /var/log/dvas/backend.log >
+   deploy/runpod/.logs/restart-backend.log` and tell me.
 
 ✔ Pass = login works, data survives the restart, and every program except perhaps some analyzers is RUNNING.
 

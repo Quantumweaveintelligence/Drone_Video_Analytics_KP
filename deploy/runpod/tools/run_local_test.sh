@@ -13,6 +13,7 @@ docker run -d --name dvas-pod-test --gpus all -p 8088:80 -v "$VOLDIR":/workspace
   -e PUBLIC_KEY="$(cat ~/.ssh/id_ed25519.pub 2>/dev/null || true)" \
   --shm-size=2g "$IMAGE"
 echo "started; follow the first boot with:"
-echo "  docker exec -it dvas-pod-test tail -f /var/log/dvas/supervisord.log /var/log/dvas/bootstrap.log"
+echo "  docker logs -f dvas-pod-test                                   # [dvas-init] … until: starting supervisord"
+echo "  docker exec -it dvas-pod-test tail -F /var/log/dvas/bootstrap.log   # then: until bootstrap complete"
 echo "then:  docker exec -it dvas-pod-test dvas-ctl status   |   dvas-ctl health"
 echo "users: $VOLDIR/dvas/secrets/users.json   (log in at http://localhost:8088)"
