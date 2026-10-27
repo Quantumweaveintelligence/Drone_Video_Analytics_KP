@@ -51,3 +51,14 @@ prometheus_data/
 grafana_data/
 dvas_ingest/output_documents/
 _dvas_temp_raw_upload_9x8a72#data/
+
+# RunPod deployment branch (runpod-v1) — plan Phase 1.7 / F9
+token.txt
+**/wireguard/*.conf
+cookies.txt
+**/users.local.json
+**/secrets/users.json
+dvas_secrets_local/
+*.engine
+# resolved `docker compose config` output — contains real passwords
+**/compose_dump.yml

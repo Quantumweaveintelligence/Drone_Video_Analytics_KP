@@ -99,6 +99,17 @@ class Config:
     ANOMALY_ALERT_HYSTERESIS_ENTER: float = float(os.getenv("ANOMALY_ALERT_HYSTERESIS_ENTER", "0.72"))
     ANOMALY_COOLDOWN_S: float = float(os.getenv("ANOMALY_COOLDOWN_S", "45"))
 
+    # ── GPU memory policy (RunPod plan Phase 2.5) ──────────────────────────
+    # true (default, local compose): /stream/stop moves models to CPU and frees
+    # VRAM. false (RunPod pod): models stay on the GPU — avoids reload stalls
+    # and is required for TensorRT engines, which cannot be moved to CPU.
+    VRAM_OFFLOAD_ON_STOP: bool = os.getenv("VRAM_OFFLOAD_ON_STOP", "true").lower() == "true"
+
+    # ── Crowd frame-rate cap (RunPod plan F19) ─────────────────────────────
+    # Max CSRNet inferences per second per drone. Crowd counts only need
+    # 1–2 fps; the Phase-10 governor later overrides this per drone.
+    CROWD_MAX_FPS: float = float(os.getenv("CROWD_MAX_FPS", "2"))
+
     # ── Logging ────────────────────────────────────────────────────────────
     LOG_LEVEL: str  = os.getenv("LOG_LEVEL", "INFO")
     LOG_JSON:  bool = os.getenv("LOG_JSON", "true").lower() == "true"

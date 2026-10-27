@@ -1,16 +1,33 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import { api, authFetch } from "@/lib/api";
+import { isCloud, roleAllowedHere, wrongAppMessage } from "@/lib/deployment";
 
 const AuthCtx = createContext(null);
 
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null); // null = checking; false = anon
   const [ready, setReady] = useState(false);
+  // Set when a signed-in role belongs to the other application (cloud vs edge build)
+  const [accessError, setAccessError] = useState("");
+
+  // End the server session without touching the edge API (used for wrong-app roles)
+  const endSessionQuietly = async () => {
+    try { await api.post("/auth/logout"); } catch (e) { console.warn("Logout request failed", e); }
+    localStorage.removeItem("dvas_token");
+    localStorage.removeItem("token");
+    localStorage.removeItem("dvas_login_ts");
+  };
 
   useEffect(() => {
     (async () => {
       try {
         const { data } = await api.get("/auth/me");
+        if (!roleAllowedHere(data?.role)) {
+          await endSessionQuietly();
+          setAccessError(wrongAppMessage(data?.role));
+          setUser(false);
+          return;
+        }
         const savedLoginTs = localStorage.getItem("dvas_login_ts") || new Date().toISOString();
         if (!localStorage.getItem("dvas_login_ts")) {
           localStorage.setItem("dvas_login_ts", savedLoginTs);
@@ -26,6 +43,13 @@ export function AuthProvider({ children }) {
 
   const login = async (email, password) => {
     const { data } = await api.post("/auth/login", { email, password });
+    if (!roleAllowedHere(data?.role)) {
+      await endSessionQuietly();
+      const msg = wrongAppMessage(data?.role);
+      setAccessError(msg);
+      throw new Error(msg);
+    }
+    setAccessError("");
     const loginTs = new Date().toISOString();
     if (data?.access_token) {
       localStorage.setItem("dvas_token", data.access_token);
@@ -38,6 +62,8 @@ export function AuthProvider({ children }) {
   };
 
   const logout = async () => {
+    // Cloud build: there is no edge API in the pod, so skip the edge mission cleanup
+    if (!isCloud) {
     try {
       // If there is an active mission on the edge, properly end it so frames stop sending
       const activeResp = await authFetch('/edge-api/api/edge/mission/active');
@@ -70,6 +96,7 @@ export function AuthProvider({ children }) {
     } catch (e) {
       console.warn('Failed to clean up edge mission on logout', e);
     }
+    }
 
     try { await api.post("/auth/logout"); } catch {}
     localStorage.removeItem("dvas_token");
@@ -79,7 +106,7 @@ export function AuthProvider({ children }) {
   };
 
   return (
-    <AuthCtx.Provider value={{ user, ready, login, logout }}>
+    <AuthCtx.Provider value={{ user, ready, login, logout, accessError }}>
       {children}
     </AuthCtx.Provider>
   );

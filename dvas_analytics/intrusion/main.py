@@ -713,6 +713,11 @@ async def stream_stop():
     if _stream_task:
         _stream_task.cancel()
         _stream_task = None
+
+    if not cfg.VRAM_OFFLOAD_ON_STOP:
+        # RunPod pod: keep models resident on the GPU (no reload stall; required for TensorRT)
+        log.info("Intrusion stream loop stopped (models kept on GPU, VRAM_OFFLOAD_ON_STOP=false)")
+        return {"status": "stopped", "device": "gpu"}
     # Release model from GPU VRAM to CPU and empty CUDA cache
     if yolo_model is not None:
         try:

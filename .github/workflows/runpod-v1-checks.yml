@@ -1,0 +1,33 @@
+# Lightweight checks for the RunPod deployment branch (no GPU, no Docker build).
+name: runpod-v1 checks
+on:
+  push:
+    branches: [runpod-v1]
+  pull_request:
+    branches: [runpod-v1]
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Zero-byte Python files (F1 guard)
+        run: bash deploy/runpod/tools/check_zero_byte_py.sh
+      - name: Byte-compile (Python 3.12, F16)
+        run: python -m compileall -q dvas_analytics DVAS_Dashboard/backend dvas_ingest/ingest deploy/runpod/tools
+      - name: Shell syntax
+        run: for f in deploy/runpod/bin/*.sh deploy/runpod/bin/dvas-ctl deploy/runpod/tools/*.sh; do bash -n "$f"; done
+      - name: Unit tests
+        run: |
+          pip install pytest pytest-xdist httpx
+          python -m pytest deploy/runpod/tests -q -p no:cacheprovider
+          (cd dvas_analytics && python -m pytest crowd/tests -q -p no:cacheprovider)
+          (cd DVAS_Dashboard/backend && python -m pytest tests/test_runtime.py -q -p no:cacheprovider)
+      - name: No hard-coded secrets (plan Phase 2 exit check)
+        run: |
+          if grep -rn "yNa0AfA0\|MvusAlJk\|super-secret-dvas\|Operator@00\|admin123" \
+               --include=*.py --include=*.yml --include=*.yaml \
+               dvas_analytics DVAS_Dashboard dvas_ingest deploy; then
+            echo "hard-coded secret found"; exit 1; fi

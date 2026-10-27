@@ -34,7 +34,7 @@ services:
     environment:
       - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://dvas:dvas_secret@postgres:5432/dvas}
       - EDGE_SYNC_HOSTS=${EDGE_SYNC_HOSTS:-10.10.55.112}
-      - JWT_SECRET=super-secret-dvas-key-change-in-prod
+      - JWT_SECRET=${JWT_SECRET:-}
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://10.253.110.250:3000}
       - INGEST_SERVER_URL=${INGEST_SERVER_URL:-http://drone_nginx}
       - EDGE_SERVER_URL=http://edge:8765
@@ -53,13 +53,15 @@ services:
       - KEYCLOAK_URL=${KEYCLOAK_URL:-http://keycloak:8080}
       - KC_REALM=kerala-police-drone
       - KC_CLIENT_ID=drone-ingest-client
+      # Secrets come from DVAS_Dashboard/.env (git-ignored) — see deploy/runpod/env/local-compose.env.example
+      - KC_CLIENT_SECRET=${KC_CLIENT_SECRET:?set KC_CLIENT_SECRET in DVAS_Dashboard/.env}
       - ADMIN_CLIENT_ID=dvas-admin-service
-      - ADMIN_CLIENT_SECRET=MvusAlJk9DMnfe6GVOwuni8ODQbES938
+      - ADMIN_CLIENT_SECRET=${ADMIN_CLIENT_SECRET:?set ADMIN_CLIENT_SECRET in DVAS_Dashboard/.env}
       - ANALYTICS_SERVICE_KEY=${ANALYTICS_SERVICE_KEY}
       # Peer DVAS backend (friend's laptop command side) — set this to the friend's dashboard URL
       # The nginx proxy on port 3000 routes /api/ to their backend, so no need to know their internal port
       - DVAS_PEER_URL=${DVAS_PEER_URL:-http://10.253.110.250:3000}
-      - DVAS_SERVICE_KEY=${DVAS_SERVICE_KEY:-dvas-inter-service-2026}
+      - DVAS_SERVICE_KEY=${DVAS_SERVICE_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -83,7 +85,7 @@ services:
     environment:
       - INGEST__ENABLED=true
       - INGEST__DRONE_ID=${INGEST_DRONE_ID:-}
-      - INGEST__CLIENT_SECRET=yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn
+      - INGEST__CLIENT_SECRET=${KC_CLIENT_SECRET:?set KC_CLIENT_SECRET in DVAS_Dashboard/.env}
       - INGEST__URL=${EDGE_INGEST_URL:-http://drone_nginx/ingest/frame}
       - INGEST__TOKEN_URL=${EDGE_TOKEN_URL:-http://keycloak:8080/realms/kerala-police-drone/protocol/openid-connect/token}
       - INGEST__MISSION_START_URL=${EDGE_MISSION_START_URL:-http://drone_nginx/ingest/mission/start}

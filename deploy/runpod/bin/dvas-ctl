@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# dvas-ctl — admin helper inside the pod (RunPod plan 3.5)
+#   dvas-ctl status                 supervisord program states
+#   dvas-ctl restart <prog|analytics|all>
+#   dvas-ctl stop|start <prog>
+#   dvas-ctl logs <prog>            tail -f /var/log/dvas/<prog>.log
+#   dvas-ctl health                 probe every service endpoint
+#   dvas-ctl lag                    consumer-group lag per drone stream
+#   dvas-ctl disk                   volume / container disk usage
+#   dvas-ctl backup-now             run one database backup immediately
+set -euo pipefail
+SV=(supervisorctl -c /etc/dvas/supervisord.conf)
+BIN=/opt/dvas/deploy/bin
+VOL="${DVAS_VOLUME:-/workspace/dvas}"
+
+name_of() { case "$1" in analytics) echo "analytics:*" ;;
+  crowd|person|vehicle|anpr|intrusion|vessel|anomaly|gateway) echo "analytics:$1" ;; *) echo "$1" ;; esac; }
+
+cmd="${1:-status}"; shift || true
+case "$cmd" in
+  status)   "${SV[@]}" status ;;
+  restart)  t="${1:?program|analytics|all}"; if [ "$t" = all ]; then "${SV[@]}" restart all; else "${SV[@]}" restart "$(name_of "$t")"; fi ;;
+  stop|start) "${SV[@]}" "$cmd" "$(name_of "${1:?program}")" ;;
+  logs)     tail -n 200 -F "/var/log/dvas/${1:?program}.log" ;;
+  health)   "$BIN/healthcheck.sh" ;;
+  lag)
+    for key in $(valkey-cli -h 127.0.0.1 --scan --pattern 'drone:frames:*'); do
+      echo "== $key  (length $(valkey-cli -h 127.0.0.1 XLEN "$key"))"
+      valkey-cli -h 127.0.0.1 XINFO GROUPS "$key" | paste - - | awk '{printf "   %s\n", $0}'
+    done ;;
+  disk)
+    df -h / /workspace 2>/dev/null
+    du -sh "$VOL"/{pgdata,minio,backups,engines} 2>/dev/null || true ;;
+  backup-now) "$BIN/backup-loop.sh" --once ;;
+  *) sed -n '2,11p' "$0"; exit 2 ;;
+esac

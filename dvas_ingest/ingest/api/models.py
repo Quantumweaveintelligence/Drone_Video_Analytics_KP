@@ -27,6 +27,11 @@ class FrameMetadata(BaseModel):
     frame_sequence: int   = Field(..., ge=0, description="Incremental counter per session")
     change_score:   float = Field(..., ge=0.0, le=1.0, description="Edge change-detection score")
 
+    # RunPod plan Phase 2.2 / 9.2 — optional ordering hint. Concurrent HTTP
+    # uploads can arrive out of order; analyzers use it (with frame_sequence,
+    # republished as `frame_seq` in the stream entry) to drop stale frames.
+    capture_ts:     Optional[float] = Field(None, ge=0.0, description="Edge capture time, epoch seconds")
+
     # Optional GPS telemetry
     latitude:    Optional[float] = Field(None, ge=-90.0,  le=90.0)
     longitude:   Optional[float] = Field(None, ge=-180.0, le=180.0)

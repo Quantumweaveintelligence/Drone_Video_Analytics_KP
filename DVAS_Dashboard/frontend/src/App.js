@@ -3,6 +3,7 @@ import { AuthProvider, useAuth } from "@/context/AuthContext";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { I18nProvider } from "@/context/I18nContext";
 import { ROLE_HOME } from "@/lib/api";
+import { isCloud, isEdge } from "@/lib/deployment";
 import Login from "@/pages/Login";
 import EdgeRouter from "@/pages/edge/EdgeRouter";
 import IngestDashboard from "@/pages/IngestDashboard";
@@ -53,10 +54,16 @@ export default function App() {
             <Routes>
               <Route path="/" element={<RootRedirect />} />
               <Route path="/login" element={<Login />} />
-              <Route path="/edge/*" element={<Guard allow={["drone_operator"]}><EdgeRouter /></Guard>} />
-              <Route path="/ingest" element={<Guard allow={["system_administrator"]}><IngestDashboard /></Guard>} />
+              {/* Edge pages exist only where the edge API does (not in the cloud build) */}
+              {!isCloud && (
+                <Route path="/edge/*" element={<Guard allow={["drone_operator"]}><EdgeRouter /></Guard>} />
+              )}
+              {!isEdge && (
+                <Route path="/ingest" element={<Guard allow={["system_administrator"]}><IngestDashboard /></Guard>} />
+              )}
 
-              {/* Nested Command Routes */}
+              {/* Nested Command Routes (not in the edge build) */}
+              {!isEdge && (
               <Route
                 path="/command"
                 element={<Guard allow={["control_room_officer", "senior_officer"]}><CommandShell /></Guard>}
@@ -78,9 +85,14 @@ export default function App() {
                 <Route path="aggregated" element={<AggregatedPage />} />
                 <Route path="*" element={<Navigate to="tactical-map" replace />} />
               </Route>
+              )}
 
-              <Route path="/admin" element={<Guard allow={["senior_officer", "system_administrator"]}><AdminDashboard /></Guard>} />
-              <Route path="/audit" element={<Guard allow={["system_administrator", "senior_officer"]}><AuditLogPage /></Guard>} />
+              {!isEdge && (
+                <Route path="/admin" element={<Guard allow={["senior_officer", "system_administrator"]}><AdminDashboard /></Guard>} />
+              )}
+              {!isEdge && (
+                <Route path="/audit" element={<Guard allow={["system_administrator", "senior_officer"]}><AuditLogPage /></Guard>} />
+              )}
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </BrowserRouter>

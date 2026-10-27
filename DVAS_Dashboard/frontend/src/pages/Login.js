@@ -14,7 +14,7 @@ function fmt(detail) {
 }
 
 export default function Login() {
-  const { user, ready, login } = useAuth();
+  const { user, ready, login, accessError } = useAuth();
   const { t } = useI18n();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -33,7 +33,8 @@ export default function Login() {
       const u = await login(email.trim().toLowerCase(), password);
       nav(ROLE_HOME[u.role] || "/command", { replace: true });
     } catch (ex) {
-      setErr(fmt(ex.response?.data?.detail) || ex.message);
+      // Server errors carry a detail; client-side errors (e.g. wrong application for the role) a message
+      setErr(ex.response ? fmt(ex.response.data?.detail) : (ex.message || "Login failed"));
     } finally { setBusy(false); }
   };
 
@@ -129,6 +130,11 @@ export default function Login() {
               </div>
             </label>
 
+            {!err && accessError && (
+              <div data-testid="login-access-error" className="text-xs px-3 py-2 border border-amber-500/50 bg-amber-500/10 text-amber-300">
+                {accessError}
+              </div>
+            )}
             {err && (
               <div data-testid="login-error" className="text-xs px-3 py-2 border border-red-500/50 bg-red-500/10 text-red-300">
                 {err}

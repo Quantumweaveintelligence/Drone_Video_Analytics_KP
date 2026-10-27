@@ -1,0 +1,8 @@
+[
+  {"username": "operator_001", "password": "<set-a-strong-password>", "firstName": "Operator", "lastName": "One",   "email": "operator@dvas.kp", "role": "drone-operator"},
+  {"username": "operator_002", "password": "<set-a-strong-password>", "firstName": "Operator", "lastName": "Two",   "email": "operator_002@kerala.police.in", "role": "drone-operator"},
+  {"username": "operator_003", "password": "<set-a-strong-password>", "firstName": "Operator", "lastName": "Three", "email": "operator_003@kerala.police.in", "role": "drone-operator"},
+  {"username": "admin_dvas",   "password": "<set-a-strong-password>", "firstName": "System",   "lastName": "Administrator", "email": "admin@dvas.kp", "role": "sys-admin"},
+  {"username": "control_001",  "password": "<set-a-strong-password>", "firstName": "Control",  "lastName": "Room",    "email": "control@dvas.kp", "role": "control-room"},
+  {"username": "senior_001",   "password": "<set-a-strong-password>", "firstName": "Senior",   "lastName": "Officer", "email": "senior@dvas.kp",  "role": "supervisor"}
+]

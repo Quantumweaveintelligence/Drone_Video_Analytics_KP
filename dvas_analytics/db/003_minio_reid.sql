@@ -58,6 +58,9 @@ ALTER TABLE evidence_frames ADD COLUMN IF NOT EXISTS bucket TEXT DEFAULT 'dvas-e
 -- Additional indexes for common dashboard queries
 CREATE INDEX IF NOT EXISTS idx_plate_reads_text_time
     ON plate_reads (plate_text, created_at DESC);
+-- vehicle_attributes has no created_at in 001; added here so this index can be
+-- built on a fresh database (RunPod plan F2 — fresh-DB init used to fail here).
+ALTER TABLE vehicle_attributes ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
 CREATE INDEX IF NOT EXISTS idx_vehicle_attrs_type
     ON vehicle_attributes (vehicle_type, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_crowd_drone_time

@@ -1,0 +1,41 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# venv /opt/venvs/ai — crowd, person, vehicle, intrusion, vessel, anomaly
+# torch / torchvision come from the RunPod PyTorch 2.8 base image
+# (--system-site-packages + constraints file generated at build time).
+# Python 3.12 (Ubuntu 24.04). RunPod plan 2.9 / 3.3.
+# After the first successful build, freeze the resolved versions with
+#   deploy/runpod/tools/freeze_image_versions.sh   and pin them here.
+# RF-DETR (rfdetr) is intentionally NOT installed in runpod-v1: vessel runs the
+# YOLOv8 engine (VESSEL_MODEL_TYPE=yolov8); RF-DETR is integrated later.
+# ═══════════════════════════════════════════════════════════════════════════
+# Web / service
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9
+pydantic==2.7.1
+httpx>=0.27.0,<0.28
+# Data services
+asyncpg==0.29.0
+redis[hiredis]>=5.0.0,<6
+miniopy-async>=1.19,<2
+cryptography>=42.0.0
+# CV / ML (numpy 1.x: same ABI generation as the compose images)
+numpy==1.26.4
+opencv-python==4.10.0.84
+ultralytics>=8.3.0,<8.4
+lap>=0.5.12
+scikit-learn>=1.4,<1.7
+scipy>=1.11,<1.15
+Pillow>=10.0,<12
+PyYAML>=6.0
+av>=12.0,<14
+huggingface_hub>=0.20,<1.0
+tqdm>=4.65
+shellingham>=1.3.0
+# person: ArcFace ONNX (CUDA 12 / cuDNN 9 build — default wheels since 1.19)
+onnxruntime-gpu==1.20.1
+# crowd: heatmaps + PDF report
+matplotlib>=3.8,<3.10
+fpdf2>=2.7.9,<2.9
+# GPU telemetry
+nvidia-ml-py>=12.535

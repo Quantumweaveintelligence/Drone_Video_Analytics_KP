@@ -36,6 +36,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("analytics-gateway")
 
+# Max seconds between bytes on /events/stream (RunPod plan 2.5: Cloudflare drops idle streams at 100 s)
+SSE_HEARTBEAT_S = 15.0
+
 app = FastAPI(
     title="DVAS Analytics Gateway",
     description="Unified SSE, health aggregation, and stats for the dashboard",
@@ -292,9 +295,16 @@ async def events_stream(drone_id: Optional[str] = Query(default=None)):
         client = get_client()
         # Start from latest ($ = only new messages after connection)
         last_ids: Dict[str, str] = {s: "$" for s in _ANALYTICS_STREAMS}
+        last_sent = time.monotonic()
 
         try:
             while True:
+                # Heartbeat comment at least every SSE_HEARTBEAT_S even while
+                # entries are flowing but filtered out by drone_id, so the
+                # Cloudflare/RunPod proxy (100 s idle cap) never drops the stream.
+                if time.monotonic() - last_sent >= SSE_HEARTBEAT_S:
+                    yield ": ping\n\n"
+                    last_sent = time.monotonic()
                 results = await client.xread(
                     last_ids,
                     count=10,
@@ -330,9 +340,11 @@ async def events_stream(drone_id: Optional[str] = Query(default=None)):
                                 "drone_id": payload_obj.get("drone_id") if isinstance(payload_obj, dict) else None,
                             })
                             yield f"data: {envelope}\n\n"
+                            last_sent = time.monotonic()
                 else:
                     # Keepalive every 3 seconds
                     yield f": keepalive {datetime.now(timezone.utc).isoformat()}\n\n"
+                    last_sent = time.monotonic()
 
         except asyncio.CancelledError:
             pass

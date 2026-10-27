@@ -237,6 +237,9 @@ class QueueManager:
             "timestamp":      metadata.get("timestamp", ""),
             "frame_sequence": str(metadata.get("frame_sequence", 0)),
             "ts":             str(int(time.time() * 1000)),
+            # Ordering hints for the latest-frame-wins sampler (RunPod plan 9.2)
+            "frame_seq":      str(metadata.get("frame_sequence", 0)),
+            "capture_ts":     str(metadata.get("capture_ts") or ""),
         }
 
         entry_id: str = await self._client.xadd(

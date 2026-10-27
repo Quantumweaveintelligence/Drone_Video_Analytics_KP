@@ -66,7 +66,7 @@ from audit_service import (
 KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "http://10.123.225.251:8080")
 KEYCLOAK_REALM = os.environ.get("KC_REALM", "kerala-police-drone")
 KEYCLOAK_CLIENT_ID = os.environ.get("KC_CLIENT_ID", "dvas-dashboard-client")
-KEYCLOAK_CLIENT_SECRET = os.environ.get("KC_CLIENT_SECRET", "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn")
+KEYCLOAK_CLIENT_SECRET = os.environ.get("KC_CLIENT_SECRET", "")  # no secret defaults in source (RunPod plan F9)
 KEYCLOAK_ADMIN = os.environ.get("KEYCLOAK_ADMIN", "admin")
 JWKS_CACHE = {}
 

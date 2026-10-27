@@ -44,6 +44,10 @@ export function useJpegPoller(url, intervalMs = 600, enabled = true) {
 
   const doFetch = useCallback(async () => {
     if (!mountedRef.current) return;
+    // Paused while the tab is hidden (saves bandwidth; lets the server-side viewer
+    // heartbeat expire so unwatched analyzers can be throttled — RunPod plan 2.7/10.2).
+    // The visibilitychange listener below resumes polling.
+    if (typeof document !== "undefined" && document.hidden) return;
     
     fetchIdRef.current += 1;
     const currentFetchId = fetchIdRef.current;
@@ -174,6 +178,18 @@ export function useJpegPoller(url, intervalMs = 600, enabled = true) {
     feedDeadRef.current = false;
     doFetch();
     
+  }, [enabled, url, doFetch]);
+
+  // Pause/resume polling with page visibility
+  useEffect(() => {
+    if (typeof document === "undefined" || !enabled || !url) return undefined;
+    const onVisibility = () => {
+      clearTimeout(timerRef.current);
+      clearTimeout(watchRef.current);   // don't flag the feed dead while hidden
+      if (!document.hidden) doFetch();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
   }, [enabled, url, doFetch]);
 
   // For compatibility with components that expected `ok`

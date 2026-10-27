@@ -495,6 +495,11 @@ async def stop_stream():
     if _stream_task:
         _stream_task.cancel()
         _stream_task = None
+
+    if not cfg.VRAM_OFFLOAD_ON_STOP:
+        # RunPod pod: keep models resident on the GPU (no reload stall; required for TensorRT)
+        log.info("Vessel stream loop stopped (models kept on GPU, VRAM_OFFLOAD_ON_STOP=false)")
+        return {"status": "stopped", "device": "gpu", "stream_running": False}
     if engine and hasattr(engine, 'to_device'):
         engine.to_device("cpu")
     import gc, torch

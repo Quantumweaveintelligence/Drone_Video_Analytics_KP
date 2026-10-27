@@ -216,8 +216,7 @@ services:
       # Logging
       LOG_LEVEL: "INFO"
       LOG_JSON:  "true"
-      # Demo: skip Keycloak JWT validation for LAN demo
-      SKIP_AUTH: "true"
+      # (SKIP_AUTH removed — it was never read by ingest/api; JWT is always enforced)
     depends_on:
       keycloak:
         condition: service_healthy
@@ -363,8 +362,15 @@ services:
     entrypoint: >
       sh -c "
         pip install httpx --quiet &&
-        python /scripts/setup_keycloak.py --url http://keycloak:8080 --no-wait
+        python /scripts/setup_keycloak.py --url http://keycloak:8080 --no-wait --users-file /scripts/users.local.json
       "
+    # Users/passwords come from the git-ignored ingest/scripts/users.local.json
+    # (template: users.example.json) — RunPod plan F9. Client secrets are NOT forced
+    # here: existing clients keep their secret; on a brand-new realm Keycloak
+    # generates one (copy it into DVAS_Dashboard/.env → KC_CLIENT_SECRET / ADMIN_CLIENT_SECRET).
+    environment:
+      KEYCLOAK_ADMIN:          admin
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-Admin@KP2025!}
     volumes:
       - ./ingest/scripts:/scripts:ro
     depends_on:

@@ -23,15 +23,26 @@ TOKEN_URL: str = f"{KEYCLOAK_URL}/realms/{REALM}/protocol/openid-connect/token"
 # Must match KC_HOSTNAME env var set on the keycloak service in docker-compose.yml
 SERVER_HOSTNAME: str = os.getenv("SERVER_HOSTNAME", "ingest.dvas.internal")
 
-# Allowed CORS origins — Windows laptops connect via the internal hostname over VPN.
-# Add additional origins here if the control-room dashboard runs on a separate host.
-ALLOWED_ORIGINS: list[str] = [
+# Allowed CORS origins.
+# RunPod/cloud: set ALLOWED_ORIGINS to a comma-separated list (e.g. the public
+# pod URL + http://localhost:8765 for the edge gateway). When the variable is
+# unset the API keeps its historical behaviour (allow any origin), so the local
+# docker-compose stack is unchanged.
+_DEFAULT_ALLOWED_ORIGINS: list[str] = [
     f"https://{SERVER_HOSTNAME}",
     "http://localhost:3000",          # Grafana dashboard (local access)
     "http://localhost:8080",          # Keycloak admin console (local access)
     "http://10.51.27.155:3000",      # Edge laptop dashboard (LAN demo)
     "http://10.51.27.250:3000",      # Ingest server dashboard (LAN demo)
 ]
+_ALLOWED_ORIGINS_ENV: str = os.getenv("ALLOWED_ORIGINS", "").strip()
+ALLOWED_ORIGINS: list[str] = (
+    [o.strip() for o in _ALLOWED_ORIGINS_ENV.split(",") if o.strip()]
+    if _ALLOWED_ORIGINS_ENV else _DEFAULT_ALLOWED_ORIGINS
+)
+# Origins actually handed to CORSMiddleware: explicit list when configured,
+# wildcard otherwise (backward-compatible with the compose stack).
+CORS_ALLOW_ORIGINS: list[str] = ALLOWED_ORIGINS if _ALLOWED_ORIGINS_ENV else ["*"]
 
 ALLOWED_ROLES: set[str] = {"drone-operator", "sys-admin", "control-room", "supervisor"}
 

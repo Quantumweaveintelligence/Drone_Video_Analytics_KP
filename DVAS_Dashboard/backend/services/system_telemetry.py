@@ -16,7 +16,6 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Tuple
 
-import docker
 import httpx
 from sqlalchemy import select, func
 
@@ -24,6 +23,7 @@ from database import async_session_factory
 from models import Drone, AuditLog, Evidence
 from core.config import INGEST_URL, CROWD_URL, KEYCLOAK_URL
 from ingest_proxy import _proxy_get, _docker_client
+from core import runtime
 
 logger = logging.getLogger("dvas.telemetry")
 
@@ -78,7 +78,8 @@ def _get_ram_metrics() -> Tuple[float, float, float]:
 def _get_disk_metrics() -> Tuple[float, float, float]:
     """Calculate real disk usage (pct, total_gb, used_gb)."""
     try:
-        u = shutil.disk_usage("/")
+        # In the RunPod pod the persistent data lives on the network volume.
+        u = shutil.disk_usage(os.getenv("DVAS_DISK_PATH", "/"))
         pct = round(max(0.0, min(100.0, u.used / u.total * 100.0)), 1)
         total_gb = round(u.total / (1024.0 ** 3), 1)
         used_gb = round(u.used / (1024.0 ** 3), 1)
@@ -90,9 +91,14 @@ def _get_disk_metrics() -> Tuple[float, float, float]:
 
 def _get_gpu_metrics() -> Tuple[int, float, float]:
     """
-    Query real NVIDIA GPU metrics (util_pct, used_gb, total_gb) via docker exec
-    on drone_crowd_analyzer which contains nvidia-smi.
+    Query real NVIDIA GPU metrics (util_pct, used_gb, total_gb).
+
+    supervisor runtime (RunPod pod): NVML directly (nvidia-ml-py).
+    docker runtime (local compose): docker exec nvidia-smi on drone_crowd_analyzer.
     """
+    if runtime.IS_SUPERVISOR:
+        nvml = runtime.gpu_metrics_nvml()
+        return nvml if nvml is not None else (0, 0.0, 0.0)
     try:
         client = _docker_client()
         c = client.containers.get("drone_crowd_analyzer")

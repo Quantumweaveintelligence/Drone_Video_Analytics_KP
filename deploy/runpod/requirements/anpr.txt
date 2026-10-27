@@ -1,0 +1,25 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# venv /opt/venvs/anpr — ANPR only (RunPod plan F13 / 3.3)
+# PaddlePaddle CPU build in its own venv: the GPU 2.6.x wheels are CUDA 11.x /
+# cuDNN 8 and clash with PyTorch 2.8 (CUDA 12.8, cuDNN 9). OCR runs only on small
+# plate crops; anpr/analyzer.py already constructs PaddleOCR(use_gpu=False).
+# If no cp312 wheel resolves for 2.6.2, switch to paddlepaddle==3.0.x (CPU) +
+# paddleocr 2.10.x and re-check OCR accuracy on 20 known plates.
+# ═══════════════════════════════════════════════════════════════════════════
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9
+pydantic==2.7.1
+httpx>=0.27.0,<0.28
+asyncpg==0.29.0
+redis[hiredis]>=5.0.0,<6
+miniopy-async>=1.19,<2
+cryptography>=42.0.0
+numpy==1.26.4
+opencv-python==4.10.0.84
+pandas>=2.0,<2.3
+ultralytics>=8.3.0,<8.4
+lap>=0.5.12
+shellingham>=1.3.0
+paddlepaddle==2.6.2
+paddleocr==2.9.1

@@ -101,6 +101,7 @@ class CrowdAnalyzer:
         
         # Session stats
         self._session_counts = []
+        self._session_samples = []   # (epoch_ts, count) pairs — real timestamps for CSV export
         self._session_start_time = time.time()
         self._session_alert_timestamps = []
         self._peak_count = 0.0
@@ -229,6 +230,7 @@ class CrowdAnalyzer:
         """Clears session data."""
         with self._stats_lock:
             self._session_counts = []
+            self._session_samples = []
             self._session_start_time = time.time()
             self._session_alert_timestamps = []
             self._peak_count = 0.0
@@ -316,6 +318,34 @@ class CrowdAnalyzer:
         density_map = output.squeeze().cpu().numpy()
         return density_map
 
+    def render_offline_frame(self, frame_bgr):
+        """Analyse one frame for display only — no session stats, no live-frame cache.
+
+        Used by /annotated/latest to recover a frame from the Valkey stream when
+        the live cache is empty (service restart / stream paused). Returns
+        (jpeg_bytes, count, label) or None when the model is not ready.
+        """
+        if not self.ready or self.model is None:
+            return None
+        with self._infer_lock:
+            density_map = self._infer(frame_bgr)
+        count = max(0.0, float(np.sum(density_map)))
+        jpeg_bytes = self._blend_heatmap_jpeg(frame_bgr, density_map)
+        return jpeg_bytes, count, get_density_label(count)[0]
+
+    def _blend_heatmap_jpeg(self, frame_bgr, density_map):
+        h, w = frame_bgr.shape[:2]
+        density_resized = cv2.resize(density_map, (w, h), interpolation=cv2.INTER_CUBIC)
+        d_min, d_max = density_resized.min(), density_resized.max()
+        if d_max > d_min:
+            density_norm = ((density_resized - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+        else:
+            density_norm = np.zeros_like(density_resized, dtype=np.uint8)
+        heatmap = cv2.applyColorMap(density_norm, cv2.COLORMAP_JET)
+        blended = cv2.addWeighted(frame_bgr, 0.55, heatmap, 0.45, 0)
+        _, jpeg = cv2.imencode('.jpg', blended, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        return jpeg.tobytes()
+
     def generate_annotated_frame(self, drone_id, frame_bgr, density_map, count):
         """Creates a pure heatmap overlaid JPEG frame without text embeddings."""
         h, w = frame_bgr.shape[:2]
@@ -342,6 +372,11 @@ class CrowdAnalyzer:
             }
             
         return jpeg_bytes
+
+    def get_session_samples(self):
+        """Thread-safe copy of the (epoch_ts, count) samples of the current session."""
+        with self._stats_lock:
+            return list(self._session_samples)
 
     def get_last_annotated_frame(self, drone_id=""):
         """Returns (jpeg_bytes, matched_drone_id, age_sec, count, label) or (None, None, 0, 0, '')."""
@@ -425,6 +460,7 @@ class CrowdAnalyzer:
         ts_iso = datetime.now(timezone.utc).isoformat()
         with self._stats_lock:
             self._session_counts.append(count)
+            self._session_samples.append((timestamp, count))
             if alert_triggered:
                 self._session_alert_timestamps.append(ts_iso)
             

@@ -20,17 +20,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 
 sys.path.insert(0, "/analytics")
-from shared.config import cfg
+from shared.config import cfg, get_drone_aliases
 from shared.db import (
     close_pool, ensure_drone, get_pool, write_confirmed_event,
     write_crowd_reading, get_crowd_history,
 )
 from shared.redis_client import (
     close_client, get_client, publish_analytics_result,
-    publish_confirmed_event, xread_frames, xreadgroup_frames, ack_frames
+    publish_confirmed_event, xread_frames, xreadgroup_frames, ack_frames,
+    get_latest_stream_frame,
 )
 from shared import minio_client as minio
 from crowd.analyzer import CrowdAnalyzer
+from crowd.stream_policy import FrameRateCap, is_cuda_failure, parse_mission_id
 from crowd.schema import CrowdAnalysisResult, StreamStatus, CrowdTimelineItem, ModelSwitchRequest, ModelInfo, SessionSummary
 
 logging.basicConfig(
@@ -66,32 +68,27 @@ _stream_task: Optional[asyncio.Task] = None
 _stream_running = False
 _frames_processed = 0
 
+# ── Frame-rate cap (RunPod plan F19) ──────────────────────────────────────────
+# Per-drone minimum interval between CSRNet inferences. Frames that arrive
+# sooner are ACKed without being decoded. The Phase-10 governor will replace
+# the env value with dvas:fps_target:crowd:<drone>.
+_rate_cap = FrameRateCap(cfg.CROWD_MAX_FPS)
+_frames_skipped = 0                    # frames ACKed without inference (rate cap)
+HEATMAP_EVERY_N_FRAMES = 10            # heatmap PNG/base64 is only uploaded every Nth frame
 
-@app.on_event("startup")
-async def startup():
-    global analyzer, _stream_running, _stream_task
-    await get_pool()
-    for drone_id in cfg.DRONE_IDS:
-        await ensure_drone(drone_id)
-    await minio.ensure_all_buckets()
-    analyzer = CrowdAnalyzer(
-        model_path=MODEL_PATH,
-        alert_threshold=cfg.CROWD_ALERT_THRESHOLD,
-    )
-    log.info("Crowd Analyzer ready. Model: %s, Device: %s", MODEL_PATH, analyzer.device)
-    _stream_running = True
-    _stream_task = asyncio.create_task(_stream_loop())
-    log.info("Crowd stream loop auto-started for drones: %s", cfg.DRONE_IDS)
+# ── Annotated-feed recovery (RunPod plan F21 / Phase-26 parity) ───────────────
+LIVE_FRAME_MAX_AGE_S = 6.0             # older cached frames are reported as offline
+RECOVERY_REFRESH_S = 30.0              # re-read the Valkey stream at most this often
+_recovered_frames: dict = {}           # drone_id -> (jpeg, count, label, monotonic_ts)
 
 
-@app.on_event("shutdown")
-async def shutdown():
-    global _stream_running, _stream_task
-    _stream_running = False
-    if _stream_task:
-        _stream_task.cancel()
-    await close_pool()
-    await close_client()
+def _is_cuda_failure(exc: BaseException) -> bool:
+    try:
+        import torch
+        oom_type = getattr(torch.cuda, "OutOfMemoryError", None)
+    except ImportError:
+        oom_type = None
+    return is_cuda_failure(exc, oom_type)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -105,6 +102,9 @@ async def health():
         "model_path":       analyzer._model_path if analyzer else "",
         "stream_running":   _stream_running,
         "frames_processed": _frames_processed,
+        "frames_skipped":   _frames_skipped,
+        "max_fps_per_drone": cfg.CROWD_MAX_FPS,
+        "device":           str(analyzer.device) if analyzer else "unknown",
     }
 
 
@@ -125,6 +125,9 @@ async def analyze_frame(
         raise HTTPException(400, "Cannot decode image")
 
     result = analyzer.analyze_frame(frame, drone_id=drone_id, include_heatmap=include_heatmap)
+    if result is None:
+        # Model became unavailable between the readiness check and inference
+        raise HTTPException(503, "Model not loaded")
     ts = datetime.now(timezone.utc)
 
     # Upload heatmap to MinIO if available
@@ -174,11 +177,83 @@ async def analyze_frame(
 
 
 # ── Stream control ─────────────────────────────────────────────────────────────
+async def _process_crowd_frame(drone_id: str, f: dict) -> None:
+    """Decode, analyse and persist one frame (the newest one read for a drone)."""
+    global _frames_processed
+    raw = f.get("jpeg_b64", "")
+    if not raw:
+        return
+    img_bytes = base64.b64decode(raw)
+    frame = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        log.debug("Undecodable frame for %s skipped", drone_id)
+        return
+
+    mission_id = parse_mission_id(f)
+    want_heatmap = _frames_processed % HEATMAP_EVERY_N_FRAMES == 0
+
+    # Run inference in worker thread pool so FastAPI event loop is never blocked
+    result = await asyncio.to_thread(
+        analyzer.analyze_frame, frame, drone_id=drone_id, include_heatmap=want_heatmap
+    )
+    if result is None:
+        # Model not ready (e.g. mid model-switch) — frame is ACKed by the caller
+        return
+    _rate_cap.mark(drone_id)
+    ts = datetime.now(timezone.utc)
+
+    heatmap_key = None
+    if want_heatmap and result.get("heatmap_b64"):
+        heatmap_bytes = base64.b64decode(result["heatmap_b64"])
+        key = minio.make_key("heatmaps", drone_id,
+                             f"heatmap_{int(ts.timestamp()*1000)}.png",
+                             mission_id=mission_id)
+        heatmap_key = await minio.upload_bytes(
+            cfg.BUCKET_HEATMAPS, key, heatmap_bytes, "image/png"
+        )
+
+    await write_crowd_reading(
+        drone_id=drone_id,
+        ts=ts,
+        estimated_count=result["estimated_count"],
+        heatmap_object_key=heatmap_key,
+    )
+
+    if result["alert_triggered"]:
+        event_id = await write_confirmed_event(
+            drone_id=drone_id,
+            event_type="crowd_threshold",
+            confidence=min(result["estimated_count"] / 200, 1.0),
+            ts=ts,
+            attributes={
+                "estimated_count": result["estimated_count"],
+                "density_label":   result["density_label"],
+                "mission_id":      mission_id or None,
+            },
+        )
+        await publish_confirmed_event({
+            "event_id":   event_id,
+            "event_type": "crowd_threshold",
+            "drone_id":   drone_id,
+            "mission_id": mission_id or None,
+            "ts":         ts.isoformat(),
+            "count":      result["estimated_count"],
+            "density":    result["density_label"],
+        })
+
+    # Publish to SSE stream — strip heavy binary fields
+    sse_result = {k: v for k, v in result.items()
+                  if k not in ("heatmap_b64", "peak_frame")}
+    sse_result["mission_id"] = mission_id or None
+    await publish_analytics_result("crowd", sse_result)
+    _frames_processed += 1
+
+
 async def _stream_loop():
-    global _stream_running, _frames_processed
+    global _stream_running, _frames_skipped
     active_drones = list(cfg.DRONE_IDS)
-    last_ids = {d: "0" for d in active_drones}
-    log.info("Crowd stream loop started for initial drones: %s", active_drones)
+    log.info("Crowd stream loop started for initial drones: %s (max %.2f fps/drone)",
+             active_drones, cfg.CROWD_MAX_FPS)
 
     loop_count = 0
     while _stream_running:
@@ -191,7 +266,6 @@ async def _stream_loop():
                 for d in discovered:
                     if d not in active_drones:
                         active_drones.append(d)
-                        last_ids[d] = "0"
                         await ensure_drone(d)
                         log.info("Crowd stream loop auto-discovered active drone: %s", d)
             except Exception as exc:
@@ -199,83 +273,32 @@ async def _stream_loop():
 
         any_frames_received = False
         for drone_id in list(active_drones):
-            if drone_id not in last_ids:
-                last_ids[drone_id] = "0"
             try:
                 frames = await xreadgroup_frames(
-                    "crowd-group", "crowd-analyzer", drone_id, ">", count=5, block_ms=0
+                    "crowd-group", "crowd-analyzer", drone_id, ">", count=5, block_ms=50
                 )
                 if not frames:
                     continue
-
                 any_frames_received = True
-
-                # If multiple frames arrived, ACK earlier frames immediately to stay realtime
-                processed_ids = [entry_id for entry_id, _ in frames[:-1]]
-
-                # Process only the latest frame
-                entry_id, f = frames[-1]
-                raw = f.get("jpeg_b64", "")
-                if not raw:
-                    processed_ids.append(entry_id)
-                else:
-                    img_bytes = base64.b64decode(raw)
-                    nparr = np.frombuffer(img_bytes, np.uint8)
-                    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    if frame is None:
-                        processed_ids.append(entry_id)
+                entry_ids = [entry_id for entry_id, _ in frames]
+                try:
+                    if not _rate_cap.due(drone_id):
+                        # Rate cap: drop without decoding (latest-frame-wins)
+                        _frames_skipped += len(entry_ids)
+                        continue
+                    # Older frames in the batch are skipped; only the newest is analysed
+                    _frames_skipped += len(entry_ids) - 1
+                    await _process_crowd_frame(drone_id, frames[-1][1])
+                except Exception as exc:
+                    if _is_cuda_failure(exc) and analyzer is not None:
+                        log.warning("CUDA failure in crowd stream for %s — falling back to CPU: %s",
+                                    drone_id, exc)
+                        await asyncio.to_thread(analyzer.to_device, "cpu")
                     else:
-                        # Run inference in worker thread pool so FastAPI event loop is never blocked
-                        result = await asyncio.to_thread(
-                            analyzer.analyze_frame, frame, drone_id=drone_id, include_heatmap=True
-                        )
-                        ts = datetime.now(timezone.utc)
-
-                        heatmap_key = None
-                        # Upload heatmap every 10 frames to save bandwidth
-                        if _frames_processed % 10 == 0 and result.get("heatmap_b64"):
-                            heatmap_bytes = base64.b64decode(result["heatmap_b64"])
-                            key = minio.make_key("heatmaps", drone_id,
-                                                 f"heatmap_{int(ts.timestamp()*1000)}.png")
-                            heatmap_key = await minio.upload_bytes(
-                                cfg.BUCKET_HEATMAPS, key, heatmap_bytes, "image/png"
-                            )
-
-                        await write_crowd_reading(
-                            drone_id=drone_id,
-                            ts=ts,
-                            estimated_count=result["estimated_count"],
-                            heatmap_object_key=heatmap_key,
-                        )
-
-                        if result["alert_triggered"]:
-                            event_id = await write_confirmed_event(
-                                drone_id=drone_id,
-                                event_type="crowd_threshold",
-                                confidence=min(result["estimated_count"] / 200, 1.0),
-                                ts=ts,
-                                attributes={
-                                    "estimated_count": result["estimated_count"],
-                                    "density_label":   result["density_label"],
-                                },
-                            )
-                            await publish_confirmed_event({
-                                "event_id":   event_id,
-                                "event_type": "crowd_threshold",
-                                "drone_id":   drone_id,
-                                "ts":         ts.isoformat(),
-                                "count":      result["estimated_count"],
-                            })
-
-                        # Publish to SSE stream — strip heavy binary fields
-                        sse_result = {k: v for k, v in result.items()
-                                      if k not in ("heatmap_b64", "peak_frame")}
-                        await publish_analytics_result("crowd", sse_result)
-                        _frames_processed += 1
-                        processed_ids.append(entry_id)
-
-                if processed_ids:
-                    await ack_frames(drone_id, "crowd-group", *processed_ids)
+                        raise
+                finally:
+                    # Always ACK, so failed frames never pile up in the pending list
+                    await ack_frames(drone_id, "crowd-group", *entry_ids)
 
             except asyncio.CancelledError:
                 return
@@ -314,6 +337,11 @@ async def stream_stop():
     if _stream_task:
         _stream_task.cancel()
         _stream_task = None
+    if not cfg.VRAM_OFFLOAD_ON_STOP:
+        # RunPod pod: keep the model resident on the GPU (no reload stall on restart)
+        log.info("Crowd stream loop stopped (model kept on %s, VRAM_OFFLOAD_ON_STOP=false)",
+                 analyzer.device if analyzer else "n/a")
+        return {"status": "stopped", "device": str(analyzer.device) if analyzer else "cpu"}
     if analyzer and hasattr(analyzer, 'to_device'):
         try:
             analyzer.to_device("cpu")
@@ -353,9 +381,13 @@ async def history(drone_id: Optional[str] = None, limit: int = 100):
 
 
 @app.get("/density/timeline")
-async def density_timeline(drone_id: Optional[str] = None, limit: int = 100):
-    """Time-series crowd counts for dashboard charts."""
+async def density_timeline(drone_id: Optional[str] = None, limit: int = 100,
+                           hours: Optional[float] = None):
+    """Time-series crowd counts for dashboard charts (optionally last `hours` only)."""
     rows = await get_crowd_history(drone_id=drone_id, limit=min(limit, 500))
+    if hours is not None and hours > 0:
+        cutoff = datetime.now(timezone.utc).timestamp() - hours * 3600.0
+        rows = [r for r in rows if hasattr(r["ts"], "timestamp") and r["ts"].timestamp() >= cutoff]
     timeline = [
         {
             "ts":              r["ts"].isoformat() if hasattr(r["ts"], "isoformat") else str(r["ts"]),
@@ -382,6 +414,10 @@ async def latest_heatmap(drone_id: str = "DRONE_KL_001"):
             return {
                 "drone_id":        drone_id,
                 "heatmap_url":     url,
+                # MinIO is internal in the cloud pod: browsers load the image via
+                # /api/minio/image?bucket=<heatmap_bucket>&key=<heatmap_object_key>
+                "heatmap_object_key": key,
+                "heatmap_bucket":  cfg.BUCKET_HEATMAPS,
                 "estimated_count": row["estimated_count"],
                 "ts":              row["ts"].isoformat() if hasattr(row["ts"], "isoformat") else str(row["ts"]),
             }
@@ -429,10 +465,41 @@ async def count_live():
 
 @app.get("/annotated/latest")
 async def annotated_latest(drone_id: str = ""):
-    """Return latest heatmap-overlaid frame as binary JPEG."""
+    """Return latest heatmap-overlaid frame as binary JPEG.
+
+    Live frames come from the analyzer cache (X-Feed-Status: live). When the
+    cache is empty or expired (service restart, stream paused) the newest frame
+    still in the Valkey stream is analysed once and served with
+    X-Feed-Status: offline (Phase-26 parity with the other analyzers).
+    """
     if not analyzer or not analyzer.ready:
         raise HTTPException(503, "Model not loaded")
     frame_bytes, matched_id, age, count, label = analyzer.get_last_annotated_frame(drone_id)
+    feed_status = "live" if frame_bytes and age <= LIVE_FRAME_MAX_AGE_S else "offline"
+
+    if not frame_bytes and drone_id:
+        now = time.monotonic()
+        for alias in get_drone_aliases(drone_id):
+            cached = _recovered_frames.get(alias)
+            if cached and now - cached[3] < RECOVERY_REFRESH_S:
+                frame_bytes, count, label = cached[0], cached[1], cached[2]
+                matched_id, age = alias, now - cached[3]
+                break
+            recovered = await get_latest_stream_frame(alias)
+            if recovered is None:
+                continue
+            try:
+                rendered = await asyncio.to_thread(analyzer.render_offline_frame, recovered)
+            except Exception as exc:
+                log.warning("Failed to recover crowd frame for %s: %s", alias, exc)
+                continue
+            if rendered:
+                frame_bytes, count, label = rendered
+                matched_id, age = alias, 0.0
+                _recovered_frames[alias] = (frame_bytes, count, label, now)
+                break
+        feed_status = "offline"
+
     if not frame_bytes:
         raise HTTPException(404, "No annotated frame available")
     return Response(
@@ -445,7 +512,9 @@ async def annotated_latest(drone_id: str = ""):
             "X-Frame-Age": f"{age:.2f}",
             "X-Crowd-Count": f"{count:.1f}" if isinstance(count, float) else str(count),
             "X-Density-Label": label or "Unknown",
-            "Access-Control-Expose-Headers": "X-Crowd-Count, X-Density-Label, X-Drone-ID, X-Frame-Age",
+            "X-Feed-Status": feed_status,
+            "X-Stream-Status": feed_status,
+            "Access-Control-Expose-Headers": "X-Crowd-Count, X-Density-Label, X-Drone-ID, X-Frame-Age, X-Feed-Status, X-Stream-Status",
         }
     )
 
@@ -490,20 +559,26 @@ import io as _io
 async def export_csv():
     if not analyzer:
         raise HTTPException(503, "No session data")
-    summary = analyzer.get_session_summary()
-    counts = analyzer._session_counts
-    if not counts:
+    samples = analyzer.get_session_samples()
+    if not samples:
         raise HTTPException(404, "No data to export")
-    
+
     from crowd.analyzer import get_density_label
     output = _io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["frame_idx", "timestamp_sec", "estimated_count", "density_level"])
-    fps = 25.0  # default, could be made configurable
-    for i, count in enumerate(counts):
+    # timestamp_sec = real seconds since the first sample of the session
+    writer.writerow(["frame_idx", "timestamp_sec", "timestamp_utc", "estimated_count", "density_level"])
+    t0 = samples[0][0]
+    for i, (ts_epoch, count) in enumerate(samples):
         label, _ = get_density_label(count)
-        writer.writerow([i, round(i / fps, 3), round(count, 2), label])
-    
+        writer.writerow([
+            i,
+            round(ts_epoch - t0, 3),
+            datetime.fromtimestamp(ts_epoch, tz=timezone.utc).isoformat(),
+            round(count, 2),
+            label,
+        ])
+
     csv_bytes = output.getvalue().encode('utf-8')
     return Response(
         content=csv_bytes,

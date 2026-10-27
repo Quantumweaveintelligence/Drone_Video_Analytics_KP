@@ -461,6 +461,11 @@ async def stream_stop():
     if _stream_task:
         _stream_task.cancel()
         _stream_task = None
+
+    if not cfg.VRAM_OFFLOAD_ON_STOP:
+        # RunPod pod: keep models resident on the GPU (no reload stall; required for TensorRT)
+        log.info("Vehicle stream loop stopped (models kept on GPU, VRAM_OFFLOAD_ON_STOP=false)")
+        return {"status": "stopped", "device": "gpu", "frames_processed": _frames_processed}
     if analyzer and hasattr(analyzer, 'to_device'):
         try:
             analyzer.to_device("cpu")

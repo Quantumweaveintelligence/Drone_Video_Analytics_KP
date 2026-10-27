@@ -158,9 +158,9 @@ async def crowd_annotated_frame(user: dict = Depends(get_current_user), drone_id
             headers = {
                 "Cache-Control": "no-cache, no-store, must-revalidate",
                 "Pragma":        "no-cache",
-                "Access-Control-Expose-Headers": "X-Crowd-Count, X-Density-Label, X-Drone-ID, X-Frame-Age",
+                "Access-Control-Expose-Headers": "X-Crowd-Count, X-Density-Label, X-Drone-ID, X-Frame-Age, X-Feed-Status, X-Stream-Status",
             }
-            for h in ["X-Drone-ID", "X-Frame-Age", "X-Crowd-Count", "X-Density-Label"]:
+            for h in ["X-Drone-ID", "X-Frame-Age", "X-Crowd-Count", "X-Density-Label", "X-Feed-Status", "X-Stream-Status"]:
                 if h in r.headers:
                     headers[h] = r.headers[h]
             return Response(

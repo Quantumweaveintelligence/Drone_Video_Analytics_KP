@@ -38,10 +38,15 @@ EXPOSE 8000
 HEALTHCHECK --interval=10s --timeout=5s --retries=5 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Start with 4 workers (matches the plan)
+# Single worker: mission/drain state, _latest_metadata and ingest stats are
+# in-process dicts, so >1 worker gives inconsistent telemetry (RunPod plan F7).
+# One async worker comfortably handles 3 drones x 30 fps of ~100 KB uploads.
+# --proxy-headers: trust X-Forwarded-* from the nginx in front of this service.
 CMD ["uvicorn", "main:app", \
      "--host", "0.0.0.0", \
      "--port", "8000", \
-     "--workers", "4", \
+     "--workers", "1", \
+     "--proxy-headers", \
+     "--forwarded-allow-ips", "*", \
      "--log-level", "info", \
      "--access-log"]

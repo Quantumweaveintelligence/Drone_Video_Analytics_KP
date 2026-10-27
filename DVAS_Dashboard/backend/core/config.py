@@ -3,14 +3,26 @@ DVAS configuration — all environment variable reads centralised here.
 NOTE: .env is loaded by server.py before this module is imported.
 """
 import os
+import logging
+
+_log = logging.getLogger("dvas.config")
+
+# ---------- Deployment mode (RunPod plan Phase 2) ----------
+# DVAS_DEPLOYMENT: "local" (docker-compose, default) | "cloud" (RunPod all-in-one pod)
+# DVAS_RUNTIME:    "docker" (default) | "supervisor" (processes managed by supervisord)
+DVAS_DEPLOYMENT = os.environ.get("DVAS_DEPLOYMENT", "local").strip().lower()
+IS_CLOUD = DVAS_DEPLOYMENT == "cloud"
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 
 # ---------- Keycloak ----------
 KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "http://keycloak:8080")
 KEYCLOAK_REALM = os.environ.get("KC_REALM", "kerala-police-drone")
 KEYCLOAK_CLIENT_ID = os.environ.get("KC_CLIENT_ID", "drone-ingest-client")
-KEYCLOAK_CLIENT_SECRET = os.environ.get("KC_CLIENT_SECRET", "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn")
+# Secrets have NO defaults in source (RunPod plan F9). Local compose passes them
+# from DVAS_Dashboard/.env; the RunPod pod generates them into dvas.env.
+KEYCLOAK_CLIENT_SECRET = os.environ.get("KC_CLIENT_SECRET", "")
 ADMIN_CLIENT_ID = os.environ.get("ADMIN_CLIENT_ID", "dvas-admin-service")
-ADMIN_CLIENT_SECRET = os.environ.get("ADMIN_CLIENT_SECRET", "MvusAlJk9DMnfe6GVOwuni8ODQbES938")
+ADMIN_CLIENT_SECRET = os.environ.get("ADMIN_CLIENT_SECRET", "")
 KEYCLOAK_ADMIN = os.environ.get("KEYCLOAK_ADMIN", "admin")
 
 # ---------- Analytics microservices ----------
@@ -37,10 +49,33 @@ INGEST_URL = os.environ.get("INGEST_SERVER_URL", "http://drone_nginx")
 # Set this env var on the edge-operator side laptop to forward incidents/suggestions to the command side
 DVAS_PEER_URL = os.environ.get("DVAS_PEER_URL", "").rstrip("/")
 # Shared inter-service secret — must match on both laptops
-DVAS_SERVICE_KEY = os.environ.get("DVAS_SERVICE_KEY", "dvas-inter-service-2026")
+# Empty => /api/push/receive rejects every request (see routers/push.py).
+DVAS_SERVICE_KEY = os.environ.get("DVAS_SERVICE_KEY", "")
 
 # ---------- CORS ----------
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
+
+
+def validate_required_secrets() -> None:
+    """Fail fast in cloud mode when a required secret is missing.
+
+    In local mode a missing secret only logs an error so the compose stack can
+    still start (login will fail until the value is provided).
+    """
+    required = {
+        "KC_CLIENT_SECRET": KEYCLOAK_CLIENT_SECRET,
+        "ADMIN_CLIENT_SECRET": ADMIN_CLIENT_SECRET,
+    }
+    if IS_CLOUD:
+        required["DVAS_SERVICE_KEY"] = DVAS_SERVICE_KEY
+        required["PUBLIC_BASE_URL"] = PUBLIC_BASE_URL
+    missing = [name for name, value in required.items() if not value]
+    if not missing:
+        return
+    msg = "Missing required configuration: " + ", ".join(missing)
+    if IS_CLOUD:
+        raise RuntimeError(msg + " (DVAS_DEPLOYMENT=cloud)")
+    _log.error("%s — set them in DVAS_Dashboard/.env (local compose)", msg)
 
 # ---------- Rate Limiter ----------
 from slowapi import Limiter

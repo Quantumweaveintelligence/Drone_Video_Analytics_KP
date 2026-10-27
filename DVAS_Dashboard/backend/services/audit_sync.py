@@ -185,8 +185,17 @@ _sync_task = None
 
 
 def start_audit_sync_service():
-    """Start the audit sync background task."""
+    """Start the audit sync background task.
+
+    No-op when EDGE_SYNC_HOSTS is set to an empty string: in the cloud (RunPod)
+    the edge laptops are behind NAT and push audit entries to the API instead
+    of being polled (RunPod plan F10).
+    """
     global _sync_task
+    hosts = [h.strip() for h in DEFAULT_EDGE_HOSTS.split(",") if h.strip()]
+    if not hosts:
+        logger.info("Audit sync disabled (EDGE_SYNC_HOSTS is empty).")
+        return
     if _sync_task is None:
         loop = asyncio.get_event_loop()
         _sync_task = loop.create_task(_audit_sync_loop())

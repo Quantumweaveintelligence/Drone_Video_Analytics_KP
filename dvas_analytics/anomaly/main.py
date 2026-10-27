@@ -462,6 +462,10 @@ async def stream_stop():
             except asyncio.CancelledError:
                 pass
             _stream_task = None
+    if not cfg.VRAM_OFFLOAD_ON_STOP:
+        # RunPod pod: keep the per-drone analyzers (and their models) resident on the GPU
+        log.info("Anomaly stream loop stopped (models kept on GPU, VRAM_OFFLOAD_ON_STOP=false)")
+        return {"status": "stopped", "stream_running": False}
     # Release dual models from GPU VRAM
     try:
         for d_id, analyzer in list(_analyzers.items()):

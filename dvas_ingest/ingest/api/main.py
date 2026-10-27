@@ -64,6 +64,7 @@ from auth import (
 )
 from config import (
     ALLOWED_TYPES,
+    CORS_ALLOW_ORIGINS,
     API_DESC,
     API_TITLE,
     API_VERSION,
@@ -291,7 +292,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_methods=["GET", "POST"],
     allow_headers=["Authorization", "Content-Type"],
 )

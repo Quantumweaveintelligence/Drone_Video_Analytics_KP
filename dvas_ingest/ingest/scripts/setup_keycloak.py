@@ -2,46 +2,55 @@
 setup_keycloak.py
 =================
 Auto-configures Keycloak for the Kerala Police Drone Ingest System.
+Idempotent: safe to re-run on every boot (RunPod bootstrap does exactly that).
 
-Creates:
-  - Realm: kerala-police-drone
+Creates / updates:
+  - Realm: kerala-police-drone (+ optional frontendUrl for the public URL)
   - Client: drone-ingest-client (confidential, direct access grants)
+  - Client: dvas-dashboard-client
+  - Client: dvas-admin-service (service account, manage/view users)
   - Roles: drone-operator, control-room, supervisor, sys-admin
-  - Users: operator_001 through operator_005 (all assigned drone-operator role)
+  - Users: read from a JSON file (--users-file) — never from source code
+
+Secrets and passwords come from arguments / environment only (RunPod plan F9):
+  KEYCLOAK_ADMIN, KEYCLOAK_ADMIN_PASSWORD   master-realm admin
+  KC_CLIENT_SECRET                          drone-ingest-client secret
+  ADMIN_CLIENT_SECRET                       dvas-admin-service secret
+
+Users file format (JSON list):
+  [{"username": "operator_001", "password": "...", "firstName": "Operator",
+    "lastName": "One", "email": "operator@dvas.kp", "role": "drone-operator"}, ...]
 
 Usage:
     pip install httpx
-    python scripts/setup_keycloak.py
-    python scripts/setup_keycloak.py --url http://localhost:8080 --password MySecurePass!
+    python setup_keycloak.py --url http://localhost:8080 --users-file users.json
+    python setup_keycloak.py --url http://127.0.0.1:8080 --no-wait \
+        --client-secret "$KC_CLIENT_SECRET" --admin-client-secret "$ADMIN_CLIENT_SECRET" \
+        --users-file /workspace/dvas/secrets/users.json --frontend-url "$PUBLIC_BASE_URL"
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
+from pathlib import Path
+
 import httpx
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
-KC_URL         = "http://localhost:8080"
-ADMIN_USER     = "admin"
-ADMIN_PASSWORD = "Admin@KP2025!"
-REALM          = "kerala-police-drone"
+# ── Defaults (no secrets in source) ───────────────────────────────────────────
+KC_URL         = os.getenv("KEYCLOAK_URL", "http://localhost:8080")
+ADMIN_USER     = os.getenv("KEYCLOAK_ADMIN", "admin")
+ADMIN_PASSWORD = os.getenv("KEYCLOAK_ADMIN_PASSWORD", "")
+REALM          = os.getenv("KC_REALM", "kerala-police-drone")
 CLIENT_ID_NAME = "drone-ingest-client"
 
 ROLES = ["drone-operator", "control-room", "supervisor", "sys-admin"]
 
-OPERATORS = [
-    {"username": "operator_001", "password": "Operator@001", "firstName": "Operator", "lastName": "One", "role": "drone-operator"},
-    {"username": "operator_002", "password": "Operator@002", "firstName": "Operator", "lastName": "Two", "role": "drone-operator"},
-    {"username": "operator_003", "password": "Operator@003", "firstName": "Operator", "lastName": "Three", "role": "drone-operator"},
-    {"username": "operator_004", "password": "Operator@004", "firstName": "Operator", "lastName": "Four", "role": "drone-operator"},
-    {"username": "operator_005", "password": "Operator@005", "firstName": "Operator", "lastName": "Five", "role": "drone-operator"},
-    {"username": "admin_dvas", "password": "admin123", "firstName": "System", "lastName": "Administrator", "email": "admin@dvas.kp", "role": "sys-admin"},
-    {"username": "control_001", "password": "Control@001", "firstName": "Control", "lastName": "Room", "email": "control@dvas.kp", "role": "control-room"},
-    {"username": "senior_001", "password": "Senior@001", "firstName": "Senior", "lastName": "Officer", "email": "senior@dvas.kp", "role": "supervisor"},
-]
+# Users must be supplied with --users-file (see module docstring).
+OPERATORS: list[dict] = []
 
 
 def log(msg: str, level: str = "INFO") -> None:
@@ -109,29 +118,44 @@ def create_realm(base_url: str, token: str, realm: str) -> None:
         log(f"Realm '{realm}' created", "OK")
 
 
-def create_client(base_url: str, token: str, realm: str, client_id: str) -> str:
-    """Create confidential client and return its client secret."""
-    # Check if exists
+def create_client(base_url: str, token: str, realm: str, client_id: str,
+                  secret: str | None = None) -> str:
+    """Create (or update) a confidential client and return its UUID.
+
+    When `secret` is given it is applied explicitly — on creation and, for an
+    existing client, via PUT — so the value always matches the deployment's
+    generated secrets. Without it Keycloak keeps/generates its own secret.
+    """
     r = api("get", f"{base_url}/admin/realms/{realm}/clients?clientId={client_id}", token)
+    r.raise_for_status()
     if r.json():
-        uuid = r.json()[0]["id"]
-        log(f"Client '{client_id}' already exists (id={uuid})", "WARN")
+        rep  = r.json()[0]
+        uuid = rep["id"]
+        if secret:
+            rep["secret"] = secret
+            u = api("put", f"{base_url}/admin/realms/{realm}/clients/{uuid}", token, json=rep)
+            u.raise_for_status()
+            log(f"Client '{client_id}' exists (id={uuid}) — secret updated", "OK")
+        else:
+            log(f"Client '{client_id}' already exists (id={uuid})", "WARN")
         return uuid
 
-    r = api("post", f"{base_url}/admin/realms/{realm}/clients", token, json={
+    body = {
         "clientId":               client_id,
         "name":                   "Drone Ingest Client",
         "description":            "Confidential client for drone edge devices and operators",
         "enabled":                True,
         "clientAuthenticatorType": "client-secret",
-        "secret":                 "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn",
         "directAccessGrantsEnabled": True,
         "serviceAccountsEnabled":  True,
         "standardFlowEnabled":     True,
         "implicitFlowEnabled":     False,
         "publicClient":           False,
         "protocol":               "openid-connect",
-    })
+    }
+    if secret:
+        body["secret"] = secret
+    r = api("post", f"{base_url}/admin/realms/{realm}/clients", token, json=body)
     r.raise_for_status()
 
     # Fetch the UUID
@@ -228,7 +252,8 @@ def create_users(
 ADMIN_SERVICE_CLIENT_ID = "dvas-admin-service"
 
 
-def create_admin_service_client(base_url: str, token: str, realm: str) -> str:
+def create_admin_service_client(base_url: str, token: str, realm: str,
+                                secret: str | None = None) -> str:
     """
     Create the dvas-admin-service confidential client with:
       - Service Accounts Enabled (M2M client_credentials grant)
@@ -243,9 +268,16 @@ def create_admin_service_client(base_url: str, token: str, realm: str) -> str:
     existing = r.json()
     if existing:
         client_uuid = existing[0]["id"]
-        log(f"Admin service client '{client_id_name}' already exists (id={client_uuid})", "WARN")
+        if secret:
+            rep = existing[0]
+            rep["secret"] = secret
+            u = api("put", f"{base_url}/admin/realms/{realm}/clients/{client_uuid}", token, json=rep)
+            u.raise_for_status()
+            log(f"Admin service client '{client_id_name}' exists (id={client_uuid}) — secret updated", "OK")
+        else:
+            log(f"Admin service client '{client_id_name}' already exists (id={client_uuid})", "WARN")
     else:
-        r2 = api("post", f"{base_url}/admin/realms/{realm}/clients", token, json={
+        body = {
             "clientId":                  client_id_name,
             "enabled":                   True,
             "clientAuthenticatorType":   "client-secret",
@@ -254,7 +286,10 @@ def create_admin_service_client(base_url: str, token: str, realm: str) -> str:
             "serviceAccountsEnabled":    True,
             "publicClient":              False,
             "protocol":                  "openid-connect",
-        })
+        }
+        if secret:
+            body["secret"] = secret
+        r2 = api("post", f"{base_url}/admin/realms/{realm}/clients", token, json=body)
         r2.raise_for_status()
 
         r3 = api("get", f"{base_url}/admin/realms/{realm}/clients?clientId={client_id_name}", token)
@@ -309,6 +344,49 @@ def create_admin_service_client(base_url: str, token: str, realm: str) -> str:
     return client_secret
 
 
+def set_frontend_url(base_url: str, token: str, realm: str, frontend_url: str) -> None:
+    """Set the realm's frontendUrl so tokens carry the public issuer (pod URL)."""
+    r = api("get", f"{base_url}/admin/realms/{realm}", token)
+    r.raise_for_status()
+    rep = r.json()
+    attrs = rep.get("attributes") or {}
+    if attrs.get("frontendUrl") == frontend_url:
+        log(f"Realm frontendUrl already {frontend_url}", "OK")
+        return
+    attrs["frontendUrl"] = frontend_url
+    u = api("put", f"{base_url}/admin/realms/{realm}", token, json={"realm": realm, "attributes": attrs})
+    u.raise_for_status()
+    log(f"Realm frontendUrl set to {frontend_url}", "OK")
+
+
+def load_users_file(path: str | None) -> list[dict]:
+    """Read the users JSON list; [] (with a warning) when no file is given/found."""
+    if not path:
+        log("No --users-file given — user creation/password sync skipped", "WARN")
+        return []
+    p = Path(path)
+    if not p.is_file():
+        log(f"Users file {path} not found — user creation/password sync skipped", "WARN")
+        return []
+    users = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(users, list):
+        raise ValueError(f"{path}: expected a JSON list of users")
+    required = {"username", "password", "role"}
+    for u in users:
+        missing = required - set(u)
+        if missing:
+            raise ValueError(f"{path}: user entry {u.get('username', '?')} missing {sorted(missing)}")
+        if u["role"] not in ROLES:
+            raise ValueError(f"{path}: user {u['username']} has unknown role {u['role']} (allowed: {ROLES})")
+    return users
+
+
+def _mask(secret: str, show: bool) -> str:
+    if show or not secret:
+        return secret
+    return f"{secret[:4]}…{secret[-2:]} (hidden; use --show-secrets)"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Auto-configure Keycloak for Drone Ingest")
     parser.add_argument("--url",      default=KC_URL,         help="Keycloak base URL")
@@ -316,7 +394,22 @@ def main() -> None:
     parser.add_argument("--password", default=ADMIN_PASSWORD, help="Admin password")
     parser.add_argument("--realm",    default=REALM,          help="Realm name")
     parser.add_argument("--no-wait",  action="store_true",    help="Skip startup wait")
+    parser.add_argument("--client-secret", default=os.getenv("KC_CLIENT_SECRET", ""),
+                        help="Explicit drone-ingest-client secret (default: $KC_CLIENT_SECRET)")
+    parser.add_argument("--admin-client-secret", default=os.getenv("ADMIN_CLIENT_SECRET", ""),
+                        help="Explicit dvas-admin-service secret (default: $ADMIN_CLIENT_SECRET)")
+    parser.add_argument("--users-file", default=os.getenv("KC_USERS_FILE", ""),
+                        help="JSON list of users to create/update (default: $KC_USERS_FILE)")
+    parser.add_argument("--frontend-url", default="",
+                        help="Public base URL to set as the realm frontendUrl (e.g. the RunPod proxy URL)")
+    parser.add_argument("--show-secrets", action="store_true",
+                        help="Print client secrets in full at the end (default: masked)")
     args = parser.parse_args()
+
+    if not args.password:
+        print("\n  ERROR: Keycloak admin password missing (--password or $KEYCLOAK_ADMIN_PASSWORD).",
+              file=sys.stderr)
+        sys.exit(2)
 
     print()
     print("=" * 62)
@@ -331,9 +424,12 @@ def main() -> None:
             sys.exit(1)
 
     try:
+        users  = load_users_file(args.users_file)
         token  = get_admin_token(base, args.user, args.password)
         create_realm(base, token, args.realm)
-        uuid   = create_client(base, token, args.realm, CLIENT_ID_NAME)
+        if args.frontend_url:
+            set_frontend_url(base, token, args.realm, args.frontend_url.rstrip("/"))
+        uuid   = create_client(base, token, args.realm, CLIENT_ID_NAME, secret=args.client_secret or None)
         secret = get_client_secret(base, token, args.realm, uuid)
         
         # Human Dashboard UI client
@@ -341,10 +437,11 @@ def main() -> None:
         dash_secret = get_client_secret(base, token, args.realm, dash_uuid)
 
         r_ids  = create_roles(base, token, args.realm, ROLES)
-        create_users(base, token, args.realm, OPERATORS, r_ids)
+        create_users(base, token, args.realm, users, r_ids)
 
         # Phase 1: Create the scoped admin service client
-        admin_secret = create_admin_service_client(base, token, args.realm)
+        admin_secret = create_admin_service_client(base, token, args.realm,
+                                                   secret=args.admin_client_secret or None)
 
         print()
         print("=" * 62)
@@ -352,17 +449,16 @@ def main() -> None:
         print()
         print(f"  Realm:                  {args.realm}")
         print(f"  Ingest M2M Client ID:   {CLIENT_ID_NAME}")
-        print(f"  Ingest Client Secret:   {secret}")
+        print(f"  Ingest Client Secret:   {_mask(secret, args.show_secrets)}")
         print(f"  Dashboard Client ID:    dvas-dashboard-client")
-        print(f"  Dashboard Client Secret:{dash_secret}")
+        print(f"  Dashboard Client Secret:{_mask(dash_secret, args.show_secrets)}")
         print()
         print(f"  Admin Service Client:   {ADMIN_SERVICE_CLIENT_ID}")
-        print(f"  Admin Service Secret:   {admin_secret}")
+        print(f"  Admin Service Secret:   {_mask(admin_secret, args.show_secrets)}")
+        print(f"  Users created/updated:  {len(users)}")
         print()
-        print("  ⚠  Copy these secrets into:")
-        print("       • docker-compose.yml → KC_CLIENT_SECRET (dashboard client)")
-        print("       • docker-compose.yml → ADMIN_CLIENT_SECRET (admin service)")
-        print("       • ingest/edge_sender.py → CLIENT_SEC (ingest client)")
+        print("  Secrets must match: KC_CLIENT_SECRET / ADMIN_CLIENT_SECRET in the")
+        print("  environment of the dashboard backend and the edge application.")
         print("=" * 62)
         print()
 

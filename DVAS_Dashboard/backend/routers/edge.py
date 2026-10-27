@@ -161,16 +161,19 @@ async def get_edge_system_logs(
     user: dict = Depends(get_current_user),
 ):
     """Fetch live operational engine metrics from edge service or fallback to live system metrics."""
+    # EDGE_API_HOST set to "" (cloud/RunPod: no edge container) -> return [] at once.
+    edge_host = os.getenv("EDGE_API_HOST", "http://edge:8765").strip()
+    if not edge_host:
+        return []
     try:
-        edge_host = os.getenv("EDGE_API_HOST", "http://edge:8765")
-        async with httpx.AsyncClient(timeout=2.0) as client:
+        async with httpx.AsyncClient(timeout=1.0) as client:
             resp = await client.get(
                 f"{edge_host}/api/edge/system-logs",
                 params={"level": level, "source": source, "limit": limit}
             )
             if resp.status_code == 200:
                 return resp.json()
-    except Exception:
-        pass
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.debug("edge system-logs unavailable from %s: %s", edge_host, exc)
 
     return []

@@ -922,6 +922,11 @@ async def stream_stop():
     _person_trajectories.clear()
     _tracker_last_seen.clear()
 
+    if not cfg.VRAM_OFFLOAD_ON_STOP:
+        # RunPod pod: keep models resident on the GPU (no reload stall; required for TensorRT)
+        log.info("Person stream loop stopped (models kept on GPU, VRAM_OFFLOAD_ON_STOP=false)")
+        return {"status": "stopped", "device": "gpu"}
+
     # Offload models from GPU VRAM to CPU
     if analyzer:
         if analyzer.person_model:

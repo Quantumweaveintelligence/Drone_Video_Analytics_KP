@@ -17,7 +17,7 @@ from starlette.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
-from core.config import CORS_ORIGINS, limiter
+from core.config import CORS_ORIGINS, IS_CLOUD, PUBLIC_BASE_URL, limiter, validate_required_secrets
 from core.security import fetch_jwks
 from database import engine
 from models import Base
@@ -32,6 +32,9 @@ from routers import auth, drones, alerts, audit, analytics, edge, infra, ws, inc
 # ---------- App ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dvas")
+
+# Fail fast in cloud mode if a required secret is missing (RunPod plan 2.4).
+validate_required_secrets()
 
 app = FastAPI(title="DVAS API")
 app.state.limiter = limiter
@@ -101,11 +104,26 @@ app.include_router(push.router)
 
 # ---------- CORS ----------
 cors_origins = [o.strip() for o in CORS_ORIGINS if o.strip() and o.strip() != "*"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=cors_origins or ["http://localhost:3000"],
-    allow_origin_regex=r"^https?://.*(:[0-9]+)?$",
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if IS_CLOUD:
+    # Cloud (RunPod): explicit allow-list only — the public pod URL plus the
+    # edge application's local gateway. No wildcard regex (RunPod plan 2.4 / S5).
+    cloud_origins = set(cors_origins)
+    if PUBLIC_BASE_URL:
+        cloud_origins.add(PUBLIC_BASE_URL)
+    cloud_origins.add("http://localhost:8765")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_credentials=True,
+        allow_origins=sorted(cloud_origins),
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_credentials=True,
+        allow_origins=cors_origins or ["http://localhost:3000"],
+        allow_origin_regex=r"^https?://.*(:[0-9]+)?$",
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )

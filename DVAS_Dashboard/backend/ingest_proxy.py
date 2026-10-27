@@ -41,6 +41,7 @@ from core.config import (
     ADMIN_CLIENT_SECRET,
     INGEST_URL,
 )
+from core import runtime
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 INGEST_SERVER_URL = INGEST_URL
@@ -522,6 +523,8 @@ CONTAINER_METADATA = {
     "drone_vehicle_analyzer": {"category": "Vehicle AI", "tier": 2},
     "drone_anpr_analyzer": {"category": "ANPR AI", "tier": 2},
     "drone_intrusion_analyzer": {"category": "Perimeter AI", "tier": 2},
+    "drone_vessel_analyzer": {"category": "Maritime AI", "tier": 2},
+    "drone_anomaly_analyzer": {"category": "Anomaly AI", "tier": 2},
     # Database & Queues & Auth
     "drone_keycloak": {"category": "Identity/IAM", "tier": 3},
     "drone_valkey": {"category": "Message Queue", "tier": 3},
@@ -559,12 +562,39 @@ def _docker_client():
         raise HTTPException(503, f"Docker socket unavailable: {exc}")
 
 
+async def _list_supervisor_containers() -> list:
+    """Container grid in supervisor mode (RunPod pod): one row per compose name
+    that exists as a supervisord program; services not deployed in the cloud
+    (headscale, step-ca, seaweedfs, monitoring, edge) are hidden."""
+    try:
+        table = await asyncio.to_thread(runtime.get_process_table)
+    except runtime.RuntimeControlError as exc:
+        raise HTTPException(503, str(exc))
+    names = [n for n in ALL_SYSTEM_CONTAINERS if runtime.is_deployed(n)]
+    names += [n for n in ("drone_vessel_analyzer", "drone_anomaly_analyzer") if n not in names]
+    result = []
+    for name in names:
+        meta = CONTAINER_METADATA.get(name, {"category": "Service", "tier": 9})
+        row = {
+            "name": name,
+            "short_name": name.replace("drone_", "").replace("dvas_", ""),
+            "category": meta["category"],
+            "tier": meta["tier"],
+        }
+        row.update(runtime.container_status(name, table))
+        result.append(row)
+    return result
+
+
 @ingest_api.get("/containers", summary="List ingest container statuses")
 async def list_containers(user: dict = Depends(_admin_user)):
     """
     Returns the live status and health of all system containers (24 services).
     Used by the admin control panel to show a container health grid.
     """
+    if runtime.IS_SUPERVISOR:
+        return await _list_supervisor_containers()
+
     client = _docker_client()
     result = []
     try:
@@ -638,6 +668,30 @@ async def control_ingest(body: dict, user: dict = Depends(_admin_user)):
     # For "all" stop, reverse order (analytics → ingest → infra) for clean shutdown
     if act == "stop" and scope == "all":
         targets = list(reversed(targets))
+
+    if runtime.IS_SUPERVISOR:
+        if scope == "core":
+            # nginx also serves the dashboard in the pod — only the ingest API is "core"
+            targets = ["drone_ingest_api"]
+        else:
+            targets = targets + ["drone_vessel_analyzer", "drone_anomaly_analyzer"]
+        try:
+            outcome = await asyncio.to_thread(runtime.control_programs, act, targets)
+        except runtime.RuntimeControlError as exc:
+            raise HTTPException(503, str(exc))
+        operator = user.get("email", user.get("sub", "unknown"))
+        logger.info(
+            "Ingest control (supervisor): operator=%s action=%s scope=%s targets=%d errors=%d skipped=%d",
+            operator, act, scope, len(outcome["results"]), len(outcome["errors"]), len(outcome["skipped"]),
+        )
+        return {
+            "action": act,
+            "scope": scope,
+            "success": len(outcome["errors"]) == 0,
+            "results": outcome["results"],
+            "errors": outcome["errors"],
+            "skipped": outcome["skipped"],
+        }
 
     client = _docker_client()
     results, errors = [], []

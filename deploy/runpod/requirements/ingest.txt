@@ -1,0 +1,10 @@
+# venv /opt/venvs/ingest — ingest API (same pins as dvas_ingest/ingest/api/requirements.txt) · RunPod plan 2.9
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-jose[cryptography]==3.3.0
+redis[hiredis]==5.0.8
+python-multipart==0.0.9
+pydantic==2.7.0
+httpx==0.27.0
+prometheus-client==0.20.0
+starlette==0.37.2
