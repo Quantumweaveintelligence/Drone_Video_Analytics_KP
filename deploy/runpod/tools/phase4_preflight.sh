@@ -37,11 +37,14 @@ root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/d
 fstype="$(stat -f -c %T "$root" 2>/dev/null || echo unknown)"
 case "$fstype" in fuseblk|ntfs*|vfat|msdos) bad "Docker root $root is on $fstype — overlay2 needs ext4/xfs";; *) ok "Docker root $root on $fstype";; esac
 free_gb="$(df -BG --output=avail "$root" 2>/dev/null | tail -1 | tr -dc '0-9')"
-# Budget with the classic overlay2 store + the default "docker" builder: base ~20 GB unpacked,
-# our layers ~8–10 GB, node build stage + cache ~3–5 GB → ~35 GB peak.
-if   [ "${free_gb:-0}" -ge 60 ]; then ok "${free_gb} GB free in $root"
-elif [ "${free_gb:-0}" -ge 40 ]; then warn "${free_gb} GB free in $root — enough with overlay2 + the docker builder (~35 GB peak); don't pull/build anything else meanwhile"
-else bad "only ${free_gb:-?} GB free in $root (need >= 40 GB)"; fi
+# Budget with the classic overlay2 store + the default "docker" builder (same rule as build_image.sh):
+# ~38 GB from empty (base ~20 GB unpacked + our layers + build stages/cache), ~18 GB once the base image is local.
+base_ref="${BASE_IMAGE:-$(sed -nE 's/^ARG BASE_IMAGE=(.*)$/\1/p' deploy/runpod/Dockerfile | head -1)}"
+if [ -n "$base_ref" ] && docker image inspect "$base_ref" >/dev/null 2>&1; then need=18; why="base image already local"
+else need=38; why="base image still to pull"; fi
+if   [ "${free_gb:-0}" -ge $((need + 15)) ]; then ok "${free_gb} GB free in $root ($why, need ~${need} GB)"
+elif [ "${free_gb:-0}" -ge "$need" ]; then warn "${free_gb} GB free in $root — enough ($why, need ~${need} GB); don't pull/build anything else meanwhile"
+else bad "only ${free_gb:-?} GB free in $root ($why, need >= ${need} GB) — see guide A0 c)"; fi
 storage="$(docker info --format '{{.Driver}}' 2>/dev/null)"
 case "$storage" in
   overlay2) ok "image store: overlay2 (layers stored once)";;
