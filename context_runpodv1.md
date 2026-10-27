@@ -470,3 +470,10 @@ Ubuntu 24.04 (above). Not run: a full image build (no registry access / weights 
   only). State: overlay2 ✅, builder `default`/docker ✅, base image 17.9 GB local, build cache 3 GB (keep it: it holds
   those stages), 26 GB free (guard needs 18). `/var/lib/containerd` 3.9 GB is probably left over from the old store;
   optional A0 d), not needed now. `BASE_IMAGE` was not in `~/.bashrc` → export it again in each new terminal.
+- **Preflight disk rule aligned (16:40):** it still demanded ≥40 GB and FAILed at 26 GB with the base image local.
+  Now it uses the same rule as `build_image.sh`: needs ~18 GB if the base image is local, ~38 GB if not
+  (OK at +15 GB, WARN in between).
+- **Build attempt 2 (27 Oct, ~11:10) failed** in `stage-8 10/20` (venvs): `onnxruntime-gpu==1.20.1` isn't on PyPI any
+  more (available: 1.20.0, 1.20.2, …). Pinned **1.20.2** (same CUDA 12 / cuDNN 9 line). All five requirements files
+  were then dry-run resolved here for cp311/manylinux, binary-only, with torch 2.8.0 / torchvision 0.23.0 constraints:
+  all resolve (ai: numpy 1.26.4, ultralytics 8.3.253, opencv 4.10.0.84; anpr: paddlepaddle 2.6.2, paddleocr 2.9.1).
