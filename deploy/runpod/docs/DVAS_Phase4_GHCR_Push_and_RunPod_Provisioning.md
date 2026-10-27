@@ -1,7 +1,7 @@
 # DVAS — Phase 4: Push to GHCR & provision RunPod
 
 > Branch `runpod-v1` · Plan: `DVAS_RunPod_Deployment_Plan.md` Phase 4 · Written 27 Oct 2026 · **Part A rewritten 27 Oct
-> for your build laptop (`user-Nitro-AN515-57`, Docker root on `/`, 47 GB free)**
+> for your build laptop (`user-Nitro-AN515-57`, Docker root on `/`)** · **A0 added 27 Oct (clean restart + safe cleanup)**
 > RunPod console steps checked against docs.runpod.io (Credentials, Storage, Templates,
 > Expose ports, Environment variables pages) on 27 Oct 2026. RunPod renames menus from
 > time to time: if a label differs, look for the closest match.
@@ -14,17 +14,20 @@
 
 ## 0. Where you are
 
-| Item | State (checked 27 Oct 2026) |
+| Item | State (checked 27 Oct 2026, 10:45) |
 |---|---|
-| `runpod-v1` committed and pushed | ✅ `origin/runpod-v1` at `819ef2f` (plus the Phase 4 files — see A1) |
-| Build laptop disk | ✅ `/` (Docker root) 108 GB, **47 GB free**; Docker holds 0 images, 0 build cache, 23 volumes (5.3 GB) |
-| `deploy/runpod/models.sha256` + `/mnt/NewVolume/dvas_models_stage/` | ❌ not created yet → **step A4** |
+| `runpod-v1` committed | ✅ last commits: *model weight manifest* (10:06) and *MinIO via source build, phase 4 fixes* (10:34) |
+| `deploy/runpod/models.sha256` + `/mnt/NewVolume/dvas_models_stage/` | ✅ done (A4) — re-running A4 is harmless |
+| MinIO build mode | ✅ `MINIO_FROM=source` written to the Dockerfile (A6) |
+| First build attempt (10:34) | ⚠️ stopped (no error) during the apt step. Already done and cached: MinIO + mc compiled from source ✅, frontend built ✅. Disk report 16:20: overlay2 ✅, base image 17.9 GB local ✅, build cache 3 GB, **26 GB free** — enough; keep the cache |
 | Image built / tested / pushed | ❌ → steps A6–A8 |
 | Baseline DB dumps, realm template | ➖ skipped on purpose (see A5) — the pod has tested fallbacks |
 
-**Is 47 GB enough?** Yes, if you follow A2 (classic `overlay2` image store + the default `docker` builder). Peak use is
-roughly: base image ~20 GB unpacked + DVAS layers ~8–10 GB + frontend build stage and cache ~3–5 GB ≈ **35 GB**.
-The model staging folder lives on `/mnt/NewVolume`, so it doesn't count. Don't build or pull anything else meanwhile.
+**How much disk?** With the classic `overlay2` image store and the default `docker` builder (A2), peak use is about
+**38 GB** from an empty Docker: base image ~20 GB unpacked + DVAS layers ~8–10 GB + frontend, MinIO source build and
+cache ~5–7 GB. With the base image already pulled the build itself needs about **18 GB** more.
+`build_image.sh` now checks this and stops before it can fill your disk. The model staging folder is on
+`/mnt/NewVolume`, so it doesn't count. Don't build or pull anything else meanwhile.
 
 > ⚠️ **Do not run `docker system prune --volumes` or `docker volume prune`.** The 23 volumes are the data of your
 > old local compose stacks (Postgres, MinIO, Keycloak). They're only 5.3 GB; leave them alone.
@@ -37,6 +40,80 @@ Do the steps in order and run every command **from the repo root** (`/mnt/NewVol
 step says otherwise. Text in `<angle brackets>` is a placeholder: replace it **including the brackets**
 (e.g. `GHCR_USER=octocat`, not `GHCR_USER=<octocat>`). Each step ends with **✔ You should see** — don't go on until you do. If a step fails, stop
 and send me the output (Part C lists the usual causes).
+
+### A0. Starting over (clean restart) — do this first if an earlier attempt ran
+
+You can always restart Part A from the top: every step is safe to repeat (git steps just say *nothing to commit*,
+A4 rewrites the same checksums, the resolver writes the same Dockerfile lines). What must be clean is the
+**terminal** and the **disk**.
+
+> **Where did the 24 GB go?** Almost certainly not junk: the build pulled the ~10 GB base image (≈20 GB unpacked),
+> the Go image and MinIO sources, and started the DVAS layers. That is the expected cost of a build — deleting it
+> only means downloading it again. The real questions are whether it sits in the right image store (overlay2) and
+> whether your build stopped half-way. a)–c) answer that.
+
+**a) Stop the old run, then use a new terminal.** In the old terminal press **Ctrl+C** (once; wait for the prompt),
+then close it. Open a **new terminal** — this drops anything exported earlier (`MINIO_IMAGE`, `MC_IMAGE`, `PY`, …),
+which `build_image.sh` would otherwise pass into the build.
+
+```bash
+cd /mnt/NewVolume/DVAS_RUNPODV1
+pgrep -af 'build_image|buildx|docker pull' || echo "nothing running"     # must print: nothing running
+mkdir -p deploy/runpod/.logs
+mv ~/dvas-build.log deploy/runpod/.logs/build-attempt1.log 2>/dev/null; ls deploy/runpod/.logs
+```
+
+`deploy/runpod/.logs/` is git-ignored and not sent into the build. Logs there are **readable by me directly** —
+you don't have to paste them.
+
+**b) Take a disk report** (read-only, deletes nothing; asks for your sudo password once for folder sizes):
+
+```bash
+chmod +x deploy/runpod/tools/*
+deploy/runpod/tools/docker_disk_report.sh
+```
+
+It saves `deploy/runpod/.logs/disk-report-<time>.txt`. If anything in it is unclear, just tell me *"report saved"*.
+
+**c) Free space — pick the row that matches the report:**
+
+| The report shows | Do this | Free afterwards |
+|---|---|---|
+| `image store driver : overlay2` and `runpod/pytorch:2.8.0-…` in **Images** | keep the base image (saves a 10 GB download); drop only the half-finished build: `docker builder prune -af` | ≈ 25–28 GB → enough (needs 18) |
+| `image store driver : overlayfs` | full clean + switch store: do **A2b** exactly as written (prunes images + cache, keeps volumes), then A3 pulls the base again | ≈ 45–47 GB |
+| `overlay2`, **no** base image, but free space is still far below 45 GB | images from the *old* store are hidden but still on disk — see **d)** | ≈ 45–47 GB |
+
+Always safe on top of that (none of it is needed by DVAS):
+
+```bash
+docker container prune -f                 # stopped containers only — volumes are kept
+sudo apt clean                            # downloaded .deb packages
+sudo journalctl --vacuum-size=200M        # old system logs
+rm -rf ~/.cache/pip                       # pip download cache (rebuilt on demand)
+df -h / | tail -1
+```
+
+> ⚠️ **Never delete:** Docker **volumes** (`docker volume prune`, `docker system prune --volumes`) — your old local
+> stacks' data; `/mnt/NewVolume/dvas_models_stage/` — the weights every build needs; anything in the repo.
+
+**d) Only if c) said so — clear the hidden old image store:**
+
+```bash
+echo '{ "features": { "containerd-snapshotter": true } }'  | sudo tee /etc/docker/daemon.json
+sudo systemctl restart docker
+docker image prune -af && docker builder prune -af       # cleans the old store (volumes kept)
+echo '{ "features": { "containerd-snapshotter": false } }' | sudo tee /etc/docker/daemon.json
+sudo systemctl restart docker
+docker info --format '{{.Driver}}'                       # → overlay2
+docker volume ls | wc -l                                 # still 24
+df -h / | tail -1
+```
+
+(If `/etc/docker/daemon.json` had other settings, keep them and only change the `"features"` line.)
+
+✔ You should see: *nothing running*, the store is `overlay2`, and free space as in the table. Then continue with
+**A1** and run **one block at a time** — wait for each ✔ before the next. Pasting all commands at once hides the
+first error under the output of the later ones.
 
 ### A1. Get the latest code onto `runpod-v1`
 
@@ -212,8 +289,11 @@ commit hash, so build only from a clean tree.
 **Build** (30–60 min the first time; keep the laptop on mains power and stop it from sleeping):
 
 ```bash
-deploy/runpod/tools/build_image.sh 2>&1 | tee ~/dvas-build.log
+deploy/runpod/tools/build_image.sh
 ```
+
+It writes its own log to `deploy/runpod/.logs/build-<time>.log` (I can read it there) and first prints
+`disk: … GB free …; need about … GB`. If it prints **STOP: not enough free space**, go back to A0 c) — don't force it.
 
 Optional, in a second terminal, to watch the disk:
 ```bash
@@ -227,7 +307,7 @@ size: …GB
 ```
 and `cat deploy/runpod/.last_build_tag` prints that tag.
 
-If the build fails: don't retry blindly — send me `tail -150 ~/dvas-build.log`. If it failed with
+If the build fails: don't retry blindly — tell me *"build failed"*; I read the newest log in `deploy/runpod/.logs/` myself. If it failed with
 *no space left on device*: `docker builder prune -f` (removes only build cache), check `df -h /`, and rerun the
 build command — finished stages are reused.
 
@@ -487,8 +567,9 @@ Put both files in the team password manager and keep an offline copy. Losing `FA
 | `push_ghcr.sh`: `denied: permission_denied: create_package/write_package` | PAT lacks `write:packages`, or the org doesn't let members create private packages (A9) |
 | `push_ghcr.sh`: `unauthorized` | stale login → `FORCE_LOGIN=1 GHCR_USER=… deploy/runpod/tools/push_ghcr.sh` |
 | Push keeps restarting on big layers | slow or unstable upload. `docker push` resumes per layer, so just run it again |
+| Build: `STOP: not enough free space` | the guard in `build_image.sh` — free space per A0 c)/d), then rerun. Only override (`FORCE_LOW_DISK=1`) if you know the cache already holds most layers |
 | Build: `no space left on device` | `docker builder prune -f`, check `df -h /`, rerun `build_image.sh` (A6). Make sure the image store is `overlay2` (A2b) |
-| Build fails in stage `minio-source` / `mc-source` (`git clone`, `go: downloading`, `go build`) | network hiccup → rerun `build_image.sh` (finished stages are cached). Still failing → send me `tail -150 ~/dvas-build.log` |
+| Build fails in stage `minio-source` / `mc-source` (`git clone`, `go: downloading`, `go build`) | network hiccup → rerun `build_image.sh` (finished stages are cached). Still failing → tell me; I read `deploy/runpod/.logs/` |
 | Build: `failed to resolve source metadata for docker.io/minio/…` | the Dockerfile still names a dead MinIO tag → rerun `resolve_minio_images.sh --write` (A6), commit, build again |
 | Build: `sha256sum: WARNING … did NOT match` | weights changed after staging → rerun `stage_models.sh` (A4), commit `models.sha256`, build again |
 | Build: pip can't find `paddlepaddle==2.6.2` | see the note at the top of `deploy/runpod/requirements/anpr.txt`; send me the log tail |

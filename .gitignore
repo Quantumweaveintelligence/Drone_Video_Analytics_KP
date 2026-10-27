@@ -65,3 +65,4 @@ dvas_secrets_local/
 
 # local build bookkeeping (tools/build_image.sh)
 deploy/runpod/.last_build_tag
+deploy/runpod/.logs/

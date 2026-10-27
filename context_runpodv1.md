@@ -446,3 +446,27 @@ Ubuntu 24.04 (above). Not run: a full image build (no registry access / weights 
 - Not testable from my workspace (no Docker Hub / Go proxy access): the Go compile itself. Git tags verified; scripts
   tested with a stubbed docker, shellcheck clean. If `minio-source` fails, the log tail is what I need.
 - Guide A6 and Part C updated to match.
+
+### 10.9 First build attempt and the clean restart (27 Oct 2026, 10:34–10:45)
+- You ran the resolver, commit, preflight and build in one paste. Commit `runpod-v1: MinIO via source build, phase 4
+  fixes` landed (10:34) and the Dockerfile matches mine (`MINIO_FROM=source`), but the build didn't finish (no
+  `.last_build_tag`) and free disk fell from 47 GB to 23 GB — the base image (~20 GB unpacked) plus partial layers.
+- **New `deploy/runpod/tools/docker_disk_report.sh`** (read-only): free space, running builds, image-store driver,
+  `daemon.json`, builder, `docker system df`, images, `/var/lib/docker` + `/var/lib/containerd` sizes, leftover env
+  vars in the shell and `~/.bashrc`, MinIO ARGs, git state, and the tail/errors of the newest build log. Saves to
+  `deploy/runpod/.logs/disk-report-<time>.txt`.
+- **`build_image.sh`** now logs itself to `deploy/runpod/.logs/build-<time>.log` and refuses to start when free space
+  is under ~18 GB (base image local) / ~38 GB (base must be pulled); `FORCE_LOW_DISK=1` overrides.
+- `deploy/runpod/.logs/` is git-ignored and docker-ignored. It's inside the connected folder, so I can read logs and
+  reports directly — no pasting needed.
+- **Guide:** new **A0 (clean restart)**: Ctrl+C + fresh terminal, move the old log, disk report, a cleanup decision
+  table (overlay2 + base present → `docker builder prune -af` only; overlayfs → A2b; hidden old-store data → toggle
+  the containerd snapshotter on, prune, off), safe extras (`container prune`, `apt clean`, journal vacuum, pip cache),
+  and a never-delete list (volumes, `dvas_models_stage`, repo). Also run Part A one block at a time. §0 and the A6
+  build command were updated, and Part C has a row for the disk guard.
+- **Disk report 16:20 + attempt-1 log (read from `deploy/runpod/.logs/`):** no errors. The build was stopped during
+  the apt step (`stage-8 3/20`). Already done: **MinIO source build ✅** (`minio DEVELOPMENT.2025-10-15T17-29-55Z`,
+  go1.27.3), **mc ✅** (`DEVELOPMENT.2025-08-13T08-35-41Z`), frontend `npm run build` ✅ (CRA "compiled with warnings"
+  only). State: overlay2 ✅, builder `default`/docker ✅, base image 17.9 GB local, build cache 3 GB (keep it: it holds
+  those stages), 26 GB free (guard needs 18). `/var/lib/containerd` 3.9 GB is probably left over from the old store;
+  optional A0 d), not needed now. `BASE_IMAGE` was not in `~/.bashrc` → export it again in each new terminal.

@@ -11,6 +11,23 @@ REPO="${IMAGE_REPO:-ghcr.io/quantumweaveintelligence/dvas-runpod}"
 [ -d "$MODELS/analytics" ] || { echo "models context $MODELS/analytics missing — run tools/stage_models.sh" >&2; exit 2; }
 [ -s deploy/runpod/models.sha256 ] || { echo "deploy/runpod/models.sha256 missing — run tools/stage_models.sh" >&2; exit 2; }
 bash deploy/runpod/tools/check_zero_byte_py.sh
+
+# Everything below is also written to deploy/runpod/.logs/build-<time>.log (git-ignored; Claude can read it)
+mkdir -p deploy/runpod/.logs
+LOG="deploy/runpod/.logs/build-$(date +%Y%m%d-%H%M%S).log"
+exec > >(tee -a "$LOG") 2>&1
+echo "log: $LOG"
+
+# Free-space guard: building with a full / can leave Ubuntu itself unusable.
+# Needs ~38 GB when the base image still has to be pulled, ~18 GB when it is already local.
+free_gb="$(df -BG --output=avail "$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /)" | tail -1 | tr -dc 0-9)"
+if docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then need=18; have_base="base image already local"
+else need=38; have_base="base image will be pulled"; fi
+echo "disk: ${free_gb} GB free on the Docker disk; ${have_base}; need about ${need} GB"
+if [ "${free_gb:-0}" -lt "$need" ] && [ "${FORCE_LOW_DISK:-0}" != 1 ]; then
+  echo "STOP: not enough free space — see guide step A0 (safe cleanup). Override: FORCE_LOW_DISK=1" >&2
+  exit 3
+fi
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   echo "WARNING: uncommitted changes — the image will not match commit $(git rev-parse --short HEAD)" >&2
 fi
@@ -33,3 +50,5 @@ docker buildx build -f deploy/runpod/Dockerfile \
 echo "built $REPO:$TAG"
 [ "$OUTPUT" = "--load" ] && docker image ls "$REPO:$TAG" --format 'size: {{.Size}}'
 echo "$TAG" > deploy/runpod/.last_build_tag
+df -h / | tail -1 | awk '{print "disk after build: " $4 " free"}'
+echo "log saved: $LOG"

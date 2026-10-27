@@ -28,7 +28,8 @@ deploy/runpod/
 │   │   export_realm.sh, sanitize_realm.py,
 │   │   check_zero_byte_py.sh, install_git_hooks.sh          Phase 1
 │   ├── build_image.sh, run_local_test.sh, freeze_image_versions.sh   Phase 3
-│   └── phase4_preflight.sh, resolve_minio_images.sh, push_ghcr.sh    Phase 4
+│   └── phase4_preflight.sh, resolve_minio_images.sh, push_ghcr.sh,
+│       docker_disk_report.sh                                          Phase 4
 ├── db/            baseline dumps (Phase 1.3) + migrations/{analytics,dashboard}/
 ├── keycloak/      realm-template.json (sanitised, Phase 1.5)
 ├── env/           dvas.env.example, local-compose.env.example

@@ -37,6 +37,8 @@ sus_deploy/
 vehicle-tracking/
 vehicle_detection_tracker-main/
 deploy/runpod/docs/
+deploy/runpod/.logs/
+deploy/runpod/.last_build_tag
 context.md
 context_runpodv1.md
 claude.md
