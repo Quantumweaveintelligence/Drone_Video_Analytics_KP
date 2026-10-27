@@ -11,10 +11,18 @@
 # ════════════════════════════════════════════════════════════════════════════
 ARG BASE_IMAGE
 ARG KEYCLOAK_IMAGE=quay.io/keycloak/keycloak:24.0.5
-ARG VALKEY_IMAGE=valkey/valkey:7.2
-# Pin MinIO/mc to the versions you run locally (Phase 0: tools/collect_versions.sh)
-ARG MINIO_IMAGE=minio/minio:RELEASE.2025-04-22T22-12-26Z
-ARG MC_IMAGE=minio/mc:RELEASE.2025-04-16T18-13-26Z
+# MinIO server + client (mc). Two ways to get them — tools/resolve_minio_images.sh --write sets these:
+#   MINIO_FROM=image  : copy the binaries out of MINIO_IMAGE / MC_IMAGE (pinned by digest)
+#   MINIO_FROM=source : compile them from the official GitHub release tags MINIO_GIT_TAG / MC_GIT_TAG
+#                       with GO_IMAGE (used because MinIO stopped publishing community images in 2025)
+# In "source" mode MINIO_IMAGE/MC_IMAGE point at GO_IMAGE: BuildKit still resolves every FROM line, so they must
+# always name a pullable image. Defaults below = source mode with the newest release tags (checked 27 Oct 2026).
+ARG MINIO_FROM=source
+ARG MINIO_IMAGE=golang:1-bookworm
+ARG MC_IMAGE=golang:1-bookworm
+ARG MINIO_GIT_TAG=RELEASE.2025-10-15T17-29-55Z
+ARG MC_GIT_TAG=RELEASE.2025-08-13T08-35-41Z
+ARG GO_IMAGE=golang:1-bookworm
 
 # ── Stage 1: cloud frontend build ─────────────────────────────────────────────
 FROM node:20-bookworm AS frontend
@@ -25,42 +33,117 @@ COPY DVAS_Dashboard/frontend/ ./
 ENV REACT_APP_DEPLOYMENT_TARGET=cloud REACT_APP_BACKEND_URL= GENERATE_SOURCEMAP=false CI=false
 RUN npm run build && test -f build/index.html
 
-# ── Stage 2: binaries from official images ────────────────────────────────────
+# ── Stage 2: Keycloak + MinIO binaries ────────────────────────────────────────
 FROM ${KEYCLOAK_IMAGE} AS keycloak
-FROM ${VALKEY_IMAGE}   AS valkey
-FROM ${MINIO_IMAGE}    AS minio
-FROM ${MC_IMAGE}       AS mc
+
+# MinIO variant "image": binaries from the official images (at /usr/bin/minio, /usr/bin/mc)
+FROM ${MINIO_IMAGE} AS minio-image
+FROM ${MC_IMAGE}    AS mc-image
+
+# MinIO variant "source": static binaries built from the release tags, installed at the same paths
+FROM ${GO_IMAGE} AS minio-source
+ARG MINIO_GIT_TAG
+ENV CGO_ENABLED=0 GOTOOLCHAIN=auto
+RUN set -eux; \
+    git clone --depth 1 --branch "${MINIO_GIT_TAG}" https://github.com/minio/minio.git /src/minio; \
+    cd /src/minio; \
+    LDFLAGS="$(go run buildscripts/gen-ldflags.go 2>/dev/null || true)"; \
+    go build -trimpath -tags kqueue -ldflags "-s -w ${LDFLAGS}" -o /usr/bin/minio .; \
+    /usr/bin/minio --version; \
+    rm -rf /src /root/go/pkg /root/.cache/go-build
+
+FROM ${GO_IMAGE} AS mc-source
+ARG MC_GIT_TAG
+ENV CGO_ENABLED=0 GOTOOLCHAIN=auto
+RUN set -eux; \
+    git clone --depth 1 --branch "${MC_GIT_TAG}" https://github.com/minio/mc.git /src/mc; \
+    cd /src/mc; \
+    LDFLAGS="$(go run buildscripts/gen-ldflags.go 2>/dev/null || true)"; \
+    go build -trimpath -tags kqueue -ldflags "-s -w ${LDFLAGS}" -o /usr/bin/mc .; \
+    /usr/bin/mc --version; \
+    rm -rf /src /root/go/pkg /root/.cache/go-build
+
+# Select the variant
+FROM minio-${MINIO_FROM} AS minio
+FROM mc-${MINIO_FROM}    AS mc
 
 # ── Stage 3: runtime ──────────────────────────────────────────────────────────
 FROM ${BASE_IMAGE}
-ARG PY=/usr/bin/python3
+# Interpreter that has torch. Empty = auto-detect from PY_CANDIDATES (works for the
+# RunPod Ubuntu 22.04 / py3.11 and Ubuntu 24.04 / py3.12 PyTorch 2.8 images).
+ARG PY=
+ARG PY_CANDIDATES="/usr/bin/python3 /usr/local/bin/python3 /usr/bin/python3.12 /usr/bin/python3.11 /usr/local/bin/python /opt/conda/bin/python"
+ARG GIT_SHA=unknown
+ARG BUILD_DATE=unknown
+ARG BASE_IMAGE
+LABEL org.opencontainers.image.source="https://github.com/Quantumweaveintelligence/Drone_Video_Analytics_KP" \
+      org.opencontainers.image.title="dvas-runpod" \
+      org.opencontainers.image.description="DVAS all-in-one RunPod image (runpod-v1)" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      dvas.base-image="${BASE_IMAGE}"
 ENV DEBIAN_FRONTEND=noninteractive TZ=Asia/Kolkata PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 LANG=C.UTF-8 LC_ALL=C.UTF-8
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Don't let the postgres package create a default cluster (ours lives on /workspace)
 RUN mkdir -p /etc/postgresql-common && echo "create_main_cluster = false" > /etc/postgresql-common/createcluster.conf
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      nginx supervisor tini openssh-server curl ca-certificates jq rsync tzdata util-linux \
-      postgresql-16 postgresql-client-16 openjdk-21-jre-headless \
-      ffmpeg libgl1 libglib2.0-0 libgomp1 libsm6 libxext6 libxrender1 python3-venv \
- && rm -rf /var/lib/apt/lists/* /etc/nginx/sites-enabled/default
 
-# Keycloak, Valkey, MinIO, mc
+# OS packages — must work on Ubuntu 22.04 AND 24.04 bases:
+#  * PostgreSQL 16 from the distro (24.04) or from apt.postgresql.org (22.04)
+#  * Java 21 when packaged, else 17 (Keycloak 24 needs >= 17)
+#  * Valkey from the distro when packaged, else redis-server 7.x (same wire protocol,
+#    same config). The official valkey:7.2 image is now Debian trixie (glibc 2.41), so
+#    copying its binary into an Ubuntu base would fail on missing GLIBC symbols.
+RUN set -eux; . /etc/os-release; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl gnupg; \
+    if ! apt-cache show postgresql-16 >/dev/null 2>&1; then \
+      install -d /usr/share/postgresql-common/pgdg; \
+      curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc; \
+      echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list; \
+      apt-get update; \
+    fi; \
+    JAVA_PKG=openjdk-21-jre-headless; apt-cache show "$JAVA_PKG" >/dev/null 2>&1 || JAVA_PKG=openjdk-17-jre-headless; \
+    KV_PKG=valkey-server;             apt-cache show "$KV_PKG"   >/dev/null 2>&1 || KV_PKG=redis-server; \
+    apt-get install -y --no-install-recommends \
+      nginx supervisor tini openssh-server jq rsync tzdata util-linux \
+      postgresql-16 postgresql-client-16 "$JAVA_PKG" "$KV_PKG" \
+      ffmpeg libgl1 libglib2.0-0 libgomp1 libsm6 libxext6 libxrender1; \
+    if [ "$KV_PKG" = redis-server ]; then kv_srv=redis-server; kv_cli=redis-cli; else kv_srv=valkey-server; kv_cli=valkey-cli; fi; \
+    ln -sf "$(command -v "$kv_srv")" /usr/local/bin/valkey-server; \
+    ln -sf "$(command -v "$kv_cli")" /usr/local/bin/valkey-cli; \
+    echo "os=${PRETTY_NAME} java=${JAVA_PKG} kv=${KV_PKG}" > /opt/dvas-os-packages.txt; \
+    rm -rf /var/lib/apt/lists/* /etc/nginx/sites-enabled/default
+
+# Keycloak, MinIO, mc
 COPY --from=keycloak /opt/keycloak /opt/keycloak
-COPY --from=valkey /usr/local/bin/valkey-server /usr/local/bin/valkey-cli /usr/local/bin/
 COPY --from=minio /usr/bin/minio /usr/local/bin/minio
 COPY --from=mc /usr/bin/mc /usr/local/bin/mc
 RUN /opt/keycloak/bin/kc.sh build --db=postgres --health-enabled=true --metrics-enabled=false \
- && valkey-server --version && minio --version && mc --version
+ && valkey-server --version && minio --version && mc --version && java -version \
+ && /usr/lib/postgresql/16/bin/postgres --version && cat /opt/dvas-os-packages.txt
 
-# Python environments. torch/torchvision come from the base image: the AI venvs
-# see them through --system-site-packages and a constraints file pins them so
-# pip never replaces them (local version label stripped: "2.8.0+cu128" -> "2.8.0").
-RUN ${PY} -c "import sys;assert sys.version_info[:2]>=(3,10),sys.version" && \
-    ${PY} -c "import torch,torchvision;print(f'torch=={torch.__version__.split(\"+\")[0]}\ntorchvision=={torchvision.__version__.split(\"+\")[0]}')" > /opt/torch-constraints.txt && \
-    cat /opt/torch-constraints.txt
+# Python: find the interpreter that has torch, pin torch/torchvision to it (local
+# version label stripped: "2.8.0+cu128" -> "2.8.0") and make sure venv works.
+RUN set -eux; PYBIN=""; \
+    for p in ${PY} ${PY_CANDIDATES}; do \
+      if [ -x "$p" ] && "$p" -c 'import torch, torchvision' 2>/dev/null; then PYBIN="$p"; break; fi; \
+    done; \
+    test -n "$PYBIN" || { echo "No interpreter with torch+torchvision in: ${PY} ${PY_CANDIDATES}" >&2; exit 1; }; \
+    echo "$PYBIN" > /opt/dvas-python; "$PYBIN" --version; \
+    "$PYBIN" -c "import sys;assert sys.version_info[:2]>=(3,10),sys.version"; \
+    "$PYBIN" -c "import torch,torchvision;print(f'torch=={torch.__version__.split(\"+\")[0]}\ntorchvision=={torchvision.__version__.split(\"+\")[0]}')" > /opt/torch-constraints.txt; \
+    cat /opt/torch-constraints.txt; \
+    if ! "$PYBIN" -m venv /tmp/venvcheck >/dev/null 2>&1; then \
+      v="$("$PYBIN" -c 'import sys;print(f"{sys.version_info[0]}.{sys.version_info[1]}")')"; \
+      apt-get update && apt-get install -y --no-install-recommends "python${v}-venv" && rm -rf /var/lib/apt/lists/*; \
+      "$PYBIN" -m venv /tmp/venvcheck; \
+    fi; \
+    rm -rf /tmp/venvcheck
 COPY deploy/runpod/requirements/ /opt/dvas/requirements/
-RUN set -e; \
+RUN set -e; PY="$(cat /opt/dvas-python)"; \
   for v in ai anpr; do \
     ${PY} -m venv --system-site-packages /opt/venvs/$v && \
     /opt/venvs/$v/bin/python -m pip install --upgrade pip wheel && \
@@ -71,7 +154,7 @@ RUN set -e; \
     /opt/venvs/$v/bin/python -m pip install --upgrade pip wheel && \
     /opt/venvs/$v/bin/python -m pip install -r /opt/dvas/requirements/$v.txt; \
   done; \
-  /opt/venvs/ai/bin/python -c "import torch;assert torch.__version__.startswith('2.8'), torch.__version__;print('torch', torch.__version__)"; \
+  /opt/venvs/ai/bin/python -c "import torch;assert torch.__version__.startswith('2.8'), torch.__version__;print('torch', torch.__version__, 'cuda', torch.version.cuda)"; \
   /opt/venvs/ai/bin/python -c "import onnxruntime as o;print('onnxruntime providers', o.get_available_providers())"
 
 # Application code (weights excluded by Dockerfile.dockerignore)
@@ -89,7 +172,7 @@ RUN cd /opt/dvas && test -s deploy/models.sha256 && \
     ln -s /opt/dvas/dvas_analytics /analytics
 
 # Pre-download PaddleOCR models (same constructor args as anpr/analyzer.py) and
-# byte-compile everything as a Python 3.12 smoke test (F16).
+# byte-compile everything with the base image's Python as a smoke test (F16).
 RUN /opt/venvs/anpr/bin/python -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False, show_log=False)" && \
     /opt/venvs/ai/bin/python -m compileall -q /opt/dvas/dvas_analytics && \
     /opt/venvs/backend/bin/python -m compileall -q /opt/dvas/DVAS_Dashboard/backend && \

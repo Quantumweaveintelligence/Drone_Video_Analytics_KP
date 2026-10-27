@@ -62,3 +62,6 @@ dvas_secrets_local/
 *.engine
 # resolved `docker compose config` output — contains real passwords
 **/compose_dump.yml
+
+# local build bookkeeping (tools/build_image.sh)
+deploy/runpod/.last_build_tag
