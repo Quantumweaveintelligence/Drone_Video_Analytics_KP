@@ -477,3 +477,14 @@ Ubuntu 24.04 (above). Not run: a full image build (no registry access / weights 
   more (available: 1.20.0, 1.20.2, …). Pinned **1.20.2** (same CUDA 12 / cuDNN 9 line). All five requirements files
   were then dry-run resolved here for cp311/manylinux, binary-only, with torch 2.8.0 / torchvision 0.23.0 constraints:
   all resolve (ai: numpy 1.26.4, ultralytics 8.3.253, opencv 4.10.0.84; anpr: paddlepaddle 2.6.2, paddleocr 2.9.1).
+- **Build 3 (27 Oct 16:37) SUCCEEDED:** `ghcr.io/quantumweaveintelligence/dvas-runpod:20261027-e5d7ef3` (= HEAD
+  `e5d7ef3`, the onnxruntime commit), 23.9 GB, 20 GB disk left. Checks inside the build passed: OS packages
+  (`Ubuntu 22.04.5`, `openjdk-21`, `redis-server` as Valkey), venvs (~16.5 min), `torch 2.8.0 … cuda 12.8`, onnxruntime
+  providers `Tensorrt/CUDA/CPU`, weights `sha256sum -c` ✅, PaddleOCR model pre-download ✅, `nginx -t` ✅.
+- **Notes / risks from the log (not blocking):**
+  - The RunPod base ships a **nightly torch `2.8.0.dev20250319+cu128`** and `torchvision 0.22.0.dev20250319`, not the
+    2.8.0 release. The constraint file pins exactly that, so the venvs are consistent. Watch for torch-version-
+    specific bugs in A7; switching to a release-torch base is a Phase 5+ option.
+  - `nginx -t` warns `4096 worker_connections exceed open file resource limit: 1024` — build-time only; supervisord
+    sets `minfds=65536` at runtime.
+- Next: A2d (NVIDIA runtime) → A7 local test → A8 push → A9 package private → Part B.

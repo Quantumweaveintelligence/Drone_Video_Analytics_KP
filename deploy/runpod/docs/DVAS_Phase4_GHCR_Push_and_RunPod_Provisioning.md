@@ -19,8 +19,8 @@
 | `runpod-v1` committed | ✅ last commits: *model weight manifest* (10:06) and *MinIO via source build, phase 4 fixes* (10:34) |
 | `deploy/runpod/models.sha256` + `/mnt/NewVolume/dvas_models_stage/` | ✅ done (A4) — re-running A4 is harmless |
 | MinIO build mode | ✅ `MINIO_FROM=source` written to the Dockerfile (A6) |
-| First build attempt (10:34) | ⚠️ stopped (no error) during the apt step. Already done and cached: MinIO + mc compiled from source ✅, frontend built ✅. Disk report 16:20: overlay2 ✅, base image 17.9 GB local ✅, build cache 3 GB, **26 GB free** — enough; keep the cache |
-| Image built / tested / pushed | ❌ → steps A6–A8 |
+| Image built | ✅ `ghcr.io/quantumweaveintelligence/dvas-runpod:20261027-e5d7ef3` (commit `e5d7ef3`), 23.9 GB, 20 GB disk left — build 3 at 16:37 |
+| Image tested / pushed | ❌ → steps A7–A9 (check A2d GPU runtime first) |
 | Baseline DB dumps, realm template | ➖ skipped on purpose (see A5) — the pod has tested fallbacks |
 
 **How much disk?** With the classic `overlay2` image store and the default `docker` builder (A2), peak use is about
