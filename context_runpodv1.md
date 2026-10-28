@@ -512,3 +512,16 @@ Ubuntu 24.04 (above). Not run: a full image build (no registry access / weights 
 - **Part B is done by a teammate** who owns the RunPod account. Guide B0 added: hand-off table (image line,
   `adhishQWI` + read-only PAT shared via password manager, `DVAS_SEED_DEMO` decision, public SSH keys only; each person
   uses their own key). B2 username = the PAT owner.
+- **First RunPod boot (28 Oct, pod on EU-NL-1, volume `dvas-vol-test` 20 GB) crash-looped every ~18 s:**
+  `chown: changing ownership of '/workspace/dvas/pgdata': Operation not permitted`. The RunPod network volume refuses
+  `chown`, even for root, and `dvas-init.sh` (set -e) exited before anything started. Postgres needs a data directory
+  owned by `postgres` with mode 0700. Also seen: `tini is not running as PID 1` (RunPod wraps the entrypoint), so
+  zombies weren't reaped.
+  **Fix:** `dvas-init.sh` `prepare_pgdata()`: chown if possible; otherwise remove the empty root-owned leftover,
+  briefly open `/workspace/dvas` (1777), let the **postgres user create `pgdata` itself** (so it owns it), chmod
+  700, and restore the parent mode. It verifies owner and mode. If the volume still can't provide that, it logs a
+  probe (mount line, `ls -ld`, filesystem type), starts **sshd only** and sleeps instead of crash-looping, so the pod
+  can be inspected. `gen-secrets.sh`: chmod failures are non-fatal (umask 077 already). Dockerfile:
+  `tini -s` (subreaper). Tested here with a chown-refusing stub and with a normal filesystem; pytest 9 passed.
+  Not testable here: RunPod's real network filesystem. If it also maps ownership to root, the fallback is
+  needed (Postgres on container disk plus dump/restore to the volume) — the probe lines will show that.

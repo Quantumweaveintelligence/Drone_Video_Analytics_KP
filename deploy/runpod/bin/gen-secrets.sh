@@ -6,7 +6,7 @@
 # boot — losing FACE_VECTOR_ENCRYPTION_KEY makes stored face embeddings unreadable.
 set -euo pipefail
 DIR="${1:?usage: gen-secrets.sh <secrets-dir>}"
-mkdir -p "$DIR"; chmod 700 "$DIR"
+mkdir -p "$DIR"; chmod 700 "$DIR" 2>/dev/null || true
 umask 077
 
 PY="$(command -v python3)"
@@ -33,7 +33,7 @@ JWT_SECRET=$(rand 48)
 FACE_VECTOR_ENCRYPTION_KEY=$(hex32)
 DRONE_IDS=DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005,DRN-001,DRN-002,DRN-003,DRN-004,DRN-005
 ENV
-  chmod 600 "$DIR/dvas.env"
+  chmod 600 "$DIR/dvas.env" 2>/dev/null || true
   echo "[gen-secrets] wrote $DIR/dvas.env"
 fi
 
@@ -58,6 +58,6 @@ for u in users:
 with open(sys.argv[1], "w", encoding="utf-8") as fh:
     json.dump(users, fh, indent=2)
 PYEOF
-  chmod 600 "$DIR/users.json"
+  chmod 600 "$DIR/users.json" 2>/dev/null || true
   echo "[gen-secrets] wrote $DIR/users.json"
 fi

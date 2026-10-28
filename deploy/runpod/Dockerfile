@@ -188,4 +188,4 @@ RUN mkdir -p /etc/dvas /var/log/dvas /var/lib/valkey /run/postgresql /run/sshd &
 EXPOSE 80 22
 HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
   CMD curl -fsS http://127.0.0.1/healthz || exit 1
-ENTRYPOINT ["/usr/bin/tini", "--", "/opt/dvas/deploy/bin/dvas-init.sh"]
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/opt/dvas/deploy/bin/dvas-init.sh"]

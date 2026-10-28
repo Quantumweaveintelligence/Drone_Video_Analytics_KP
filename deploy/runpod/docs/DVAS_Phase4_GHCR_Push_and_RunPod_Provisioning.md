@@ -500,7 +500,8 @@ Go to **Templates** (My Templates), then **New Template**:
 | Volume disk / Volume mount path | mount path **`/workspace`** (the network volume replaces the volume disk) |
 | HTTP ports | **80** (label `dvas-web`). Our nginx is the only public entry point |
 | TCP ports | **22** (SSH) |
-| Environment variables | `TZ` = `Asia/Kolkata`, `DVAS_DEV_MODE` = `0` |
+| UDP support | **off**: nothing in DVAS uses UDP (web = HTTP on 80, SSH = TCP 22) |
+| Environment variables | `TZ` = `Asia/Kolkata`, `DVAS_DEV_MODE` = `0`, and `DVAS_SEED_DEMO` = `0` for a clean DB (leave it out on a pure test volume if you want demo missions/evidence to click through). Decide before the first start. **Don't** set `PUBLIC_BASE_URL`: it's derived from `RUNPOD_POD_ID` |
 
 Then click **Save Template**.
 
@@ -607,6 +608,7 @@ Put both files in the team password manager and keep an offline copy. Losing `FA
 | Build: `sha256sum: WARNING … did NOT match` | weights changed after staging → rerun `stage_models.sh` (A4), commit `models.sha256`, build again |
 | Build: pip can't find `paddlepaddle==2.6.2` | see the note at the top of `deploy/runpod/requirements/anpr.txt`; send me the log tail |
 | Build: `No interpreter with torch+torchvision` | the base image isn't a PyTorch image, or torch lives elsewhere → `PY=/path/to/python deploy/runpod/tools/build_image.sh` |
+| RunPod: log repeats `chown: changing ownership of '/workspace/dvas/pgdata': Operation not permitted` every ~18 s | image older than the network-volume fix → build + push the new tag, put it in the template, redeploy with the same volume. If a newer image logs `FATAL: … can't be owned by 'postgres'`, send the `probe:` lines |
 | RunPod: image pull fails, 401/403/"not found" | template has no `ghcr-dvas` credential, the tag has a typo, or the PAT lacks `read:packages` / the user can't see the private package |
 | RunPod: pull fails with a disk error | raise **Container disk** (B5) to 80 GB |
 | Pod restarts in a loop | open **Logs**. `dvas-init.sh` failed: usually the volume isn't mounted, or Postgres can't `chmod`/`fsync` on the volume (risk R3, fallback in the plan) |
