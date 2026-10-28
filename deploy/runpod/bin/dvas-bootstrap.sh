@@ -94,6 +94,12 @@ if [ ${#extra_dashboard[@]} -gt 0 ]; then
   "$BIN/db-migrate.sh" dvas_dashboard runpod-dashboard "${extra_dashboard[@]}"
 fi
 
+# ── 4b) Fresh base backup on the volume when needed (after a restore, or none in 24 h) ──
+if [ -f "$VOL/state/pg_basebackup_needed" ] || \
+   [ -z "$(find "$VOL/pg/base" -mindepth 2 -maxdepth 2 -name COMPLETE -mmin -1440 2>/dev/null)" ]; then
+  "$BIN/pg-volume.sh" basebackup || log "WARNING: base backup failed — the WAL archive still protects the data"
+fi
+
 # ── 5) Done ──────────────────────────────────────────────────────────────────
 date -Is > "$VOL/state/bootstrap_ok"
 log "bootstrap complete — status summary:"

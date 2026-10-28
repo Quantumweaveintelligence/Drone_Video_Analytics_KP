@@ -19,6 +19,7 @@ backup_once() {
       log "ERROR: pg_dump $db failed"; ok=0
     fi
   done
+  /opt/dvas/deploy/bin/pg-volume.sh basebackup || { log "ERROR: base backup failed"; ok=0; }
   cp -p "$VOL/secrets/dvas.env" "$VOL/secrets/users.json" "$dest/" 2>/dev/null || log "WARNING: secrets not copied"
   chmod 600 "$dest"/* 2>/dev/null || true
   if [ "$ok" -eq 1 ]; then

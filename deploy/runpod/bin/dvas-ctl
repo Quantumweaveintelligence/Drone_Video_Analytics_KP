@@ -30,7 +30,7 @@ case "$cmd" in
     done ;;
   disk)
     df -h / /workspace 2>/dev/null
-    du -sh "$VOL"/{pgdata,minio,backups,engines} 2>/dev/null || true ;;
+    du -sh "$VOL"/{pg,minio,backups,engines} /var/lib/postgresql/dvas 2>/dev/null || true ;;
   backup-now) "$BIN/backup-loop.sh" --once ;;
   *) sed -n '2,11p' "$0"; exit 2 ;;
 esac

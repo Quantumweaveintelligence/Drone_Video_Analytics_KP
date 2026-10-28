@@ -9,7 +9,7 @@ set -euo pipefail
 DVAS_ROOT=/opt/dvas
 BIN=$DVAS_ROOT/deploy/bin
 VOL="${DVAS_VOLUME:-/workspace/dvas}"
-PGDATA="$VOL/pgdata"
+PGDATA="${PGDATA_LOCAL:-/var/lib/postgresql/dvas}"
 PGBIN=/usr/lib/postgresql/16/bin
 log() { echo "[dvas-init] $(date -Is) $*"; }
 
@@ -17,40 +17,14 @@ if ! mountpoint -q /workspace 2>/dev/null; then
   log "WARNING: /workspace is not a mounted volume — databases, MinIO and secrets will NOT survive a pod stop"
 fi
 
-mkdir -p "$VOL"/{minio,engines,backups,secrets,state,calibration} \
+mkdir -p "$VOL"/{pg,minio,engines,backups,secrets,state,calibration} \
          /var/log/dvas /var/lib/valkey /run/postgresql /run/sshd /run/dvas
 chown postgres:postgres /run/postgresql
 chmod 700 "$VOL/secrets" "$VOL/backups" 2>/dev/null || log "WARNING: chmod 700 on secrets/backups not permitted by the volume"
 
-# Postgres needs a data directory OWNED by the postgres user with mode 0700/0750.
-# RunPod network volumes refuse chown (even for root): "chown: … Operation not permitted".
-# Fallback: let the postgres user create the directory itself (then it owns it).
-pg_dir_ok() {
-  [ "$(stat -c %U "$PGDATA" 2>/dev/null)" = postgres ] && case "$(stat -c %a "$PGDATA" 2>/dev/null)" in 700|750) true;; *) false;; esac
-}
-prepare_pgdata() {
-  [ -d "$PGDATA" ] || mkdir "$PGDATA"
-  if chown postgres:postgres "$PGDATA" 2>/dev/null && chmod 700 "$PGDATA" 2>/dev/null && pg_dir_ok; then return 0; fi
-  log "volume refuses chown ($(stat -f -c %T "$VOL" 2>/dev/null || echo '?') filesystem) — postgres creates its own data directory"
-  if [ -d "$PGDATA" ] && [ -z "$(ls -A "$PGDATA" 2>/dev/null)" ] && [ "$(stat -c %U "$PGDATA")" != postgres ]; then
-    rmdir "$PGDATA"                                  # empty leftover owned by root
-  fi
-  local vol_mode; vol_mode="$(stat -c %a "$VOL")"
-  chmod 1777 "$VOL" 2>/dev/null || log "WARNING: chmod on $VOL not permitted"
-  [ -d "$PGDATA" ] || runuser -u postgres -- mkdir "$PGDATA" || true
-  runuser -u postgres -- chmod 700 "$PGDATA" 2>/dev/null || true
-  chmod "$vol_mode" "$VOL" 2>/dev/null || true
-  log "pgdata: owner=$(stat -c %U "$PGDATA" 2>/dev/null) mode=$(stat -c %a "$PGDATA" 2>/dev/null)"
-  pg_dir_ok
-}
-if ! prepare_pgdata; then
-  log "FATAL: $PGDATA can't be owned by 'postgres' with mode 0700 on this volume — Postgres can't run there."
-  log "probe: $(mount | grep -E ' /workspace ' || echo 'no /workspace mount line'); id postgres: $(id postgres)"
-  ls -ld "$VOL" "$PGDATA" 2>&1 | sed 's/^/[dvas-init] probe: /'
-  log "starting sshd only, so the pod can be inspected (send this log to Claude). No DVAS services are running."
-  /usr/sbin/sshd -D -e &
-  exec sleep infinity
-fi
+# Postgres runs on the container disk; the network volume keeps base backups + the WAL
+# archive (RunPod volumes are MooseFS/FUSE: no chown, everything root:root 0777, which
+# Postgres refuses). See bin/pg-volume.sh. The cluster itself is prepared in step 5.
 
 # ── 1) Secrets: generated once onto the volume; real env vars win ───────────
 [ -s "$VOL/secrets/dvas.env" ] && [ -s "$VOL/secrets/users.json" ] || "$BIN/gen-secrets.sh" "$VOL/secrets"
@@ -107,18 +81,20 @@ fi
 ssh-keygen -A >/dev/null 2>&1 || true
 sed -i -E 's/^#?PasswordAuthentication.*/PasswordAuthentication no/; s/^#?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config || true
 
-# ── 5) First-time database creation (Postgres on the unix socket only) ──────
-if [ ! -s "$PGDATA/PG_VERSION" ]; then
-  log "initialising Postgres cluster in $PGDATA"
-  runuser -u postgres -- "$PGBIN/initdb" -D "$PGDATA" -U postgres -E UTF8 --locale=C.UTF-8 \
-          --auth-local=peer --auth-host=scram-sha-256 >/dev/null
+# ── 5) Postgres: restore from the volume, or create (first boot only) ──────
+if ! "$BIN/pg-volume.sh" prepare; then
+  log "FATAL: Postgres could not be prepared (restore/init failed) — starting sshd only for inspection"
+  /usr/sbin/sshd -D -e &
+  exec sleep infinity
 fi
+[ -f /run/dvas/pg_first_boot ] && rm -f "$VOL/state/db_bootstrapped"
 if [ ! -f "$VOL/state/db_bootstrapped" ]; then
   log "first boot: creating roles, databases and schema"
   runuser -u postgres -- "$PGBIN/pg_ctl" -D "$PGDATA" -w -t 120 \
           -o "-c config_file=/etc/dvas/postgresql.conf -c listen_addresses=''" start
   trap 'runuser -u postgres -- "$PGBIN/pg_ctl" -D "$PGDATA" -m fast -w stop || true' EXIT
   "$BIN/db-bootstrap.sh"
+  "$BIN/pg-volume.sh" basebackup     # first restore point on the volume
   runuser -u postgres -- "$PGBIN/pg_ctl" -D "$PGDATA" -m fast -w stop
   trap - EXIT
   date -Is > "$VOL/state/db_bootstrapped"
