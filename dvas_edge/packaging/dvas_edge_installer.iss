@@ -138,6 +138,9 @@ begin
         Lines.Add('INGEST__TLS_VERIFY=false');
       Lines.Add('EDGE_API_KEY={#EdgeApiKey}');
       Lines.Add('REQUIRE_EDGE_AUTH=true');
+      Lines.Add('# Local ports (auto-detects free port if busy)');
+      Lines.Add('# DVAS_PORT=8765');
+      Lines.Add('# DVAS_CORE_PORT=8766');
       Lines.Add('ENV=production');
       Lines.SaveToFile(EnvFile);
     finally

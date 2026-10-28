@@ -51,16 +51,20 @@
 ## Phase E2 — Local Gateway Launcher ✅ COMPLETE
 
 ### New File: `dvas_edge/packaging/edge_launcher.py`
-- FastAPI gateway on `127.0.0.1:8765`
+- FastAPI gateway on `127.0.0.1:8765` (with dynamic fallback & single-instance protection)
 - Routes:
   - `/` → serves static React build from `static/` directory
-  - `/edge-api/*` → proxies to local edge core on `127.0.0.1:8766`
+  - `/edge-launcher/health` → lightweight health check & instance detection
+  - `/edge-api/*` → proxies to local edge core on `127.0.0.1:8766` (or dynamic core port)
   - `/api/*` → proxies to cloud backend (`DVAS_CLOUD_URL`)
   - `/api/ws` → WebSocket bidirectional proxy to cloud
-- Starts `edge_api_server.py` as subprocess with `stdin=PIPE` (prevents Uvicorn EOF shutdown)
-- Loads config from `%LOCALAPPDATA%\DVAS_Edge\config\edge.env`
-- Auto-opens browser to `http://localhost:8765` after 3 seconds
-- Strips `Secure` flag from cloud cookies so they work on `http://localhost`
+- **Single-Instance Detection:** If DVAS Edge is already running, re-launching opens the existing session in the browser and exits cleanly without error or spawning duplicate background processes.
+- **Dynamic Port Fallback:** If port 8765 is occupied by another third-party application, the launcher automatically scans for the next free port (`8767`, `8768`, etc.) and binds dynamically, opening the browser to the assigned port.
+- **Configurable Ports:** Supports `DVAS_PORT` (default 8765) and `DVAS_CORE_PORT` (default 8766) in `edge.env`.
+- Starts `edge_api_server.py` as subprocess with `stdin=PIPE` (prevents Uvicorn EOF shutdown).
+- Loads config from `%LOCALAPPDATA%\DVAS_Edge\config\edge.env`.
+- Auto-opens default web browser to `http://localhost:<ui_port>` via background timer (`threading.Timer`).
+- Strips `Secure` flag from cloud cookies so they work on `http://localhost`.
 
 ---
 
@@ -273,4 +277,6 @@ dist/                          (511.2 MB total)
 | `INGEST__TLS_VERIFY` | Verify HTTPS certs (`false` for HTTP LAN, `true` for public SSL) | `true` |
 | `EDGE_API_KEY` | Local Edge API authentication token | Pre-configured |
 | `REQUIRE_EDGE_AUTH` | Guard edge core routes | `true` |
+| `DVAS_PORT` | Optional UI Gateway port override (auto-fallbacks if busy) | `8765` |
+| `DVAS_CORE_PORT` | Optional Edge Core port override (auto-fallbacks if busy) | `8766` |
 | `ENV` | Environment | `production` |

@@ -1,11 +1,12 @@
 """
 DVAS Edge launcher: static UI + local edge core + cloud API reverse proxy
 =========================================================================
-Binds 127.0.0.1:8765 and provides:
-  /              → static edge React build (REACT_APP_DEPLOYMENT_TARGET=edge)
-  /edge-api/*    → edge core on 127.0.0.1:8766 (existing edge_api_server.py)
-  /api/*         → cloud backend (DVAS_CLOUD_URL)
-  /api/ws (WS)   → cloud WebSocket (wss://...)
+Binds 127.0.0.1:8765 (with dynamic port fallback) and provides:
+  /                     → static edge React build (REACT_APP_DEPLOYMENT_TARGET=edge)
+  /edge-launcher/health → launcher health & single-instance check
+  /edge-api/*           → edge core on 127.0.0.1:8766 (or dynamic core port)
+  /api/*                → cloud backend (DVAS_CLOUD_URL)
+  /api/ws (WS)          → cloud WebSocket (wss://...)
 
 This reproduces exactly what the dashboard nginx does today on a single
 origin, so the React code needs NO URL changes.
@@ -15,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import os
 import pathlib
+import socket
 import subprocess
 import sys
 import threading
@@ -47,6 +49,43 @@ HOP = {
     "transfer-encoding", "upgrade", "te", "trailer",
 }
 METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+# ── Port & Instance Helpers ───────────────────────────────────────────────────
+def is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    """Check if a port is in use."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((host, port)) == 0
+
+
+def find_free_port(start_port: int, host: str = "127.0.0.1", max_attempts: int = 50) -> int:
+    """Find the next available port starting from start_port."""
+    for p in range(start_port, start_port + max_attempts):
+        if not is_port_in_use(p, host):
+            return p
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+
+
+def is_dvas_edge_running(port: int) -> bool:
+    """Check if the service on the port is already an active DVAS Edge session."""
+    try:
+        with httpx.Client(timeout=1.0) as check_client:
+            resp = check_client.get(f"http://127.0.0.1:{port}/edge-launcher/health")
+            if resp.status_code == 200 and resp.json().get("app") == "DVAS_Edge_Launcher":
+                return True
+    except Exception:
+        pass
+    try:
+        with httpx.Client(timeout=1.0) as check_client:
+            resp = check_client.get(f"http://127.0.0.1:{port}/")
+            if resp.status_code == 200 and ("DVAS" in resp.text or "Drone Video Analytics" in resp.text):
+                return True
+    except Exception:
+        pass
+    return False
+
 
 # ── FastAPI App ───────────────────────────────────────────────────────────────
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -93,10 +132,17 @@ async def _proxy(request: Request, target: str) -> StreamingResponse:
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+@app.get("/edge-launcher/health")
+async def launcher_health():
+    """Health & single-instance check endpoint."""
+    return {"status": "ok", "app": "DVAS_Edge_Launcher", "version": "1.0.0"}
+
+
 @app.api_route("/edge-api/{path:path}", methods=METHODS)
 async def edge_core(path: str, request: Request):
-    """Proxy to the local edge core on port 8766."""
-    return await _proxy(request, f"{CORE}/{path}")
+    """Proxy to the local edge core on the dynamically assigned core port."""
+    target_core = getattr(request.app.state, "core_url", CORE)
+    return await _proxy(request, f"{target_core}/{path}")
 
 
 @app.websocket("/api/ws")
@@ -156,6 +202,38 @@ async def spa(path: str):
 
 # ── Main: start edge core subprocess + gateway ───────────────────────────────
 def main():
+    global CORE
+
+    preferred_ui_port   = int(os.environ.get("DVAS_PORT", os.environ.get("EDGE_GATEWAY_PORT", "8765")))
+    preferred_core_port = int(os.environ.get("DVAS_CORE_PORT", os.environ.get("EDGE_CORE_PORT", "8766")))
+
+    # 1. Single Instance Check: Is DVAS Edge already running?
+    if is_port_in_use(preferred_ui_port):
+        if is_dvas_edge_running(preferred_ui_port):
+            print("=" * 60)
+            print("  DVAS Edge Operator is already running!")
+            print(f"  Focusing existing session: http://localhost:{preferred_ui_port}")
+            print("=" * 60)
+            webbrowser.open(f"http://localhost:{preferred_ui_port}")
+            sys.exit(0)
+        else:
+            print(f"[!] Port {preferred_ui_port} is occupied by another application.")
+            ui_port = find_free_port(preferred_ui_port + 1)
+            print(f"[+] Reassigned UI Gateway to free port: {ui_port}")
+    else:
+        ui_port = preferred_ui_port
+
+    # 2. Check Core Port
+    if is_port_in_use(preferred_core_port) or preferred_core_port == ui_port:
+        print(f"[!] Core port {preferred_core_port} is unavailable.")
+        core_port = find_free_port(max(preferred_core_port + 1, ui_port + 1))
+        print(f"[+] Reassigned Edge Core to free port: {core_port}")
+    else:
+        core_port = preferred_core_port
+
+    CORE = f"http://127.0.0.1:{core_port}"
+    app.state.core_url = CORE
+
     # Ensure data directories exist
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "config").mkdir(parents=True, exist_ok=True)
@@ -166,7 +244,7 @@ def main():
     env = {
         **os.environ,
         "EDGE_HOST": "127.0.0.1",
-        "EDGE_PORT": "8766",
+        "EDGE_PORT": str(core_port),
         "DVAS_EDGE_DATA_DIR": str(DATA_DIR / "data"),
     }
 
@@ -182,16 +260,16 @@ def main():
     try:
         # Auto-open the browser after a short delay
         if os.environ.get("DVAS_OPEN_BROWSER", "1") == "1":
-            threading.Timer(2.0, lambda: webbrowser.open("http://localhost:8765")).start()
+            threading.Timer(2.0, lambda: webbrowser.open(f"http://localhost:{ui_port}")).start()
 
         print("=" * 60)
         print("  DVAS Edge Operator")
-        print(f"  UI:    http://localhost:8765")
+        print(f"  UI:    http://localhost:{ui_port}")
         print(f"  Core:  {CORE}")
         print(f"  Cloud: {CLOUD}")
         print("=" * 60)
 
-        uvicorn.run(app, host="127.0.0.1", port=8765, log_level="info")
+        uvicorn.run(app, host="127.0.0.1", port=ui_port, log_level="info")
     finally:
         core.terminate()
         try:
