@@ -507,3 +507,8 @@ Ubuntu 24.04 (above). Not run: a full image build (no registry access / weights 
 - Login in A7 worked once the right `users.json` password was used (the first "Invalid email or password" was a copy
   mistake). `tools/diagnose_login.sh` was added for future login problems.
 - Guide A7 restart step: `dvas-ctl` through `docker exec` (it exists only in the container).
+- **Pushed (27 Oct 12:41Z):** `ghcr.io/quantumweaveintelligence/dvas-runpod:20261027-ed8b02c`
+  `sha256:c8d478a74a26d1c7a65ac2b602fd100e2975821ee0f0a6c58107e86363ebfffc` (commit `ed8b02c`, seed fix), 23.9 GB.
+- **Part B is done by a teammate** who owns the RunPod account. Guide B0 added: hand-off table (image line,
+  `adhishQWI` + read-only PAT shared via password manager, `DVAS_SEED_DEMO` decision, public SSH keys only; each person
+  uses their own key). B2 username = the PAT owner.

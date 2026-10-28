@@ -421,6 +421,23 @@ Keep the DVAS image and the base image if you'll rebuild soon: the next build th
 
 # PART B — Provision RunPod (🌐 console, done by you)
 
+### B0. If a teammate owns the RunPod account (hand-off)
+
+Part B can be done by whoever holds the RunPod account and its credits. That person follows B1–B12 exactly as
+written. "You" in Part B means the **RunPod account owner**. The image builder hands over:
+
+| What | Value / how |
+|---|---|
+| This guide | `deploy/runpod/docs/DVAS_Phase4_GHCR_Push_and_RunPod_Provisioning.md` on branch `runpod-v1` (GitHub) |
+| Container image (B5) | `ghcr.io/quantumweaveintelligence/dvas-runpod:20261027-ed8b02c` (latest row in `RELEASES.md`) |
+| Registry credential (B2) | Username **`adhishQWI`** (the GitHub user who owns the token, not the teammate's) + the **read-only** PAT (`read:packages` only), already checked with `docker manifest inspect`. Send the PAT through a password manager share or a one-time secret link, never chat or email, and never the `write:packages` build token |
+| Demo data decision (B5 env) | `DVAS_SEED_DEMO=0` for a clean production database, or leave it unset for demo missions/evidence (test pod). Decide **before the first start** |
+| SSH (B1) | **Public** keys only. Each person who needs SSH creates their own key (`ssh-keygen -t ed25519 -C <name>-dvas`) and sends only the `.pub` line. The account owner adds every `.pub` under **Credentials → SSH Public Keys**; RunPod injects all of them, and each person connects with their own private key. If a private key was ever shared, make new ones and remove the old public key |
+
+What comes back to the builder: everything in **Part D**. `dvas.env` and `users.json` (B9) go into the shared
+password manager, not chat.
+
+
 ### B1. Account basics (once)
 
 1. Turn on **2FA** and add credit.
@@ -437,7 +454,7 @@ Go to **Credentials**, then the **Container Registry Auth** tab, then **Add Cred
 |---|---|
 | Name | `ghcr-dvas` |
 | Registry URL | `ghcr.io` |
-| Username | your GitHub username |
+| Username | the GitHub username that owns the PAT (`adhishQWI`) |
 | Password / access token | a PAT with **`read:packages`** |
 
 Then click **Save**.
