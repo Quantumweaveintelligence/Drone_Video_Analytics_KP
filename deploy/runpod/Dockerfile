@@ -73,15 +73,6 @@ FROM ${BASE_IMAGE}
 # RunPod Ubuntu 22.04 / py3.11 and Ubuntu 24.04 / py3.12 PyTorch 2.8 images).
 ARG PY=
 ARG PY_CANDIDATES="/usr/bin/python3 /usr/local/bin/python3 /usr/bin/python3.12 /usr/bin/python3.11 /usr/local/bin/python /opt/conda/bin/python"
-ARG GIT_SHA=unknown
-ARG BUILD_DATE=unknown
-ARG BASE_IMAGE
-LABEL org.opencontainers.image.source="https://github.com/Quantumweaveintelligence/Drone_Video_Analytics_KP" \
-      org.opencontainers.image.title="dvas-runpod" \
-      org.opencontainers.image.description="DVAS all-in-one RunPod image (runpod-v1)" \
-      org.opencontainers.image.revision="${GIT_SHA}" \
-      org.opencontainers.image.created="${BUILD_DATE}" \
-      dvas.base-image="${BASE_IMAGE}"
 ENV DEBIAN_FRONTEND=noninteractive TZ=Asia/Kolkata PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 LANG=C.UTF-8 LC_ALL=C.UTF-8
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -184,6 +175,18 @@ RUN mkdir -p /etc/dvas /var/log/dvas /var/lib/valkey /run/postgresql /run/sshd &
     ln -sf /opt/dvas/deploy/bin/dvas-ctl /usr/local/bin/dvas-ctl && \
     chown postgres:postgres /run/postgresql && \
     nginx -t -c /etc/dvas/nginx.conf
+
+# Build metadata LAST: an ARG in scope is part of every later RUN's cache key, so declaring
+# GIT_SHA/BUILD_DATE at the top made every commit rebuild the whole image (~20 min, ~11 GB).
+ARG GIT_SHA=unknown
+ARG BUILD_DATE=unknown
+ARG BASE_IMAGE
+LABEL org.opencontainers.image.source="https://github.com/Quantumweaveintelligence/Drone_Video_Analytics_KP" \
+      org.opencontainers.image.title="dvas-runpod" \
+      org.opencontainers.image.description="DVAS all-in-one RunPod image (runpod-v1)" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      dvas.base-image="${BASE_IMAGE}"
 
 EXPOSE 80 22
 HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \

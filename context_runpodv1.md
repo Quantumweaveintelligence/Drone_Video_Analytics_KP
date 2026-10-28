@@ -525,3 +525,33 @@ Ubuntu 24.04 (above). Not run: a full image build (no registry access / weights 
   `tini -s` (subreaper). Tested here with a chown-refusing stub and with a normal filesystem; pytest 9 passed.
   Not testable here: RunPod's real network filesystem. If it also maps ownership to root, the fallback is
   needed (Postgres on container disk plus dump/restore to the volume) — the probe lines will show that.
+- **RunPod boot 2 (image `20261028-4d287fd`, RTX PRO 6000, EU-NL-1):** the probe showed
+  `mfs#eu-nl-1.runpod.net:9421 on /workspace type fuse (… user_id=0,group_id=0,allow_other)`. The network volume is
+  **MooseFS over FUSE**: every file shows `root:root 0777`, and chown/chmod do nothing, even on files the postgres
+  user creates. Postgres can't keep its data directory there at all (it needs postgres-owned 0700 and refuses root).
+  (An earlier boot that showed RunPod's Jupyter start script was a wrong template/start command, not our image.)
+- **Fix — Postgres on the container disk, made durable on the volume (`bin/pg-volume.sh`, new):**
+  - live cluster `/var/lib/postgresql/dvas` (container disk, fast). On the volume: `/workspace/dvas/pg/base/<time>/`
+    (pg_basebackup tar.gz + START_WAL, keep 2) and `/workspace/dvas/pg/wal/` (continuous WAL archive, gzip).
+  - `prepare` (dvas-init step 5): local cluster present → use it (container restart). Else, with a base backup
+    on the volume → restore it + replay archived WAL (`recovery_target_timeline=latest`) → stop. Else → initdb,
+    and dvas-init runs db-bootstrap + the first base backup. A WAL archive without a base is moved aside.
+  - `run` (supervisord `postgres`, user postgres): starts postgres. A flusher forces `pg_switch_wal()` every
+    `PG_WAL_FLUSH_SECS` (default 120 s) when rows changed (`pg_stat_database` tup counters). On TERM it switches
+    WAL, waits ≤30 s for the segment in the archive, then fast-stops. `archive_timeout` did **not** fire in testing
+    (PG16 here), so it's 0, with `wal_recycle=off` so forced switches gzip to a few KB.
+  - `basebackup`: dvas-init first boot, dvas-bootstrap when flagged after a restore or none in 24 h, backup-loop
+    nightly. Prunes to 2 and `pg_archivecleanup -x .gz`.
+  - postgresql.conf: `wal_level=replica`, `archive_mode=on`, archive_command → pg-volume.sh. pg_hba: `local replication
+    postgres peer`. supervisord: `pg-volume.sh run`, stopsignal TERM. dvas-ctl disk updated.
+  - **Tested here on PostgreSQL 16:** first boot + base backup; clean stop → wipe local → restore (1500/1500 rows); +500
+    rows → hard SIGKILL after the flush interval → restore (2000/2000, timeline 3); new bases + prune; restore from
+    the newest base (2000); container restart reuses the local cluster. WAL archive for all of it: ~170 KB.
+  - Data-loss bound: clean pod stop → none; hard kill → at most `PG_WAL_FLUSH_SECS` (120 s) of DB writes. MinIO
+    objects go straight to the volume.
+  - Still untested on RunPod: MinIO on MooseFS, and the full image on Blackwell (RTX PRO 6000).
+- **Build cache bug fixed (28 Oct):** `ARG GIT_SHA` / `ARG BUILD_DATE` (+ LABEL) sat at the top of the final stage, so
+  every commit changed every later RUN's cache key: full rebuild each time (~20 min, ~11 GB of new layers; seen as
+  "2 CACHED" in build-20261028-131927.log). Moved to the end of the Dockerfile. The next build is a full rebuild
+  once; later builds reuse the cache. One-time cleanup: `docker builder prune -af` + remove the old local tags
+  (all pushed). Keep the `runpod/pytorch` base image.
