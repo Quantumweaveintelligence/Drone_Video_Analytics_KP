@@ -3,6 +3,7 @@ import { useNavigate, Navigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import { useI18n } from "@/context/I18nContext";
 import { ROLE_HOME, ROLE_LABELS } from "@/lib/api";
+import { isEdgeBuild, ALLOWED_ROLES } from "@/lib/deployment";
 import { Shield, Lock as LockKey, User, ChevronDown, Eye, EyeOff } from "lucide-react";
 
 
@@ -31,6 +32,14 @@ export default function Login() {
     setErr(""); setBusy(true);
     try {
       const u = await login(email.trim().toLowerCase(), password);
+      // Edge build: block non-operator roles
+      if (!ALLOWED_ROLES.includes(u.role)) {
+        setErr(isEdgeBuild
+          ? "This terminal is for Drone Operators only. Please use the Control Room dashboard."
+          : "Your role is not authorised for this application.");
+        setBusy(false);
+        return;
+      }
       nav(ROLE_HOME[u.role] || "/command", { replace: true });
     } catch (ex) {
       setErr(fmt(ex.response?.data?.detail) || ex.message);
@@ -62,7 +71,7 @@ export default function Login() {
               </div>
             </div>
             <div className="text-xl font-medium tracking-tight text-slate-300 mt-4">
-              Drone Video Analytics System
+              {isEdgeBuild ? "Edge Operator Terminal" : "Drone Video Analytics System"}
             </div>
             <div className="dvas-label mt-6 max-w-sm">
               {t("login.tagline")}
@@ -81,7 +90,7 @@ export default function Login() {
               KERALA POLICE
             </div>
             <div className="text-xs text-slate-400 mt-1">
-              Drone Video Analytics System
+              {isEdgeBuild ? "Edge Operator Terminal" : "Drone Video Analytics System"}
             </div>
           </div>
           <div className="dvas-label mb-1">{t("login.secureAccess")}</div>

@@ -99,16 +99,17 @@ for _s, _l, _m, _met in _init_events:
     emit_system_log(_s, _l, _m, _met)
 
 # ── Persistent Edge Settings ──────────────────────────────────────────────────
-SETTINGS_FILE_PATH = Path("/data/edge_settings.json")
+_EDGE_DATA_DIR = Path(os.getenv("DVAS_EDGE_DATA_DIR", "/data"))
+SETTINGS_FILE_PATH = _EDGE_DATA_DIR / "edge_settings.json"
 
 DEFAULT_SETTINGS = {
     "transmission": {
         "ingest_url": os.getenv("INGEST__URL", "http://drone_nginx/ingest/frame"),
         "mission_start_url": os.getenv("INGEST__MISSION_START_URL", "http://drone_nginx/ingest/mission/start"),
         "mission_end_url": os.getenv("INGEST__MISSION_END_URL", "http://drone_nginx/ingest/mission/end"),
-        "bypass_target_fps": 10,
-        "jpeg_quality": 80,
-        "max_resolution": "1080p",
+        "bypass_target_fps": 30,
+        "jpeg_quality": 75,
+        "max_resolution": "720p",
         "concurrency_semaphore": 10,
     },
     "storage": {
@@ -681,7 +682,7 @@ class PipelineManager:
                 basename = ntpath.basename(clean_video_source)
                 if not basename:
                     basename = os.path.basename(clean_video_source)
-                clean_video_source = f"/data/{basename}"
+                clean_video_source = str(_EDGE_DATA_DIR / basename)
 
             # ── Auto-extract embedded SRT telemetry from video ────────────
             if req.video_source_type == "file" and os.path.isfile(clean_video_source):
@@ -938,7 +939,7 @@ class PipelineManager:
         # Storage usage
         storage_pct = 0.0
         try:
-            disk = psutil.disk_usage("/data") if os.path.exists("/data") else psutil.disk_usage("/")
+            disk = psutil.disk_usage(str(_EDGE_DATA_DIR)) if _EDGE_DATA_DIR.exists() else psutil.disk_usage("/")
             storage_pct = round(disk.percent, 1)
         except Exception:
             try:
@@ -1191,7 +1192,7 @@ async def upload_video_stream(
         except ValueError:
             pass
         
-    upload_dir = Path("/data")
+    upload_dir = _EDGE_DATA_DIR
     upload_dir.mkdir(parents=True, exist_ok=True)
     
     video_path = (upload_dir / safe_name).resolve()
@@ -1224,7 +1225,7 @@ async def upload_video(
     srt: Optional[UploadFile] = File(None),
     auth: dict = Depends(verify_edge_auth)
 ):
-    upload_dir = Path("/data")
+    upload_dir = _EDGE_DATA_DIR
     upload_dir.mkdir(parents=True, exist_ok=True)
     
     import urllib.parse
@@ -1272,7 +1273,7 @@ async def upload_srt(
     auth: dict = Depends(verify_edge_auth)
 ):
     """Upload SRT file separately."""
-    upload_dir = Path("/data")
+    upload_dir = _EDGE_DATA_DIR
     upload_dir.mkdir(parents=True, exist_ok=True)
     
     import urllib.parse
@@ -1421,7 +1422,7 @@ def update_edge_settings(req: UpdateSettingsRequest, auth: dict = Depends(verify
 
 @app.get("/api/edge/storage/disk-usage")
 def get_disk_usage(auth: dict = Depends(verify_edge_auth)):
-    data_path = Path("/data")
+    data_path = _EDGE_DATA_DIR
     target_path = data_path if data_path.exists() else Path("/")
     total, used, free = shutil.disk_usage(target_path)
     
@@ -1463,7 +1464,7 @@ def get_disk_usage(auth: dict = Depends(verify_edge_auth)):
 
 @app.post("/api/edge/storage/purge-temp")
 def purge_temp_files(auth: dict = Depends(verify_edge_auth)):
-    data_path = Path("/data")
+    data_path = _EDGE_DATA_DIR
     reclaimed_bytes = 0
     deleted_count = 0
     MEDIA_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".ts", ".webm", ".srt", ".vtt"}
@@ -1955,7 +1956,7 @@ def get_system_health(auth: dict = Depends(verify_edge_auth)):
 
     # Storage
     try:
-        disk = psutil.disk_usage("/data") if os.path.exists("/data") else psutil.disk_usage("/")
+        disk = psutil.disk_usage(str(_EDGE_DATA_DIR)) if _EDGE_DATA_DIR.exists() else psutil.disk_usage("/")
         storage_pct = round(disk.percent, 1)
         storage_used_gb = round(disk.used / (1024**3), 1)
         storage_total_gb = round(disk.total / (1024**3), 1)
@@ -2078,4 +2079,7 @@ async def proxy_ingest_drone_status(drone_id: str, auth: dict = Depends(verify_e
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8765)
+    _host = os.getenv("EDGE_HOST", "0.0.0.0")
+    _port = int(os.getenv("EDGE_PORT", "8765"))
+    uvicorn.run(app, host=_host, port=_port)
+

@@ -3,8 +3,11 @@ import { AuthProvider, useAuth } from "@/context/AuthContext";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { I18nProvider } from "@/context/I18nContext";
 import { ROLE_HOME } from "@/lib/api";
+import { isEdgeBuild, ALLOWED_ROLES } from "@/lib/deployment";
 import Login from "@/pages/Login";
 import EdgeRouter from "@/pages/edge/EdgeRouter";
+
+// ── Cloud-only imports (lazy-loaded to keep edge bundle small) ───────────────
 import IngestDashboard from "@/pages/IngestDashboard";
 import AdminDashboard from "@/pages/AdminDashboard";
 import AuditLogPage from "@/pages/AuditLogPage";
@@ -41,6 +44,8 @@ function Guard({ allow, children }) {
 function RootRedirect() {
   const { user, ready } = useAuth();
   if (!ready) return <Splash />;
+  // Edge build: always go to /edge for the operator
+  if (isEdgeBuild && user) return <Navigate to="/edge" replace />;
   return <Navigate to={user ? (ROLE_HOME[user.role] || "/command/tactical-map") : "/login"} replace />;
 }
 
@@ -54,33 +59,40 @@ export default function App() {
               <Route path="/" element={<RootRedirect />} />
               <Route path="/login" element={<Login />} />
               <Route path="/edge/*" element={<Guard allow={["drone_operator"]}><EdgeRouter /></Guard>} />
-              <Route path="/ingest" element={<Guard allow={["system_administrator"]}><IngestDashboard /></Guard>} />
 
-              {/* Nested Command Routes */}
-              <Route
-                path="/command"
-                element={<Guard allow={["control_room_officer", "senior_officer"]}><CommandShell /></Guard>}
-              >
-                <Route index element={<Navigate to="tactical-map" replace />} />
-                <Route path="tactical-map" element={<TacticalMapPage />} />
-                <Route path="multi-drone" element={<MultiDronePage />} />
-                <Route path="alerts" element={<AlertsFeedPage />} />
-                <Route path="crowd" element={<CrowdPage />} />
-                <Route path="traffic" element={<TrafficPage />} />
-                <Route path="person" element={<PersonPage />} />
-                <Route path="intrusion" element={<IntrusionPage />} />
-                <Route path="anomaly" element={<AnomalyPage />} />
-                <Route path="evidence" element={<EvidencePage />} />
-                <Route path="missions" element={<MissionsPage />} />
-                <Route path="models" element={<ModelsPage />} />
-                <Route path="exports" element={<ExportsPage />} />
-                <Route path="reports" element={<ReportsPage />} />
-                <Route path="aggregated" element={<AggregatedPage />} />
-                <Route path="*" element={<Navigate to="tactical-map" replace />} />
-              </Route>
+              {/* Cloud-only routes — excluded from edge build */}
+              {!isEdgeBuild && (
+                <>
+                  <Route path="/ingest" element={<Guard allow={["system_administrator"]}><IngestDashboard /></Guard>} />
 
-              <Route path="/admin" element={<Guard allow={["senior_officer", "system_administrator"]}><AdminDashboard /></Guard>} />
-              <Route path="/audit" element={<Guard allow={["system_administrator", "senior_officer"]}><AuditLogPage /></Guard>} />
+                  {/* Nested Command Routes */}
+                  <Route
+                    path="/command"
+                    element={<Guard allow={["control_room_officer", "senior_officer"]}><CommandShell /></Guard>}
+                  >
+                    <Route index element={<Navigate to="tactical-map" replace />} />
+                    <Route path="tactical-map" element={<TacticalMapPage />} />
+                    <Route path="multi-drone" element={<MultiDronePage />} />
+                    <Route path="alerts" element={<AlertsFeedPage />} />
+                    <Route path="crowd" element={<CrowdPage />} />
+                    <Route path="traffic" element={<TrafficPage />} />
+                    <Route path="person" element={<PersonPage />} />
+                    <Route path="intrusion" element={<IntrusionPage />} />
+                    <Route path="anomaly" element={<AnomalyPage />} />
+                    <Route path="evidence" element={<EvidencePage />} />
+                    <Route path="missions" element={<MissionsPage />} />
+                    <Route path="models" element={<ModelsPage />} />
+                    <Route path="exports" element={<ExportsPage />} />
+                    <Route path="reports" element={<ReportsPage />} />
+                    <Route path="aggregated" element={<AggregatedPage />} />
+                    <Route path="*" element={<Navigate to="tactical-map" replace />} />
+                  </Route>
+
+                  <Route path="/admin" element={<Guard allow={["senior_officer", "system_administrator"]}><AdminDashboard /></Guard>} />
+                  <Route path="/audit" element={<Guard allow={["system_administrator", "senior_officer"]}><AuditLogPage /></Guard>} />
+                </>
+              )}
+
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </BrowserRouter>

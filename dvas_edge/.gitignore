@@ -52,3 +52,15 @@ Thumbs.db
 *.mp4
 *.avi
 *.mkv
+
+# Secrets -- never commit
+token.txt
+config/wireguard/wg0-client.conf
+packaging/config/edge.env
+*.env
+
+# Build artifacts (large binaries)
+packaging/output/
+packaging/*.zip
+packaging/get-pip.py
+

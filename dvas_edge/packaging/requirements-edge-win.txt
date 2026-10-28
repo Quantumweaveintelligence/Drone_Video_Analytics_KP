@@ -1,0 +1,52 @@
+# ============================================================
+# requirements-edge-win.txt
+# DVAS Edge — Windows .exe build (no CUDA, no test deps)
+# ============================================================
+
+# Core computer vision (CPU only — no CUDA/NVDEC in pip wheel)
+opencv-python>=4.8.0
+
+# Image compression fallback
+Pillow>=9.0.0
+
+# Numpy — required by OpenCV
+numpy>=1.24.0
+
+# Configuration (YAML parsing)
+PyYAML>=6.0
+
+# Environment variable helpers
+python-dotenv>=1.0.0
+
+# Metrics — lightweight Prometheus client
+prometheus-client>=0.14.0
+
+# Structured logging
+structlog>=21.0.0
+colorama>=0.4.6
+
+# Pydantic v2 for config validation
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# FastAPI + Uvicorn (edge API server + launcher gateway)
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+
+# System monitoring
+psutil>=5.9.0
+
+# JWT verification
+python-jose[cryptography]>=3.3.0
+
+# HTTP client (frame uploads, proxy)
+httpx>=0.24.0
+
+# Multipart form parsing
+python-multipart==0.0.18
+
+# Rate limiting
+slowapi>=0.1.9
+
+# WebSocket proxy for edge launcher gateway
+websockets>=11.0

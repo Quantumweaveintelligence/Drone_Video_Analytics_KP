@@ -77,10 +77,17 @@ def setup_logging(
             _structlog.processors.StackInfoRenderer(),
             _structlog.processors.format_exc_info,
         ]
+        use_colors = False
+        if sys.stdout and hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
+            try:
+                import colorama  # noqa: F401
+                use_colors = True
+            except Exception:
+                use_colors = False
         renderer = (
             _structlog.processors.JSONRenderer()
             if json_output
-            else _structlog.dev.ConsoleRenderer(colors=sys.stdout.isatty())
+            else _structlog.dev.ConsoleRenderer(colors=use_colors)
         )
         _structlog.configure(
             processors=shared + [renderer],

@@ -5,7 +5,7 @@
 
 drone:
   # Primary RTSP stream (Hikvision / Dahua / DJI style URL)
-  rtsp_url: "rtsp://admin:Admin12345@10.10.32.23:554/h264/ch1/main/av_stream"
+  rtsp_url: "rtsp://10.10.32.23:554/h264/ch1/main/av_stream"  # credentials set via env var DRONE_RTSP_URL
 
   # USB/HDMI capture-card fallback (0 = first system camera)
   usb_device_index: 0
@@ -22,7 +22,7 @@ drone:
 
   # Use NVIDIA NVDEC (h264_cuvid) for hardware-accelerated H.264 decode on GPU
   # Requires FFMPEG built with CUVID support (confirmed available on this system)
-  use_gpu: true
+  use_gpu: false
 
   # RTSP transport: tcp prevents UDP packet-loss corrupting H.264 for NVDEC
   rtsp_transport: "tcp"
@@ -45,7 +45,7 @@ buffer:
 
   # Absolute path to a fast SSD directory for memory-mapped buffer files
   # Use a raw string or forward slashes on Windows
-  storage_dir: "./buffer_storage"
+  storage_dir: ""  # set via DVAS_EDGE_DATA_DIR env var in .exe build
 
   # JPEG quality for buffer frames (1–100); 85 balances size (~10–30 KB) vs quality
   jpeg_quality: 85
@@ -82,11 +82,11 @@ ingest:
 
   # Keycloak client credentials — match values configured in Keycloak on Ubuntu
   client_id:     "drone-ingest-client"
-  client_secret: "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn"   # rotate after pilot
+  client_secret: ""  # set via INGEST__CLIENT_SECRET env var
 
   # Operator credentials for Resource Owner Password Grant
-  username: "operator_001"
-  password: "Operator@001"   # rotate after pilot
+  username: ""  # set via INGEST__USERNAME env var
+  password: ""  # set via INGEST__PASSWORD env var
 
   # Drone / mission identifiers embedded in every frame payload
   drone_id:   "DRN-001"

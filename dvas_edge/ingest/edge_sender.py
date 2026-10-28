@@ -317,6 +317,8 @@ class IngestClient:
             "gb_roll":        gb_roll,
             "focal_len":      focal_len,
             "dzoom_ratio":    dzoom_ratio,
+            "frame_seq":     self.frame_seq,
+            "capture_ts":    time.time(),
         }
 
         last_exc: Optional[Exception] = None
