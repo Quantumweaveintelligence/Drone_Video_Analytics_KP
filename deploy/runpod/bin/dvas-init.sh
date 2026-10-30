@@ -90,11 +90,15 @@ done
 # Extra admin keys can be kept on the volume (survive pod re-creation, no console needed):
 #   /workspace/dvas/secrets/authorized_keys   (one public key per line)
 mkdir -p /root/.ssh
+# Only complete "<type> <base64> [comment]" lines: a key pasted wrapped over two lines (30 Oct)
+# left a bare "ssh-ed25519" line and locked the builder out after every re-deploy.
 { [ -n "${PUBLIC_KEY:-}" ] && printf '%s\n' "$PUBLIC_KEY"
   [ -s "$VOL/secrets/authorized_keys" ] && cat "$VOL/secrets/authorized_keys"
-} | grep -E '^(ssh-|ecdsa-|sk-)' | sort -u > /root/.ssh/authorized_keys || true
+} | awk 'NF >= 2 && $1 ~ /^(ssh-|ecdsa-|sk-)/ && $2 ~ /^AAAA/' | sort -u > /root/.ssh/authorized_keys || true
 chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
-log "SSH: $(wc -l < /root/.ssh/authorized_keys) authorized key(s)"
+skipped=$(grep -cvE '^[[:space:]]*(#|$)|^(ssh-|ecdsa-|sk-)[^ ]+ AAAA' "$VOL/secrets/authorized_keys" 2>/dev/null || true)
+[ "${skipped:-0}" -gt 0 ] 2>/dev/null || skipped=""
+log "SSH: $(wc -l < /root/.ssh/authorized_keys) authorized key(s)${skipped:+, skipped ${skipped} broken line(s) in $VOL/secrets/authorized_keys}"
 ssh-keygen -A >/dev/null 2>&1 || true
 sed -i -E 's/^#?PasswordAuthentication.*/PasswordAuthentication no/; s/^#?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config || true
 # Don't take LANG/LC_* from SSH clients (e.g. en_IN isn't installed → perl/psql locale warnings)
