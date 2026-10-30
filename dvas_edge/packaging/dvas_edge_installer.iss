@@ -20,6 +20,9 @@
 #ifndef EdgeApiKey
   #define EdgeApiKey "test-key-123"
 #endif
+#ifndef IngestPassword
+  #define IngestPassword ""
+#endif
 
 [Setup]
 AppId={{D8A7E3F1-4B2C-4E5D-9A1B-3C7F8E2D6A4B}
@@ -84,7 +87,7 @@ begin
     'Verify or edit the DVAS Ingest Server URL for this operator laptop.'#13#10 +
     'The cloud ingest endpoint is pre-configured below by default:');
   IngestPage.Add('Ingest Server URL:', False);
-  IngestPage.Values[0] := 'https://j7x9k2m4p-8000.proxy.runpod.net/ingest';
+  IngestPage.Values[0] := 'https://4nrza3dukc231h-80.proxy.runpod.net/ingest';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -129,8 +132,8 @@ begin
       Lines.Add('INGEST__TOKEN_URL=' + CloudBase + '/realms/kerala-police-drone/protocol/openid-connect/token');
       Lines.Add('INGEST__CLIENT_ID=drone-ingest-client');
       Lines.Add('INGEST__CLIENT_SECRET={#ClientSecret}');
-      Lines.Add('INGEST__USERNAME=operator_001');
-      Lines.Add('INGEST__PASSWORD=Operator@001');
+      Lines.Add('INGEST__USERNAME=edge_laptop_01');
+      Lines.Add('INGEST__PASSWORD={#IngestPassword}');
       Lines.Add('INGEST__DRONE_ID=DRN-001');
       if Pos('https://', LowerUrl) = 1 then
         Lines.Add('INGEST__TLS_VERIFY=true')

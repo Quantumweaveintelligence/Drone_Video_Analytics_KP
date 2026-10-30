@@ -224,12 +224,38 @@ dist/                          (511.2 MB total)
 - Setup File: `D:\DVAS_KP\dvas_edge\packaging\output\DVAS_Edge_Setup_1.0.0.exe`
 - Size: **146.5 MB** (compressed with LZMA2 ultra from 511.2 MB uncompressed distribution)
 - Installation Target: `%LOCALAPPDATA%\Programs\DVAS_Edge` (Standard non-admin / non-elevated user)
-- Configuration Wizard: Prompts only for Ingest Server URL (pre-configured with default `https://j7x9k2m4p-8000.proxy.runpod.net/ingest`); Drone ID and uploader credentials are removed from wizard so operators can enter them in the UI / mission start.
+- Configuration Wizard: Prompts only for Ingest Server URL (pre-configured with default `https://4nrza3dukc231h-80.proxy.runpod.net/ingest`); Drone ID and uploader credentials are removed from wizard so operators can enter them in the UI / mission start.
 - Shortcuts:
   - Desktop: `DVAS Edge Operator` (runs `Start_DVAS_Edge.vbs` without console popup)
   - Start Menu: `DVAS Edge Operator`, `Change Ingest URL` (opens `edge.env` in Notepad), `View Logs`
 
 ---
+
+
+---
+
+## Phase E7 / RunPod Live Cloud Integration ✅ COMPLETE
+
+> Integration verified with RunPod pod `4nrza3dukc231h` (image `20261030-d0df131`, RTX PRO 6000) on 30 Oct 2026. Reference: `DVAS_Edge_Integration_Sheet.md`.
+
+### Integration Updates:
+1. **Live Cloud Base URL:**
+   - Active URL: `https://4nrza3dukc231h-80.proxy.runpod.net` (Cloudflare HTTPS, port 443).
+   - Ingest Endpoint: `https://4nrza3dukc231h-80.proxy.runpod.net/ingest/frame`
+   - Mission Endpoints: `/ingest/mission/start`, `/ingest/mission/end`, `/ingest/mission/geofence`
+   - Keycloak Token Endpoint: `https://4nrza3dukc231h-80.proxy.runpod.net/realms/kerala-police-drone/protocol/openid-connect/token` (routed through proxy path, no `:8080`).
+2. **Account & Identity Structure:**
+   - **Uploader Accounts (M2M frame ingest):** `edge_laptop_01` (for `DRN-001`), `edge_laptop_02` (for `DRN-002`), `edge_laptop_03` (for `DRN-003`). Passwords managed securely per pod volume.
+   - **Human Operator UI Login:** Operators log in with their email (e.g. `operator@dvas.kp`, `operator_002@kerala.police.in`) at `/api/auth/login`.
+3. **Zero-Trust Edge Security:**
+   - Removed hard-coded fallback `dvas-edge-field-secret-key` in `edge_api_server.py`.
+   - `EDGE_API_KEY` is now strictly environment/config driven (`edge.env`).
+4. **Frame Metadata Compliance:**
+   - Added `capture_ts` (epoch seconds float) and `frame_seq` to all frame submission paths (`send_frame` and `send_frame_bytes`) in `edge_sender.py` for cloud out-of-order frame prevention.
+5. **Installer & Configuration Defaults:**
+   - Updated `dvas_edge_installer.iss` wizard default to `https://4nrza3dukc231h-80.proxy.runpod.net/ingest`.
+   - Added `#ifndef IngestPassword` support for build-time password injection.
+   - Updated `edge.env.template` with official RunPod pod endpoints and `edge_laptop_01` defaults.
 
 ## Field Operator Runbook (Running on Another Laptop)
 
@@ -237,7 +263,7 @@ dist/                          (511.2 MB total)
 1. Copy `DVAS_Edge_Setup_1.0.0.exe` (~146.5 MB) via USB / network to the operator laptop.
 2. Double-click `DVAS_Edge_Setup_1.0.0.exe`.
 3. The wizard displays the pre-configured Ingest Server URL:
-   - **Default:** `https://j7x9k2m4p-8000.proxy.runpod.net/ingest`
+   - **Default:** `https://4nrza3dukc231h-80.proxy.runpod.net/ingest`
    - If using another server or local server, simply edit the URL, or keep the default and click **Next**.
    - No Drone ID or uploader credentials required during installation!
 4. Click **Install** and finish installation (no admin / UAC prompt required).
@@ -264,15 +290,15 @@ dist/                          (511.2 MB total)
 ### 4. Configuration Reference (`%LOCALAPPDATA%\DVAS_Edge\config\edge.env`)
 | Key | Purpose | Example |
 |---|---|---|
-| `DVAS_CLOUD_URL` | Cloud / Server base URL for dashboard API | `https://j7x9k2m4p-8000.proxy.runpod.net` |
-| `INGEST__URL` | Frame ingest endpoint | `https://j7x9k2m4p-8000.proxy.runpod.net/ingest/frame` |
-| `INGEST__MISSION_START_URL` | Mission start notification | `https://j7x9k2m4p-8000.proxy.runpod.net/ingest/mission/start` |
-| `INGEST__MISSION_END_URL` | Mission end notification | `https://j7x9k2m4p-8000.proxy.runpod.net/ingest/mission/end` |
-| `INGEST__TOKEN_URL` | Keycloak OpenID token endpoint | `https://j7x9k2m4p-8000.proxy.runpod.net/realms/...` |
+| `DVAS_CLOUD_URL` | Cloud / Server base URL for dashboard API | `https://4nrza3dukc231h-80.proxy.runpod.net` |
+| `INGEST__URL` | Frame ingest endpoint | `https://4nrza3dukc231h-80.proxy.runpod.net/ingest/frame` |
+| `INGEST__MISSION_START_URL` | Mission start notification | `https://4nrza3dukc231h-80.proxy.runpod.net/ingest/mission/start` |
+| `INGEST__MISSION_END_URL` | Mission end notification | `https://4nrza3dukc231h-80.proxy.runpod.net/ingest/mission/end` |
+| `INGEST__TOKEN_URL` | Keycloak OpenID token endpoint | `https://4nrza3dukc231h-80.proxy.runpod.net/realms/...` |
 | `INGEST__CLIENT_ID` | Keycloak client ID | `drone-ingest-client` |
 | `INGEST__CLIENT_SECRET` | Keycloak client secret | Pre-baked in installer |
-| `INGEST__USERNAME` | Frame uploader account fallback | `operator_001` |
-| `INGEST__PASSWORD` | Frame uploader password fallback | `Operator@001` |
+| `INGEST__USERNAME` | Frame uploader account (per laptop: edge_laptop_01..03) | `edge_laptop_01` |
+| `INGEST__PASSWORD` | Frame uploader password (from team password manager) | Set in edge.env |
 | `INGEST__DRONE_ID` | Assigned Drone ID fallback | `DRN-001` |
 | `INGEST__TLS_VERIFY` | Verify HTTPS certs (`false` for HTTP LAN, `true` for public SSL) | `true` |
 | `EDGE_API_KEY` | Local Edge API authentication token | Pre-configured |

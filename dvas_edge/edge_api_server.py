@@ -1109,7 +1109,7 @@ app.add_middleware(
 
 
 # ── Edge Security & Authentication Guard ──────────────────────────────────────
-EDGE_API_KEY = os.getenv("EDGE_API_KEY", "dvas-edge-field-secret-key")
+EDGE_API_KEY = os.getenv("EDGE_API_KEY", "")
 REQUIRE_EDGE_AUTH = os.getenv("REQUIRE_EDGE_AUTH", "true").lower() in ("true", "1", "yes")
 
 async def verify_edge_auth(
@@ -1124,7 +1124,7 @@ async def verify_edge_auth(
     3. Validates dvas_access_token Cookie or query param ?token= (Officer Browser / Stream)
     """
     # 1. API Key Header Match
-    if x_edge_api_key and x_edge_api_key == EDGE_API_KEY:
+    if x_edge_api_key and EDGE_API_KEY and x_edge_api_key == EDGE_API_KEY:
         return {"auth_type": "api_key", "role": "edge_m2m"}
 
     # 2. Extract Bearer / Query / Cookie Token
@@ -1138,7 +1138,7 @@ async def verify_edge_auth(
         bearer_token = request.cookies.get("dvas_access_token")
 
     if bearer_token:
-        if bearer_token == EDGE_API_KEY:
+        if EDGE_API_KEY and bearer_token == EDGE_API_KEY:
             return {"auth_type": "token_match", "role": "edge_m2m"}
         try:
             from jose import jwt as jose_jwt
@@ -2051,7 +2051,7 @@ async def stream_live(request: Request, auth: dict = Depends(verify_edge_auth)):
 # ---------------------------------------------------------------------------
 # Ingest Server Proxy
 # ---------------------------------------------------------------------------
-INGEST_BASE_URL = os.getenv("INGEST_URL", "http://10.253.110.250/ingest").replace("/frame", "")
+INGEST_BASE_URL = os.getenv("INGEST__URL", os.getenv("INGEST_URL", "https://4nrza3dukc231h-80.proxy.runpod.net/ingest")).replace("/frame", "")
 
 @app.get("/api/ingest-server/status")
 async def proxy_ingest_status(auth: dict = Depends(verify_edge_auth)):

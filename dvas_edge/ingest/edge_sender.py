@@ -44,9 +44,9 @@ TOKEN_URL   = os.getenv("INGEST__TOKEN_URL", os.getenv("TOKEN_URL",   "http://10
 CLIENT_ID   = os.getenv("KC_CLIENT_ID",  "drone-ingest-client")
 CLIENT_SEC  = os.getenv("INGEST__CLIENT_SECRET", os.getenv("KC_CLIENT_SEC", "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn"))
 
-USERNAME    = os.getenv("EDGE_USERNAME", "operator_001")
-PASSWORD    = os.getenv("EDGE_PASSWORD", "Operator@001")  # rotate after pilot
-DRONE_ID    = os.getenv("DRONE_ID",      "DRONE_KL_001")
+USERNAME    = os.getenv("INGEST__USERNAME", os.getenv("EDGE_USERNAME", "edge_laptop_01"))
+PASSWORD    = os.getenv("INGEST__PASSWORD", os.getenv("EDGE_PASSWORD", ""))
+DRONE_ID    = os.getenv("INGEST__DRONE_ID", os.getenv("DRONE_ID", "DRN-001"))
 MISSION_ID  = os.getenv("MISSION_ID",    "MISSION_DEFAULT")
 
 # TLS verification:
@@ -55,7 +55,7 @@ MISSION_ID  = os.getenv("MISSION_ID",    "MISSION_DEFAULT")
 #   TLS_VERIFY=false                       → skip verification (dev only)
 # Python's httpx does NOT read the Windows certificate store automatically,
 # so always supply TLS_CA_CERT when the server uses a private / self-signed CA.
-TLS_VERIFY  = os.getenv("TLS_VERIFY",  "false").lower() == "true"
+TLS_VERIFY  = os.getenv("INGEST__TLS_VERIFY", os.getenv("TLS_VERIFY", "true")).lower() == "true"
 TLS_CA_CERT = os.getenv("TLS_CA_CERT", "")   # path to root_ca.crt
 
 
@@ -204,6 +204,8 @@ class IngestClient:
             "latitude":       lat,
             "longitude":      lon,
             "altitude_m":     alt,
+            "frame_seq":      self.frame_seq,
+            "capture_ts":     time.time(),
         }
 
         frame_bytes = Path(frame_path).read_bytes()
