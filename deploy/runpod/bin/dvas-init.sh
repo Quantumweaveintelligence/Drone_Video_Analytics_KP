@@ -63,6 +63,19 @@ export ANOMALY_CONFIDENCE="${ANOMALY_CONFIDENCE:-0.35}" ANOMALY_ALERT_HYSTERESIS
        ANOMALY_COOLDOWN_S="${ANOMALY_COOLDOWN_S:-45}" VESSEL_CONFIDENCE="${VESSEL_CONFIDENCE:-0.50}"
 export LOG_LEVEL="${LOG_LEVEL:-INFO}" TZ="${TZ:-Asia/Kolkata}" PYTHONUNBUFFERED=1
 
+# CPU threads. The pod gets a cgroup CPU quota (RunPod, 30 Oct: 27.2 vCPU) but nproc shows
+# the host (256 cores), so torch/OpenMP/BLAS started ~200 threads in every analyzer. Cap
+# each process's compute pools to a share of the quota (override: DVAS_CPUS / OMP_NUM_THREADS).
+if [ -z "${DVAS_CPUS:-}" ]; then
+  read -r cpu_q cpu_p < /sys/fs/cgroup/cpu.max 2>/dev/null || cpu_q=max
+  if [[ "$cpu_q" =~ ^[0-9]+$ ]]; then DVAS_CPUS=$(( (cpu_q + cpu_p - 1) / cpu_p )); else DVAS_CPUS="$(nproc)"; fi
+fi
+threads=$(( DVAS_CPUS / 8 )); [ "$threads" -ge 2 ] || threads=2; [ "$threads" -le 8 ] || threads=8
+export DVAS_CPUS OMP_NUM_THREADS="${OMP_NUM_THREADS:-$threads}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$OMP_NUM_THREADS}" OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-$OMP_NUM_THREADS}" \
+       NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-$OMP_NUM_THREADS}"
+log "CPU quota ${DVAS_CPUS} vCPU → ${OMP_NUM_THREADS} compute threads per process"
+
 # Snapshot for interactive tools (dvas-ctl over SSH); root-only
 ( umask 077; export -p | grep -E 'declare -x (DVAS_|PUBLIC_BASE_URL|SECURE_COOKIES|[A-Z_]*_URL=|KC_|MINIO_|KEYCLOAK_|DRONE_IDS|KNOWN_DRONES)' > /run/dvas/runtime.env || true )
 
@@ -84,6 +97,8 @@ chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
 log "SSH: $(wc -l < /root/.ssh/authorized_keys) authorized key(s)"
 ssh-keygen -A >/dev/null 2>&1 || true
 sed -i -E 's/^#?PasswordAuthentication.*/PasswordAuthentication no/; s/^#?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config || true
+# Don't take LANG/LC_* from SSH clients (e.g. en_IN isn't installed → perl/psql locale warnings)
+sed -i -E 's/^AcceptEnv/#AcceptEnv/' /etc/ssh/sshd_config || true
 
 # ── 5) Postgres: restore from the volume, or create (first boot only) ──────
 if ! "$BIN/pg-volume.sh" prepare; then

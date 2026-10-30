@@ -104,6 +104,14 @@ async def _admin_user(request: Request):
     return user
 
 
+async def _any_user(request: Request):
+    """Any logged-in DVAS user (header, ?token= or cookie). The routes below answered
+    anonymously, which exposed live drone positions and camera frames on the public
+    cloud URL (RunPod Phase 5)."""
+    from core.security import get_current_user
+    return await get_current_user(request)
+
+
 # ── Cached health state for the top-bar indicator ────────────────────────────
 _last_health: dict = {"status": "unknown", "ts": 0}
 _health_lock = asyncio.Lock()
@@ -246,7 +254,7 @@ async def ingest_metrics(user: dict = Depends(_admin_user)):
 # ═════════════════════════════════════════════════════════════════════════════
 
 @ingest_api.get("/telemetry", summary="Proxy: latest telemetry for all drones")
-async def ingest_telemetry():
+async def ingest_telemetry(user: dict = Depends(_any_user)):
     """
     Returns the latest cached telemetry (GPS, battery, speed, etc.) for every
     drone that has sent at least one frame to the ingest server.
@@ -262,7 +270,7 @@ async def ingest_telemetry():
 
 
 @ingest_api.get("/streams/active", summary="Proxy: active drone streams from Valkey (restart-safe)")
-async def ingest_streams_active():
+async def ingest_streams_active(user: dict = Depends(_any_user)):
     """
     Returns active drones with frames in the ingest pipeline.
 
@@ -342,7 +350,7 @@ async def ingest_streams_active():
 
 
 @ingest_api.get("/frame/{drone_id}/latest", summary="Proxy: latest JPEG frame for a drone")
-async def ingest_latest_frame(drone_id: str, request: Request):
+async def ingest_latest_frame(drone_id: str, request: Request, user: dict = Depends(_any_user)):
     """
     Fetches the most recent JPEG frame stored in the ingest server's Valkey queue
     for the given drone and streams it back as image/jpeg.
@@ -359,23 +367,27 @@ async def ingest_latest_frame(drone_id: str, request: Request):
 
     # Prefer a fresh service token so this endpoint never breaks due to
     # missing/expired user tokens in the frontend.
-    svc_token = await _get_service_token()
-    if svc_token:
-        headers = {"Authorization": f"Bearer {svc_token}"}
+    # Fallback: the user's own token from header or cookie
+    auth_header = request.headers.get("Authorization")
+    cookie_token = request.cookies.get("dvas_access_token")
+    if auth_header:
+        user_headers = {"Authorization": auth_header}
+    elif cookie_token:
+        user_headers = {"Authorization": f"Bearer {cookie_token}"}
     else:
-        # Fallback: try the user's own token from header or cookie
-        auth_header = request.headers.get("Authorization")
-        cookie_token = request.cookies.get("dvas_access_token")
-        if auth_header:
-            headers = {"Authorization": auth_header}
-        elif cookie_token:
-            headers = {"Authorization": f"Bearer {cookie_token}"}
-        else:
-            headers = {}
+        user_headers = {}
+    svc_token = await _get_service_token()
+    headers = {"Authorization": f"Bearer {svc_token}"} if svc_token else user_headers
 
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(url, headers=headers)
+            if resp.status_code in (401, 403) and svc_token:
+                # A service token cached before its realm role was assigned (first boot:
+                # the backend starts before the Keycloak bootstrap) — drop it, use the user's.
+                global _svc_token_exp
+                _svc_token_exp = 0.0
+                resp = await client.get(url, headers=user_headers)
             if resp.status_code == 404:
                 raise HTTPException(404, f"No frames yet for drone {drone_id}")
             resp.raise_for_status()

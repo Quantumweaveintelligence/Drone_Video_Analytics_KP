@@ -128,12 +128,17 @@ cmd_basebackup() {
   date -Is > "$tmp/COMPLETE"
   mv "$tmp" "$dst"
   log "base backup complete ($(du -sh "$dst" | cut -f1), start WAL $start)"
-  # keep the newest $KEEP complete base backups; drop WAL older than the oldest kept one
-  ls -1d "$BASE"/*/ 2>/dev/null | sort -r | while read -r d; do [ -f "$d/COMPLETE" ] && echo "${d%/}"; done \
-    | tail -n +"$((KEEP + 1))" | xargs -r rm -rf
-  local oldest; oldest="$(ls -1d "$BASE"/*/ 2>/dev/null | sort | while read -r d; do [ -f "$d/COMPLETE" ] && echo "${d%/}"; done | head -1)"
-  if [ -n "$oldest" ] && [ -s "$oldest/START_WAL" ]; then
-    "$PGBIN/pg_archivecleanup" -x .gz "$WAL" "$(cat "$oldest/START_WAL")" || log "WARNING: pg_archivecleanup failed"
+  # keep the newest $KEEP complete base backups; drop WAL older than the oldest kept one.
+  # (An array, not `… | head -1`: under pipefail the closed pipe aborted this function, so
+  #  the WAL archive was never pruned — seen on RunPod 30 Oct.)
+  local d complete=()
+  for d in "$BASE"/*/; do [ -f "$d/COMPLETE" ] && complete+=("${d%/}"); done   # sorted: oldest first
+  if [ "${#complete[@]}" -gt "$KEEP" ]; then
+    rm -rf "${complete[@]:0:${#complete[@]}-KEEP}"
+    complete=("${complete[@]:${#complete[@]}-KEEP}")
+  fi
+  if [ "${#complete[@]}" -gt 0 ] && [ -s "${complete[0]}/START_WAL" ]; then
+    "$PGBIN/pg_archivecleanup" -x .gz "$WAL" "$(cat "${complete[0]}/START_WAL")" || log "WARNING: pg_archivecleanup failed"
   fi
   rm -rf "$BASE"/.tmp-* 2>/dev/null || true
   rm -f "$VOL/state/pg_basebackup_needed" 2>/dev/null || true

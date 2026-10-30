@@ -249,6 +249,28 @@ def create_users(
             log(f"  -> role '{target_role}' assigned to '{username}'", "OK")
 
 
+def assign_service_account_role(base_url: str, token: str, realm: str, client_uuid: str,
+                                role_name: str, role_id: str) -> None:
+    """Give a client's service account one realm role (idempotent).
+
+    The backend calls the ingest API with a client-credentials token of the ingest
+    client (live frames, status). Ingest only accepts tokens with a DVAS realm role, so
+    without this every proxied frame was a 403 (RunPod Phase 5). drone-operator is the
+    least privileged role: the edge laptops hold this client's secret, and a control-room
+    role here would give them dashboard officer access without a user login.
+    """
+    sa_r = api("get", f"{base_url}/admin/realms/{realm}/clients/{client_uuid}/service-account-user", token)
+    if sa_r.status_code != 200:
+        log(f"Could not fetch service account user: {sa_r.status_code}", "ERR")
+        return
+    r = api("post", f"{base_url}/admin/realms/{realm}/users/{sa_r.json()['id']}/role-mappings/realm",
+            token, json=[{"id": role_id, "name": role_name}])
+    if r.status_code in (200, 204):
+        log(f"Service account of the ingest client has realm role '{role_name}'", "OK")
+    else:
+        log(f"Failed to assign '{role_name}' to the ingest service account: {r.status_code}", "ERR")
+
+
 ADMIN_SERVICE_CLIENT_ID = "dvas-admin-service"
 
 
@@ -438,6 +460,8 @@ def main() -> None:
 
         r_ids  = create_roles(base, token, args.realm, ROLES)
         create_users(base, token, args.realm, users, r_ids)
+        if "drone-operator" in r_ids:
+            assign_service_account_role(base, token, args.realm, uuid, "drone-operator", r_ids["drone-operator"])
 
         # Phase 1: Create the scoped admin service client
         admin_secret = create_admin_service_client(base, token, args.realm,
