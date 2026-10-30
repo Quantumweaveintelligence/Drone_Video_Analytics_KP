@@ -28,8 +28,10 @@ deploy/runpod/
 │   │   export_realm.sh, sanitize_realm.py,
 │   │   check_zero_byte_py.sh, install_git_hooks.sh          Phase 1
 │   ├── build_image.sh, run_local_test.sh, freeze_image_versions.sh   Phase 3
-│   └── phase4_preflight.sh, resolve_minio_images.sh, push_ghcr.sh,
-│       docker_disk_report.sh                                          Phase 4
+│   ├── phase4_preflight.sh, resolve_minio_images.sh, push_ghcr.sh,
+│   │   docker_disk_report.sh                                          Phase 4
+│   └── smoke_public.py   public-URL smoke test (health, exposure, token, ingest,
+│                         per-role dashboard API, WebSocket, reports)  Phase 5/6
 ├── db/            baseline dumps (Phase 1.3) + migrations/{analytics,dashboard}/
 ├── keycloak/      realm-template.json (sanitised, Phase 1.5)
 ├── env/           dvas.env.example, local-compose.env.example
@@ -53,6 +55,7 @@ deploy/runpod/tools/build_image.sh               # Phase 3.6
 deploy/runpod/tools/run_local_test.sh ghcr.io/quantumweaveintelligence/dvas-runpod:<tag>
 GHCR_USER=<github-user> deploy/runpod/tools/push_ghcr.sh      # Phase 4.1
 # Phase 4.2–4.7 (RunPod console): docs/DVAS_Phase4_GHCR_Push_and_RunPod_Provisioning.md
+deploy/runpod/tools/smoke_public.py --url https://<POD_ID>-80.proxy.runpod.net [--write]   # Phase 5/6
 ```
 
 Tests: `python -m pytest deploy/runpod/tests -q`

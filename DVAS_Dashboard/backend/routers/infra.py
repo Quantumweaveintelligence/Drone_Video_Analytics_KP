@@ -17,6 +17,7 @@ from core.config import (
     limiter,
 )
 from core.analytics_client import _get_minio_client
+from core import runtime
 from audit_service import write_audit_v2
 from schemas.models import ModelUpdateIn
 from services.system_telemetry import (
@@ -64,7 +65,7 @@ async def infra_health(user: dict = Depends(require_roles("system_administrator"
 
     gpu = [
         {
-            "node": "gpu-0 (NVIDIA GTX 1650)",
+            "node": f"gpu-0 ({runtime.gpu_name_nvml() or 'GPU'})",
             "util_pct": infra["gpu_pct"],
             "batch": 16,
             "inference_ms": 28 if infra["gpu_pct"] > 0 else 0,

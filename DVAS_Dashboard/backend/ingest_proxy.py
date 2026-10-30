@@ -762,7 +762,9 @@ async def ingest_ws_relay(ws: WebSocket):
         return
 
     ingest_ws_url = INGEST_SERVER_URL.replace("http://", "ws://").replace("https://", "wss://")
-    ingest_ws_url = f"{ingest_ws_url}/ws/status"
+    # ingest /ws/status requires ?token= — pass on the (already checked) admin token
+    from urllib.parse import quote
+    ingest_ws_url = f"{ingest_ws_url}/ws/status?token={quote(token)}"
 
     try:
         import websockets

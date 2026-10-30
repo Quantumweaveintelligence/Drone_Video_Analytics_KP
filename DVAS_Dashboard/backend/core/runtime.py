@@ -14,6 +14,7 @@ of `docker exec <analyzer> nvidia-smi`.
 """
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from datetime import datetime, timezone
@@ -175,6 +176,22 @@ def _call_ignoring(fn, program: str, *, wait: bool, ignore: Tuple[int, ...]) -> 
         if fault.faultCode == _FAULT_BAD_NAME:
             raise RuntimeControlError(f"unknown supervisor program '{program}'") from fault
         raise
+
+
+@functools.lru_cache(maxsize=1)
+def gpu_name_nvml() -> Optional[str]:
+    """Name of GPU 0 via NVML (e.g. 'NVIDIA RTX PRO 6000 Blackwell Server Edition'), or None."""
+    try:
+        import pynvml  # noqa: PLC0415  (package: nvidia-ml-py)
+        pynvml.nvmlInit()
+        try:
+            name = pynvml.nvmlDeviceGetName(pynvml.nvmlDeviceGetHandleByIndex(0))
+            return name.decode() if isinstance(name, bytes) else name
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception as exc:  # ImportError, NVMLError
+        logger.debug("NVML name query failed: %s", exc)
+        return None
 
 
 def gpu_metrics_nvml() -> Optional[Tuple[int, float, float]]:

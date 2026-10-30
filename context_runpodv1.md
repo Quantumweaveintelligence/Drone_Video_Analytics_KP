@@ -1,6 +1,6 @@
 # context_runpodv1.md — RunPod v1 implementation (Phases 0–4)
 
-> Branch: `runpod-v1` · Working copy: `/mnt/NewVolume/DVAS_RUNPODV1` · Date: 26 Oct 2026 · **Updated 30 Oct 2026 — Phase 4 functionally complete (§10.12); first RunPod deployment 29 Oct (§10.10)**
+> Branch: `runpod-v1` · Working copy: `/mnt/NewVolume/DVAS_RUNPODV1` · Date: 26 Oct 2026 · **Updated 30 Oct 2026 — Phases 5–6 run on the pod (§11): all checks pass with hot-patches; new image needed (§11.5)**
 > Plan followed: `deploy/runpod/docs/DVAS_RunPod_Deployment_Plan.md` (v2, rev 3)
 > Scope delivered: **code and repository changes for Phases 0–3**. Steps that need your
 > accounts, the live local stack, Docker or a GPU (marked 🧑 below) are prepared as scripts
@@ -655,3 +655,86 @@ add `DVAS_VOLUME_GB=20` to the template.
 pick the production data centre/GPU closer to Kerala, size the volume (50–100 GB).
 **Roles going forward:** teammate = RunPod console (pods, template, env, billing). Builder = image builds/pushes + pod
 shell over SSH + browser → can drive Phase 5 (first boot, platform bootstrap & smoke tests) from his laptop.
+
+
+---
+
+## 11. Phases 5 & 6 — first-boot checks, smoke tests, dashboard go-live (30 Oct 2026, 12:25–13:15 IST)
+
+Run from the builder's laptop: SSH `root@91.199.227.82 -p 42603` + public URL. **The pod ID is now
+`erv9019r7wxhsu`** (`https://erv9019r7wxhsu-80.proxy.runpod.net`); the old `o5vg7007ar5zk9` URL returns 404, so
+the pod was re-created on the same volume (container start 30 Oct 11:10). SSH IP:port stayed the same.
+
+### 11.1 Phase 5 results
+| Plan step | Result |
+|---|---|
+| 5.1 first boot | 18 programs RUNNING, `bootstrap` EXITED 0, `bootstrap_ok` written |
+| 5.2 credentials | `dvas.env` + `users.json` on the laptop (`~/dvas-runpod-secrets`, 30 Oct). Password manager: ☐ (teammate/you) |
+| 5.3 health | `dvas-ctl health` all OK; Valkey 8 GB `volatile-lru`; 13 analytics + 14 dashboard tables owned by `dvas`; 9 buckets; ILM 3 d / 14 d, evidence + watchlist none |
+| Resources | cgroup quota **27.2 vCPU**, memory limit ~251 GB (`nproc`/`free` show the 256-core / 2 TB host); container disk 50 GB; RTX PRO 6000 96 GB |
+| 5.4 public path | `tools/smoke_public.py --write`: token (ROPC, `drone-ingest-client`), mission start → 3 frames (202, 350–750 ms round trip from Kerala) → mission end. Real client IP: see 11.3 |
+| 5.5 persistence | Pod re-created on the same volume: Postgres restored (timeline 2), secrets from 29 Oct, demo data + MinIO buckets intact, Keycloak `frontendUrl` = new URL (issuer checked). Marker for the next Stop/Start: `local/dvas-heatmaps/smoke/persistence-marker.txt` (**expires in 3 days**) |
+| 5.6 retention | ILM rules listed ✅. Disk guard logs only; the plan's `system_alert` row on the Ingest dashboard is **not implemented** (open) |
+| GPU inference | vehicle analyzer processed the smoke frames on `cuda:0` (Blackwell + torch nightly cu128 OK); no traceback / CUDA / OOM in any analyzer log |
+
+### 11.2 Phase 6 results (browser pane, you logged in; I drove)
+| Row | Result |
+|---|---|
+| Login / redirect | CRO + Senior → `/command/tactical-map`, Admin → `/ingest`, `operator@dvas.kp` refused ("Drone operators use the DVAS Edge application"), no token left |
+| Token refresh | `POST /api/auth/refresh` 200 (API). Idle past expiry not waited out (token lifetime 1 h) |
+| WebSocket | `/api/ws` welcome + ping/pong; **10.8 min with 20 s pings: 32/32 pongs**; a silent socket stayed open 411 s without traffic (no 100 s idle cut). Sockets drop only on a backend restart |
+| Command pages (14) | all load for CRO and Senior with no failed request and no JS error (the 404/503s on annotated/frame endpoints are the app's "no live feed" answers) |
+| Models | stream stop/start of an analyzer reflected in `/health` (`stream_running`), model stays on the GPU |
+| Admin (5 tabs — plan said 7) | users (6, via `dvas-admin-service`), policy, sessions, audit explorer, config: all clean |
+| Ingest dashboard (8 tabs) | container grid = 17 supervisor programs; restart (scope core) touches only `ingest`; WS relay **Connected** (after fix); GPU tab NVML (after fix) |
+| Audit | explorer 25 rows, hash chain valid (64/64), PDF export 0.4 s, CSV |
+| Reports | daily / weekly / utilisation generated in 0.7–3.8 s, PDF downloads |
+| Security | `/admin/*`, `/docs`, `/openapi.json`, `/minio/*` → SPA; `/realms/master`, `/api/docs`, `/edge-api/*` → 404; tokens kept out of logs |
+
+### 11.3 Findings and fixes (commits `579b1b0` + phase 6 commit; hot-patched on the pod)
+| # | Finding | Fix |
+|---|---|---|
+| 1 | 🔴 `/api/ingest-server/telemetry` + `/streams/active` answered **without login** (live drone GPS, drone/mission IDs); `/frame/{id}/latest` fetched frames with the backend's service token without checking the caller | `ingest_proxy.py`: `_any_user` dependency on all three |
+| 2 | 🔴 **Every live frame in the dashboard failed** (500): the ingest client's service account had no realm role → ingest 403 | `setup_keycloak.py` gives it `drone-operator` (least privilege; edge laptops hold that client secret, so not `control-room`). Frame proxy retries with the user's token if the cached service token is rejected (first boot: backend starts before bootstrap) |
+| 3 | 🟠 Client IP spoofable: nginx trusted `X-Forwarded-For` from anyone → fake IP in rate limiting **and the audit log** | nginx: `real_ip_header CF-Connecting-IP` from the RunPod LB (100.64/10) + private ranges only; upstream `X-Forwarded-For` = that one address. Measured chain: `XFF = <client-sent>, <client>, <cloudflare>`, `CF-Connecting-IP = client`, peer `100.64.1.32`. Audit logins now show the real IP |
+| 4 | 🟠 `/realms/master/*` public (Keycloak admin realm → password guessing) | nginx 404 |
+| 5 | 🟠 ingest `/ingest/status*`, `/ingest/streams/active` have no auth in the ingest API and were public | nginx 404 publicly (dashboard reads them internally via `/api/ingest-server/*`, which needs a login) |
+| 6 | 🟠 JWTs from `?token=` in `backend.log` and `nginx_access.log` | backend `--no-access-log` (nginx logs every request); nginx `log_format dvas` logs `$uri` without query string. Existing logs scrubbed on the pod |
+| 7 | 🟠 Reloading `/ingest` (admin landing page) → 301 to `http://100.65.x.x/ingest/` (nginx auto-redirect to the `/ingest/` API location) | `location = /ingest` serves the SPA; `absolute_redirect off`. Browsers that saw the 301 cached it: clear site data once |
+| 8 | 🟠 `pg-volume.sh basebackup`: prune pipeline `… | head -1` hit SIGPIPE under pipefail → **WAL archive never pruned**, flag never cleared, bootstrap logged "base backup failed" | array-based prune (tested: keeps 2 newest complete, cleans WAL from the oldest kept). On the pod: 18 → 14 WAL files, flag cleared |
+| 9 | 🟡 ~200 threads per analyzer (torch sees 256 host cores, quota is 27 vCPU) | `dvas-init.sh`: `DVAS_CPUS` from `cpu.max`, `OMP/MKL/OPENBLAS/NUMEXPR_NUM_THREADS = clamp(CPUs/8, 2, 8)` → 3. Measured on the pod: 195 → 8 threads. **Needs the new image** (env is set before supervisord) |
+| 10 | 🟡 Admin ingest WS relay always "Disconnected" (relay connected to ingest `/ws/status` without a token → 403) | relay passes the admin's token |
+| 11 | 🟡 Security headers missing on `index.html` (location-level `add_header` drops server-level ones) | repeated in `/index.html` and `/static/` |
+| 12 | 🟢 GPU tab said "NVIDIA GTX 1650" | `runtime.gpu_name_nvml()` → "RTX PRO 6000 Blackwell Server Edition" |
+| 13 | 🟢 perl/psql locale warnings over SSH (client sends `LANG=en_IN`) | sshd `AcceptEnv` disabled |
+
+New tool: **`deploy/runpod/tools/smoke_public.py`** (stdlib; reads `~/dvas-runpod-secrets`, never prints secrets).
+Read-only: 57 checks; `--write`: 71 (mission/frames on `DRN-SMOKE`, reports, audit PDF, grid restart of ingest).
+Final runs: 71/71 (write) and 57/57 (read-only) on the hot-patched pod.
+
+### 11.4 Known gaps (logged, not fixed)
+- Disk guard → `system_alert` row on the Ingest dashboard (plan 5.6): only a log line today.
+- Models page header "Kerala Police Analytics Node (H100)", "4 / 4 GB VRAM" (config `cluster_label`), GPU tab batch 16 /
+  latency 28 ms are placeholders → real numbers come with the Phase 10 capacity advisor.
+- KPI "Evidence items 0" while the vault lists 14 demo items (KPI is scope/today-based).
+- Demo seed creates RPT-4001 permanently "generating" — gone with `DVAS_SEED_DEMO=0`.
+- The `/api/ingest-server/health` top-bar indicator stays public (up/down only).
+- Smoke-test residue: missions `SMOKE-*`, reports, audit entries on `dvas-vol-test` (test volume).
+
+### 11.5 Hot-patches on the pod — lost on the next restart until a new image is deployed
+Changed in place (originals in `/root/*.orig-82c7456`): `/etc/dvas/nginx.conf`, `/etc/dvas/supervisord.conf`
+(backend `--no-access-log`), `/opt/dvas/deploy/bin/pg-volume.sh`,
+`/opt/dvas/DVAS_Dashboard/backend/{ingest_proxy.py,core/runtime.py,routers/infra.py}`,
+`/opt/dvas/dvas_ingest/ingest/scripts/setup_keycloak.py`. The Keycloak role mapping (#2) lives in the DB and persists.
+The thread cap (#9) is **not** active until the new image.
+
+**Next (🧑):**
+1. `git push`, then build + push a new image (guide A6–A8): `deploy/runpod/tools/build_image.sh` →
+   `GHCR_USER=adhishQWI deploy/runpod/tools/push_ghcr.sh` → commit `RELEASES.md`.
+2. Teammate: template image → new tag, add **`DVAS_VOLUME_GB=20`** (and decide `DVAS_SEED_DEMO`); this restarts the pod.
+   That restart also exercises the restore path (`pg-volume: restoring …` in the pod's Logs); the explicit B10
+   **Stop → Start** is still to do: then `mc cat local/dvas-heatmaps/smoke/persistence-marker.txt` and note the URL/SSH port.
+3. After it boots, the pod's Logs show `[dvas-init] … CPU quota 28 vCPU → 3 compute threads per process`; then run
+   `deploy/runpod/tools/smoke_public.py --url https://<POD_ID>-80.proxy.runpod.net --write` → expect all PASS.
+4. Before real data (unchanged from §10.12): rotate the six test passwords, secrets into the password manager,
+   GHCR package private + 2FA confirmed, production DC/GPU and volume size.
