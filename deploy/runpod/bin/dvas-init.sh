@@ -67,7 +67,11 @@ export LOG_LEVEL="${LOG_LEVEL:-INFO}" TZ="${TZ:-Asia/Kolkata}" PYTHONUNBUFFERED=
 # the host (256 cores), so torch/OpenMP/BLAS started ~200 threads in every analyzer. Cap
 # each process's compute pools to a share of the quota (override: DVAS_CPUS / OMP_NUM_THREADS).
 if [ -z "${DVAS_CPUS:-}" ]; then
-  read -r cpu_q cpu_p < /sys/fs/cgroup/cpu.max 2>/dev/null || cpu_q=max
+  # cgroup v2 (cpu.max), else v1 (cfs_quota_us / cfs_period_us; the L40S host on 30 Oct is v1)
+  read -r cpu_q cpu_p 2>/dev/null < /sys/fs/cgroup/cpu.max \
+    || { cpu_q="$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null)"; cpu_p="$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null)"; } \
+    || cpu_q=max
+  [[ "${cpu_q:-}" =~ ^[0-9]+$ && "${cpu_p:-}" =~ ^[0-9]+$ && "$cpu_p" -gt 0 ]] || cpu_q=max
   if [[ "$cpu_q" =~ ^[0-9]+$ ]]; then DVAS_CPUS=$(( (cpu_q + cpu_p - 1) / cpu_p )); else DVAS_CPUS="$(nproc)"; fi
 fi
 threads=$(( DVAS_CPUS / 8 )); [ "$threads" -ge 2 ] || threads=2; [ "$threads" -le 8 ] || threads=8

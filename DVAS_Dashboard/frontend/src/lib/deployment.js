@@ -11,16 +11,21 @@ export const TARGET = (process.env.REACT_APP_DEPLOYMENT_TARGET || "all").toLower
 export const isCloud = TARGET === "cloud";
 export const isEdge = TARGET === "edge";
 
-/** Roles that may sign in to this build, or null when every role is allowed. */
+/** Roles that may sign in to this build. */
 export const ALLOWED_ROLES = isCloud
   ? ["control_room_officer", "senior_officer", "system_administrator"]
   : isEdge
     ? ["drone_operator"]
-    : null;
+    : ["drone_operator", "control_room_officer", "senior_officer", "system_administrator"];
+
+// Names used by the edge-exe-v1 branch (Phase 7.2: one shared deployment.js for both builds)
+export const DEPLOYMENT_TARGET = TARGET;
+export const isEdgeBuild = isEdge;
+export const isCloudBuild = !isEdge;
 
 /** True when a user with `role` may use this build. */
 export function roleAllowedHere(role) {
-  return ALLOWED_ROLES === null || ALLOWED_ROLES.includes(role);
+  return ALLOWED_ROLES.includes(role);
 }
 
 /** Message shown when a signed-in role belongs to the other application. */

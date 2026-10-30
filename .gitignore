@@ -66,3 +66,6 @@ dvas_secrets_local/
 # local build bookkeeping (tools/build_image.sh)
 deploy/runpod/.last_build_tag
 deploy/runpod/.logs/
+
+# edge developer's working notes (contain local credentials) — not for this repo
+dvas_edge_exe_context*.md

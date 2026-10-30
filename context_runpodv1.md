@@ -1,13 +1,49 @@
-# context_runpodv1.md — RunPod v1 implementation (Phases 0–4)
+# context_runpodv1.md — DVAS on RunPod (`runpod-v1`): implementation log, Phases 0–7
 
-> Branch: `runpod-v1` · Working copy: `/mnt/NewVolume/DVAS_RUNPODV1` · Date: 26 Oct 2026 · **Updated 30 Oct 2026 — Phases 5–6 run on the pod (§11): all checks pass; image `20261030-d0df131` pushed, template update pending (§11.6)**
-> Plan followed: `deploy/runpod/docs/DVAS_RunPod_Deployment_Plan.md` (v2, rev 3)
-> Scope delivered: **code and repository changes for Phases 0–3**. Steps that need your
-> accounts, the live local stack, Docker or a GPU (marked 🧑 below) are prepared as scripts
-> and listed in §6 — they have not been executed.
-> User directives applied: restored `crowd/main.py` is the base (reviewed + extended);
-> **RF-DETR is not integrated** (no `rfdetr` dependency, RF-DETR checkpoints excluded from
-> the image); all changes made locally for you to commit and push.
+> Branch `runpod-v1` · Working copy `/mnt/NewVolume/DVAS_RUNPODV1` · Started 26 Oct 2026 · **Last update 30 Oct 2026, 17:30 IST**
+> Plan: `deploy/runpod/docs/DVAS_RunPod_Deployment_Plan.md` (v2, rev 3). Phase guides in `deploy/runpod/docs/`.
+> Directives: restored `crowd/main.py` is the base; **RF-DETR not integrated**; `dvas_edge/` is owned by the edge
+> teammate (branch `edge-exe-v1`) and isn't edited here.
+> Read **§0** for where things stand; §1–§12 are the history, phase by phase.
+
+---
+
+## 0. Current state (30 Oct 2026, 17:30 IST)
+
+### 0.1 Live system
+| Item | Value |
+|---|---|
+| Pod | **`4nrza3dukc231h`**, RunPod Secure Cloud **EU-NL-1**, **1 × NVIDIA L40S 46 GB** (was RTX PRO 6000 until 30 Oct afternoon) |
+| Public URL | **https://4nrza3dukc231h-80.proxy.runpod.net** (changes on every pod re-create — 3 IDs on 29–30 Oct) |
+| SSH | `ssh root@91.199.227.82 -p 25676` (port changes per pod: Connect → Direct TCP, or pod env `RUNPOD_TCP_PORT_22`) |
+| Image | `ghcr.io/quantumweaveintelligence/dvas-runpod:20261030-d0df131` (`sha256:24b5777e…6831`); rollback `20261028-82c7456` |
+| Resources | cgroup quota **27.2 vCPU**, memory limit 125 GB (`nproc`/`free` show the host), container disk 50 GB |
+| Volume | `dvas-vol-test` 20 GB Standard, MooseFS (`du` ≈ 94 MB). Postgres runs on container disk, base backups + WAL on the volume (timeline 3 = restored 3×) |
+| Secrets | on the volume `/workspace/dvas/secrets/{dvas.env,users.json,authorized_keys}`; laptop copy `~/dvas-runpod-secrets/` (0700/0600, `users.json` incl. `edge_laptop_*` since 17:10) |
+| Accounts | 6 users from Phase 4 + **`edge_laptop_01..03`** (drone-operator, Phase 7) |
+| Health | `smoke_public.py`: 57/57 read-only on this pod; edge checks §12.2 all pass |
+
+### 0.2 Phase status
+| Phase | Status | Where |
+|---|---|---|
+| 0–3 prepare, build | ✅ (Phase 1 extras skipped on purpose: baseline dumps, realm export) | §2–§5 |
+| 4 GHCR + RunPod | ✅ (2FA, GHCR private, secrets in password manager: confirm) | §10 |
+| 5 first boot, smoke | ✅ incl. persistence across 2 pod re-creates (MinIO marker + DB restore) | §11 |
+| 6 dashboard go-live | ✅ all roles, all pages | §11 |
+| **7 edge handoff** | ◐ sheet ready, accounts created, checks pass; **waiting**: password-manager entries, frontend PR, first edge frame | §12 |
+| 8–13 | not started | plan |
+
+### 0.3 Open items (owner)
+1. **Template** (teammate): add `DVAS_VOLUME_GB=20` (disk guard shows `?` today) and decide `DVAS_SEED_DEMO`. Both missing on
+   `4nrza3dukc231h`.
+2. **Next image** (you, when convenient): carries `c7da60c` (SSH key filter) and the cgroup-v1 CPU-quota fix (§12.3).
+   Until then, on this pod: analyzers use 8 threads each (32 OS threads) instead of 3.
+3. **Before real data:** rotate the six Phase 4 test passwords (pasted in chat 30 Oct), password manager, data-residency
+   approval (EU-NL), production DC/GPU/volume size (50–100 GB).
+4. **Security gaps logged, not fixed:** `DELETE /api/evidence/{id}` allowed for any logged-in role (incl. operators);
+   ingest `/ingest/incident` and `/ingest/model-suggestion` accept empty bodies (broadcast only, not stored);
+   old local client secret still in `dvas_edge/config/settings.yaml` on `testing` (rotate in Phase 13).
+5. Known UI gaps (§11.4): disk-guard alert not on the Ingest dashboard; Models page "H100" label/VRAM placeholders.
 
 ---
 
@@ -215,7 +251,7 @@ after the backend is up.
 
 ---
 
-## 6. What you need to do next (🧑)
+## 6. Phase 0–3 hand-off (historical, done — current open items in §0.3)
 
 > **Status 27 Oct 2026:** done. Commit `819ef2f` "runpod-v1: phases 0-3 …" is on `origin/runpod-v1` and the CI
 > workflow is in `.github/workflows/`. The build-server items below (Phase 0/1 scripts, Phase 3 build)
@@ -262,7 +298,7 @@ Then, on the Ubuntu build server:
   `PUBLIC_BASE_URL`, `VRAM_OFFLOAD_ON_STOP`, `CROWD_MAX_FPS`, `ALLOWED_ORIGINS` (ingest), `DVAS_DISK_PATH`,
   `SUPERVISOR_SOCKET`, `REACT_APP_DEPLOYMENT_TARGET`, `KC_USERS_FILE`.
 
-## 8. Open items / risks (carried forward)
+## 8. Open items / risks as of 26 Oct (current list in §0.3)
 - **Not run**: image build, `npm run build` of the cloud target, dependency resolution on the base image's
   Python (3.11 on the Ubuntu 22.04 RunPod tag, 3.12 on a 24.04 one). Paddle 2.6.2 has cp311 wheels; the cp312
   fallback is noted in `anpr.txt`.
@@ -379,7 +415,7 @@ Ubuntu 24.04 (above). Not run: a full image build (no registry access / weights 
 4. Send the Part D items (tag/digest, pod ID, data centre, vCPU/RAM, `dvas-ctl status`, `/opt/dvas-os-packages.txt`,
    bootstrap log tail, stop-vs-terminate answer). Then Phase 5 (first boot, bootstrap & smoke tests) starts.
 
-### 10.5 To record after you provision (fill in)
+### 10.5 Provisioning record (as of Phase 4; current values in §0.1)
 | Item | Value |
 |---|---|
 | Image tag / digest | `20261028-82c7456` / `sha256:5f75353d3b58c73cdcdfa2621c9f7038b630d60a054324261d87c31f910f6b57` (commit `82c7456`) |
@@ -387,8 +423,8 @@ Ubuntu 24.04 (above). Not run: a full image build (no registry access / weights 
 | Data centre / volume | EU-NL-1 · network volume `dvas-vol-test` (`jtvh8it04e`), 20 GB, Standard ($1.40/mo), MooseFS/FUSE |
 | GPU | 1 × RTX PRO 6000 (L40S not available in EU-NL-1 at deploy time) |
 | Pod ID / proxy URL | `o5vg7007ar5zk9` · https://o5vg7007ar5zk9-80.proxy.runpod.net |
-| vCPU / RAM / container disk | vCPU/RAM _to record_ (`nproc; free -g`) · container disk 50 GB (overlay, 237 MB used) |
-| Stop offered with a network volume? URL kept after Stop/Start? | restore after a restart **observed** 30 Oct (WAL timeline 2, see §10.11); Stop vs Terminate and URL _to record_ |
+| vCPU / RAM / container disk | cgroup quota 27.2 vCPU (`cpu.max` / `cpu.cfs_quota_us`), memory limit 251 GB (RTX host) / 125 GB (L40S host) · container disk 50 GB |
+| Stop offered with a network volume? URL kept after Stop/Start? | Re-create on the same volume observed twice (template changes): new pod ID + URL + SSH port each time, data restored (timelines 2, 3). Explicit Stop → Start still untested |
 
 ### 10.6 Build machine = your laptop (27 Oct 2026, later)
 - You build Part A yourself on `user-Nitro-AN515-57` (Ubuntu). Docker root is on `/` (`/dev/nvme0n1p6`, 108 GB, **47 GB free**).
@@ -745,5 +781,51 @@ The thread cap (#9) is **not** active until the new image.
 - Pushed 07:49Z: `ghcr.io/quantumweaveintelligence/dvas-runpod:20261030-d0df131`
   `sha256:24b5777e8274675e0534cad3f9ad1a8851c511e14636bf314fe23d7a20446831` (row in `RELEASES.md`). Base layers
   already existed on GHCR, so only the changed layers uploaded.
-- **Pending (teammate, RunPod console):** template image → `20261030-d0df131`, add `DVAS_VOLUME_GB=20`, decide
-  `DVAS_SEED_DEMO`. Rollback = `20261028-82c7456`. Then steps 2–4 of §11.5.
+- **Deployed** by the teammate ~16:47 IST on a new pod `4nrza3dukc231h` (L40S). Hot-patches of §11.5 are now in the image.
+  `DVAS_VOLUME_GB` / `DVAS_SEED_DEMO` were **not** added (§0.3). Rollback = `20261028-82c7456`.
+
+
+## 12. Phase 7 — edge integration handoff (30 Oct 2026, 16:45–17:30 IST)
+
+Guides: `deploy/runpod/docs/DVAS_Phase7_Edge_Handoff.md` (Part 1 = how the owner collects each item) and
+**`deploy/runpod/docs/DVAS_Edge_Integration_Sheet.md`** (Part 2 = what to send the edge developer; no secrets).
+Edge side read from the edge developer's `dvas_edge_exe_context (2).md` (repo root, untracked — **don't commit it**:
+its runbook contains a local operator password) and `origin/edge-exe-v1` (`c8e4253`).
+
+### 12.1 New pod after the template change
+The teammate deployed `20261030-d0df131`: pod **`4nrza3dukc231h`**, **L40S 46 GB**, SSH port **25676**. Old URLs 404.
+Volume restored (Postgres timeline 3); the MinIO marker written on pod `erv9019r7wxhsu` at 12:49 was still there →
+**persistence across pod re-creation proven for DB + MinIO**. Keycloak issuer follows the new URL. Smoke 57/57.
+
+### 12.2 Checks run for the handoff (public URL, from the builder's laptop)
+| Check | Result |
+|---|---|
+| CORS preflight `Origin: http://localhost:8765` on `/api/auth/login`, `/ingest/frame` | 200, `Access-Control-Allow-Origin: http://localhost:8765` (+ credentials on `/api`); foreign origin → 400 |
+| Keycloak ROPC `drone-ingest-client` for `operator_001`, `edge_laptop_01..03` | 200; access 3600 s, refresh 86 400 s; refresh grant 200 |
+| Ingest with operator/laptop tokens: mission start/end/geofence (empty body) | 422 = authorised; no token → 403 |
+| Operator (`drone_operator`) on every cloud route the edge pages call | `/api/auth/me`, `missions`, `drones`, `evidence`, `incidents`, `analytics/suggestions`, `audit-logs`, `audit-logs/verify`, `edge/status`, `edge/system-logs`, `ingest-server/streams/active` → 200; `ingest-server/status` → 403 (admin, not used by edge pages) |
+| `wss /api/ws?token=` as operator | welcome `drone_operator` |
+| `/api/push/receive` | no key 403, `DVAS_SERVICE_KEY` accepted |
+
+### 12.3 Changes
+| Change | Why |
+|---|---|
+| **SSH** (`c7da60c`): `dvas-init.sh` keeps only complete `type AAAA… comment` key lines, logs skipped ones | Builder locked out of the new pod: the key in `/workspace/dvas/secrets/authorized_keys` had been saved **wrapped over two lines**, so only a bare `ssh-ed25519` survived the filter. Fixed on the volume (1 clean key; backup `/root/authorized_keys.vol.bak`) |
+| **CPU quota on cgroup v1**: `dvas-init.sh` reads `cpu.cfs_quota_us/period_us` when `cpu.max` is absent | The L40S host is cgroup v1 → `DVAS_CPUS` fell back to 256 → 8 threads. Tested on the pod: 28 vCPU → 3 threads. **Next image** |
+| **Uploader accounts** `edge_laptop_01..03` (`@dvas.kp`, drone-operator) added to `users.json` on the volume + bootstrap re-run | One account per laptop (plan 7.1). Passwords random (22 chars), never printed; laptop copy updated |
+| **`deployment.js`**: exports the edge branch's names (`DEPLOYMENT_TARGET`, `isEdgeBuild`, `isCloudBuild`); `ALLOWED_ROLES` is always an array (all 4 roles for `all`) | Trial merge `edge-exe-v1` → `runpod-v1` conflicts in `App.js` + `deployment.js`. With the aliases, the edge `App.js`/`Login.js` work on our file (its `ALLOWED_ROLES.includes` crashed on our `null`). Behaviour of cloud/edge/all builds unchanged (tested). Frontend only; no image rebuild needed |
+| Phase 7 guide corrected | old URL; **`DVAS_SERVICE_KEY` and the cloud `EDGE_API_KEY` are not for the edge developer**: push/receive is backend↔backend (`DVAS_PEER_URL`), the edge's `EDGE_API_KEY` is local to the laptop |
+
+### 12.4 Findings for the edge developer (in the sheet)
+- `edge.env` for RunPod: token URL through the proxy path (no `:8080`), `INGEST__TLS_VERIFY=true`, uploader = `edge_laptop_NN`.
+- Add `capture_ts` to frame metadata; `frame_seq` is accepted as extra.
+- `edge_api_server.py` has a hard-coded `EDGE_API_KEY` fallback (`dvas-edge-field-secret-key`) → remove.
+- Their runbook uses the local password `Operator@001`; cloud passwords are random per volume.
+- Evidence clips stay on the laptop (no cloud upload yet).
+
+### 12.5 Still open for Phase 7 "done when"
+- [ ] Password-manager entries: client secret, `operator_001..003`, `edge_laptop_01..03` (from `~/dvas-runpod-secrets/`)
+- [ ] Sheet sent; 7.2 contract confirmed by the edge developer
+- [ ] Shared frontend PR to `testing` (our `deployment.js` + resolved `App.js`), merged into both branches
+- [ ] First frame from the edge build seen in `dvas-ctl lag` / Multi-drone view
+- [x] CORS + token/ingest checks (§12.2) · [x] uploader accounts · [x] SSH restored
