@@ -1,6 +1,6 @@
 # context_runpodv1.md — RunPod v1 implementation (Phases 0–4)
 
-> Branch: `runpod-v1` · Working copy: `/mnt/NewVolume/DVAS_RUNPODV1` · Date: 26 Oct 2026 · **Updated 30 Oct 2026 — Phases 5–6 run on the pod (§11): all checks pass with hot-patches; new image needed (§11.5)**
+> Branch: `runpod-v1` · Working copy: `/mnt/NewVolume/DVAS_RUNPODV1` · Date: 26 Oct 2026 · **Updated 30 Oct 2026 — Phases 5–6 run on the pod (§11): all checks pass; image `20261030-d0df131` pushed, template update pending (§11.6)**
 > Plan followed: `deploy/runpod/docs/DVAS_RunPod_Deployment_Plan.md` (v2, rev 3)
 > Scope delivered: **code and repository changes for Phases 0–3**. Steps that need your
 > accounts, the live local stack, Docker or a GPU (marked 🧑 below) are prepared as scripts
@@ -691,7 +691,7 @@ the pod was re-created on the same volume (container start 30 Oct 11:10). SSH IP
 | Reports | daily / weekly / utilisation generated in 0.7–3.8 s, PDF downloads |
 | Security | `/admin/*`, `/docs`, `/openapi.json`, `/minio/*` → SPA; `/realms/master`, `/api/docs`, `/edge-api/*` → 404; tokens kept out of logs |
 
-### 11.3 Findings and fixes (commits `579b1b0` + phase 6 commit; hot-patched on the pod)
+### 11.3 Findings and fixes (commits `579b1b0` + `d0df131`; hot-patched on the pod)
 | # | Finding | Fix |
 |---|---|---|
 | 1 | 🔴 `/api/ingest-server/telemetry` + `/streams/active` answered **without login** (live drone GPS, drone/mission IDs); `/frame/{id}/latest` fetched frames with the backend's service token without checking the caller | `ingest_proxy.py`: `_any_user` dependency on all three |
@@ -729,8 +729,7 @@ Changed in place (originals in `/root/*.orig-82c7456`): `/etc/dvas/nginx.conf`, 
 The thread cap (#9) is **not** active until the new image.
 
 **Next (🧑):**
-1. `git push`, then build + push a new image (guide A6–A8): `deploy/runpod/tools/build_image.sh` →
-   `GHCR_USER=adhishQWI deploy/runpod/tools/push_ghcr.sh` → commit `RELEASES.md`.
+1. ~~`git push`, build + push a new image~~ → done, §11.6.
 2. Teammate: template image → new tag, add **`DVAS_VOLUME_GB=20`** (and decide `DVAS_SEED_DEMO`); this restarts the pod.
    That restart also exercises the restore path (`pg-volume: restoring …` in the pod's Logs); the explicit B10
    **Stop → Start** is still to do: then `mc cat local/dvas-heatmaps/smoke/persistence-marker.txt` and note the URL/SSH port.
@@ -738,3 +737,13 @@ The thread cap (#9) is **not** active until the new image.
    `deploy/runpod/tools/smoke_public.py --url https://<POD_ID>-80.proxy.runpod.net --write` → expect all PASS.
 4. Before real data (unchanged from §10.12): rotate the six test passwords, secrets into the password manager,
    GHCR package private + 2FA confirmed, production DC/GPU and volume size.
+
+### 11.6 Release `20261030-d0df131` (30 Oct 2026, 13:14–13:20 IST)
+- `runpod-v1` pushed (`0fa06da..d0df131`). Build from cache in ~2 min (only the code layers changed), 23.9 GB,
+  20 GB disk left. Verified inside the image: nginx (CF-Connecting-IP, `/ingest`, log format), backend
+  `--no-access-log`, dvas-init CPU cap, pg-volume prune, `_any_user`, Keycloak service-account role, NVML GPU name.
+- Pushed 07:49Z: `ghcr.io/quantumweaveintelligence/dvas-runpod:20261030-d0df131`
+  `sha256:24b5777e8274675e0534cad3f9ad1a8851c511e14636bf314fe23d7a20446831` (row in `RELEASES.md`). Base layers
+  already existed on GHCR, so only the changed layers uploaded.
+- **Pending (teammate, RunPod console):** template image → `20261030-d0df131`, add `DVAS_VOLUME_GB=20`, decide
+  `DVAS_SEED_DEMO`. Rollback = `20261028-82c7456`. Then steps 2–4 of §11.5.
