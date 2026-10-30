@@ -74,10 +74,14 @@ for h in postgres valkey redis minio keycloak drone_nginx ingest-api backend ana
 done
 
 # ── 4) SSH: key-only, key injected by RunPod as PUBLIC_KEY ──────────────────
-if [ -n "${PUBLIC_KEY:-}" ]; then
-  mkdir -p /root/.ssh && echo "$PUBLIC_KEY" > /root/.ssh/authorized_keys
-  chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
-fi
+# Extra admin keys can be kept on the volume (survive pod re-creation, no console needed):
+#   /workspace/dvas/secrets/authorized_keys   (one public key per line)
+mkdir -p /root/.ssh
+{ [ -n "${PUBLIC_KEY:-}" ] && printf '%s\n' "$PUBLIC_KEY"
+  [ -s "$VOL/secrets/authorized_keys" ] && cat "$VOL/secrets/authorized_keys"
+} | grep -E '^(ssh-|ecdsa-|sk-)' | sort -u > /root/.ssh/authorized_keys || true
+chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
+log "SSH: $(wc -l < /root/.ssh/authorized_keys) authorized key(s)"
 ssh-keygen -A >/dev/null 2>&1 || true
 sed -i -E 's/^#?PasswordAuthentication.*/PasswordAuthentication no/; s/^#?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config || true
 

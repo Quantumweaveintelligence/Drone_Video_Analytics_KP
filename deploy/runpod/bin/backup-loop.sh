@@ -35,8 +35,17 @@ backup_once() {
 }
 
 disk_guard() {
-  local pct
-  pct="$(df --output=pcent /workspace 2>/dev/null | tail -1 | tr -dc '0-9')"
+  # RunPod network volumes are one big MooseFS cluster: `df /workspace` shows the CLUSTER
+  # (e.g. 534T, 71%), not your volume's size. With DVAS_VOLUME_GB set (template env, e.g. 20),
+  # usage is measured with du against that size instead.
+  local pct used_kb
+  if [ -n "${DVAS_VOLUME_GB:-}" ]; then
+    used_kb="$(du -sk /workspace 2>/dev/null | cut -f1)"
+    [ -n "$used_kb" ] || return 0
+    pct=$(( used_kb * 100 / (DVAS_VOLUME_GB * 1024 * 1024) ))
+  else
+    pct="$(df --output=pcent /workspace 2>/dev/null | tail -1 | tr -dc '0-9')"
+  fi
   [ -n "$pct" ] || return 0
   if [ "$pct" -ge "$DISK_WARN_PCT" ]; then
     log "WARNING: /workspace is ${pct}% full (threshold ${DISK_WARN_PCT}%) — check MinIO retention and old backups"

@@ -1,6 +1,6 @@
 # context_runpodv1.md — RunPod v1 implementation (Phases 0–4)
 
-> Branch: `runpod-v1` · Working copy: `/mnt/NewVolume/DVAS_RUNPODV1` · Date: 26 Oct 2026 · **Updated 27 Oct 2026 (Phase 4, §10)**
+> Branch: `runpod-v1` · Working copy: `/mnt/NewVolume/DVAS_RUNPODV1` · Date: 26 Oct 2026 · **Updated 30 Oct 2026 — Phase 4 functionally complete (§10.12); first RunPod deployment 29 Oct (§10.10)**
 > Plan followed: `deploy/runpod/docs/DVAS_RunPod_Deployment_Plan.md` (v2, rev 3)
 > Scope delivered: **code and repository changes for Phases 0–3**. Steps that need your
 > accounts, the live local stack, Docker or a GPU (marked 🧑 below) are prepared as scripts
@@ -382,12 +382,13 @@ Ubuntu 24.04 (above). Not run: a full image build (no registry access / weights 
 ### 10.5 To record after you provision (fill in)
 | Item | Value |
 |---|---|
-| Image tag / digest | |
-| Base image used | |
-| Data centre | |
-| Pod ID / proxy URL | |
-| vCPU / RAM / container disk | |
-| Stop offered with a network volume? URL kept after Stop/Start? | |
+| Image tag / digest | `20261028-82c7456` / `sha256:5f75353d3b58c73cdcdfa2621c9f7038b630d60a054324261d87c31f910f6b57` (commit `82c7456`) |
+| Base image used | `runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04` |
+| Data centre / volume | EU-NL-1 · network volume `dvas-vol-test` (`jtvh8it04e`), 20 GB, Standard ($1.40/mo), MooseFS/FUSE |
+| GPU | 1 × RTX PRO 6000 (L40S not available in EU-NL-1 at deploy time) |
+| Pod ID / proxy URL | `o5vg7007ar5zk9` · https://o5vg7007ar5zk9-80.proxy.runpod.net |
+| vCPU / RAM / container disk | vCPU/RAM _to record_ (`nproc; free -g`) · container disk 50 GB (overlay, 237 MB used) |
+| Stop offered with a network volume? URL kept after Stop/Start? | restore after a restart **observed** 30 Oct (WAL timeline 2, see §10.11); Stop vs Terminate and URL _to record_ |
 
 ### 10.6 Build machine = your laptop (27 Oct 2026, later)
 - You build Part A yourself on `user-Nitro-AN515-57` (Ubuntu). Docker root is on `/` (`/dev/nvme0n1p6`, 108 GB, **47 GB free**).
@@ -555,3 +556,102 @@ Ubuntu 24.04 (above). Not run: a full image build (no registry access / weights 
   "2 CACHED" in build-20261028-131927.log). Moved to the end of the Dockerfile. The next build is a full rebuild
   once; later builds reuse the cache. One-time cleanup: `docker builder prune -af` + remove the old local tags
   (all pushed). Keep the `runpod/pytorch` base image.
+
+
+### 10.10 First successful RunPod deployment (29 Oct 2026, 19:09 IST) — from `logs_29_10.txt`
+**Image:** `ghcr.io/quantumweaveintelligence/dvas-runpod:20261028-82c7456` (pushed 29 Oct 06:56Z; it carries the
+Postgres-on-container-disk + volume WAL archive design and the cache-friendly Dockerfile). The RunPod account owner
+(teammate) deployed it on pod `o5vg7007ar5zk9`, RTX PRO 6000, EU-NL-1, with volume `dvas-vol-test`.
+
+**First-boot timeline (all clean, ~60 s to bootstrap done):**
+| Time (IST) | Event |
+|---|---|
+| 19:09:50 | `gen-secrets` wrote `/workspace/dvas/secrets/dvas.env` + `users.json` (new random secrets for this volume) |
+| 19:09:50 | `pg-volume: no base backup on the volume — creating a new cluster in /var/lib/postgresql/dvas` |
+| 19:09:51 | `first boot: creating roles, databases and schema`. PostgreSQL 16.15 (PGDG, jammy) on the unix socket |
+| 19:09:52–54 | 13 analytics migrations applied (001…012). `vector` extension missing → `003_minio_reid.sql` falls back to `FLOAT4[]` (expected; embeddings are stored encrypted and matched in Python) |
+| 19:09:54 | `database bootstrap complete`. Dashboard tables are created by the backend at start |
+| 19:09:57 | `base backup complete (8.4M, start WAL 000000010000000000000002)` → `/workspace/dvas/pg/base/20261029-190954`. **The first restore point is on the network volume**, so archiving to MooseFS works |
+| 19:09:57 | `starting supervisord (public URL: https://o5vg7007ar5zk9-80.proxy.runpod.net)` |
+| 19:09:59–19:10:29 | all 18 programs RUNNING: sshd, minio, postgres (via `pg-volume.sh run`), valkey, nginx, backup, ingest, gateway, backend, crowd, person, vehicle, anpr, intrusion, vessel, anomaly, keycloak |
+| 19:10:51 | `bootstrap` exited 0 → Keycloak realm/clients/roles/users, MinIO buckets + expiry rules, migrations, partitions done |
+
+**What this proves on RunPod:** the MooseFS volume works for secrets, base backups and the WAL archive. MinIO
+starts on it (buckets were created, since bootstrap only exits 0 after `mc mb` and the ILM rules). The image runs
+on Blackwell (RTX PRO 6000): every analyzer process stayed up past its 20 s startsecs (inference not exercised yet).
+The template is correct (our entrypoint ran, not RunPod's `/start.sh`).
+
+**Logins:** the dashboard users are `admin@dvas.kp` (sys-admin), `control@dvas.kp` (control room), `senior@dvas.kp`
+(supervisor), `operator@dvas.kp`, `operator_002@kerala.police.in`, `operator_003@kerala.police.in` (drone operators).
+Passwords are random per volume and never logged. Read them inside the pod (web terminal or SSH):
+`python3 -c "import json; [print(f\"{u['email']:32} {u['password']}\") for u in json.load(open('/workspace/dvas/secrets/users.json'))]"`.
+Store `users.json` + `dvas.env` in the team password manager (B9).
+
+**Release history (`RELEASES.md`):** `20261027-ed8b02c` (seed fix) → `20261028-4d287fd` (chown attempt; FATAL on
+MooseFS) → **`20261028-82c7456` (deployed)**. Commit `d1460f4` (Postgres on container disk) was never built on its own; 82c7456 contains it plus the
+Dockerfile ARG move was added on top.
+
+**Still to do (Part D / Phase 4 "done when"):**
+1. In the pod: `dvas-ctl status`, `dvas-ctl health`, `/opt/dvas/deploy/bin/pg-volume.sh status`,
+   `cat /opt/dvas-os-packages.txt`, `df -h / /workspace`, `nvidia-smi` → record vCPU/RAM/container disk in §10.5.
+2. Log in on the proxy URL as `control@dvas.kp`. Check the dashboard loads and SSE/streams connect.
+3. B10 stop-vs-terminate test: Stop → Start the pod. Expect `pg-volume: restoring … replaying archived WAL` →
+   `recovered to …`, no `first boot` line, same passwords, data intact. Record whether the proxy URL stayed.
+4. Decide `DVAS_SEED_DEMO` for the production volume (only takes effect on an empty DB).
+5. Later: move to L40S (or keep the RTX PRO 6000) when choosing the production data centre (closer to Kerala); grow
+   the volume for production (50–100 GB; evidence never expires); optionally add `postgresql-16-pgvector`.
+
+
+### 10.11 Pod checks, 30 Oct 2026 11:14 IST (Part D outputs)
+- `dvas-ctl status`: all 18 programs RUNNING, `bootstrap EXITED` (11:11). `dvas-ctl health`: every endpoint OK
+  (nginx, ingest, backend, keycloak, minio, gateway, 7 analyzers, valkey, postgres). `curl localhost/healthz` → ok.
+- **Persistence proven on RunPod:** `pg-volume.sh status` → 2 base backups (newest `20261030-111119`), 14 archived
+  WAL files (4.4 MB gzip), `archiver: archived=5 last=00000002000000000000000C failed=0`. Timeline **2** means the
+  cluster was **restored from the volume** on this boot (the 29 Oct first boot was timeline 1). Bootstrap then took the
+  fresh base backup (flag after restore). Pod uptime ~2 min at 11:14. The passwords printed from
+  `users.json` came from the volume; gen-secrets didn't regenerate them.
+- `/opt/dvas-os-packages.txt`: `Ubuntu 22.04.5 LTS java=openjdk-21-jre-headless kv=redis-server`.
+- `df -h /`: overlay 50 GB (237 MB used). **`df -h /workspace` shows the whole MooseFS cluster** (`534T, 71%`), not
+  the 20 GB volume, so the disk guard's percentage was meaningless (and 71% heads toward its 80% warning).
+  **Fix:** `backup-loop.sh` disk_guard uses `du -sk /workspace` against a new template env **`DVAS_VOLUME_GB`** (e.g. 20).
+  `dvas-ctl disk` shows `du` used of `DVAS_VOLUME_GB` and sources `/run/dvas/runtime.env`. Guide B5 env + B9 updated.
+  (Takes effect with the next image build.)
+- `nvidia-smi`: **RTX PRO 6000 Blackwell, 97,887 MiB**, driver 595.91.07 (CUDA 13.2 driver; image CUDA 12.8). Only
+  the `person` analyzer holds GPU memory (976 MiB) at idle. The others load models lazily per stream. The image's
+  torch nightly cu128 initialises on Blackwell. Inference on real streams isn't tested yet (Phase 5).
+- **Security note:** the six test-user passwords were pasted into chat on 30 Oct. Treat them as exposed. Rotate before
+  any real data. Edit `/workspace/dvas/secrets/users.json` (new passwords), then `dvas-ctl restart bootstrap`
+  (setup_keycloak re-syncs passwords from the file), and update the password manager.
+- **Roles:** the RunPod account and console (stop/start, template, env vars, billing) belong to the teammate. The builder
+  works on the pod over **SSH** (his public key is on her account → `PUBLIC_KEY` → `authorized_keys`), using the
+  `IP:PORT -> :22` from Connect, plus the proxy URL in a browser. That's enough for Phase 5. Console actions are
+  requested from her, or she invites him to a RunPod team if the plan allows.
+- **SSH from the builder's laptop (30 Oct):** `Permission denied (publickey)` on `91.199.227.82:42603`, so his key
+  isn't in the pod's `authorized_keys` (not on her account, or added after the pod started; RunPod only injects
+  account keys at pod start). Interim: append his `.pub` in the web terminal. **Change (next image):**
+  `dvas-init.sh` builds `authorized_keys` from `PUBLIC_KEY` **plus `/workspace/dvas/secrets/authorized_keys`** on
+  the volume (deduped, logs the count), so admin keys survive pod re-creation without console access.
+
+
+### 10.12 Phase 4 status — 30 Oct 2026: functionally complete, 3 small items to close
+| "Done when" item | Status | Evidence / note |
+|---|---|---|
+| Image pushed, immutable tag, `RELEASES.md` row | ✅ | `20261028-82c7456`, `sha256:5f75353d…6b57`, commit `82c7456` (release commit `111b12d`) |
+| GHCR package private | ☐ confirm | GitHub → org → Packages → `dvas-runpod` → visibility **Private** |
+| RunPod 2FA, SSH key, `ghcr-dvas` read-only credential | ✅ / ☐ 2FA | Image pulled with `ghcr-dvas`. The builder's key was missing from the pod (no account keys at pod start) → added by hand to `/root/.ssh/authorized_keys` and `/workspace/dvas/secrets/authorized_keys`. **Add both teammates' keys under Credentials → SSH Public Keys.** 2FA: teammate confirms |
+| Network volume in the chosen data centre | ✅ (deviation) | `dvas-vol-test`, EU-NL-1, **20 GB** instead of 30. Grow before real use |
+| Template as in B5 | ✅ | our entrypoint ran; start command empty; HTTP 80 / TCP 22 / `/workspace` |
+| Pod running, Secure Cloud | ✅ (deviation) | **RTX PRO 6000 Blackwell 96 GB** instead of L40S (L40S unavailable in EU-NL-1). All 18 programs RUNNING, all health checks OK |
+| Proxy URL shows login; SSH over TCP works | ✅ | `https://o5vg7007ar5zk9-80.proxy.runpod.net`. SSH `root@91.199.227.82 -p 42603` works from the builder's laptop |
+| `dvas.env` + `users.json` copied off the pod | ✅ / ☐ | `scp` to `~/dvas-runpod-secrets/` (builder's laptop, chmod 600) on 30 Oct 12:01. **Put both into the team password manager**, keep an offline copy |
+| Stop-vs-terminate behaviour recorded | ◐ | A restart **restored the DB from the volume** (WAL timeline 2, same passwords). Still to do: explicit **Stop → Start** and **Terminate → new pod on the same volume**; note whether the URL / SSH port changes |
+
+**To close Phase 4:** (1) the B10 Stop and Terminate tests, (2) GHCR private + 2FA confirmed, (3) secrets in the
+password manager, plus `nproc; free -g` for §10.5.
+**Pending code on the laptop (commit + next build, no rush):** `dvas-init.sh` (SSH keys also from the volume),
+`backup-loop.sh` + `dvas-ctl` (`DVAS_VOLUME_GB` disk check), guide B5/B8/B9 edits. When that image is deployed,
+add `DVAS_VOLUME_GB=20` to the template.
+**Before real data:** rotate the six test passwords (they were pasted in chat on 30 Oct), decide `DVAS_SEED_DEMO`,
+pick the production data centre/GPU closer to Kerala, size the volume (50–100 GB).
+**Roles going forward:** teammate = RunPod console (pods, template, env, billing). Builder = image builds/pushes + pod
+shell over SSH + browser → can drive Phase 5 (first boot, platform bootstrap & smoke tests) from his laptop.

@@ -11,6 +11,7 @@
 set -euo pipefail
 SV=(supervisorctl -c /etc/dvas/supervisord.conf)
 BIN=/opt/dvas/deploy/bin
+[ -r /run/dvas/runtime.env ] && . /run/dvas/runtime.env 2>/dev/null || true   # DVAS_* settings from dvas-init
 VOL="${DVAS_VOLUME:-/workspace/dvas}"
 
 name_of() { case "$1" in analytics) echo "analytics:*" ;;
@@ -29,7 +30,8 @@ case "$cmd" in
       valkey-cli -h 127.0.0.1 XINFO GROUPS "$key" | paste - - | awk '{printf "   %s\n", $0}'
     done ;;
   disk)
-    df -h / /workspace 2>/dev/null
+    df -h / 2>/dev/null
+    echo "network volume used: $(du -sh /workspace 2>/dev/null | cut -f1) of ${DVAS_VOLUME_GB:-?} GB (df /workspace shows the whole RunPod cluster)"
     du -sh "$VOL"/{pg,minio,backups,engines} /var/lib/postgresql/dvas 2>/dev/null || true ;;
   backup-now) "$BIN/backup-loop.sh" --once ;;
   *) sed -n '2,11p' "$0"; exit 2 ;;

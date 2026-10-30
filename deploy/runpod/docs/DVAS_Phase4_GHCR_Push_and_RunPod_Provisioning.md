@@ -501,7 +501,7 @@ Go to **Templates** (My Templates), then **New Template**:
 | HTTP ports | **80** (label `dvas-web`). Our nginx is the only public entry point |
 | TCP ports | **22** (SSH) |
 | UDP support | **off**: nothing in DVAS uses UDP (web = HTTP on 80, SSH = TCP 22) |
-| Environment variables | `TZ` = `Asia/Kolkata`, `DVAS_DEV_MODE` = `0`, and `DVAS_SEED_DEMO` = `0` for a clean DB (leave it out on a pure test volume if you want demo missions/evidence to click through). Decide before the first start. **Don't** set `PUBLIC_BASE_URL`: it's derived from `RUNPOD_POD_ID` |
+| Environment variables | `TZ` = `Asia/Kolkata`, `DVAS_DEV_MODE` = `0`, and `DVAS_VOLUME_GB` = your volume size (e.g. `20`; `df /workspace` shows the whole RunPod storage cluster, so the disk warning needs this), `DVAS_SEED_DEMO` = `0` for a clean DB (leave it out on a pure test volume if you want demo missions/evidence to click through). Decide before the first start. **Don't** set `PUBLIC_BASE_URL`: it's derived from `RUNPOD_POD_ID` |
 
 Then click **Save Template**.
 
@@ -539,16 +539,21 @@ Then click **Save Template**.
 Open the **Connect** menu on the pod:
 
 - **HTTP Service, port 80**: `https://<POD_ID>-80.proxy.runpod.net`. This is the DVAS login page.
-- **Direct TCP Ports**: it shows something like `213.173.x.x:NNNNN -> :22`. Connect with:
+- **Direct TCP Ports**: it shows something like `213.173.x.x:NNNNN -> :22`. `<IP>` is the address and `<PORT>`
+  is the **public number before the arrow** (`NNNNN`, random per pod, e.g. 40123). It is **not** 22, which is only
+  the port inside the pod. Connect **from your own laptop** (any machine whose public key is on the RunPod account):
   ```bash
   ssh root@<IP> -p <PORT> -i ~/.ssh/id_ed25519
   ```
+  The IP and port change when a pod is re-created; look them up in **Connect** again.
   Use the **TCP** route. The "basic SSH" proxy (`ssh.runpod.io`) is designed around RunPod's own images.
 
 ### B9. Checks on the pod (Phase 4 "Done when")
 
+Run these **inside the pod** (SSH or **Connect → Web Terminal**):
 ```bash
-df -h /workspace                      # ~30 GB network volume
+du -sh /workspace; echo "$DVAS_VOLUME_GB"   # df /workspace shows the whole RunPod cluster (e.g. 534T), not your volume
+nproc; free -g                        # vCPU / RAM you actually got
 dvas-ctl status                       # every program RUNNING, bootstrap EXITED (status 0)
 cat /workspace/dvas/state/bootstrap_ok
 cat /opt/dvas-os-packages.txt         # which Postgres/Java/Valkey variant the image used
@@ -561,10 +566,13 @@ Then open the proxy URL in a browser. The DVAS login page should appear.
 **Secure the generated credentials now.** Phase 5.2 says the same, but don't wait:
 
 ```bash
-# from your machine
+# on YOUR LAPTOP (not in the pod): copies the two files from the pod to your machine over SSH
 mkdir -p ~/dvas-runpod-secrets && chmod 700 ~/dvas-runpod-secrets
 scp -P <PORT> root@<IP>:/workspace/dvas/secrets/{dvas.env,users.json} ~/dvas-runpod-secrets/
 ```
+
+No SSH from that laptop? In the pod's web terminal run `cat /workspace/dvas/secrets/dvas.env` and
+`cat /workspace/dvas/secrets/users.json` and paste the output straight into the password manager.
 
 Put both files in the team password manager and keep an offline copy. Losing `FACE_VECTOR_ENCRYPTION_KEY` makes stored face embeddings unreadable.
 
