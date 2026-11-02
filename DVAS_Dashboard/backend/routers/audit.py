@@ -17,7 +17,7 @@ from audit_service import (
     generate_audit_section65b_pdf, detect_anomalies,
     check_rate_limit, write_audit_v2,
     save_preset, list_presets, delete_preset,
-    get_audit_trends, log_audit_access,
+    get_audit_trends, get_audit_aggregate, log_audit_access,
     place_legal_hold, release_legal_hold, get_chain_of_custody,
     dry_run_purge, export_archive_bundle, execute_statutory_purge,
 )
@@ -203,6 +203,17 @@ async def audit_trends(
         return await get_audit_trends(range_val=range_val or range, user=user)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/audit-logs/aggregate")
+async def audit_aggregate(
+    user: dict = Depends(require_roles(*AUDIT_FULL_ROLES)),
+    days: int = 30,
+):
+    """Whole-log rollup by role, action and category over the last `days` days (ADM-09)."""
+    if not 1 <= days <= 366:
+        raise HTTPException(status_code=400, detail="days must be between 1 and 366")
+    return await get_audit_aggregate(days=days)
 
 
 @router.post("/audit-logs/access-log")

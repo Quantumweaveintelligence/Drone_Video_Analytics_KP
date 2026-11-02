@@ -213,3 +213,33 @@ def test_unreachable_ingest_reports_unknown_not_defaults(app_env, monkeypatch):
     assert frames["available"] is False and frames["total_frames"] is None
     trend = system_telemetry.update_trend_history(None, None)
     assert trend[-1]["cpu"] is None and len(trend) <= 24
+
+
+def test_aggregate_and_chain_of_custody(app_env):
+    seed(app_env, log_row(1, actor_role="control_room_officer"), log_row(2), log_row(3, prev_hash="h2"))
+    so = client(SENIOR)
+    agg = so.get("/api/audit-logs/aggregate", params={"days": 7}).json()
+    assert agg["total"] == 3 and {r["key"]: r["count"] for r in agg["by_role"]}["senior_officer"] == 2
+    assert so.get("/api/audit-logs/aggregate", params={"days": 0}).status_code == 400
+    assert client(CRO).get("/api/audit-logs/aggregate").status_code == 403
+    proof = so.get("/api/audit-logs/log-3/chain-of-custody").json()["cryptographic_proof"]
+    assert proof["chain_length"] == 3 and 1 <= proof["chain_position"] <= 3 and proof["is_genesis"] is False
+
+
+def test_infra_alert_ack_is_server_side(monkeypatch):
+    from routers import infra
+    audits = []
+
+    async def _audit(**kw):
+        audits.append(kw)
+    monkeypatch.setattr(infra, "write_audit_v2", _audit)
+    monkeypatch.setattr(infra, "_INFRA_ACKS", {})
+    app = FastAPI()
+    app.include_router(infra.router)
+    app.dependency_overrides[get_current_user] = lambda: ADMIN
+    c = TestClient(app)
+    assert c.post("/api/infra/alerts/alert-disk/ack").status_code == 200
+    assert infra._INFRA_ACKS["alert-disk"]["by"] == "ad@test" and audits[-1]["action"] == "infra_alert_ack"
+    assert c.post("/api/infra/alerts/whatever/ack").status_code == 404
+    app.dependency_overrides[get_current_user] = lambda: SENIOR
+    assert c.post("/api/infra/alerts/alert-disk/ack").status_code == 403

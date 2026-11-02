@@ -1416,6 +1416,22 @@ def generate_audit_section65b_pdf(items: List[dict], user: dict, filter_desc: st
 # Activity Trend & Analytics
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def get_audit_aggregate(days: int = 30) -> dict:
+    """Counts over every audit entry of the last `days` days, grouped in the database."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    out = {"days": days, "since": since}
+    async with async_session_factory() as session:
+        out["total"] = (await session.execute(
+            select(func.count(AuditLog.id)).where(AuditLog.ts >= since))).scalar_one()
+        for key, col in (("by_role", AuditLog.actor_role), ("by_action", AuditLog.action),
+                         ("by_category", AuditLog.category)):
+            rows = (await session.execute(
+                select(col, func.count(AuditLog.id)).where(AuditLog.ts >= since)
+                .group_by(col).order_by(func.count(AuditLog.id).desc()).limit(50))).all()
+            out[key] = [{"key": k or "—", "count": n} for k, n in rows]
+    return out
+
+
 async def get_audit_trends(range_val: str = "24h", user: Optional[dict] = None) -> dict:
     """Compute hourly or daily activity trend histograms and top actor stats.
 
@@ -1652,10 +1668,15 @@ async def get_chain_of_custody(log_id: str) -> dict:
             )
         )
         hold = hold_res.scalar_one_or_none()
+        chain_position = (await session.execute(
+            select(func.count(AuditLog.id)).where(AuditLog.ts <= log.ts))).scalar_one()
+        chain_length = (await session.execute(select(func.count(AuditLog.id)))).scalar_one()
 
     doc = _row_to_dict(log, legal_hold={
         "case_number": hold.case_number,
         "hold_reason": hold.hold_reason,
+        "legal_authority": hold.legal_authority,
+        "contact_email": hold.contact_email,
         "placed_by": hold.placed_by_name or hold.placed_by,
         "placed_at": hold.placed_at,
     } if hold else None)
@@ -1687,6 +1708,9 @@ async def get_chain_of_custody(log_id: str) -> dict:
             "previous_hash_sha256": log.prev_hash,
             "expected_hash_sha256": expected_hash,
             "hash_matches_content": is_valid,
+            "chain_position": chain_position,
+            "chain_length": chain_length,
+            "is_genesis": not log.prev_hash,
             "chain_algorithm": "SHA-256 Merkle Chain",
             "statutory_compliance": "Indian Evidence Act Section 65B(4)",
             "certifying_authority": "Kerala Police Department - DVAS Command Centre",

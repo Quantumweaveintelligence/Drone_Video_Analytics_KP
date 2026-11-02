@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useCommand } from "@/context/CommandContext";
 import { useAuth } from "@/context/AuthContext";
 import {
@@ -16,7 +17,8 @@ export default function MissionsPage() {
   const { missions, generateMissionReport, generatingReport } = useCommand();
   const { user } = useAuth();
   const isSenior = user?.role === "senior_officer";
-  const [filter, setFilter] = useState("");
+  const [searchParams] = useSearchParams();
+  const [filter, setFilter] = useState(() => searchParams.get("q") || "");
 
   const filtered = (missions || []).filter(m => {
     if (!filter) return true;

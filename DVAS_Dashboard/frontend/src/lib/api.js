@@ -46,6 +46,30 @@ export const downloadSigned = async (kind, id, role) => {
   window.location.assign(`${BACKEND_URL}${res.data.url}`);
 };
 
+/** Fetch a file through the API (cookie auth) and save it under `filename`. */
+export const downloadBlob = async (path, params = {}, filename = "download") => {
+  const res = await api.get(path, { params, responseType: "blob" });
+  const cd = res.headers?.["content-disposition"] || "";
+  const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+  const url = URL.createObjectURL(res.data);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = m ? decodeURIComponent(m[1]) : filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
+/** Human-readable message from an API error (FastAPI 422 details are arrays of objects). */
+export const apiError = (err, fallback = "Request failed") => {
+  const d = err?.response?.data?.detail;
+  if (typeof d === "string") return d;
+  if (Array.isArray(d)) return d.map(x => x?.msg || JSON.stringify(x)).join("; ");
+  if (d && typeof d === "object") return d.message || JSON.stringify(d);
+  return err?.message || fallback;
+};
+
 export const getAuthHeaders = () => {
   const token = getAuthToken();
   return token ? { Authorization: `Bearer ${token}` } : {};

@@ -34,7 +34,7 @@ import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom';
 import AppShell from '@/components/layout/AppShell';
 import { useAuth } from '@/context/AuthContext';
-import { api, API } from '@/lib/api';
+import { api, API, apiError, downloadBlob } from '@/lib/api';
 import { useDvasSocket } from '@/lib/useDvasSocket';
 import {
   Search, Filter, Download, X, ChevronLeft, ChevronRight,
@@ -619,7 +619,9 @@ function RelatedEventsTimeline({ correlationId, sessionId, currentLogId, onSelec
 function ActivityTrendsChart({ range, onRangeChange, trendsData, loading }) {
   const timeline = trendsData?.timeline || [];
   const topActors = trendsData?.top_actors || [];
-  const severities = trendsData?.severity_distribution || [];
+  // Backend: by_severity {critical, warning, info}, total_scanned, top_actors[{actor, role, count}] (AUD-02)
+  const severities = Object.entries(trendsData?.by_severity || {}).map(([severity, count]) => ({ severity, count }));
+  const totalEvents = trendsData?.total_scanned || 0;
 
   return (
     <div
@@ -708,7 +710,7 @@ function ActivityTrendsChart({ range, onRangeChange, trendsData, loading }) {
                       fontSize: 11,
                     }}
                   />
-                  <Area type="monotone" dataKey="count" name="Total Events" stroke="#38bdf8" strokeWidth={2} fillOpacity={1} fill="url(#colorCount)" />
+                  <Area type="monotone" dataKey="total" name="Total Events" stroke="#38bdf8" strokeWidth={2} fillOpacity={1} fill="url(#colorCount)" />
                   <Area type="monotone" dataKey="failed" name="Failed Actions" stroke="#ef4444" strokeWidth={2} fillOpacity={1} fill="url(#colorFailed)" />
                 </AreaChart>
               </ResponsiveContainer>
@@ -730,7 +732,7 @@ function ActivityTrendsChart({ range, onRangeChange, trendsData, loading }) {
                 <div key={i} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 11, marginBottom: 6 }}>
                   <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '70%', color: 'var(--dvas-text)' }}>
                     <span style={{ fontFamily: 'JetBrains Mono, monospace', color: 'var(--dvas-text-dim)', marginRight: 6 }}>#{i + 1}</span>
-                    {act.name || act.email || 'Officer'}
+                    {act.actor || '—'}
                   </div>
                   <span style={{ fontFamily: 'JetBrains Mono, monospace', fontWeight: 600, color: 'var(--dvas-blue)' }}>
                     {act.count} ev
@@ -744,12 +746,11 @@ function ActivityTrendsChart({ range, onRangeChange, trendsData, loading }) {
           <div style={{ background: 'var(--dvas-surface-2)', padding: 10, borderRadius: 8, border: '1px solid var(--dvas-border)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, fontWeight: 600, color: 'var(--dvas-text-dim)', marginBottom: 4 }}>
               <span>SEVERITY BREAKDOWN</span>
-              <span>{trendsData?.total_events || 0} TOTAL</span>
+              <span>{totalEvents} TOTAL</span>
             </div>
             <div style={{ display: 'flex', height: 6, borderRadius: 3, overflow: 'hidden', gap: 2 }}>
-              {severities.map((s) => {
-                const total = trendsData?.total_events || 1;
-                const pct = Math.max(5, Math.round((s.count / total) * 100));
+              {severities.filter((s) => s.count > 0).map((s) => {
+                const pct = Math.max(5, Math.round((s.count / (totalEvents || 1)) * 100));
                 const col = s.severity === 'critical' ? '#ef4444' : s.severity === 'warning' ? '#f59e0b' : '#38bdf8';
                 return (
                   <div
@@ -775,6 +776,7 @@ function ChainOfCustodyModal({ log, isOpen, onClose, timezone }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
+  const [loadError, setLoadError] = useState('');
 
   useEffect(() => {
     if (!isOpen || !log) return;
@@ -782,10 +784,11 @@ function ChainOfCustodyModal({ log, isOpen, onClose, timezone }) {
     async function loadProof() {
       try {
         setLoading(true);
+        setLoadError('');
         const res = await api.get(`/audit-logs/${log.id}/chain-of-custody`);
         if (active) setData(res.data);
       } catch (err) {
-        console.error('Failed to load chain of custody:', err);
+        if (active) { setData(null); setLoadError(apiError(err, 'Could not load the proof')); }
       } finally {
         if (active) setLoading(false);
       }
@@ -795,6 +798,12 @@ function ChainOfCustodyModal({ log, isOpen, onClose, timezone }) {
   }, [isOpen, log]);
 
   if (!isOpen || !log) return null;
+
+  // AUD-05: the backend returns cryptographic_proof.*; no proof loaded ≠ tampered
+  const proof = data?.cryptographic_proof || {};
+  const verified = proof.hash_matches_content === true;
+  const unknown = !data;
+  const bannerOk = verified && !unknown;
 
   const handleCopyProof = () => {
     if (!data) return;
@@ -848,18 +857,20 @@ function ChainOfCustodyModal({ log, isOpen, onClose, timezone }) {
                 padding: '12px 16px',
                 borderRadius: 8,
                 marginBottom: 16,
-                background: data?.verification?.is_valid ? 'var(--dvas-safe-bg)' : 'var(--dvas-crit-bg)',
-                border: `1px solid ${data?.verification?.is_valid ? 'rgba(52,211,153,0.3)' : 'rgba(239,68,68,0.3)'}`,
+                background: bannerOk ? 'var(--dvas-safe-bg)' : unknown ? 'var(--dvas-elev)' : 'var(--dvas-crit-bg)',
+                border: `1px solid ${bannerOk ? 'rgba(52,211,153,0.3)' : unknown ? 'var(--dvas-border)' : 'rgba(239,68,68,0.3)'}`,
                 display: 'flex',
                 alignItems: 'center',
                 gap: 10,
               }}
             >
-              {data?.verification?.is_valid ? <CheckCircle size={18} style={{ color: 'var(--dvas-safe)' }} /> : <AlertTriangle size={18} style={{ color: 'var(--dvas-crit)' }} />}
-              <div style={{ fontSize: 12, fontWeight: 600, color: data?.verification?.is_valid ? 'var(--dvas-safe)' : 'var(--dvas-crit)' }}>
-                {data?.verification?.is_valid
-                  ? 'Cryptographic Chain Integrity VERIFIED (Immutable & Tamper-Free)'
-                  : 'INTEGRITY ALERT: Hash mismatch detected on this record'}
+              {bannerOk ? <CheckCircle size={18} style={{ color: 'var(--dvas-safe)' }} /> : <AlertTriangle size={18} style={{ color: unknown ? 'var(--dvas-warn)' : 'var(--dvas-crit)' }} />}
+              <div style={{ fontSize: 12, fontWeight: 600, color: bannerOk ? 'var(--dvas-safe)' : unknown ? 'var(--dvas-warn)' : 'var(--dvas-crit)' }}>
+                {unknown
+                  ? `Integrity not verified: ${loadError || 'no proof returned'}`
+                  : bannerOk
+                    ? 'Record hash matches its content (SHA-256 verified)'
+                    : 'INTEGRITY ALERT: stored hash does not match this record'}
               </div>
             </div>
 
@@ -873,7 +884,7 @@ function ChainOfCustodyModal({ log, isOpen, onClose, timezone }) {
                 <div>
                   <div style={{ color: 'var(--dvas-text-dim)', fontSize: 10 }}>CHAIN POSITION</div>
                   <div style={{ color: 'var(--dvas-text)', fontWeight: 600, fontFamily: 'JetBrains Mono, monospace' }}>
-                    #{data?.chain_index || 0} of {data?.total_chain_entries || '—'}
+                    {proof.chain_position ? `#${proof.chain_position} of ${proof.chain_length}` : '—'}
                   </div>
                 </div>
               </div>
@@ -881,14 +892,14 @@ function ChainOfCustodyModal({ log, isOpen, onClose, timezone }) {
               <div style={{ marginBottom: 8 }}>
                 <div style={{ color: 'var(--dvas-text-dim)', fontSize: 10 }}>CURRENT RECORD SHA-256 HASH</div>
                 <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 10, color: 'var(--dvas-blue)', wordBreak: 'break-all', background: 'var(--dvas-elev)', padding: '6px 8px', borderRadius: 4, marginTop: 2 }}>
-                  {data?.hash || log.hash || '—'}
+                  {proof.current_hash_sha256 || log.hash || '—'}
                 </div>
               </div>
 
               <div>
                 <div style={{ color: 'var(--dvas-text-dim)', fontSize: 10 }}>PREVIOUS LINKED SHA-256 HASH</div>
                 <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 10, color: 'var(--dvas-text-muted)', wordBreak: 'break-all', background: 'var(--dvas-elev)', padding: '6px 8px', borderRadius: 4, marginTop: 2 }}>
-                  {data?.prev_hash || log.prev_hash || (data?.is_genesis ? 'GENESIS_BLOCK (Initial Ledger Seed)' : '—')}
+                  {proof.previous_hash_sha256 || log.prev_hash || (proof.is_genesis ? 'GENESIS (first entry of the chain)' : '—')}
                 </div>
               </div>
             </div>
@@ -910,7 +921,7 @@ function ChainOfCustodyModal({ log, isOpen, onClose, timezone }) {
                   <Lock size={14} /> ACTIVE LEGAL HOLD PRESERVATION
                 </div>
                 <div style={{ color: 'var(--dvas-text)' }}>
-                  Case No: <strong>{data.legal_hold.case_number}</strong> · Authority: {data.legal_hold.legal_authority}
+                  Case No: <strong>{data.legal_hold.case_number}</strong> · Authority: {data.legal_hold.legal_authority || '—'}
                 </div>
                 <div style={{ color: 'var(--dvas-text-muted)', marginTop: 2 }}>
                   Placed by: {data.legal_hold.placed_by} on {formatTimestamp(data.legal_hold.placed_at, timezone)}
@@ -992,7 +1003,7 @@ function LegalHoldModal({ log, isOpen, onClose, onHoldUpdated, timezone }) {
       if (onHoldUpdated) onHoldUpdated();
       onClose();
     } catch (err) {
-      setErrorMsg(err.response?.data?.detail || 'Failed to place legal hold.');
+      setErrorMsg(apiError(err, 'Failed to place legal hold.'));
     } finally {
       setSubmitting(false);
     }
@@ -1015,7 +1026,7 @@ function LegalHoldModal({ log, isOpen, onClose, onHoldUpdated, timezone }) {
       if (onHoldUpdated) onHoldUpdated();
       onClose();
     } catch (err) {
-      setErrorMsg(err.response?.data?.detail || 'Failed to release legal hold.');
+      setErrorMsg(apiError(err, 'Failed to release legal hold.'));
     } finally {
       setSubmitting(false);
     }
@@ -1189,8 +1200,9 @@ function LegalHoldModal({ log, isOpen, onClose, onHoldUpdated, timezone }) {
   );
 }
 
-function RetentionPolicyModal({ isOpen, onClose }) {
+function RetentionPolicyModal({ isOpen, onClose, policy }) {
   if (!isOpen) return null;
+  const days = policy?.retention_period_days;
 
   return (
     <div style={{ position: 'fixed', inset: 0, zIndex: 120, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.7)' }}>
@@ -1219,9 +1231,13 @@ function RetentionPolicyModal({ isOpen, onClose }) {
 
         <div style={{ fontSize: 12, color: 'var(--dvas-text)', lineHeight: 1.6, display: 'flex', flexDirection: 'column', gap: 12 }}>
           <div style={{ background: 'var(--dvas-surface-2)', padding: 12, borderRadius: 8, border: '1px solid var(--dvas-border)' }}>
-            <div style={{ fontWeight: 700, color: 'var(--dvas-blue)', marginBottom: 2 }}>Statutory 365-Day Operational Window</div>
+            <div style={{ fontWeight: 700, color: 'var(--dvas-blue)', marginBottom: 2 }}>
+              {days ? `${days}-day retention window (enforced)` : 'Retention window unavailable'}
+            </div>
             <div style={{ fontSize: 11, color: 'var(--dvas-text-muted)' }}>
-              In compliance with the Digital Personal Data Protection Act (DPDPA) 2023 and Kerala Police IT Standing Orders, audit records are retained for an active statutory window of 365 calendar days.
+              Audit records younger than {days || '—'} days cannot be archived or purged (statutory floor 365 days; set in Admin → System settings).
+              {' '}Basis: {(policy?.legal_compliance || []).join('; ') || '—'}.
+              {' '}Last purge: {policy?.last_purge_date ? formatTimestamp(policy.last_purge_date, 'IST') : 'never'}. Purges are manual only.
             </div>
           </div>
 
@@ -1272,6 +1288,19 @@ function ArchiveAndPurgeModal({ isOpen, onClose, onPurged, timezone }) {
   const [executingPurge, setExecutingPurge] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [purgeSuccess, setPurgeSuccess] = useState(null);
+  const [minDays, setMinDays] = useState(365);
+
+  // AUD-07: thresholds below the enforced audit retention (Admin → System settings) are not offered
+  useEffect(() => {
+    if (!isOpen) return;
+    api.get('/audit-logs/retention-policy')
+      .then(({ data }) => {
+        const d = Number(data?.retention_period_days) || 365;
+        setMinDays(d);
+        setThresholdDays((cur) => Math.max(cur, d));
+      })
+      .catch(() => {});
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -1284,7 +1313,7 @@ function ArchiveAndPurgeModal({ isOpen, onClose, onPurged, timezone }) {
       });
       setDryRunData(data);
     } catch (err) {
-      setErrorMsg(err.response?.data?.detail || 'Dry run preview failed.');
+      setErrorMsg(apiError(err, 'Dry run preview failed.'));
     } finally {
       setRunningDryRun(false);
     }
@@ -1294,15 +1323,11 @@ function ArchiveAndPurgeModal({ isOpen, onClose, onPurged, timezone }) {
     try {
       setDownloadingArchive(true);
       setErrorMsg('');
-      const response = await api.get(`/audit-logs/archive/export?older_than_days=${thresholdDays}`, { responseType: 'blob' });
-      const blob = new Blob([response.data], { type: 'application/gzip' });
-      const link = document.createElement('a');
-      link.href = URL.createObjectURL(blob);
-      link.download = `dvas_audit_archive_${new Date().toISOString().slice(0, 10)}.tar.gz`;
-      link.click();
+      await downloadBlob('/audit-logs/archive/export', { older_than_days: thresholdDays },
+        `dvas_audit_archive_${thresholdDays}d.json`);
       setArchiveDownloaded(true);
     } catch (err) {
-      setErrorMsg('Failed to download pre-purge archive bundle.');
+      setErrorMsg(apiError(err, 'Failed to download pre-purge archive bundle.'));
     } finally {
       setDownloadingArchive(false);
     }
@@ -1324,7 +1349,7 @@ function ArchiveAndPurgeModal({ isOpen, onClose, onPurged, timezone }) {
       setPurgeSuccess(data);
       if (onPurged) onPurged();
     } catch (err) {
-      setErrorMsg(err.response?.data?.detail || 'Statutory purge execution failed.');
+      setErrorMsg(apiError(err, 'Statutory purge execution failed.'));
     } finally {
       setExecutingPurge(false);
     }
@@ -1371,7 +1396,7 @@ function ArchiveAndPurgeModal({ isOpen, onClose, onPurged, timezone }) {
             <div style={{ padding: '16px', background: 'var(--dvas-safe-bg)', border: '1px solid rgba(52,211,153,0.3)', borderRadius: 8, color: 'var(--dvas-safe)', fontSize: 12, marginBottom: 16 }}>
               <div style={{ fontWeight: 700, marginBottom: 4 }}>Statutory Purge Complete</div>
               <div>Successfully purged {purgeSuccess.purged_count} records older than {thresholdDays} days.</div>
-              <div>Protected {purgeSuccess.protected_by_legal_hold || 0} active legal hold records.</div>
+              <div>Preserved {dryRunData?.legal_held_records_preserved ?? 0} records under active legal hold.</div>
             </div>
             <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
               <button
@@ -1399,9 +1424,9 @@ function ArchiveAndPurgeModal({ isOpen, onClose, onPurged, timezone }) {
                   }}
                   style={{ padding: '6px 12px', fontSize: 12, background: 'var(--dvas-elev)', border: '1px solid var(--dvas-border)', borderRadius: 8, color: 'var(--dvas-text)', outline: 'none' }}
                 >
-                  <option value={365}>365 Days (Statutory 1 Year - Recommended)</option>
-                  <option value={180}>180 Days (6 Months)</option>
-                  <option value={730}>730 Days (2 Years)</option>
+                  {[...new Set([minDays, 365, 730, 1095])].filter((d) => d >= minDays).sort((a, b) => a - b).map((d) => (
+                    <option key={d} value={d}>{d} days{d === minDays ? ' (minimum enforced)' : ''}</option>
+                  ))}
                 </select>
                 <button
                   onClick={handleRunDryRun}
@@ -1423,19 +1448,19 @@ function ArchiveAndPurgeModal({ isOpen, onClose, onPurged, timezone }) {
                   <div style={{ background: 'var(--dvas-elev)', padding: 8, borderRadius: 6 }}>
                     <div style={{ fontSize: 10, color: 'var(--dvas-text-dim)' }}>CANDIDATES</div>
                     <div style={{ fontSize: 16, fontWeight: 700, fontFamily: 'JetBrains Mono, monospace', color: 'var(--dvas-text)' }}>
-                      {dryRunData.total_candidates}
+                      {dryRunData.total_records_in_window}
                     </div>
                   </div>
                   <div style={{ background: 'var(--dvas-elev)', padding: 8, borderRadius: 6 }}>
                     <div style={{ fontSize: 10, color: 'var(--dvas-warn)' }}>LEGAL HOLDS (SHIELDED)</div>
                     <div style={{ fontSize: 16, fontWeight: 700, fontFamily: 'JetBrains Mono, monospace', color: 'var(--dvas-warn)' }}>
-                      {dryRunData.protected_by_legal_hold}
+                      {dryRunData.legal_held_records_preserved}
                     </div>
                   </div>
                   <div style={{ background: 'var(--dvas-elev)', padding: 8, borderRadius: 6 }}>
                     <div style={{ fontSize: 10, color: 'var(--dvas-crit)' }}>NET DELETABLE</div>
                     <div style={{ fontSize: 16, fontWeight: 700, fontFamily: 'JetBrains Mono, monospace', color: 'var(--dvas-crit)' }}>
-                      {dryRunData.net_purgeable}
+                      {dryRunData.purgeable_records_count}
                     </div>
                   </div>
                 </div>
@@ -1446,7 +1471,7 @@ function ArchiveAndPurgeModal({ isOpen, onClose, onPurged, timezone }) {
                     3. Mandatory Pre-Purge Archive Download
                   </div>
                   <div style={{ fontSize: 11, color: 'var(--dvas-text-muted)', marginBottom: 8 }}>
-                    Before database records can be purged, you must generate and preserve the signed archive export.
+                    Before database records can be purged, download and preserve the JSON archive; it carries a SHA-256 checksum of its records.
                   </div>
                   <button
                     onClick={handleDownloadArchive}
@@ -1466,7 +1491,7 @@ function ArchiveAndPurgeModal({ isOpen, onClose, onPurged, timezone }) {
                     }}
                   >
                     {archiveDownloaded ? <Check size={13} /> : <Download size={13} />}
-                    {archiveDownloaded ? 'Archive Downloaded & Verified' : downloadingArchive ? 'Packaging Archive…' : 'Download Signed Archive (.tar.gz)'}
+                    {archiveDownloaded ? 'Archive downloaded (JSON + SHA-256 manifest)' : downloadingArchive ? 'Packaging archive…' : 'Download archive (.json, SHA-256 manifest)'}
                   </button>
                 </div>
               </div>
@@ -1479,7 +1504,7 @@ function ArchiveAndPurgeModal({ isOpen, onClose, onPurged, timezone }) {
                   4. Irreversible Confirmation
                 </div>
                 <div style={{ fontSize: 11, color: 'var(--dvas-text)', marginBottom: 8 }}>
-                  To finalize statutory deletion of {dryRunData?.net_purgeable || 0} records, type: <strong>CONFIRM STATUTORY PURGE</strong>
+                  To finalize statutory deletion of {dryRunData?.purgeable_records_count || 0} records, type: <strong>CONFIRM STATUTORY PURGE</strong>
                 </div>
                 <input
                   type="text"
@@ -1662,6 +1687,11 @@ export default function AuditLogPage() {
 
   // KPIs, Anomaly Alerts & Trends
   const [summary, setSummary] = useState({ total_events: 0, failed_actions: 0, critical_events: 0, warnings: 0, active_legal_holds: 0 });
+  // AUD-09: retention shown from the enforced policy, not static text
+  const [retentionPolicy, setRetentionPolicy] = useState(null);
+  useEffect(() => {
+    api.get('/audit-logs/retention-policy').then(({ data }) => setRetentionPolicy(data)).catch(() => setRetentionPolicy(null));
+  }, []);
   const [chainStatus, setChainStatus] = useState(null);
   const [verifyingChain, setVerifyingChain] = useState(false);
   const [anomaliesData, setAnomaliesData] = useState([]);
@@ -1774,7 +1804,7 @@ export default function AuditLogPage() {
   const fetchTrends = useCallback(async (rangeVal) => {
     try {
       setTrendsLoading(true);
-      const { data } = await api.get(`/audit-logs/trends?range_val=${rangeVal}`);
+      const { data } = await api.get('/audit-logs/trends', { params: { range: rangeVal } });
       setTrendsData(data);
     } catch (err) {
       console.error('Trends fetch error:', err);
@@ -1826,7 +1856,7 @@ export default function AuditLogPage() {
     } catch (err) {
       console.error('Audit query error:', err);
       const status = err?.response?.status;
-      const detail = err?.response?.data?.detail || err?.message || 'Failed to communicate with the Audit API service';
+      const detail = apiError(err, 'Failed to communicate with the Audit API service');
       setQueryError({ status, detail });
       setLogs([]);
     } finally {
@@ -1998,14 +2028,23 @@ export default function AuditLogPage() {
     setRowTabMap((prev) => ({ ...prev, [id]: tab }));
   };
 
-  // Target resource deep navigator
+  // AUD-11: target resource deep links (only to pages this role can open; SA has no Command access)
+  const resourceLink = (targetType, targetId) => {
+    const type = (targetType || '').toLowerCase();
+    const q = targetId ? `?q=${encodeURIComponent(targetId)}` : '';
+    const isSenior = authUser?.role === 'senior_officer';
+    if (type === 'user' && authUser?.role === 'system_administrator') return '/admin';
+    if (!isSenior) return null;
+    if (type === 'mission') return `/command/missions${q}`;
+    if (type === 'evidence') return `/command/evidence${q}`;
+    if (type === 'export') return `/command/exports${q}`;
+    if (type === 'case') return `/command/cases${q}`;
+    if (type === 'report') return '/command/reports';
+    return null;
+  };
   const handleNavigateResource = (targetType, targetId) => {
-    if (!targetType) return;
-    const type = targetType.toLowerCase();
-    if (type === 'user') navigate('/admin');
-    else if (type === 'mission' || type === 'drone') navigate('/command');
-    else if (type === 'evidence' || type === 'export') navigate('/admin');
-    else navigate('/admin');
+    const to = resourceLink(targetType, targetId);
+    if (to) navigate(to);
   };
 
   // Preset Application
@@ -2189,7 +2228,15 @@ export default function AuditLogPage() {
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <button
-              onClick={() => setSelectedSeverities(['critical', 'warning'])}
+              onClick={() => {
+                // AUD-13: narrow the list to the window the detected anomalies cover
+                const firsts = anomaliesData.map((a) => a.first_seen).filter(Boolean).sort();
+                const lasts = anomaliesData.map((a) => a.last_seen).filter(Boolean).sort();
+                setSelectedSeverities([...new Set(anomaliesData.map((a) => a.severity).filter(Boolean))].concat(['critical', 'warning'])
+                  .filter((v, i, arr) => arr.indexOf(v) === i));
+                if (firsts.length) setDateFrom(firsts[0].slice(0, 19));
+                if (lasts.length) setDateTo(lasts[lasts.length - 1].slice(0, 19));
+              }}
               style={{
                 fontSize: 11,
                 fontWeight: 600,
@@ -2238,7 +2285,7 @@ export default function AuditLogPage() {
             </span>
           </span>
           <span style={{ fontSize: 10, padding: '2px 8px', borderRadius: 999, background: 'var(--dvas-elev)', color: 'var(--dvas-text-muted)', border: '1px solid var(--dvas-border)' }}>
-            Jurisdiction: {authUser?.jurisdiction || 'State HQ (Kerala)'}
+            Jurisdiction: {authUser?.jurisdiction || (authUser?.role === 'senior_officer' || authUser?.role === 'system_administrator' ? 'All districts' : '—')}
           </span>
         </div>
 
@@ -2356,7 +2403,7 @@ export default function AuditLogPage() {
           {/* Retention Policy Pill */}
           <button
             onClick={() => setIsRetentionModalOpen(true)}
-            title="View Statutory 365-Day Retention & DPDPA Policy"
+            title="View the enforced audit retention policy"
             style={{
               display: 'flex',
               alignItems: 'center',
@@ -2372,7 +2419,7 @@ export default function AuditLogPage() {
             }}
           >
             <Clock size={12} style={{ color: 'var(--dvas-blue)' }} />
-            Retention: 365 Days · IEA 65B & DPDPA
+            Retention: {retentionPolicy?.retention_period_days ? `${retentionPolicy.retention_period_days} days` : '—'} · BSA s.63 & DPDPA
           </button>
 
           {/* Super-Admin Archive & Purge Button */}
@@ -3174,7 +3221,7 @@ export default function AuditLogPage() {
                           {log.target_name || log.target ? (
                             <span
                               onClick={(e) => {
-                                if (log.target_type) {
+                                if (resourceLink(log.target_type, log.target_id)) {
                                   e.stopPropagation();
                                   handleNavigateResource(log.target_type, log.target_id);
                                 }
@@ -3185,10 +3232,10 @@ export default function AuditLogPage() {
                                 gap: 4,
                                 fontFamily: 'JetBrains Mono, monospace',
                                 fontSize: 11,
-                                color: log.target_type ? 'var(--dvas-blue)' : 'var(--dvas-text)',
-                                textDecoration: log.target_type ? 'underline' : 'none',
+                                color: resourceLink(log.target_type, log.target_id) ? 'var(--dvas-blue)' : 'var(--dvas-text)',
+                                textDecoration: resourceLink(log.target_type, log.target_id) ? 'underline' : 'none',
                                 textUnderlineOffset: 3,
-                                cursor: log.target_type ? 'pointer' : 'default',
+                                cursor: resourceLink(log.target_type, log.target_id) ? 'pointer' : 'default',
                                 overflow: 'hidden',
                                 textOverflow: 'ellipsis',
                                 whiteSpace: 'nowrap',
@@ -3834,6 +3881,7 @@ export default function AuditLogPage() {
       <RetentionPolicyModal
         isOpen={isRetentionModalOpen}
         onClose={() => setIsRetentionModalOpen(false)}
+        policy={retentionPolicy}
       />
 
       <ArchiveAndPurgeModal

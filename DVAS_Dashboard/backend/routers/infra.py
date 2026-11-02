@@ -42,6 +42,10 @@ class WorkerSyncIn(BaseModel):
 
 
 
+# alert id → {"by", "at"}; cleared when the alert no longer fires
+_INFRA_ACKS: dict = {}
+
+
 @router.get("/infra/health")
 async def infra_health(user: dict = Depends(require_roles("system_administrator"))):
     """Infrastructure health for sub-tabs (Feeds, GPU, Queue, Alerts) using real data."""
@@ -127,7 +131,29 @@ async def infra_health(user: dict = Depends(require_roles("system_administrator"
             "ts": now.isoformat(),
         })
 
+    # ING-01: acknowledgements are kept server-side until the condition clears
+    current = {a["id"] for a in alerts_infra}
+    for stale in set(_INFRA_ACKS) - current:
+        _INFRA_ACKS.pop(stale, None)
+    for a in alerts_infra:
+        ack = _INFRA_ACKS.get(a["id"])
+        a["acknowledged_by"] = ack["by"] if ack else None
+        a["acknowledged_at"] = ack["at"] if ack else None
+
     return {"feeds": feeds, "gpu": gpu, "queue": queue, "alerts": alerts_infra}
+
+
+@router.post("/infra/alerts/{alert_id}/ack")
+async def ack_infra_alert(alert_id: str, request: Request,
+                          user: dict = Depends(require_roles("system_administrator"))):
+    if not alert_id.startswith("alert-") or len(alert_id) > 64:
+        raise HTTPException(404, "Unknown infrastructure alert")
+    at = datetime.now(timezone.utc).isoformat()
+    _INFRA_ACKS[alert_id] = {"by": user.get("email"), "at": at}
+    await write_audit_v2(actor=user, action="infra_alert_ack", category="operations", target=alert_id,
+                         target_type="system", target_id=alert_id, details="Infrastructure alert acknowledged",
+                         source_endpoint="POST /api/infra/alerts/{id}/ack", request=request)
+    return {"ok": True, "id": alert_id, "acknowledged_at": at}
 
 
 # ---------- Detection Models (GPU) ----------

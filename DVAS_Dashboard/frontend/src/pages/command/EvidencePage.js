@@ -1,4 +1,5 @@
-import React, { useRef, useState, useMemo } from "react";
+import React, { useEffect, useRef, useState, useMemo } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useCommand } from "@/context/CommandContext";
 import { useAuth } from "@/context/AuthContext";
 import EvidenceImage from "@/components/EvidenceImage";
@@ -57,6 +58,17 @@ export default function EvidencePage() {
 
   const evidenceFiltersRef = useRef(evidenceFilters);
   evidenceFiltersRef.current = evidenceFilters;
+
+  // Deep link from the Audit page: /command/evidence?q=<evidence id>
+  const [searchParams] = useSearchParams();
+  const deepQuery = searchParams.get("q") || "";
+  useEffect(() => {
+    if (!deepQuery) return;
+    const f = { ...evidenceFiltersRef.current, search: deepQuery };
+    setEvidenceFilters(f);
+    loadFilteredEvidence(f);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deepQuery]);
 
   const groupedEvidence = useMemo(() => {
     const groups = {};

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import AppShell from "@/components/layout/AppShell";
-import { api, ROLE_LABELS } from "@/lib/api";
+import { api, apiError, ROLE_LABELS } from "@/lib/api";
+import { fmtIST } from "@/lib/ist";
 import { useI18n } from "@/context/I18nContext";
 import { useIngestServer } from "@/hooks/useIngestServer";
 import { useDvasSocket } from "@/lib/useDvasSocket";
@@ -78,7 +79,6 @@ export default function IngestDashboard() {
   const [audit, setAudit] = useState([]);
   const [users, setUsers] = useState([]);
   const ingestSrv = useIngestServer();
-  const [ackedAlertIds, setAckedAlertIds] = useState([]);
   const [feedFilter, setFeedFilter] = useState("all");
   const [feedSort, setFeedSort] = useState("drone_id");
   const [liveIncidents, setLiveIncidents] = useState([]);
@@ -125,6 +125,19 @@ export default function IngestDashboard() {
       setTimeout(() => setModelToast(null), 8000);
     } else if (msg.type === "model_suggestion_status") {
       setModelSuggestions((prev) => prev.map(x => x.id === msg.suggestion_id ? { ...x, status: msg.status } : x));
+    } else if (msg.type === "incident_deleted") {
+      // F2: deletes and clears made elsewhere disappear here too
+      setLiveIncidents((prev) => prev.filter(x => x.id !== msg.incident_id));
+      setActiveBanner((curr) => (curr?.id === msg.incident_id ? null : curr));
+    } else if (msg.type === "incidents_cleared") {
+      const ids = msg.incident_ids;
+      setLiveIncidents((prev) => (ids ? prev.filter(x => !ids.includes(x.id)) : []));
+      setActiveBanner((curr) => (curr && (!ids || ids.includes(curr.id)) ? null : curr));
+    } else if (msg.type === "model_suggestion_deleted") {
+      setModelSuggestions((prev) => prev.filter(x => x.id !== msg.suggestion_id));
+    } else if (msg.type === "model_suggestions_cleared") {
+      const ids = msg.suggestion_ids;
+      setModelSuggestions((prev) => (ids ? prev.filter(x => !ids.includes(x.id)) : []));
     }
   });
 
@@ -152,7 +165,7 @@ export default function IngestDashboard() {
   };
   const loadAudit = async () => {
     try {
-      const { data } = await api.get("/audit-logs");
+      const { data } = await api.get("/audit-logs", { params: { page_size: 100 } });
       setAudit(Array.isArray(data) ? data : (data?.items || []));
     } catch (e) {
       setAudit([]);
@@ -212,12 +225,21 @@ export default function IngestDashboard() {
     }
   };
 
+  // ING-02: "Deploy to GPU" applies the model config on the backend; show what it did
+  const [suggestionMsg, setSuggestionMsg] = useState("");
   const handleUpdateSuggestionStatus = async (suggestionId, newStatus) => {
+    setSuggestionMsg("");
     try {
-      await api.post(`/analytics/suggestions/${suggestionId}/status`, { status: newStatus });
-      setModelSuggestions((prev) => prev.map(s => s.id === suggestionId ? { ...s, status: newStatus } : s));
+      const { data } = await api.post(`/analytics/suggestions/${encodeURIComponent(suggestionId)}/status`, { status: newStatus });
+      setModelSuggestions((prev) => prev.map(s => s.id === suggestionId ? { ...s, status: data?.new_status || newStatus } : s));
+      if (newStatus === "DEPLOYED_TO_GPU") {
+        const acts = data?.stream_actions || {};
+        const n = Array.isArray(acts) ? acts.length : Object.keys(acts).length;
+        setSuggestionMsg(`Model configuration applied (${n} stream action${n === 1 ? "" : "s"}); see Detection Models for live status.`);
+      }
+      loadModelSuggestions();
     } catch (err) {
-      console.error("Failed to update suggestion status", err);
+      setSuggestionMsg(apiError(err, "Failed to update suggestion status"));
     }
   };
 
@@ -299,7 +321,7 @@ export default function IngestDashboard() {
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] font-mono text-slate-400">
                   <span>📍 <strong className="text-slate-200">Location:</strong> {activeBanner.location || "Edge Station"}</span>
                   <span>👤 <strong className="text-slate-200">Reported By:</strong> {activeBanner.created_by || "Edge Operator"}</span>
-                  <span>🕒 <strong className="text-slate-200">Time:</strong> {activeBanner.timestamp ? new Date(activeBanner.timestamp).toLocaleTimeString() : "Just now"}</span>
+                  <span>🕒 <strong className="text-slate-200">Time:</strong> {activeBanner.timestamp ? fmtIST(activeBanner.timestamp) : "Just now"}</span>
                 </div>
               </div>
             </div>
@@ -345,12 +367,16 @@ export default function IngestDashboard() {
               gpu={h?.gpu || []}
               suggestions={modelSuggestions}
               onUpdateStatus={handleUpdateSuggestionStatus}
+              message={suggestionMsg}
             />
           )}
           {page === "alerts" && (
             <AlertsPage
-              alerts={(h?.alerts || []).filter(a => !ackedAlertIds.includes(a.id))}
-              onAck={(id) => setAckedAlertIds(v => [...v, id])}
+              alerts={(h?.alerts || []).filter(a => !a.acknowledged_by)}
+              onAck={async (id) => {
+                try { await api.post(`/infra/alerts/${encodeURIComponent(id)}/ack`); load(); }
+                catch (e) { window.alert(apiError(e, "Could not acknowledge the alert")); }
+              }}
               incidents={liveIncidents}
               onAckIncident={handleAcknowledgeIncident}
             />
@@ -916,7 +942,7 @@ function ServerPage({ srv }) {
                         {formatBytes(d.bytes_ingested || 0)}
                       </td>
                       <td className="px-3 py-2 border-b border-slate-800/60 text-slate-400">
-                        {d.last_frame_ts ? new Date(d.last_frame_ts * 1000).toLocaleTimeString() : "—"}
+                        {d.last_frame_ts ? fmtIST(d.last_frame_ts * 1000) : "—"}
                       </td>
                     </tr>
                   );
@@ -990,7 +1016,7 @@ function ServerPage({ srv }) {
                         <div className="mono text-[10px] text-slate-500 mt-0.5">
                           {ev.mission_id && <span>mission: {ev.mission_id} · </span>}
                           {ev.message_id && <span>msg: {ev.message_id.slice(0, 12)}… · </span>}
-                          {ev._received && new Date(ev._received).toLocaleTimeString()}
+                          {ev._received && fmtIST(ev._received)}
                         </div>
                       </div>
                     </div>
@@ -1057,6 +1083,9 @@ function ServerPage({ srv }) {
 }
 
 /* ---------- OVERVIEW ---------- */
+// Values the backend does not measure arrive as null and are shown as "—" (ING-03…08)
+const na = (v, suffix = "") => (v === null || v === undefined ? "—" : `${v}${suffix}`);
+
 function StatCard({ label, value, sub, tone = "text-slate-100", Icon }) {
   return (
     <div className="border border-slate-800 bg-slate-900 p-4">
@@ -1071,6 +1100,7 @@ function StatCard({ label, value, sub, tone = "text-slate-100", Icon }) {
 }
 
 function GaugeBar({ label, pct, tone = "auto", suffix = "%" }) {
+  const unknown = pct === null || pct === undefined;
   const p = Math.min(100, Math.max(0, pct ?? 0));
   // auto: high = red (usage); good: high = green (validity)
   let barCls;
@@ -1085,22 +1115,22 @@ function GaugeBar({ label, pct, tone = "auto", suffix = "%" }) {
     <div>
       <div className="flex items-baseline justify-between mb-1">
         <div className="dvas-label">{label}</div>
-        <div className="mono text-sm text-slate-100 font-semibold">{p}{suffix}</div>
+        <div className="mono text-sm text-slate-100 font-semibold">{unknown ? "—" : `${p}${suffix}`}</div>
       </div>
       <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
-        <div className={`h-full transition-all duration-500 ${barCls}`} style={{ width: `${p}%` }} />
+        <div className={`h-full transition-all duration-500 ${barCls}`} style={{ width: `${unknown ? 0 : p}%` }} />
       </div>
     </div>
   );
 }
 
 function MeterBar({ label, used, total, suffix = "GB" }) {
-  const p = Math.min(100, Math.round((used / (total || 1)) * 100));
+  const p = used == null || !total ? 0 : Math.min(100, Math.round((used / total) * 100));
   return (
     <div>
       <div className="flex items-baseline justify-between mb-1">
         <div className="dvas-label">{label}</div>
-        <div className="mono text-[11px] text-slate-100"><span className="font-semibold">{used}</span> <span className="text-slate-500">/ {total} {suffix}</span></div>
+        <div className="mono text-[11px] text-slate-100"><span className="font-semibold">{na(used)}</span> <span className="text-slate-500">{total ? `/ ${total} ${suffix}` : suffix}</span></div>
       </div>
       <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
         <div className={`h-full ${p > 85 ? "bg-red-500" : p > 70 ? "bg-amber-500" : "bg-sky-500"}`} style={{ width: `${p}%` }} />
@@ -1110,6 +1140,9 @@ function MeterBar({ label, used, total, suffix = "GB" }) {
 }
 
 function Sparkline({ data, color = "#0ea5e9", height = 36 }) {
+  if (!data || data.length < 2) {
+    return <div className="mono text-[10px] text-slate-500" style={{ height }}>Collecting samples…</div>;
+  }
   const max = Math.max(...data) || 1;
   const w = 100 / (data.length - 1 || 1);
   const points = data.map((v, i) => `${i * w},${100 - (v / max) * 100}`).join(" ");
@@ -1133,9 +1166,9 @@ function OverviewPage({ ov }) {
         <StatCard label="Active streams"   value={ss.active}   tone="text-emerald-400" Icon={CheckCircle2} />
         <StatCard label="Warning streams"  value={ss.warning}  tone="text-amber-400"   Icon={AlertTriangle} />
         <StatCard label="Critical streams" value={ss.critical} tone="text-red-400"     Icon={XCircle} />
-        <StatCard label="Authenticated"    value={ss.authenticated} sub="tokens active" Icon={Zap} />
-        <StatCard label="Avg latency"      value={`${ss.avg_latency_ms} ms`} tone={ss.avg_latency_ms > 200 ? "text-amber-400" : "text-sky-400"} Icon={TrendingUp} />
-        <StatCard label="Avg FPS"          value={ss.avg_fps} tone="text-sky-400" sub="across active feeds" Icon={Activity} />
+        <StatCard label="Ingest server"    value={ss.ingest_reachable ? "reachable" : "unreachable"} tone={ss.ingest_reachable ? "text-emerald-400" : "text-red-400"} Icon={Zap} />
+        <StatCard label="Avg frame age"    value={na(ss.avg_frame_age_s, " s")} tone={ss.avg_frame_age_s > 5 ? "text-amber-400" : "text-sky-400"} sub="time since last frame" Icon={TrendingUp} />
+        <StatCard label="Avg FPS"          value={na(ss.avg_fps)} tone="text-sky-400" sub="measured between polls" Icon={Activity} />
       </div>
 
       {/* Row 2: Live stream table + Infra gauges */}
@@ -1147,7 +1180,7 @@ function OverviewPage({ ov }) {
           </div>
           <table className="w-full text-xs mono">
             <thead className="bg-slate-950/40">
-              <tr>{["Drone","Operator","FPS","Latency","Packet drop","Sync","Bitrate","Status"].map(h => (
+              <tr>{["Drone","Operator","FPS","Frame age","Rejected","Sync","Bitrate","Status"].map(h => (
                 <th key={h} className="text-left px-3 py-2 dvas-label border-b border-slate-800" style={{ fontSize: 10 }}>{h}</th>
               ))}</tr>
             </thead>
@@ -1155,18 +1188,18 @@ function OverviewPage({ ov }) {
               {streams.map(s => (
                 <tr key={s.drone_id} data-testid={`stream-${s.drone_id}`} className="hover:bg-slate-800/40">
                   <td className="px-3 py-2 border-b border-slate-800/60 text-slate-100">{s.drone_id}</td>
-                  <td className="px-3 py-2 border-b border-slate-800/60 text-slate-400">{s.operator}</td>
-                  <td className="px-3 py-2 border-b border-slate-800/60">{s.fps}</td>
+                  <td className="px-3 py-2 border-b border-slate-800/60 text-slate-400">{s.operator || "—"}</td>
+                  <td className="px-3 py-2 border-b border-slate-800/60">{na(s.fps)}</td>
                   <td className="px-3 py-2 border-b border-slate-800/60">
-                    <span className={s.latency_ms > 200 ? "text-red-400" : s.latency_ms > 100 ? "text-amber-400" : "text-emerald-400"}>{s.latency_ms} ms</span>
+                    <span className={s.frame_age_s == null ? "text-slate-500" : s.frame_age_s > 15 ? "text-red-400" : s.frame_age_s > 5 ? "text-amber-400" : "text-emerald-400"}>{na(s.frame_age_s, " s")}</span>
                   </td>
                   <td className="px-3 py-2 border-b border-slate-800/60">
-                    <span className={s.packet_drop_pct > 1 ? "text-red-400" : s.packet_drop_pct > 0.5 ? "text-amber-400" : "text-emerald-400"}>{s.packet_drop_pct}%</span>
+                    <span className={s.packet_drop_pct > 1 ? "text-red-400" : s.packet_drop_pct > 0.5 ? "text-amber-400" : "text-emerald-400"}>{na(s.packet_drop_pct, "%")}</span>
                   </td>
                   <td className="px-3 py-2 border-b border-slate-800/60">
-                    <span className={`px-1.5 py-0.5 border text-[10px] ${s.sync === "synced" ? "text-emerald-400 border-emerald-500/40 bg-emerald-500/10" : s.sync === "drift" ? "text-amber-400 border-amber-500/40 bg-amber-500/10" : "text-red-400 border-red-500/40 bg-red-500/10"}`}>{s.sync}</span>
+                    <span className={`px-1.5 py-0.5 border text-[10px] ${s.sync === "synced" ? "text-emerald-400 border-emerald-500/40 bg-emerald-500/10" : s.sync === "drift" ? "text-amber-400 border-amber-500/40 bg-amber-500/10" : s.sync == null ? "text-slate-400 border-slate-600" : "text-red-400 border-red-500/40 bg-red-500/10"}`}>{s.sync || "unknown"}</span>
                   </td>
-                  <td className="px-3 py-2 border-b border-slate-800/60">{s.bitrate_mbps} Mbps</td>
+                  <td className="px-3 py-2 border-b border-slate-800/60">{na(s.bitrate_mbps, " Mbps")}</td>
                   <td className="px-3 py-2 border-b border-slate-800/60">
                     <span className={`px-1.5 py-0.5 border text-[10px] ${s.status === "live" ? "text-emerald-400 border-emerald-500/40 bg-emerald-500/10" : s.status === "degraded" ? "text-amber-400 border-amber-500/40 bg-amber-500/10" : "text-red-400 border-red-500/40 bg-red-500/10"}`}>{s.status}</span>
                   </td>
@@ -1197,12 +1230,11 @@ function OverviewPage({ ov }) {
               <div className="dvas-label capitalize">{q.name}</div>
               <Database size={12} className="text-slate-500" />
             </div>
-            <div className="mono text-2xl font-semibold text-sky-400">{q.depth}</div>
-            <div className="mono text-[10px] text-slate-500 mt-0.5">queue length</div>
-            <div className="mt-3 grid grid-cols-3 gap-1 text-[10px] mono">
-              <div><div className="text-slate-500">Backlog</div><div className={q.backlog > 30 ? "text-amber-300" : "text-slate-300"}>{q.backlog}</div></div>
-              <div><div className="text-slate-500">Thr.</div><div className="text-slate-300">{q.throughput_fps}</div></div>
-              <div><div className="text-slate-500">Err</div><div className={q.error_rate_pct > 1 ? "text-red-400" : "text-slate-300"}>{q.error_rate_pct}%</div></div>
+            <div className="mono text-2xl font-semibold text-sky-400">{na(q.depth)}</div>
+            <div className="mono text-[10px] text-slate-500 mt-0.5">queue length · {q.source}</div>
+            <div className="mt-3 grid grid-cols-2 gap-1 text-[10px] mono">
+              <div><div className="text-slate-500">Throughput</div><div className="text-slate-300">{na(q.throughput_fps)}{q.throughput_unit && q.throughput_fps != null ? ` ${q.throughput_unit}` : ""}</div></div>
+              <div><div className="text-slate-500">Err</div><div className={q.error_rate_pct > 1 ? "text-red-400" : "text-slate-300"}>{na(q.error_rate_pct, "%")}</div></div>
             </div>
           </div>
         ))}
@@ -1212,26 +1244,27 @@ function OverviewPage({ ov }) {
       <div className="grid grid-cols-12 gap-4">
         <div className="col-span-12 lg:col-span-7 border border-slate-800 bg-slate-900 p-4">
           <div className="flex items-center gap-2 mb-3 font-medium text-sm">
-            <TrendingUp size={14} className="text-sky-400" /> Frame Ingestion (24h)
+            <TrendingUp size={14} className="text-sky-400" /> Frame Ingestion
+            <span className="mono text-[10px] text-slate-500 font-normal">{frames.window}{frames.available === false ? " · ingest server unreachable" : ""}</span>
           </div>
           <div className="grid grid-cols-3 gap-3 mb-3">
             <div>
               <div className="dvas-label">Total frames</div>
-              <div className="mono text-2xl font-semibold text-sky-400">{(frames.total_frames_24h / 1e6).toFixed(2)}M</div>
+              <div className="mono text-2xl font-semibold text-sky-400">{frames.total_frames == null ? "—" : frames.total_frames.toLocaleString()}</div>
             </div>
             <div>
-              <div className="dvas-label">Selection ratio</div>
-              <div className="mono text-2xl font-semibold text-emerald-400">{frames.selection_ratio_pct}%</div>
-              <div className="mono text-[10px] text-slate-500">{(frames.kept_frames_24h / 1e3).toFixed(0)}k kept</div>
+              <div className="dvas-label">Accepted</div>
+              <div className="mono text-2xl font-semibold text-emerald-400">{na(frames.selection_ratio_pct, "%")}</div>
+              <div className="mono text-[10px] text-slate-500">{na(frames.kept_frames?.toLocaleString())} frames</div>
             </div>
             <div>
               <div className="dvas-label">Dropped</div>
-              <div className={`mono text-2xl font-semibold ${frames.drop_ratio_pct > 0.5 ? "text-red-400" : "text-amber-400"}`}>{frames.drop_ratio_pct}%</div>
-              <div className="mono text-[10px] text-slate-500">{frames.dropped_frames_24h.toLocaleString()} frames</div>
+              <div className={`mono text-2xl font-semibold ${frames.drop_ratio_pct > 0.5 ? "text-red-400" : "text-amber-400"}`}>{na(frames.drop_ratio_pct, "%")}</div>
+              <div className="mono text-[10px] text-slate-500">{na(frames.dropped_frames?.toLocaleString())} rejected</div>
             </div>
           </div>
           <div className="border-t border-slate-800 pt-3">
-            <div className="dvas-label mb-2">Live FPS (last 30 samples)</div>
+            <div className="dvas-label mb-2">Measured FPS, all feeds (last {frames.sparkline_fps?.length || 0} samples)</div>
             <Sparkline data={frames.sparkline_fps} color="#0ea5e9" height={48} />
           </div>
         </div>
@@ -1244,7 +1277,7 @@ function OverviewPage({ ov }) {
           <GaugeBar label="Timestamp validity" pct={metadata.timestamp_valid_pct} tone="good" />
           <GaugeBar label="Sensor validity" pct={metadata.sensor_valid_pct} tone="good" />
           <div className="mono text-[10px] text-slate-500 pt-2 border-t border-slate-800">
-            {metadata.records_checked_24h.toLocaleString()} records validated in the last 24h
+            {metadata.records_checked} drone record(s) and {metadata.timestamps_checked} frame timestamp(s) checked · {metadata.scope}
           </div>
         </div>
       </div>
@@ -1253,24 +1286,24 @@ function OverviewPage({ ov }) {
       <div className="border border-slate-800 bg-slate-900">
         <div className="p-3 border-b border-slate-800 flex items-center gap-3 text-sm font-medium">
           <Activity size={16} className="text-sky-400" /> API Monitor
-          <span className="mono text-[10px] text-slate-500 ml-2">{apiInfo.total_rps} req/s · avg p95 {apiInfo.avg_p95_ms}ms · {apiInfo.avg_success_pct}% ok</span>
+          <span className="mono text-[10px] text-slate-500 ml-2">dependency probes · avg p95 {apiInfo.avg_p95_ms} ms · {apiInfo.avg_success_pct}% ok (last 20 probes each)</span>
         </div>
         <table className="w-full text-xs mono">
           <thead className="bg-slate-950/40">
-            <tr>{["Endpoint","Req/s","p95","Success","Health"].map(h => (
+            <tr>{["Service","Last probe","p95","Success","Health"].map(h => (
               <th key={h} className="text-left px-3 py-2 dvas-label border-b border-slate-800" style={{ fontSize: 10 }}>{h}</th>
             ))}</tr>
           </thead>
           <tbody>
             {apiInfo.endpoints.map(e => {
-              const healthy = e.success_pct >= 99.5 && e.p95_ms < 200;
-              const warn = !healthy && e.success_pct >= 99.0;
+              const healthy = e.ok && e.success_pct >= 99.5 && e.p95_ms < 200;
+              const warn = !healthy && e.ok;
               return (
                 <tr key={e.path} data-testid={`api-ep-${e.path}`} className="hover:bg-slate-800/40">
                   <td className="px-3 py-2 border-b border-slate-800/60 text-slate-100">{e.path}</td>
-                  <td className="px-3 py-2 border-b border-slate-800/60">{e.rps}</td>
+                  <td className="px-3 py-2 border-b border-slate-800/60">{e.ok ? "ok" : "failed"}</td>
                   <td className="px-3 py-2 border-b border-slate-800/60"><span className={e.p95_ms > 250 ? "text-red-400" : e.p95_ms > 150 ? "text-amber-400" : "text-emerald-400"}>{e.p95_ms} ms</span></td>
-                  <td className="px-3 py-2 border-b border-slate-800/60">{e.success_pct}%</td>
+                  <td className="px-3 py-2 border-b border-slate-800/60">{e.success_pct}% <span className="text-slate-500">of {e.samples}</span></td>
                   <td className="px-3 py-2 border-b border-slate-800/60">
                     <span className={`px-1.5 py-0.5 border text-[10px] ${healthy ? "text-emerald-400 border-emerald-500/40 bg-emerald-500/10" : warn ? "text-amber-400 border-amber-500/40 bg-amber-500/10" : "text-red-400 border-red-500/40 bg-red-500/10"}`}>
                       {healthy ? "healthy" : warn ? "degraded" : "critical"}
@@ -1332,8 +1365,8 @@ function FeedsPage({ feeds, filter, setFilter, setSort }) {
           {feeds.map(f => (
             <tr key={f.drone_id} data-testid={`feed-row-${f.drone_id}`} className="hover:bg-slate-800/60">
               <td className="px-3 py-2 border-b border-slate-800/60">{f.drone_id}</td>
-              <td className="px-3 py-2 border-b border-slate-800/60">{f.operator}</td>
-              <td className="px-3 py-2 border-b border-slate-800/60">{f.mission_id}</td>
+              <td className="px-3 py-2 border-b border-slate-800/60">{f.operator || "—"}</td>
+              <td className="px-3 py-2 border-b border-slate-800/60">{f.mission_id || "—"}</td>
               <td className="px-3 py-2 border-b border-slate-800/60">
                 <span className={`px-1.5 py-0.5 border text-[10px] ${
                   f.status === "live" ? "text-emerald-400 border-emerald-500/40 bg-emerald-500/10"
@@ -1341,9 +1374,9 @@ function FeedsPage({ feeds, filter, setFilter, setSort }) {
                   : "text-red-400 border-red-500/40 bg-red-500/10"
                 }`}>{f.status}</span>
               </td>
-              <td className="px-3 py-2 border-b border-slate-800/60 text-slate-400">{f.last_heartbeat?.slice(11, 19)}</td>
-              <td className="px-3 py-2 border-b border-slate-800/60">{f.fps}</td>
-              <td className="px-3 py-2 border-b border-slate-800/60">{f.bitrate_mbps} Mbps</td>
+              <td className="px-3 py-2 border-b border-slate-800/60 text-slate-400">{f.last_heartbeat ? fmtIST(f.last_heartbeat) : "no frames yet"}</td>
+              <td className="px-3 py-2 border-b border-slate-800/60">{na(f.fps)}</td>
+              <td className="px-3 py-2 border-b border-slate-800/60">{na(f.bitrate_mbps, " Mbps")}</td>
             </tr>
           ))}
         </tbody>
@@ -1440,11 +1473,12 @@ function QueuePage({ throughput, queue, ingestSrv }) {
   );
 }
 
-function GpuPage({ gpu, suggestions = [], onUpdateStatus }) {
+function GpuPage({ gpu, suggestions = [], onUpdateStatus, message }) {
   const pendingSuggestionsCount = suggestions.filter(s => s.status === "PENDING").length;
 
   return (
     <div className="space-y-4">
+      {message && <div className="mono text-[11px] text-sky-300 border border-sky-500/30 bg-sky-500/5 px-3 py-2">{message}</div>}
       {/* Edge Operator AI Model Suggestions Panel */}
       <div className="border border-slate-800 bg-slate-900 rounded overflow-hidden font-mono">
         <div className="p-3 border-b border-slate-800 flex items-center justify-between bg-slate-950/40">
@@ -1514,7 +1548,7 @@ function GpuPage({ gpu, suggestions = [], onUpdateStatus }) {
                     {sugg.suggested_by || "Edge Operator"}
                   </td>
                   <td className="px-3 py-3 whitespace-nowrap text-slate-500 text-[11px]">
-                    {sugg.timestamp ? new Date(sugg.timestamp).toLocaleTimeString() : "—"}
+                    {sugg.timestamp ? fmtIST(sugg.timestamp) : "—"}
                   </td>
                   <td className="px-3 py-3 whitespace-nowrap">
                     <span className={`px-2 py-0.5 rounded text-[10px] font-semibold border ${
@@ -1571,34 +1605,16 @@ function GpuPage({ gpu, suggestions = [], onUpdateStatus }) {
           </ResponsiveContainer>
         </div>
       </div>
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div className="border border-slate-800 bg-slate-900 p-3">
-          <div className="dvas-label mb-2">Queue → inference latency (ms)</div>
-          <div style={{ width: "100%", height: 220 }}>
-            <ResponsiveContainer>
-              <LineChart data={gpu}>
-                <CartesianGrid stroke="#1e293b" />
-                <XAxis dataKey="node" stroke="#64748b" fontSize={10} />
-                <YAxis stroke="#64748b" fontSize={10} />
-                <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #334155", fontSize: 12 }} />
-                <Line dataKey="inference_ms" stroke="#a78bfa" dot={{ fill: "#a78bfa" }} strokeWidth={2} />
-              </LineChart>
-            </ResponsiveContainer>
+      <div className="border border-slate-800 bg-slate-900 p-3 text-xs mono">
+        <div className="dvas-label mb-2">GPU memory · per node</div>
+        {(gpu || []).map(g => (
+          <div key={g.node} className="flex items-center justify-between py-1 border-b border-slate-800/60">
+            <span className="text-slate-300">{g.node}</span>
+            <span className="text-slate-100">{na(g.mem_used_gb)} / {na(g.mem_total_gb)} GB · {na(g.util_pct, "%")} util</span>
           </div>
-        </div>
-        <div className="border border-slate-800 bg-slate-900 p-3">
-          <div className="dvas-label mb-2">Batch size per node</div>
-          <div style={{ width: "100%", height: 220 }}>
-            <ResponsiveContainer>
-              <BarChart data={gpu}>
-                <CartesianGrid stroke="#1e293b" />
-                <XAxis dataKey="node" stroke="#64748b" fontSize={10} />
-                <YAxis stroke="#64748b" fontSize={10} />
-                <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #334155", fontSize: 12 }} />
-                <Bar dataKey="batch" fill="#10b981" />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
+        ))}
+        <div className="text-[10px] text-slate-500 mt-2">
+          The analyzers do not report batch size or queue-to-inference latency, so those charts are not shown.
         </div>
       </div>
     </div>
@@ -1710,7 +1726,7 @@ function AlertsPage({ alerts, onAck, incidents = [], onAckIncident }) {
                       {inc.created_by || "Edge Operator"}
                     </td>
                     <td className="px-3 py-3 whitespace-nowrap text-slate-400 font-mono text-[11px]">
-                      {inc.timestamp ? new Date(inc.timestamp).toLocaleString() : "—"}
+                      {inc.timestamp ? fmtIST(inc.timestamp) : "—"}
                     </td>
                     <td className="px-3 py-3 whitespace-nowrap">
                       <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border ${
@@ -1753,7 +1769,7 @@ function AlertsPage({ alerts, onAck, incidents = [], onAckIncident }) {
                 <span className={`px-1.5 py-0.5 border text-[10px] uppercase mono ${sevColor[a.severity]}`}>{a.severity}</span>
                 <div className="flex-1 min-w-0">
                   <div className="text-xs text-slate-200">{a.text}</div>
-                  <div className="mono text-[10px] text-slate-500 mt-1">{a.ts.slice(11, 19)}</div>
+                  <div className="mono text-[10px] text-slate-500 mt-1">{fmtIST(a.ts)}</div>
                 </div>
                 <button data-testid={`ack-infra-${a.id}`} onClick={() => onAck(a.id)} className="text-[11px] px-2 py-1 border border-slate-700 hover:border-sky-500">
                   {t("common.acknowledge")}
@@ -1784,7 +1800,7 @@ function AuditPage({ audit }) {
         <tbody>
           {auditList.map(l => (
             <tr key={l.id} className="hover:bg-slate-800/40">
-              <td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-400">{new Date(l.ts).toLocaleString()}</td>
+              <td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-400">{fmtIST(l.ts)}</td>
               <td className="px-3 py-1.5 border-b border-slate-800/60"><span className="px-1.5 py-0.5 border border-sky-500/40 bg-sky-500/10 text-sky-300 text-[10px]">{l.action}</span></td>
               <td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-400">{l.target || "-"}</td>
               <td className="px-3 py-1.5 border-b border-slate-800/60 text-slate-500">{l.ip}</td>
