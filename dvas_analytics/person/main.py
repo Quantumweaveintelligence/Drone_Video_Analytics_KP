@@ -222,13 +222,8 @@ async def analyze_frame(
             drone_id, None, "person", ts, ts, tracker_id=tracker_id
         )
         person["track_id"] = track_id
-
-        if person["confidence"] >= 0.4:
-            event_id = await write_confirmed_event(
-                drone_id=drone_id, event_type="person_detected",
-                confidence=person["confidence"], ts=ts, track_id=track_id,
-            )
-            person["event_id"] = event_id
+        # No confirmed event per detected person (B29), same as the stream path;
+        # the person incident is a face-watchlist match
 
         # Upload person crop to MinIO
         crop_bytes = person.pop("crop_bytes", None)

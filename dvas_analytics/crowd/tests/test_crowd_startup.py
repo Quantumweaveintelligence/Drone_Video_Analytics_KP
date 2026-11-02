@@ -88,3 +88,43 @@ def test_health_is_503_when_model_failed_to_load(crowd_main):
 def test_health_is_503_before_startup(crowd_main):
     resp = asyncio.run(crowd_main.health())
     assert resp.status_code == 503
+
+
+class _Upload:
+    content_type = "image/jpeg"
+
+    def __init__(self, data):
+        self._data = data
+
+    async def read(self):
+        return self._data
+
+
+def test_http_frame_one_event_per_surge_with_exact_upload(crowd_main, monkeypatch):
+    import types as _types
+    events, uploads = [], []
+
+    async def write_confirmed_event(**kw):
+        events.append(kw)
+        return f"ev{len(events)}"
+
+    async def upload_object(bucket, key, data, content_type="", kind=""):
+        uploads.append((bucket, data, kind))
+        return {"bucket": bucket, "key": key, "content_type": content_type, "sha256": "h", "bytes": len(data),
+                "kind": kind}
+
+    counts = iter([120, 130, 40])
+    _run_startup(crowd_main)
+    crowd_main.analyzer.alert_threshold = 100
+    crowd_main.analyzer.analyze_frame = lambda frame, **kw: {
+        "estimated_count": next(counts), "density_label": "high", "alert_triggered": True}
+    monkeypatch.setattr(crowd_main, "write_confirmed_event", write_confirmed_event)
+    monkeypatch.setattr(crowd_main.minio, "upload_object", upload_object, raising=False)
+    monkeypatch.setattr(crowd_main, "cv2", _types.SimpleNamespace(imdecode=lambda *a: "frame", IMREAD_COLOR=1))
+
+    for _ in range(3):
+        asyncio.run(crowd_main.analyze_frame(file=_Upload(b"jpeg-bytes"), drone_id="D1", include_heatmap=False))
+    assert len(events) == 1                                   # 120 fires, 130 same surge, 40 below
+    block = events[0]["attributes"]["evidence"]
+    assert block["objects"][0]["kind"] == "source_frame" and uploads[0][1] == b"jpeg-bytes"
+    assert block["frame"]["source"] == "http_upload" and block["geo"] is None

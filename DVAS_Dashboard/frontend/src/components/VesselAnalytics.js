@@ -22,16 +22,15 @@ import {
   PieChart, Pie, Cell, ResponsiveContainer, Tooltip as RechartsTooltip,
   BarChart, Bar, XAxis, YAxis
 } from "recharts";
-import { api, authFetch, getAuthToken } from "@/lib/api";
+import { api, authFetch } from "@/lib/api";
 import { useJpegPoller } from "@/hooks/useJpegPoller";
 import { useActiveStreams } from "@/hooks/useActiveStreams";
 
 const resolveVesselThumbnail = (key) => {
   if (!key) return null;
   const cleanKey = String(key).replace(/^\/+/, '');
-  const token = getAuthToken();
-  const tokenParam = token ? `&token=${encodeURIComponent(token)}` : '';
-  return `/api/minio/image?bucket=dvas-vessels-maritime&key=${encodeURIComponent(cleanKey)}${tokenParam}`;
+  // Auth comes from the httpOnly dvas_access_token cookie (same origin); no token in the URL.
+  return `/api/minio/image?bucket=dvas-vessels-maritime&key=${encodeURIComponent(cleanKey)}`;
 };
 
 // ── 9-Class High-Contrast Marine Palette ───────────────────────────────────────

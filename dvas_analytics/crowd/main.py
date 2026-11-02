@@ -31,7 +31,7 @@ from shared.redis_client import (
     get_latest_stream_frame,
 )
 from shared import minio_client as minio
-from shared.evidence import ThresholdGate, evidence_block, frame_context, model_info
+from shared.evidence import ThresholdGate, evidence_block, frame_context, model_info, upload_context
 from crowd.analyzer import CrowdAnalyzer
 from crowd.stream_policy import FrameRateCap, is_cuda_failure, parse_mission_id
 from crowd.schema import CrowdAnalysisResult, StreamStatus, CrowdTimelineItem, ModelSwitchRequest, ModelInfo, SessionSummary
@@ -170,12 +170,14 @@ async def analyze_frame(
     # Upload heatmap to MinIO if available
     heatmap_key = None
     heatmap_url  = None
+    heatmap_obj = None
     if result.get("heatmap_b64"):
         heatmap_bytes = base64.b64decode(result["heatmap_b64"])
         key = minio.make_key("heatmaps", drone_id, f"heatmap_{int(ts.timestamp()*1000)}.png")
-        heatmap_key = await minio.upload_bytes(
-            cfg.BUCKET_HEATMAPS, key, heatmap_bytes, "image/png"
+        heatmap_obj = await minio.upload_object(
+            cfg.BUCKET_HEATMAPS, key, heatmap_bytes, "image/png", kind="heatmap"
         )
+        heatmap_key = heatmap_obj["key"] if heatmap_obj else None
         if heatmap_key:
             heatmap_url = await minio.get_presigned_url(
                 cfg.BUCKET_HEATMAPS, heatmap_key, cfg.MINIO_URL_EXPIRY
@@ -188,15 +190,26 @@ async def analyze_frame(
         heatmap_object_key=heatmap_key,
     )
 
-    if result["alert_triggered"]:
+    # Same surge rule as the stream (shared gate, so a frame posted while the drone
+    # streams does not raise a second event); evidence = the uploaded image as received
+    threshold = analyzer.alert_threshold
+    if _surge_gate.update(drone_id, result["estimated_count"], threshold):
+        source_obj = await minio.upload_object(
+            cfg.BUCKET_EVIDENCE,
+            minio.make_key("crowd", drone_id, f"upload_{int(ts.timestamp()*1000)}.jpg"),
+            contents, file.content_type or "image/jpeg", kind="source_frame")
         event_id = await write_confirmed_event(
             drone_id=drone_id,
             event_type="crowd_threshold",
-            confidence=min(result["estimated_count"] / 200, 1.0),
+            confidence=min(result["estimated_count"] / max(threshold, 1), 1.0),
             ts=ts,
             attributes={
                 "estimated_count": result["estimated_count"],
                 "density_label":   result["density_label"],
+                "threshold":       threshold,
+                "source":          "http_upload",
+                "evidence": evidence_block([source_obj, heatmap_obj], upload_context(),
+                                           model=model_info("crowd", analyzer._model_path or "")),
             },
         )
         await publish_confirmed_event({

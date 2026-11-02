@@ -24,11 +24,11 @@ sys.path.insert(0, "/analytics")
 from shared.config import cfg, get_drone_aliases
 from shared.db import (
     close_pool, ensure_drone, get_pool, upsert_track,
-    write_confirmed_event, write_vehicle_attributes,
+    write_vehicle_attributes,
     write_evidence_frame, get_vehicle_plate_link,
 )
 from shared.redis_client import (
-    close_client, publish_analytics_result, publish_confirmed_event,
+    close_client, publish_analytics_result,
     xread_frames, xreadgroup_frames, ack_frames, hset_vehicle_track, hget_vehicle_track,
     scan_active_stream_drones, get_latest_stream_frame,
 )
@@ -225,18 +225,14 @@ async def analyze_frame(
             drone_id, None, "vehicle", ts, ts, tracker_id=tracker_id
         )
         veh["track_id"] = track_id
-
-        event_id = await write_confirmed_event(
-            drone_id=drone_id, event_type="vehicle_detected",
-            confidence=veh["confidence"], ts=ts, track_id=track_id,
-            attributes={"vehicle_type": veh["vehicle_type"]},
-        )
+        # No confirmed event per detected vehicle (B29), same as the stream path;
+        # vehicle incidents come from ANPR (theft_alert)
 
         colour_label = veh["colour_top3"][0]["colour"] if veh.get("colour_top3") else None
 
         await write_vehicle_attributes(
             track_id=track_id,
-            event_id=event_id,
+            event_id=None,
             vehicle_type=veh["vehicle_type"],
             colour_top3=veh.get("colour_top3", []),
             make_model_top3=veh.get("make_model_top3", []),
@@ -268,16 +264,6 @@ async def analyze_frame(
             },
             ttl=cfg.VEHICLE_TRACK_TTL,
         )
-
-        await publish_confirmed_event({
-            "event_id":    event_id,
-            "event_type":  "vehicle_detected",
-            "drone_id":    drone_id,
-            "ts":          ts.isoformat(),
-            "vehicle_type": veh["vehicle_type"],
-            "colour":      colour_label,
-            "confidence":  veh["confidence"],
-        })
 
     await publish_analytics_result("vehicle", result)
     return result

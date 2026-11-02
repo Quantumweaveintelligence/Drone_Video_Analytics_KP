@@ -36,7 +36,7 @@ from shared.redis_client import (
     scan_active_stream_drones, get_latest_stream_frame,
 )
 from shared import minio_client as minio
-from shared.evidence import EventGate, bbox_xyxy, evidence_block, frame_context, model_info
+from shared.evidence import EventGate, bbox_xyxy, evidence_block, frame_context, model_info, upload_context
 from anpr.analyzer import ANPRAnalyzer
 from anpr.schema import ANPRFrameResult, WatchlistEntry, TheftAlert
 
@@ -266,36 +266,63 @@ async def analyze_frame(
 
         plate_image_key   = None
         vehicle_image_key = None
+        vehicle_obj = plate_obj = None
 
         veh_img_b64 = plate.get("vehicle_image_b64")
         if veh_img_b64:
             veh_img_bytes = base64.b64decode(veh_img_b64)
             key = minio.make_key("plates", drone_id,
                                  f"vehicle_{tracker_id}_{int(ts.timestamp()*1000)}.jpg")
-            vehicle_image_key = await minio.upload_bytes(
-                cfg.BUCKET_VEHICLES, key, veh_img_bytes, "image/jpeg"
+            vehicle_obj = await minio.upload_object(
+                cfg.BUCKET_VEHICLES, key, veh_img_bytes, "image/jpeg", kind="vehicle_crop"
             )
+            vehicle_image_key = vehicle_obj["key"] if vehicle_obj else None
 
         plate_crop_b64 = plate.pop("plate_crop_b64", None)
         if plate_crop_b64:
             plate_bytes = base64.b64decode(plate_crop_b64)
             key = minio.make_key("plates", drone_id,
                                  f"plate_{plate['plate_text']}_{int(ts.timestamp()*1000)}.jpg")
-            plate_image_key = await minio.upload_bytes(
-                cfg.BUCKET_PLATES, key, plate_bytes, "image/jpeg"
+            plate_obj = await minio.upload_object(
+                cfg.BUCKET_PLATES, key, plate_bytes, "image/jpeg", kind="plate_crop"
             )
+            plate_image_key = plate_obj["key"] if plate_obj else None
 
-        event_id = await write_confirmed_event(
-            drone_id=drone_id,
-            event_type="intrusion" if plate["is_watchlisted"] else "vehicle_detected",
-            confidence=plate["ocr_confidence"],
-            ts=ts, track_id=track_id,
-            attributes={
-                "plate_text":   plate["plate_text"],
-                "vehicle_type": plate["vehicle_type"],
-                "is_theft":     plate["is_watchlisted"],
-            },
-        )
+        # Confirmed event only for a watchlisted plate (B29), gated like the stream path.
+        # Plain plate reads stay in plate_reads. (This used to write every plate as an
+        # event, and stolen plates with event_type "intrusion".)
+        event_id = None
+        if plate["is_watchlisted"] and _theft_gate.allow((plate["plate_text"], drone_id)):
+            source_obj = await minio.upload_object(
+                cfg.BUCKET_EVIDENCE,
+                minio.make_key("anpr", drone_id, f"upload_{int(ts.timestamp()*1000)}.jpg"),
+                contents, file.content_type or "image/jpeg", kind="source_frame",
+            )
+            wl_row = await (await get_pool()).fetchrow(
+                "SELECT reason, case_ref FROM plate_watchlist WHERE plate_text=$1", plate["plate_text"])
+            event_id = await write_confirmed_event(
+                drone_id=drone_id,
+                event_type="theft_alert",
+                confidence=plate["ocr_confidence"],
+                ts=ts, track_id=track_id,
+                attributes={
+                    "plate_text":   plate["plate_text"],
+                    "ocr_confidence": plate["ocr_confidence"],
+                    "vehicle_type": plate["vehicle_type"],
+                    "tracker_id":   tracker_id,
+                    "watchlist_reason": wl_row["reason"] if wl_row else None,
+                    "case_ref":     wl_row["case_ref"] if wl_row else None,
+                    "source":       "http_upload",
+                    "evidence": evidence_block(
+                        [vehicle_obj, plate_obj, dict(source_obj, role="source") if source_obj else None],
+                        upload_context(),
+                        detection={"track_id": tracker_id, "class": "vehicle",
+                                   "bbox_xyxy": bbox_xyxy(plate.get("vehicle_bbox")),
+                                   "confidence": plate["ocr_confidence"]},
+                        model=model_info("anpr", LP_MODEL),
+                    ),
+                },
+            )
 
         await write_plate_read(
             track_id=track_id, event_id=event_id,
@@ -328,7 +355,7 @@ async def analyze_frame(
                 ttl=cfg.VEHICLE_TRACK_TTL,
             )
 
-        if plate["is_watchlisted"]:
+        if event_id:
             await publish_confirmed_event({
                 "event_id":    event_id, "event_type": "theft_alert",
                 "drone_id":    drone_id, "ts": ts.isoformat(),
@@ -829,7 +856,7 @@ async def get_missions():
         missions = await get_all_missions()
         return {"missions": missions}
     except Exception as e:
-        logger.error(f"Error fetching missions: {e}")
+        log.error("Error fetching missions: %s", e)
         raise HTTPException(status_code=500, detail="Database error")
 
 @app.get("/plates/recent")

@@ -35,6 +35,7 @@ P0 differs from the plan in two places:
 - **E2 — vault.** Each object is copied to the new bucket `dvas-evidence-vault` (object lock, GOVERNANCE, `EVIDENCE_RETENTION_DAYS`, versioned), created by the backend. Legal hold sets the S3 legal hold on the copies and refuses if MinIO refuses. `DELETE /api/evidence/{id}` now disposes (status change). A retention job (every 6 h) disposes expired items and later removes their vault copies; preview at `GET /api/retention/preview`.
 - **E3 — hashes.** SHA-256 at analyzer upload (`x-amz-meta-sha256`), re-checked at the vault copy, record hash (`record_sha256`) in the row and the creation audit entry, report PDFs hashed, `GET /api/evidence/{id}/verify`.
 - **E4 — cases and bundles.** `/api/cases` (create, add/remove evidence, close; access by jurisdiction). Exports of a case or a single item; decisions are final (B15); the bundle is built once at approval with `manifest.json`, `SHA256SUMS.txt` and a BSA s.63 certificate (Part A + Part B form), stored in the vault under legal hold. Direct export needs a case number and is marked self-approved.
+- **Single-frame `/analyze/frame`** (crowd, vehicle, person, ANPR) follows the same incident rules: crowd shares the surge gate and stores the uploaded image as evidence; vehicle/person write no per-detection event; ANPR writes a gated `theft_alert` (previously every plate was an event and stolen plates were typed `intrusion`).
 - **E5 — access.** `GET /api/evidence/{id}/objects/{role}` (scope-checked, 404 out of scope, PII roles for face/plate, `no-store`, view audited once per hour). `/api/minio/image` limits face/plate/watchlist buckets to PII roles and caches privately for 60 s. Signed single-use 60 s links (`POST /api/downloads`) for bundles, reports and evidence images; the evidence screens use them and load images with the Bearer header.
 
 ### Decisions taken on open questions (change if wrong)
@@ -54,8 +55,7 @@ New env vars: `EVIDENCE_RETENTION_DAYS`, `PII_VIEW_ROLES` (both optional, defaul
 ### Still to do / not covered
 
 - The vault bucket is created with object lock by the backend on first start; MinIO object lock cannot be added to an existing bucket, so do not create `dvas-evidence-vault` by hand.
-- Analytics pages (traffic, person, vessel, anomaly) still load live crops through `/api/minio/image` with the token in the URL — U1.
-- The single-frame HTTP `/analyze/frame` endpoints still write per-detection events without an evidence block; only the stream path was changed.
+- Live video/event streams (SSE, WebSocket, edge MJPEG) still pass the token in the URL, because browsers can't send headers on them. Image URLs no longer do: the analytics pages rely on the httpOnly `dvas_access_token` cookie.
 - There is no cases screen yet (U1); cases are API-only. CRO export requests from the evidence screen still export one item.
 - `services/pdf_service._make_65b_pdf` is no longer used.
 

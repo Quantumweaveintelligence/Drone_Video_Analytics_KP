@@ -25,16 +25,15 @@ import {
   BarChart, Bar, XAxis, YAxis, Tooltip as RechartsTooltip,
   ResponsiveContainer, Cell, PieChart, Pie
 } from "recharts";
-import { api, getAuthToken } from "@/lib/api";
+import { api } from "@/lib/api";
 import { useJpegPoller } from "@/hooks/useJpegPoller";
 import { useActiveStreams } from "@/hooks/useActiveStreams";
 
 const resolveAnomalyThumbnail = (key) => {
   if (!key) return null;
   const cleanKey = String(key).replace(/^\/+/, "");
-  const token = getAuthToken();
-  const tokenParam = token ? `&token=${encodeURIComponent(token)}` : "";
-  return `/api/minio/image?bucket=dvas-anomaly&key=${encodeURIComponent(cleanKey)}${tokenParam}`;
+  // Auth comes from the httpOnly dvas_access_token cookie (same origin); no token in the URL.
+  return `/api/minio/image?bucket=dvas-anomaly&key=${encodeURIComponent(cleanKey)}`;
 };
 
 const SEVERITY_COLORS = {

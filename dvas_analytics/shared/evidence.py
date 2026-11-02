@@ -76,6 +76,15 @@ def frame_context(fields: Dict[str, Any]) -> Dict[str, Any]:
     return {"mission_id": str(meta.get("mission_id") or "") or None, "frame": frame, "geo": geo}
 
 
+def upload_context(mission_id: Optional[str] = None) -> Dict[str, Any]:
+    """Frame context for an image posted to /analyze/frame (no Valkey metadata):
+    no capture time or GPS is known, so none is claimed."""
+    return {"mission_id": mission_id or None,
+            "frame": {"frame_sequence": None, "capture_ts": None, "ingest_ts": time.time(),
+                      "timestamp": None, "source": "http_upload"},
+            "geo": None}
+
+
 @lru_cache(maxsize=32)
 def _file_sha256(path: str) -> Optional[str]:
     try:

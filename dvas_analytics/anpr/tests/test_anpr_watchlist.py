@@ -34,9 +34,25 @@ def anpr(monkeypatch):
     async def _noop(*a, **k):
         return None
 
+    class FakePool:
+        async def fetchrow(self, *a):
+            return {"reason": "theft", "case_ref": "FIR/1"}
+
+        async def execute(self, *a):
+            db_state["theft_rows"] = db_state.get("theft_rows", 0) + 1
+
+    async def get_pool():
+        return FakePool()
+
+    async def write_confirmed_event(**kw):
+        db_state.setdefault("events", []).append(kw)
+        return f"ev{len(db_state['events'])}"
+
     db = types.ModuleType("shared.db")
     db.get_active_watchlist_plates = get_active_watchlist_plates
     db.add_to_watchlist = add_to_watchlist
+    db.get_pool = get_pool
+    db.write_confirmed_event = write_confirmed_event
     db.__getattr__ = lambda attr: _noop
     other = {}
     for name in ("shared.redis_client", "shared.minio_client"):
@@ -94,3 +110,34 @@ def test_add_persists_case_ref(anpr):
     asyncio.run(main.watchlist_add(req))
     assert state["added"] == [(" kl07ab9 ", "theft", "FIR/2026/11")]
     assert "KL07AB9" in main.analyzer.watchlist
+
+
+
+class _Upload:
+    content_type = "image/jpeg"
+
+    async def read(self):
+        return b"frame-bytes"
+
+
+def test_http_frame_only_watchlisted_plates_become_gated_theft_events(anpr, monkeypatch):
+    main, state = anpr
+    _startup(main)
+
+    async def upload_object(bucket, key, data, content_type="", kind=""):
+        return {"bucket": bucket, "key": key, "content_type": content_type, "sha256": "h",
+                "bytes": len(data), "kind": kind}
+    monkeypatch.setattr(main.minio, "upload_object", upload_object, raising=False)
+    monkeypatch.setattr(main, "cv2", types.SimpleNamespace(imdecode=lambda *a: "frame", IMREAD_COLOR=1))
+    plates = [{"plate_text": "KL07AB1234", "tracker_id": None, "ocr_confidence": 0.9, "is_reliable": True,
+               "vehicle_type": "car", "is_watchlisted": True, "plate_crop_b64": "cGxhdGU="},
+              {"plate_text": "KL01ZZ9", "tracker_id": None, "ocr_confidence": 0.8, "is_reliable": True,
+               "vehicle_type": "car", "is_watchlisted": False}]
+    main.analyzer.analyze_frame = lambda frame, **kw: {"plate_reads": [dict(p) for p in plates]}
+    for _ in range(2):
+        asyncio.run(main.analyze_frame(file=_Upload(), drone_id="D1"))
+    events = state["events"]
+    assert [e["event_type"] for e in events] == ["theft_alert"]          # once, and not "intrusion"
+    objs = events[0]["attributes"]["evidence"]["objects"]
+    assert [(o["kind"], o["role"]) for o in objs] == [("plate_crop", "primary"), ("source_frame", "source")]
+    assert events[0]["attributes"]["case_ref"] == "FIR/1"

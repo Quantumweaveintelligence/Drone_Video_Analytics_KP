@@ -33,9 +33,8 @@ export const resolveMinioImageUrl = (key, explicitBucket = "") => {
   if (key.startsWith("http://") || key.startsWith("https://")) return key;
   const cleanKey = key.replace(/^\/+/, "");
   const bucket = resolveMinioBucket(cleanKey, explicitBucket);
-  const token = getAuthToken();
-  const tokenParam = token ? `&token=${encodeURIComponent(token)}` : "";
-  return `/api/minio/image?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(cleanKey)}${tokenParam}`;
+  // Auth comes from the httpOnly dvas_access_token cookie (same origin); no token in the URL.
+  return `/api/minio/image?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(cleanKey)}`;
 };
 
 /**

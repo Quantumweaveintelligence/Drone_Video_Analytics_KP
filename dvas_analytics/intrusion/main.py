@@ -845,6 +845,8 @@ async def annotated_latest(drone_id: str = ""):
                         drone_lat=d_lat, drone_lon=d_lon, drone_alt=50.0,
                         gimbal_yaw=0.0, gimbal_pitch=-45.0, gimbal_roll=0.0,
                     )
+                    # The stream loop's annotator is local to it; this recovery path draws its own
+                    annotator = IntrusionAnnotator()
                     annotator.draw_geofence(ann_frame, pixel_pts, vis_flags, gm.polygon)
                     sm = _state_machines.get(drone_id)
                     active_intrusions = sm.get_active_intrusion_count() if sm else 0

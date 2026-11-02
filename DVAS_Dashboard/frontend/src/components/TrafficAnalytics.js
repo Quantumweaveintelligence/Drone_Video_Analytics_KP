@@ -16,7 +16,7 @@ import {
 
 import { useJpegPoller } from '../hooks/useJpegPoller';
 import { useActiveStreams } from '../hooks/useActiveStreams';
-import { api, getAuthToken } from '../lib/api';
+import { api } from '../lib/api';
 
 /* ─── constants ─────────────────────────────────────────────────── */
 const POLL_TRACKS    = 5000;
@@ -42,9 +42,8 @@ const CHART_TOOLTIP = {
 const resolveMinioUrl = (bucket, key, fallbackUrl = null) => {
   if (!key) return fallbackUrl || null;
   const cleanKey = String(key).replace(/^\/+/, '');
-  const token = getAuthToken();
-  const tokenParam = token ? `&token=${encodeURIComponent(token)}` : '';
-  return `/api/minio/image?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(cleanKey)}${tokenParam}`;
+  // Auth comes from the httpOnly dvas_access_token cookie (same origin); no token in the URL.
+  return `/api/minio/image?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(cleanKey)}`;
 };
 
 function fmtAge(ts) {

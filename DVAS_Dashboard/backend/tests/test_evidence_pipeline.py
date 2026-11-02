@@ -510,3 +510,19 @@ def test_signed_link_single_use_and_expiry(env, monkeypatch):
     op_link = client_for(OPERATOR).post("/api/downloads",
                                         json={"kind": "evidence_object", "id": e1.id, "role": "primary"}).json()
     assert client_for().get(op_link["url"]).status_code == 403
+
+
+def test_proxy_image_authenticates_with_cookie_only(env, monkeypatch):
+    """Analytics pages no longer put the JWT in image URLs; the httpOnly cookie is enough."""
+    from core import security
+    env.s3.put("dvas-plates", "plates/a.jpg", b"plate")
+    monkeypatch.setattr(security, "get_jwks", lambda: {})
+    monkeypatch.setattr(security.jwt, "decode", lambda token, *a, **k: {
+        "sub": "c1", "email": "cro@test", "realm_access": {"roles": ["control-room"]}} if token == "cookie-jwt"
+        else (_ for _ in ()).throw(security.jwt.JWTError("bad")))
+    c = client_for()
+    url = "/api/minio/image?bucket=dvas-plates&key=plates/a.jpg"
+    assert c.get(url).status_code == 401                         # nothing sent
+    c.cookies.set("dvas_access_token", "cookie-jwt")
+    r = c.get(url)
+    assert r.status_code == 200 and r.content == b"plate"

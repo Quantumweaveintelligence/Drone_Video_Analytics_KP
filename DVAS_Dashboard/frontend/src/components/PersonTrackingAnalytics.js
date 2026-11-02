@@ -104,16 +104,14 @@ function fmtIST(isoTs) {
 }
 
 /**
- * Append authentication token to an image URL if not already present.
+ * Image URLs carry no credential: the proxy authenticates with the httpOnly
+ * dvas_access_token cookie (same origin). Any token= left in a stored URL is removed.
  */
-export function appendToken(url) {
-  if (!url) return url;
-  const token = typeof window !== 'undefined'
-    ? (localStorage.getItem('dvas_token') || localStorage.getItem('token') || '')
-    : '';
-  const tokenParam = token ? `token=${encodeURIComponent(token)}` : '';
-  if (!tokenParam || url.includes('token=')) return url;
-  return url.includes('?') ? `${url}&${tokenParam}` : `${url}?${tokenParam}`;
+export function withoutToken(url) {
+  if (!url || !url.includes('token=')) return url;
+  const [path, query = ''] = url.split('?');
+  const rest = query.split('&').filter((p) => p && !p.startsWith('token=')).join('&');
+  return rest ? `${path}?${rest}` : path;
 }
 
 /**
@@ -125,9 +123,9 @@ export function toProxiedUrl(objectKeyOrUrl, bucket = 'dvas-faces') {
   if (!objectKeyOrUrl) return null;
   if (objectKeyOrUrl.startsWith('data:image')) return objectKeyOrUrl;
 
-  // Already a proxied URL — pass through (ensure token is attached)
+  // Already a proxied URL — pass through (without any token)
   if (objectKeyOrUrl.startsWith('/api/minio/')) {
-    return appendToken(objectKeyOrUrl);
+    return withoutToken(objectKeyOrUrl);
   }
 
   // Internal MinIO presigned URL: http://minio:9000/<bucket>/<key>?...
@@ -138,13 +136,13 @@ export function toProxiedUrl(objectKeyOrUrl, bucket = 'dvas-faces') {
       if (parts.length >= 2) {
         const b = parts[0];
         const k = parts.slice(1).join('/');
-        return appendToken(`/api/minio/image?bucket=${encodeURIComponent(b)}&key=${encodeURIComponent(k)}`);
+        return `/api/minio/image?bucket=${encodeURIComponent(b)}&key=${encodeURIComponent(k)}`;
       }
     } catch { /* ignore parse errors */ }
   }
 
   // Plain object_key string (e.g. "faces/DRN-001/...jpg")
-  return appendToken(`/api/minio/image?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(objectKeyOrUrl)}`);
+  return `/api/minio/image?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(objectKeyOrUrl)}`;
 }
 
 /* ───────────────────────────────────────────────────────────────
