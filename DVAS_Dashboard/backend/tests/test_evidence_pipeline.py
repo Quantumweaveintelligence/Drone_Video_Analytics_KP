@@ -125,7 +125,10 @@ class FakeMinio:
 
     def remove_object(self, bucket, key, version_id=None):
         versions = self.buckets[bucket]["objects"][key]
-        v = next(v for v in versions if v["version"] == version_id)
+        # no version id → the latest version (StopIteration must not escape into asyncio.to_thread)
+        v = versions[-1] if version_id is None else next((v for v in versions if v["version"] == version_id), None)
+        if v is None:
+            raise FakeS3Error("NoSuchVersion")
         if v["hold"] or (v["until"] and v["until"] > datetime.now(timezone.utc)):
             raise FakeS3Error("AccessDenied: object is WORM protected")
         versions.remove(v)
@@ -477,8 +480,9 @@ def test_object_endpoint_scope_and_pii(env):
             await s.commit()
     env.run(set_jur())
     assert client_for(out_of_scope).get(f"/api/evidence/{row.id}/objects/primary").status_code == 404
-    assert client_for(ADMIN).get(f"/api/evidence/{row.id}/objects/primary").status_code == 200
-    assert client_for(ADMIN).get(f"/api/evidence/{row.id}/objects/secondary").status_code == 403   # plate = PII
+    # Administrators run the platform but never see evidence content (admin content wall)
+    assert client_for(ADMIN).get(f"/api/evidence/{row.id}/objects/primary").status_code == 403
+    assert client_for(ADMIN).get(f"/api/evidence/{row.id}/objects/secondary").status_code == 403
     assert client_for(OPERATOR).get(f"/api/evidence/{row.id}/objects/primary").status_code == 403
     views = [a for a in env.audit if a["action"] == "evidence_view"]
     client_for(CRO).get(f"/api/evidence/{row.id}/objects/primary")

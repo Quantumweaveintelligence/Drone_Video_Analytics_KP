@@ -67,7 +67,9 @@ async def finalize_export(export_id: str, approver: Dict, request=None) -> Dict:
 
     try:
         data, info = await asyncio.to_thread(build_bundle, export_dict, case, evidence, audit_rows, approver)
-        stored = await asyncio.to_thread(evidence_vault.put_bundle, export_id, data)
+        from services.settings_service import get as get_setting
+        retain = int(await get_setting("evidence_retention_days"))
+        stored = await asyncio.to_thread(evidence_vault.put_bundle, export_id, data, "bundle.zip", retain)
     except BundleIntegrityError as exc:
         await _record_error(export_id, str(exc))
         await write_audit_v2(actor=approver, action="export_bundle_failed", category="evidence",

@@ -218,7 +218,8 @@ def remove_prefix(prefix: str) -> List[str]:
     return errors
 
 
-def put_bundle(export_id: str, data: bytes, filename: str = "bundle.zip") -> Dict:
+def put_bundle(export_id: str, data: bytes, filename: str = "bundle.zip",
+               retain_days: int = EVIDENCE_RETENTION_DAYS) -> Dict:
     """Store an export bundle in the vault under legal hold (court material)."""
     from minio.commonconfig import GOVERNANCE
     from minio.retention import Retention
@@ -229,7 +230,7 @@ def put_bundle(export_id: str, data: bytes, filename: str = "bundle.zip") -> Dic
     kwargs = {"metadata": {"sha256": digest}}
     if locked:
         kwargs["retention"] = Retention(
-            GOVERNANCE, datetime.now(timezone.utc) + timedelta(days=EVIDENCE_RETENTION_DAYS))
+            GOVERNANCE, datetime.now(timezone.utc) + timedelta(days=retain_days))
         kwargs["legal_hold"] = True
     _client().put_object(VAULT, key, io.BytesIO(data), len(data), content_type="application/zip", **kwargs)
     return {"bucket": VAULT, "key": key, "sha256": digest, "bytes": len(data)}

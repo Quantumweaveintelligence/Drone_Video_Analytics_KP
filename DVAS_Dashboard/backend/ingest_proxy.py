@@ -159,12 +159,11 @@ async def _proxy_get(path: str, timeout: float = 5.0) -> dict:
     svc_token = await _get_service_token()
     if svc_token:
         headers["Authorization"] = f"Bearer {svc_token}"
-    print(f"PROXY GET {url} - Token starts with: {svc_token[:10] if svc_token else 'NONE'}")
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.get(url, headers=headers)
             if resp.status_code != 200:
-                print(f"PROXY GET FAILED: {resp.status_code} - {resp.text}")
+                logger.warning("Ingest GET %s returned %s", path, resp.status_code)
             resp.raise_for_status()
             return resp.json()
     except httpx.ConnectError:

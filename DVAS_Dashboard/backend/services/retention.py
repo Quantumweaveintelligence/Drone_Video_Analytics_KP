@@ -1,5 +1,6 @@
 """
-Evidence retention job (evidence plan E2). Runs in the backend every 6 h.
+Evidence retention job (evidence plan E2). Runs daily at the time set in
+Admin → System Settings (retention_job_time_ist).
 
 1. Active evidence past retention_until, not on legal hold, not in an open case
    and not in a pending export → status 'disposed' (reason 'retention'), audited.
@@ -23,7 +24,6 @@ from services import evidence_vault
 
 logger = logging.getLogger("dvas.retention")
 
-RETENTION_INTERVAL_S = 6 * 3600
 SYSTEM_ACTOR = {"id": "system:retention", "email": "system@dvas", "role": "system", "name": "DVAS retention job"}
 
 
@@ -104,14 +104,59 @@ async def run_retention(dry_run: bool = False) -> Dict[str, List[str]]:
     return result
 
 
+async def run_report_retention() -> int:
+    """Delete stored report PDFs older than report_retention_days; the row stays
+    (status 'expired') so the request and its hash remain auditable."""
+    from datetime import timedelta
+    from core.analytics_client import _get_minio_client
+    from models import Report
+    from services.settings_service import get as get_setting
+    days = int(await get_setting("report_retention_days"))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    removed = 0
+    client = _get_minio_client()
+    async with async_session_factory() as session:
+        rows = (await session.execute(select(Report).where(
+            Report.status == "ready", Report.generated_at < cutoff))).scalars().all()
+        for r in rows:
+            if client is not None and r.file_key:
+                try:
+                    await asyncio.to_thread(client.remove_object, r.file_bucket or "dvas-evidence", r.file_key)
+                except Exception as exc:
+                    logger.warning("Could not delete report %s: %s", r.id, exc)
+                    continue
+            r.status, r.error_message = "expired", f"PDF deleted after {days} days (retention)"
+            removed += 1
+        await session.commit()
+    if removed:
+        await write_audit_v2(actor=SYSTEM_ACTOR, action="report_retention", category="data",
+                             target="reports", target_type="report",
+                             details=f"{removed} report PDF(s) older than {days} days deleted",
+                             compliance_tags=["RETENTION"], source_module="retention")
+    return removed
+
+
+def _due(now_ist: datetime, hhmm: str, last_run_day) -> bool:
+    h, m = (int(x) for x in hhmm.split(":"))
+    return now_ist.date() != last_run_day and (now_ist.hour, now_ist.minute) >= (h, m)
+
+
 async def _retention_loop():
-    await asyncio.sleep(300)           # let the backend settle after start
+    """Runs once a day at the configured IST time (Admin → System Settings)."""
+    from core.timeutil import IST
+    from services.settings_service import get as get_setting
+    last_run_day = None
+    await asyncio.sleep(60)
     while True:
         try:
-            await run_retention()
+            now_ist = datetime.now(IST)
+            if _due(now_ist, await get_setting("retention_job_time_ist"), last_run_day):
+                last_run_day = now_ist.date()
+                await run_retention()
+                await run_report_retention()
         except Exception as exc:
             logger.error("Retention job failed: %s", exc)
-        await asyncio.sleep(RETENTION_INTERVAL_S)
+        await asyncio.sleep(300)
 
 
 def start_retention_job():

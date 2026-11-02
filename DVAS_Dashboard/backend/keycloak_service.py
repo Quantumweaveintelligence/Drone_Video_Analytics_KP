@@ -101,15 +101,9 @@ async def list_users_from_keycloak() -> list[dict]:
             if role_res.status_code == 200:
                 roles = [r["name"] for r in role_res.json()]
 
-            # Map Keycloak role to DVAS role
-            dvas_role = "drone_operator"  # default
-            # Reverse map: kc_role_name -> dvas_role_name
-            reverse_map = {v: k for k, v in KC_ROLE_MAP.items()}
-            for kc_role in roles:
-                if kc_role in reverse_map:
-                    dvas_role = reverse_map[kc_role]
-                    if dvas_role == "system_administrator":
-                        break
+            # Same priority rule as login (J7): highest DVAS role wins
+            from core.security import derive_role
+            dvas_role = derive_role(roles) or "none"
 
             attrs = u.get("attributes", {})
             result.append({
@@ -281,3 +275,63 @@ async def disable_user_in_keycloak(user_id: str) -> None:
                 detail="Failed to disable user in IAM"
             )
         logger.info(f"Disabled user '{user_id}' in Keycloak")
+
+
+
+# ── Sessions (Admin → Token & Sessions, ADM-01) ──────────────────────────────
+async def _admin_headers() -> dict:
+    return {"Authorization": f"Bearer {await get_service_token()}"}
+
+
+async def list_active_sessions() -> list[dict]:
+    """Every active user session in the realm (view-users)."""
+    headers = await _admin_headers()
+    users = await list_users_from_keycloak()
+    out = []
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for u in users:
+            if u.get("suspended"):
+                continue
+            r = await client.get(f"{KEYCLOAK_INTERNAL_URL}/admin/realms/{REALM}/users/{u['id']}/sessions",
+                                 headers=headers)
+            if r.status_code != 200:
+                continue
+            for sess in r.json():
+                out.append({
+                    "session_id": sess.get("id"),
+                    "user_id": u["id"], "email": u.get("email"), "name": u.get("name"), "role": u.get("role"),
+                    "ip": sess.get("ipAddress"),
+                    "started_ms": sess.get("start"), "last_access_ms": sess.get("lastAccess"),
+                    "clients": sorted((sess.get("clients") or {}).values()),
+                })
+    return sorted(out, key=lambda s: s.get("last_access_ms") or 0, reverse=True)
+
+
+async def revoke_session(session_id: str) -> None:
+    """End one session (manage-users); its refresh token stops working at once."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.delete(f"{KEYCLOAK_INTERNAL_URL}/admin/realms/{REALM}/sessions/{session_id}",
+                                headers=await _admin_headers())
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=404 if r.status_code == 404 else 502,
+                            detail="Session not found" if r.status_code == 404 else "IAM refused the revocation")
+
+
+async def logout_user_everywhere(user_id: str) -> None:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(f"{KEYCLOAK_INTERNAL_URL}/admin/realms/{REALM}/users/{user_id}/logout",
+                              headers=await _admin_headers())
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=502, detail="IAM refused the logout")
+
+
+async def realm_token_settings() -> dict:
+    """Token lifetimes as configured in Keycloak (view-realm). Read-only in DVAS."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(f"{KEYCLOAK_INTERNAL_URL}/admin/realms/{REALM}", headers=await _admin_headers())
+    if r.status_code != 200:
+        return {}
+    d = r.json()
+    return {"access_token_lifespan_s": d.get("accessTokenLifespan"),
+            "sso_session_idle_s": d.get("ssoSessionIdleTimeout"),
+            "sso_session_max_s": d.get("ssoSessionMaxLifespan")}

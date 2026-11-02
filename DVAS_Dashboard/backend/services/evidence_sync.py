@@ -23,7 +23,7 @@ from sqlalchemy import select
 
 from audit_service import write_audit_v2
 from core.analytics_client import _service_headers
-from core.config import ANALYTICS_BASE, ANALYTICS_DATABASE_URL, EVIDENCE_RETENTION_DAYS
+from core.config import ANALYTICS_BASE, ANALYTICS_DATABASE_URL
 from database import async_session_factory
 from models import Alert, Evidence, EvidenceSyncState, Mission
 from services import evidence_vault
@@ -241,7 +241,8 @@ async def create_evidence(session, ev: dict) -> Evidence:
     image_match = "exact" if objects else "none"
 
     evidence_id = f"EVI-{uuid.uuid4().hex[:12]}"
-    retain_until = datetime.now(timezone.utc) + timedelta(days=EVIDENCE_RETENTION_DAYS)
+    from services.settings_service import get as get_setting
+    retain_until = datetime.now(timezone.utc) + timedelta(days=int(await get_setting("evidence_retention_days")))
     row = Evidence(
         id=evidence_id,
         label=f"{_event_type_label(f['event_type'])} — {f['drone_id']}",

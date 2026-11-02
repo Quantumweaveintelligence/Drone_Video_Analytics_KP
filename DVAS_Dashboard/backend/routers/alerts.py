@@ -795,7 +795,8 @@ def _object_for_role(ev: Evidence, role: str) -> Optional[dict]:
 
 
 async def stream_evidence_object(evidence_id: str, role: str, user: dict, request) -> Response:
-    if user.get("role") not in ("control_room_officer", "senior_officer", "system_administrator"):
+    # admin_content_wall: administrators manage the system, they do not view evidence content
+    if user.get("role") not in ("control_room_officer", "senior_officer"):
         raise HTTPException(403, "Not permitted")
     async with async_session_factory() as session:
         ev = (await session.execute(

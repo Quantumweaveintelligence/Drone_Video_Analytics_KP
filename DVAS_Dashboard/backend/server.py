@@ -30,7 +30,7 @@ from services.retention import start_retention_job
 from services.report_jobs import start_report_worker
 from ingest_proxy import ingest_api
 
-from routers import auth, drones, alerts, audit, analytics, edge, infra, ws, incidents, reports, push, cases, downloads
+from routers import admin, auth, drones, alerts, audit, analytics, edge, infra, ws, incidents, reports, push, cases, downloads
 
 # ---------- App ----------
 logging.basicConfig(level=logging.INFO)
@@ -106,6 +106,7 @@ async def root():
 
 # ---------- Register routers ----------
 app.include_router(auth.router)
+app.include_router(admin.router)
 app.include_router(drones.router)
 app.include_router(alerts.router)
 app.include_router(cases.router)

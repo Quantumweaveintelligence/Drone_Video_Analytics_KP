@@ -57,6 +57,7 @@ async def list_audit(
     is_legal_hold: Optional[str] = None,
     correlation_id: Optional[str] = None,
     request_id: Optional[str] = None,
+    actor_session_id: Optional[str] = None,
     sort_by: str = "ts",
     sort_dir: str = "desc",
     page: int = 1,
@@ -79,6 +80,7 @@ async def list_audit(
         is_legal_hold=is_legal_hold,
         correlation_id=correlation_id,
         request_id=request_id,
+        actor_session_id=actor_session_id,
         sort_by=sort_by,
         sort_dir=sort_dir,
         page=page,
@@ -93,13 +95,27 @@ async def audit_summary(
     q: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    actor_id: Optional[str] = None,
+    actor_role: Optional[str] = None,
+    action_type: Optional[str] = None,
+    category: Optional[str] = None,
+    severity: Optional[str] = None,
+    status: Optional[str] = None,
+    source_module: Optional[str] = None,
+    target_type: Optional[str] = None,
+    compliance_tag: Optional[str] = None,
+    is_legal_hold: Optional[str] = None,
+    correlation_id: Optional[str] = None,
+    request_id: Optional[str] = None,
+    actor_session_id: Optional[str] = None,
 ):
-    """Aggregate summary KPI counts (Total, Failed, Critical, Warning, Info)."""
+    """Aggregate summary KPI counts over the same filters as the list (AUD-10)."""
     return await get_audit_summary(
-        q=q,
-        date_from=date_from,
-        date_to=date_to,
-        user=user,
+        q=q, date_from=date_from, date_to=date_to, actor_id=actor_id, actor_role=actor_role,
+        action_type=action_type, category=category, severity=severity, status=status,
+        source_module=source_module, target_type=target_type, compliance_tag=compliance_tag,
+        is_legal_hold=is_legal_hold, correlation_id=correlation_id, request_id=request_id,
+        actor_session_id=actor_session_id, user=user,
     )
 
 
@@ -117,7 +133,7 @@ async def audit_retention_policy(
     user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
 ):
     """Return audit trail statutory retention policy details."""
-    return get_retention_policy()
+    return await get_retention_policy()
 
 
 @router.get("/audit-logs/action-types")
@@ -180,9 +196,13 @@ async def audit_compliance_tags(
 async def audit_trends(
     user: dict = Depends(require_roles(*AUDIT_FULL_ROLES)),
     range: str = "24h",
+    range_val: Optional[str] = None,
 ):
-    """Aggregate activity trend histograms and top actor stats."""
-    return await get_audit_trends(range_val=range, user=user)
+    """Aggregate activity trend histograms and top actor stats (range: today, 24h, 7d, 30d)."""
+    try:
+        return await get_audit_trends(range_val=range_val or range, user=user)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post("/audit-logs/access-log")
@@ -467,6 +487,8 @@ async def place_legal_hold_endpoint(
             audit_log_id=log_id,
             case_number=body.case_number,
             reason=body.hold_reason,
+            legal_authority=body.legal_authority,
+            contact_email=body.contact_email,
             actor=user,
         )
     except ValueError as e:

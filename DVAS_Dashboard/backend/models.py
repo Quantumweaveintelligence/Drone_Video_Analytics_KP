@@ -90,6 +90,8 @@ class AuditLegalHold(Base):
     released_by = Column(String, nullable=True)
     released_at = Column(String, nullable=True)
     release_reason = Column(Text, nullable=True)
+    legal_authority = Column(Text, nullable=True)
+    contact_email = Column(String, nullable=True)
 
 
 class AuditFilterPreset(Base):
@@ -210,6 +212,16 @@ class Evidence(Base):
     record_sha256 = Column(String, nullable=True)
     integrity = Column(String, nullable=False, default="unverified")  # ok | mismatch | missing | unverified
     integrity_checked_at = Column(UTCDateTime, nullable=True)
+
+
+class SystemSetting(Base):
+    """Run-time settings the backend enforces (migrations/system_settings.sql)."""
+    __tablename__ = "system_settings"
+
+    key = Column(String, primary_key=True)
+    value = Column(JSONB, nullable=False)
+    updated_by = Column(String, nullable=True)
+    updated_at = Column(UTCDateTime, nullable=True)
 
 
 class EvidenceSyncState(Base):

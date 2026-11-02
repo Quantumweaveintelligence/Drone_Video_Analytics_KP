@@ -1,5 +1,4 @@
 import asyncio
-import random
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import List
@@ -57,7 +56,7 @@ async def infra_health(user: dict = Depends(require_roles("system_administrator"
             "operator": s["operator"],
             "mission_id": s["mission_id"],
             "status": s["status"],
-            "last_heartbeat": now.isoformat(),
+            "last_heartbeat": s["last_frame_at"],
             "fps": s["fps"],
             "bitrate_mbps": s["bitrate_mbps"],
         }
@@ -68,8 +67,11 @@ async def infra_health(user: dict = Depends(require_roles("system_administrator"
         {
             "node": f"gpu-0 ({runtime.gpu_name_nvml() or 'GPU'})",
             "util_pct": infra["gpu_pct"],
-            "batch": 16,
-            "inference_ms": 28 if infra["gpu_pct"] > 0 else 0,
+            "mem_used_gb": infra["gpu_mem_used_gb"],
+            "mem_total_gb": infra["gpu_mem_total_gb"],
+            # The analyzers do not report batch size or inference time.
+            "batch": None,
+            "inference_ms": None,
         }
     ]
 
@@ -78,30 +80,50 @@ async def infra_health(user: dict = Depends(require_roles("system_administrator"
             "partition": f"q-{q['name']}",
             "depth": q["depth"],
             "throughput_fps": q["throughput_fps"],
+            "throughput_unit": q["throughput_unit"],
         }
         for q in queues
     ]
 
     alerts_infra = []
-    if infra["cpu_pct"] > 85:
+    if infra["cpu_pct"] is not None and infra["cpu_pct"] > 85:
         alerts_infra.append({
             "id": "alert-cpu",
             "severity": "warn",
             "text": f"High Host CPU utilization: {infra['cpu_pct']}%",
             "ts": now.isoformat(),
         })
-    if infra["disk_pct"] > 90:
+    if infra["disk_pct"] is not None and infra["disk_pct"] > 90:
         alerts_infra.append({
             "id": "alert-disk",
             "severity": "warn",
             "text": f"Host disk space usage high: {infra['disk_pct']}% ({infra['disk_used_gb']}GB / {infra['disk_total_gb']}GB)",
             "ts": now.isoformat(),
         })
-    if not alerts_infra:
+    try:
+        if not runtime.IS_SUPERVISOR:
+            raise RuntimeError("process supervision is only reported in the supervisor runtime")
+        table = await asyncio.get_running_loop().run_in_executor(None, runtime.get_process_table)
+        down = sorted(name for name, info in table.items() if info.get("statename") != "RUNNING")
+        if down:
+            alerts_infra.append({
+                "id": "alert-processes",
+                "severity": "warn",
+                "text": f"{len(down)} of {len(table)} services not running: {', '.join(down)}",
+                "ts": now.isoformat(),
+            })
+        elif not alerts_infra:
+            alerts_infra.append({
+                "id": "alert-nominal",
+                "severity": "info",
+                "text": f"All {len(table)} supervised services running",
+                "ts": now.isoformat(),
+            })
+    except Exception as exc:
         alerts_infra.append({
-            "id": "alert-nominal",
-            "severity": "info",
-            "text": "All 24 system containers & services operating within nominal parameters",
+            "id": "alert-supervisor",
+            "severity": "info" if not runtime.IS_SUPERVISOR else "warn",
+            "text": f"Service status unavailable: {exc}",
             "ts": now.isoformat(),
         })
 

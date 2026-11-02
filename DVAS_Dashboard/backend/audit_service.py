@@ -495,6 +495,7 @@ def _build_filter_clauses(
     is_legal_hold: Optional[Union[str, bool]] = None,
     correlation_id: Optional[str] = None,
     request_id: Optional[str] = None,
+    actor_session_id: Optional[str] = None,
     user: Optional[dict] = None,
 ) -> list:
     """Build list of SQLAlchemy filter clauses from query parameters and user role."""
@@ -573,6 +574,8 @@ def _build_filter_clauses(
         clauses.append(AuditLog.correlation_id == str(correlation_id)[:64])
     if request_id:
         clauses.append(AuditLog.request_id == str(request_id)[:64])
+    if actor_session_id:
+        clauses.append(AuditLog.actor_session_id == str(actor_session_id)[:128])
 
     # M4: only seniors / admins read the whole log; everyone else their own entries
     if user is not None and user.get("role") not in ("senior_officer", "system_administrator"):
@@ -598,6 +601,7 @@ async def query_audit_logs(
     is_legal_hold: Optional[Union[str, bool]] = None,
     correlation_id: Optional[str] = None,
     request_id: Optional[str] = None,
+    actor_session_id: Optional[str] = None,
     sort_by: str = "ts",
     sort_dir: str = "desc",
     page: int = 1,
@@ -626,6 +630,7 @@ async def query_audit_logs(
         is_legal_hold=is_legal_hold,
         correlation_id=correlation_id,
         request_id=request_id,
+        actor_session_id=actor_session_id,
         user=user,
     )
 
@@ -674,6 +679,8 @@ async def query_audit_logs(
                     "id": h.id,
                     "case_number": h.case_number,
                     "hold_reason": h.hold_reason,
+                    "legal_authority": h.legal_authority,
+                    "contact_email": h.contact_email,
                     "placed_by": h.placed_by,
                     "placed_by_name": h.placed_by_name,
                     "placed_at": h.placed_at,
@@ -714,20 +721,12 @@ async def query_audit_logs(
 # Summary KPI Aggregates
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def get_audit_summary(
-    *,
-    q: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    user: Optional[dict] = None,
-) -> dict:
-    """Compute aggregate counts for summary KPI cards (Total, Failed, Critical, Warning, Info)."""
-    clauses = _build_filter_clauses(
-        q=q,
-        date_from=date_from,
-        date_to=date_to,
-        user=user,
-    )
+async def get_audit_summary(*, user: Optional[dict] = None, **filters) -> dict:
+    """
+    Aggregate counts for the summary KPI cards (Total, Failed, Critical, Warning, Info).
+    Accepts the same filters as query_audit_logs, so the cards match the visible list.
+    """
+    clauses = _build_filter_clauses(user=user, **filters)
 
     async with async_session_factory() as session:
         # Base count
@@ -935,16 +934,27 @@ async def get_distinct_values(column_name: str) -> List[str]:
         return [r for r in result.scalars().all() if r]
 
 
-def get_retention_policy() -> dict:
-    """Return statutory audit retention policy details."""
+async def _audit_min_days() -> int:
+    from services.settings_service import AUDIT_STATUTORY_MIN_DAYS, get
+    return max(AUDIT_STATUTORY_MIN_DAYS, int(await get("audit_retention_days")))
+
+
+async def get_retention_policy() -> dict:
+    """Audit retention policy as enforced (Admin → Policy setting, statutory floor 365 days).
+    Purges are manual (Archive & Purge); there is no scheduled purge."""
+    async with async_session_factory() as session:
+        last = (await session.execute(
+            select(AuditLog.ts).where(AuditLog.action == "audit_purge")
+            .order_by(AuditLog.ts.desc()).limit(1))).scalar_one_or_none()
     return {
         "policy_name": "Kerala Police Statutory Audit Trail Policy",
-        "retention_period_days": 365,
+        "retention_period_days": await _audit_min_days(),
         "immutable": True,
-        "hash_algorithm": "SHA-256 (Merkle / Hash-Chain)",
-        "legal_compliance": ["Indian Evidence Act Section 65B", "IT Act 2000 (Section 43A / 79)", "Digital Personal Data Protection Act (DPDPA) 2023"],
-        "last_purge_date": None,
-        "next_scheduled_purge": "2027-01-01T00:00:00Z",
+        "hash_algorithm": "SHA-256 hash chain",
+        "legal_compliance": ["Bharatiya Sakshya Adhiniyam 2023, Section 63", "IT Act 2000 (Section 43A / 79)",
+                             "Digital Personal Data Protection Act (DPDPA) 2023"],
+        "last_purge_date": last,
+        "next_scheduled_purge": None,
     }
 
 
@@ -1407,14 +1417,21 @@ def generate_audit_section65b_pdf(items: List[dict], user: dict, filter_desc: st
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def get_audit_trends(range_val: str = "24h", user: Optional[dict] = None) -> dict:
-    """Compute hourly or daily activity trend histograms and top actor stats."""
-    hours = 24
-    if range_val == "7d":
-        hours = 24 * 7
-    elif range_val == "30d":
-        hours = 24 * 30
+    """Compute hourly or daily activity trend histograms and top actor stats.
 
-    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    range_val: "today" (since 00:00 IST), "24h", "7d" or "30d".
+    """
+    if range_val not in ("today", "24h", "7d", "30d"):
+        raise ValueError("range must be one of today, 24h, 7d, 30d")
+    hours = {"today": 24, "24h": 24, "7d": 24 * 7, "30d": 24 * 30}[range_val]
+
+    now_utc = datetime.now(timezone.utc)
+    if range_val == "today":
+        ist = timezone(timedelta(hours=5, minutes=30))
+        since_dt = now_utc.astimezone(ist).replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        since_dt = now_utc - timedelta(hours=hours)
+    since = since_dt.astimezone(timezone.utc).isoformat()
     clauses = [AuditLog.ts >= since]
 
     async with async_session_factory() as session:
@@ -1521,7 +1538,8 @@ async def log_audit_access(actor: dict, request=None, referrer: Optional[str] = 
 # Legal Hold & Forensic Chain-of-Custody
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def place_legal_hold(*, audit_log_id: str, case_number: str, reason: str, actor: dict) -> dict:
+async def place_legal_hold(*, audit_log_id: str, case_number: str, reason: str, actor: dict,
+                           legal_authority: Optional[str] = None, contact_email: Optional[str] = None) -> dict:
     """Place a statutory legal hold on an audit entry, preventing deletion under retention policies."""
     async with async_session_factory() as session:
         log_res = await session.execute(select(AuditLog).where(AuditLog.id == audit_log_id))
@@ -1548,6 +1566,8 @@ async def place_legal_hold(*, audit_log_id: str, case_number: str, reason: str, 
             placed_by_name=actor.get("name") or actor.get("email") or "Officer",
             placed_at=now_iso,
             active=True,
+            legal_authority=legal_authority,
+            contact_email=contact_email,
         )
         session.add(hold)
         await session.commit()
@@ -1562,7 +1582,10 @@ async def place_legal_hold(*, audit_log_id: str, case_number: str, reason: str, 
         target_type="audit_log",
         target_id=audit_log_id,
         target_name=f"Legal Hold (Case {case_number})",
-        details=f"Legal hold placed under case {case_number}. Reason: {reason}",
+        details=f"Legal hold placed under case {case_number}"
+                + (f" (authority: {legal_authority})" if legal_authority else "") + f". Reason: {reason}",
+        after_values={"case_number": case_number, "hold_reason": reason,
+                      "legal_authority": legal_authority, "contact_email": contact_email},
         source_module="dashboard",
         source_endpoint=f"POST /api/audit-logs/{audit_log_id}/legal-hold",
     )
@@ -1571,6 +1594,8 @@ async def place_legal_hold(*, audit_log_id: str, case_number: str, reason: str, 
         "audit_log_id": audit_log_id,
         "case_number": case_number,
         "hold_reason": reason,
+        "legal_authority": legal_authority,
+        "contact_email": contact_email,
         "placed_by": actor.get("id"),
         "placed_at": now_iso,
         "active": True,
@@ -1678,8 +1703,9 @@ async def get_chain_of_custody(log_id: str) -> dict:
 
 async def dry_run_purge(older_than_days: int = 365, user: Optional[dict] = None) -> dict:
     """Dry-run calculation of purgeable records older than retention threshold."""
-    if older_than_days < 365:
-        raise ValueError("Statutory retention policy mandates minimum 365 days retention before purge.")
+    min_days = await _audit_min_days()
+    if older_than_days < min_days:
+        raise ValueError(f"Retention policy mandates at least {min_days} days before purge.")
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
     async with async_session_factory() as session:
@@ -1710,8 +1736,9 @@ async def dry_run_purge(older_than_days: int = 365, user: Optional[dict] = None)
 
 async def export_archive_bundle(older_than_days: int = 365, user: Optional[dict] = None) -> dict:
     """Generate downloadable JSON archive bundle of records to be purged, with SHA-256 checksum."""
-    if older_than_days < 365:
-        raise ValueError("Minimum retention is 365 days.")
+    min_days = await _audit_min_days()
+    if older_than_days < min_days:
+        raise ValueError(f"Minimum retention is {min_days} days.")
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
     async with async_session_factory() as session:
@@ -1749,8 +1776,9 @@ async def execute_statutory_purge(*, older_than_days: int = 365, confirmation_ph
     if actor.get("role") != "system_administrator":
         raise PermissionError("Only system_administrator can execute statutory purge.")
 
-    if older_than_days < 365:
-        raise ValueError("Cannot purge records within statutory 365-day retention period.")
+    min_days = await _audit_min_days()
+    if older_than_days < min_days:
+        raise ValueError(f"Cannot purge records within the {min_days}-day retention period.")
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
 
