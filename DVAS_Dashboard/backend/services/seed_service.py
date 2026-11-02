@@ -65,7 +65,8 @@ SEED_USERS = [
 # Idempotent schema migrations for tables the ORM already creates on a fresh DB.
 # They run right after create_all, before any request, so the ORM's new columns
 # exist on old databases too (create_all never adds columns to existing tables).
-STARTUP_MIGRATIONS = ("evidence_v2.sql", "evidence_v3_integrity.sql", "exports_v2.sql")
+STARTUP_MIGRATIONS = ("evidence_v2.sql", "evidence_v3_integrity.sql", "exports_v2.sql",
+                      "dashboard_timestamps.sql")
 _MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "migrations")
 
 

@@ -28,6 +28,7 @@ from database import async_session_factory
 from models import Evidence, EvidenceSyncState, Mission
 from services import evidence_vault
 from services.evidence_integrity import record_sha256
+from core.timeutil import iso_utc
 
 logger = logging.getLogger("dvas.evidence_sync")
 
@@ -178,7 +179,8 @@ def build_evidence_fields(ev: dict) -> dict:
     if not mission_id and drone_id.startswith("DRN-MSN-"):
         mission_id = drone_id[4:]
     event_type = ev.get("event_type", "unknown") or "unknown"
-    ts = str(ev.get("ts", ""))
+    # Canonical UTC form = what the timestamptz column returns, so record_sha256 stays verifiable
+    ts = iso_utc(ev.get("ts")) or ""
     geo = (block or {}).get("geo") or {}
     frame = (block or {}).get("frame") or {}
     return {

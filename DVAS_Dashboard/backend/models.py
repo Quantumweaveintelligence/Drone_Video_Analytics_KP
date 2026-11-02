@@ -18,6 +18,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase
 
+from core.timeutil import UTCDateTime   # E6: timestamptz in, ISO-8601 strings out
+
 
 class Base(DeclarativeBase):
     pass
@@ -112,8 +114,8 @@ class Mission(Base):
     drone_id = Column(String, nullable=True)
     operator_name = Column(String, nullable=True)
     jurisdiction = Column(String)
-    started_at = Column(String)
-    ended_at = Column(String, nullable=True)
+    started_at = Column(UTCDateTime)
+    ended_at = Column(UTCDateTime, nullable=True)
     operator_ids = Column(JSONB, default=list)  # list of user IDs
     supervisor = Column(String)
     zone = Column(String)
@@ -149,9 +151,20 @@ class Alert(Base):
     type = Column(String)
     confidence = Column(Float)
     zone = Column(String)
-    ts = Column(String, index=True)
+    ts = Column(UTCDateTime, index=True)
     acknowledged_by = Column(String, nullable=True)
-    acknowledged_at = Column(String, nullable=True)
+    acknowledged_at = Column(UTCDateTime, nullable=True)
+    # E6 / R1 (migrations/dashboard_timestamps.sql)
+    category = Column(String, nullable=True)            # ai | incident | suggestion | manual
+    severity = Column(String, nullable=True)            # critical | high | medium | low
+    rule = Column(String, nullable=True)                # analyzer rule that raised it
+    title = Column(String, nullable=True)
+    evidence_id = Column(String, nullable=True, index=True)
+    lat = Column(Float, nullable=True)
+    lon = Column(Float, nullable=True)
+    source_event_id = Column(String, nullable=True, unique=True)
+    disposition = Column(String, nullable=True)         # true_positive | false_positive | duplicate | handled
+    disposition_note = Column(Text, nullable=True)
 
 
 class Evidence(Base):
@@ -169,20 +182,20 @@ class Evidence(Base):
     thumbnail = Column(String)
     image_bucket = Column(String, default="")
     secondary_image_key = Column(String, default="")
-    ts = Column(String, index=True)
+    ts = Column(UTCDateTime, index=True)
     legal_hold = Column(Boolean, default=False)
-    retention_until = Column(String)
+    retention_until = Column(UTCDateTime)
     # Phase 10: Legal hold details
     legal_hold_reason = Column(Text, nullable=True)
     legal_hold_by = Column(String, nullable=True)
-    legal_hold_at = Column(String, nullable=True)
+    legal_hold_at = Column(UTCDateTime, nullable=True)
     # Phase 10: Analytics confirmed-event dedup key
     source_event_id = Column(String, nullable=True, unique=True, index=True)
     # Evidence plan E1 (migrations/evidence_v2.sql): copied from the analyzer's event
     attributes = Column(JSONB, nullable=False, default=dict)
     objects = Column(JSONB, nullable=False, default=list)       # vault objects: role/bucket/key/sha256/kind/source
     image_match = Column(String, nullable=False, default="none")  # exact | heuristic | none
-    capture_ts = Column(String, nullable=True)
+    capture_ts = Column(UTCDateTime, nullable=True)
     lat = Column(Float, nullable=True)
     lon = Column(Float, nullable=True)
     severity = Column(String, nullable=True)
@@ -190,13 +203,13 @@ class Evidence(Base):
     # E2: vault copy + disposal
     vault_status = Column(String, nullable=True)                # copied | partial | failed | none; NULL = legacy
     status = Column(String, nullable=False, default="active")   # active | disposed
-    disposed_at = Column(String, nullable=True)
+    disposed_at = Column(UTCDateTime, nullable=True)
     disposed_by = Column(String, nullable=True)
     disposal_reason = Column(Text, nullable=True)
     # E3 (migrations/evidence_v3_integrity.sql)
     record_sha256 = Column(String, nullable=True)
     integrity = Column(String, nullable=False, default="unverified")  # ok | mismatch | missing | unverified
-    integrity_checked_at = Column(String, nullable=True)
+    integrity_checked_at = Column(UTCDateTime, nullable=True)
 
 
 class EvidenceSyncState(Base):
@@ -204,9 +217,9 @@ class EvidenceSyncState(Base):
     __tablename__ = "evidence_sync_state"
 
     id = Column(Integer, primary_key=True)
-    last_ts = Column(String, nullable=True)
+    last_ts = Column(UTCDateTime, nullable=True)
     last_event_id = Column(String, nullable=True)
-    updated_at = Column(String, nullable=True)
+    updated_at = Column(UTCDateTime, nullable=True)
 
 
 class Case(Base):
@@ -220,7 +233,7 @@ class Case(Base):
     jurisdiction = Column(String, nullable=True)
     title = Column(String, nullable=True)
     created_by = Column(String, nullable=False)
-    created_at = Column(String, nullable=False)
+    created_at = Column(UTCDateTime, nullable=False)
     status = Column(String, nullable=False, default="open")     # open | closed
 
 
@@ -230,7 +243,7 @@ class CaseEvidence(Base):
     case_id = Column(String, ForeignKey("cases.id"), primary_key=True)
     evidence_id = Column(String, ForeignKey("evidence.id"), primary_key=True)
     added_by = Column(String, nullable=False)
-    added_at = Column(String, nullable=False)
+    added_at = Column(UTCDateTime, nullable=False)
 
 
 class Export(Base):
@@ -241,11 +254,11 @@ class Export(Base):
     evidence_label = Column(String)
     jurisdiction = Column(String)
     requested_by = Column(String)
-    requested_at = Column(String)
+    requested_at = Column(UTCDateTime)
     justification = Column(Text)
     status = Column(String, default="pending")
     decision_by = Column(String, nullable=True)
-    decision_at = Column(String, nullable=True)
+    decision_at = Column(UTCDateTime, nullable=True)
     decision_comment = Column(Text, nullable=True)
     # Evidence plan E4 (migrations/exports_v2.sql)
     case_id = Column(String, ForeignKey("cases.id"), nullable=True)
@@ -278,7 +291,7 @@ class Incident(Base):
     category = Column(String, default="hardware")  # hardware, stream, telemetry, network, tactical
     created_by = Column(String, nullable=False)
     location = Column(String, nullable=True)
-    timestamp = Column(String, index=True)
+    timestamp = Column(UTCDateTime, index=True)
     mission_id = Column(String, nullable=True)
     drone_id = Column(String, nullable=True)
     status = Column(String, default="OPEN")  # OPEN, ACKNOWLEDGED, RESOLVED
@@ -295,7 +308,7 @@ class AIModelSuggestion(Base):
     reason = Column(Text, nullable=True)
     location = Column(String, nullable=True)
     suggested_by = Column(String, nullable=False)
-    timestamp = Column(String, index=True)
+    timestamp = Column(UTCDateTime, index=True)
     status = Column(String, default="PENDING")   # PENDING, ACKNOWLEDGED, DEPLOYED_TO_GPU
     drone_id = Column(String, nullable=True)
     mission_id = Column(String, nullable=True)
@@ -313,13 +326,13 @@ class Report(Base):
     report_type = Column(String, nullable=False)      # daily_incident | weekly_response | drone_utilisation | mission_after_action
     title = Column(String, nullable=False)
     requested_by = Column(String, nullable=False)
-    requested_at = Column(String, nullable=False)
+    requested_at = Column(UTCDateTime, nullable=False)
     jurisdiction = Column(String)
     status = Column(String, default="generating")     # generating | ready | failed
     params = Column(JSONB, default=dict)              # date range, mission_id, etc.
     file_key = Column(String, nullable=True)          # MinIO object key
     file_size_bytes = Column(BigInteger, nullable=True)
-    generated_at = Column(String, nullable=True)
+    generated_at = Column(UTCDateTime, nullable=True)
     error_message = Column(Text, nullable=True)
     watermark_text = Column(String, nullable=True)
     sha256 = Column(String, nullable=True)                      # E3: hash of the stored PDF
