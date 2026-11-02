@@ -140,13 +140,15 @@ REACT_APP_DEPLOYMENT_TARGET=edge REACT_APP_BACKEND_URL= GENERATE_SOURCEMAP=false
 ### Modified Files (7)
 | File | Phase |
 |---|---|
-| `dvas_edge/edge_api_server.py` | E1 |
+| `dvas_edge/edge_api_server.py` | E1, E8 |
 | `dvas_edge/config/settings.yaml` | E1 |
 | `dvas_edge/.gitignore` | E1 |
-| `dvas_edge/ingest/edge_sender.py` | E1 |
+| `dvas_edge/ingest/edge_sender.py` | E1, E7, E8 |
 | `dvas_edge/requirements.txt` | E1 |
 | `DVAS_Dashboard/frontend/src/App.js` | E3 |
 | `DVAS_Dashboard/frontend/src/pages/Login.js` | E3 |
+| `dvas_edge/packaging/config/edge.env.template` | E4, E7, E8 |
+| `dvas_edge/packaging/dvas_edge_installer.iss` | E5, E7, E8 |
 
 ### New Files (8)
 | File | Phase |
@@ -167,7 +169,8 @@ REACT_APP_DEPLOYMENT_TARGET=edge REACT_APP_BACKEND_URL= GENERATE_SOURCEMAP=false
 | Phase | Status | Notes |
 |---|---|---|
 | E6 — Testing | ✅ COMPLETE (local) | Build script works, launcher tested, frontend served |
-| E7 — Hardening | ⏳ Pending | Code signing, per-laptop service accounts, clip upload |
+| E7 — Hardening & RunPod Integration | ✅ COMPLETE | Zero-trust auth, SRT telemetry extraction, installer wizard simplification |
+| E8 — Session Token Forwarding | ✅ COMPLETE | Seamless ingest streaming reusing operator Keycloak JWT; removes client secret dependency |
 
 ---
 
@@ -306,3 +309,53 @@ dist/                          (511.2 MB total)
 | `DVAS_PORT` | Optional UI Gateway port override (auto-fallbacks if busy) | `8765` |
 | `DVAS_CORE_PORT` | Optional Edge Core port override (auto-fallbacks if busy) | `8766` |
 | `ENV` | Environment | `production` |
+
+---
+
+## Phase E8 — Approach 2: Dynamic Session Token Forwarding ✅ COMPLETE
+
+### Root Cause of Frame Upload Failure:
+During live operator field trials on RunPod, the operator successfully authenticated to the Web UI using their assigned credentials (`edge_laptop_01@dvas.kp` / `drone_operator` role). However, when starting a mission, frame uploads immediately failed with:
+`{"error":"unauthorized_client","error_description":"Invalid client or Invalid client credentials"}`
+- **Reason:** The previous Phase 1 design attempted to acquire a separate M2M Keycloak token in `edge_sender.py` using static credentials in `edge.env` (`INGEST__CLIENT_SECRET` and `INGEST__PASSWORD`). When RunPod pods are recreated, Keycloak generates a new realm client secret, invalidating any hardcoded client secrets stored on operator laptops.
+- **Field Usability Barrier:** Ordinary police field constables cannot be expected to edit `.env` configuration files or retrieve backend Keycloak client secrets every time a cloud pod changes. Furthermore, drones are reassigned dynamically between patrol laptops, so hardcoding static drone IDs and per-laptop uploader passwords in config files created operational friction.
+
+### Architectural Solution (Approach 2 — Session Token Forwarding):
+Instead of managing separate machine credentials on each laptop, the Edge Operator terminal directly forwards and multiplexes the logged-in operator's Keycloak JWT session token:
+1. **Single Human Authentication Flow:**
+   - The constable logs into `http://localhost:8765` using their standard Keycloak credentials.
+   - The browser receives an RS256-signed JWT access token with role `drone-operator` from the active Keycloak instance.
+   - Central Ingest endpoints (`POST /ingest/mission/start`, `POST /ingest/frame`, `POST /ingest/mission/geofence`, `POST /ingest/mission/end`) require only a valid `drone-operator` (or `sys-admin`) role and Keycloak signature. The operator's active JWT fulfills this requirement out-of-the-box.
+2. **Reverse Proxy & Zero-Trust Token Interception:**
+   - The React frontend automatically sends `Authorization: Bearer <operator_token>` on all `/edge-api/...` endpoints.
+   - The local gateway (`edge_launcher.py`) forwards these headers to the edge core on port 8766.
+   - `verify_edge_auth()` in `edge_api_server.py` validates the token using cached JWKS (`/certs`) from Keycloak and records it in `_ACTIVE_OPERATOR_TOKEN` along with its expiration timestamp.
+3. **Continuous Background Token Synchronization:**
+   - When a mission starts via `POST /api/edge/mission/start`, the active session token is forwarded directly into `IngestClient`.
+   - The React UI polls `/api/edge/status` and `/api/edge/telemetry` every 1-2 seconds with the active Bearer token.
+   - When the React frontend auto-refreshes the token via `/api/auth/refresh`, subsequent status polls immediately trigger `update_active_operator_token()`, which dynamically calls `pipeline.sender_thread.set_session_token(token, expiry)`.
+   - The streaming pipeline stays continuously authorized without interrupting the live video transmission.
+4. **Graceful Fallback & Zero-Touch Deployment:**
+   - `IngestClient.get_token()` prioritizes the forwarded session token.
+   - Machine credentials in `edge.env` (`INGEST__CLIENT_SECRET` / `INGEST__PASSWORD`) are now completely optional fallback parameters. Even if they are blank or mismatched, the stream succeeds using the active UI session token.
+   - Drones can be freely selected during Mission Start in the UI (`req.drone_id`), eliminating drone-to-laptop lock-in.
+
+### Key Code Modifications:
+1. **`dvas_edge/ingest/edge_sender.py`:**
+   - `IngestClient.__init__`: Added `session_token: Optional[str] = None` and `token_expiry: float = 0.0`.
+   - Added `set_session_token(token, expiry)` to dynamically receive refreshed session tokens.
+   - `get_token()`: Returns forwarded session token if valid (>15s remaining); attempts Keycloak direct grant only if credentials exist; gracefully retains session token if direct grant fails instead of crashing.
+   - Added `verify=_tls_param()` to `_acquire_token` for consistent SSL verification.
+2. **`dvas_edge/edge_api_server.py`:**
+   - Added `EdgeSenderThread.set_session_token()` to route token updates from thread-safe API handlers to the running client.
+   - Added module-level `update_active_operator_token(token, expiry)` to synchronize tokens across incoming requests and active sender threads.
+   - Updated `verify_edge_auth` to capture validated JWT tokens and update active session state.
+   - Updated `start_mission` route and `EdgePipeline.start_mission` to initialize `IngestClient` with the operator's active session token.
+   - Updated `toggle_ingest` route to refresh the session token upon ingestion toggle.
+   - Updated `get_jwks` and proxy status routes to respect `INGEST__TLS_VERIFY`.
+3. **`dvas_edge/packaging/config/edge.env.template` & `dvas_edge/packaging/dvas_edge_installer.iss`:**
+   - Pre-configured defaults updated to the current RunPod cloud pod (`https://g03m12pg2h741j-80.proxy.runpod.net/ingest`).
+4. **Packaging & Distribution:**
+   - Synchronized updated `edge_api_server.py` and `ingest/edge_sender.py` into `dvas_edge/packaging/dist/`.
+   - Cleaned `__pycache__` artifacts.
+   - Recompiled `DVAS_Edge_Setup_1.0.0.exe` with Inno Setup.

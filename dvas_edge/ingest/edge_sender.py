@@ -93,10 +93,12 @@ class IngestClient:
 
     def __init__(
         self,
-        drone_id:   str,
-        mission_id: str,
-        username:   str,
-        password:   str,
+        drone_id:      str,
+        mission_id:    str,
+        username:      str = "",
+        password:      str = "",
+        session_token: Optional[str] = None,
+        token_expiry:  float = 0.0,
     ) -> None:
         if drone_id:
             import re
@@ -110,20 +112,34 @@ class IngestClient:
         self.mission_id    = mission_id
         self.username      = username
         self.password      = password
-        self.token:        Optional[str] = None
-        self.token_expiry: float         = 0.0
+        self.token:        Optional[str] = session_token
+        self.token_expiry: float         = token_expiry if (session_token and token_expiry > 0) else (time.time() + 300 if session_token else 0.0)
         self.frame_seq:    int           = 0
         # Persistent HTTP client — avoids TCP+TLS handshake per frame
         self._http_client: Optional[httpx.AsyncClient] = None
 
     # ── Token management ──────────────────────────────────────────────────────
 
+    def set_session_token(self, token: str, expiry: float = 0.0) -> None:
+        """
+        Dynamically update or refresh the active operator session token forwarded
+        from the authenticated Edge web UI.
+        """
+        if not token:
+            return
+        self.token = token
+        self.token_expiry = expiry if expiry > 0 else (time.time() + 300)
+        log.info(
+            "session_token_updated",
+            extra={"expires_in_s": max(0, int(self.token_expiry - time.time()))},
+        )
+
     async def _acquire_token(self) -> str:
         """
         Fetch a new token from Keycloak using the Resource Owner Password
-        Credentials Grant (direct access).
+        Credentials Grant (direct access) using machine credentials.
         """
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, verify=_tls_param()) as client:
             resp = await client.post(
                 TOKEN_URL,
                 data={
@@ -146,10 +162,32 @@ class IngestClient:
         return self.token
 
     async def get_token(self) -> str:
-        """Return a valid token, refreshing 30 seconds before expiry."""
-        if self.token and time.time() < self.token_expiry - 30:
+        """
+        Return a valid token. Prefers the active operator session token forwarded
+        from the web UI. Falls back to Keycloak direct grant if credentials are
+        configured and no valid session token exists.
+        """
+        # 1. Forwarded session token / cached token valid (>15s remaining)
+        if self.token and time.time() < self.token_expiry - 15:
             return self.token
-        return await self._acquire_token()
+
+        # 2. Keycloak direct grant acquisition if machine credentials exist
+        if self.username and self.password and CLIENT_SEC:
+            try:
+                return await self._acquire_token()
+            except Exception as exc:
+                if self.token:
+                    log.warning(
+                        f"Direct Keycloak token acquisition failed ({exc}); continuing with forwarded session token"
+                    )
+                    return self.token
+                raise
+
+        # 3. Fallback to existing session token even if near expiry
+        if self.token:
+            return self.token
+
+        raise RuntimeError("No valid Keycloak session token or credentials available for ingest transmission")
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Return the persistent HTTP client, creating it on first use."""

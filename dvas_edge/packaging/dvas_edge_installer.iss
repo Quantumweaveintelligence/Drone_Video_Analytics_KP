@@ -87,7 +87,7 @@ begin
     'Verify or edit the DVAS Ingest Server URL for this operator laptop.'#13#10 +
     'The cloud ingest endpoint is pre-configured below by default:');
   IngestPage.Add('Ingest Server URL:', False);
-  IngestPage.Values[0] := 'https://4nrza3dukc231h-80.proxy.runpod.net/ingest';
+  IngestPage.Values[0] := 'https://g03m12pg2h741j-80.proxy.runpod.net/ingest';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

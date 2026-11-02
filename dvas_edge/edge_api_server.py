@@ -274,6 +274,11 @@ class EdgeSenderThread(threading.Thread):
         self._operator:     Optional[str] = None
         self._geofence:     Optional[dict] = None
 
+    def set_session_token(self, token: str, expiry: float = 0.0) -> None:
+        """Forward renewed operator session token to the IngestClient."""
+        if self._client:
+            self._client.set_session_token(token, expiry)
+
     def set_mission_details(self, mission_name: str = None, location: str = None, operator: str = None, geofence: dict = None) -> None:
         """Store mission details so they can be sent at start_mission time."""
         self._mission_name = mission_name
@@ -508,7 +513,12 @@ class PipelineManager:
 
     # ── Mission lifecycle ─────────────────────────────────────────────────
 
-    def start_mission(self, req: MissionStartRequest) -> dict:
+    def start_mission(
+        self,
+        req: MissionStartRequest,
+        session_token: Optional[str] = None,
+        token_expiry: float = 0.0,
+    ) -> dict:
         with self.lock:
             if self._running:
                 return {"error": "Mission already running"}
@@ -736,11 +746,15 @@ class PipelineManager:
             )
 
             # ── Edge Sender Thread ─────────────────────────────────────────
+            effective_token = session_token or _ACTIVE_OPERATOR_TOKEN
+            effective_expiry = token_expiry if (token_expiry and token_expiry > 0) else _ACTIVE_OPERATOR_TOKEN_EXPIRY
             client = IngestClient(
                 username=cfg.ingest.username,
                 password=cfg.ingest.password,
                 drone_id=drone_id,
-                mission_id=req.mission_id
+                mission_id=req.mission_id,
+                session_token=effective_token,
+                token_expiry=effective_expiry,
             )
             self.sender_thread = EdgeSenderThread(
                 client=client,
@@ -1062,9 +1076,10 @@ def get_jwks():
         return JWKS_CACHE
     token_url = os.getenv("INGEST__TOKEN_URL", "http://keycloak:8080/realms/kerala-police-drone/protocol/openid-connect/token")
     certs_url = token_url.replace("/token", "/certs")
+    tls_verify = os.getenv("INGEST__TLS_VERIFY", "true").lower() == "true"
     try:
         import httpx
-        r = httpx.get(certs_url, timeout=5.0)
+        r = httpx.get(certs_url, timeout=5.0, verify=tls_verify)
         if r.status_code == 200:
             JWKS_CACHE = r.json()
     except Exception as e:
@@ -1107,6 +1122,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ── Operator Session Token Tracking (Approach 2: Token Forwarding) ────────────
+_ACTIVE_OPERATOR_TOKEN: Optional[str] = None
+_ACTIVE_OPERATOR_TOKEN_EXPIRY: float = 0.0
+
+def update_active_operator_token(token: str, expiry: float = 0.0) -> None:
+    """
+    Store the latest valid JWT bearer token from the operator's browser session
+    and immediately propagate it to any active Ingest sender thread.
+    """
+    global _ACTIVE_OPERATOR_TOKEN, _ACTIVE_OPERATOR_TOKEN_EXPIRY
+    if not token:
+        return
+    _ACTIVE_OPERATOR_TOKEN = token
+    _ACTIVE_OPERATOR_TOKEN_EXPIRY = expiry if expiry > 0 else (time.time() + 300)
+    if pipeline and hasattr(pipeline, "sender_thread") and pipeline.sender_thread:
+        pipeline.sender_thread.set_session_token(token, _ACTIVE_OPERATOR_TOKEN_EXPIRY)
 
 # ── Edge Security & Authentication Guard ──────────────────────────────────────
 EDGE_API_KEY = os.getenv("EDGE_API_KEY", "")
@@ -1151,7 +1183,14 @@ async def verify_edge_auth(
                 options={"verify_signature": True, "verify_aud": False}
             )
             if payload and payload.get("exp", float("inf")) >= time.time():
-                return {"auth_type": "jwt", "user": payload.get("preferred_username") or payload.get("sub")}
+                token_exp = float(payload.get("exp", time.time() + 300))
+                update_active_operator_token(bearer_token, token_exp)
+                return {
+                    "auth_type": "jwt",
+                    "user": payload.get("preferred_username") or payload.get("sub"),
+                    "token": bearer_token,
+                    "token_expiry": token_exp,
+                }
         except Exception as e:
             log.warning(f"JWT verification failed: {e}")
 
@@ -1296,7 +1335,9 @@ async def upload_srt(
 
 @app.post("/api/edge/mission/start")
 def start_mission(req: MissionStartRequest, auth: dict = Depends(verify_edge_auth)):
-    return pipeline.start_mission(req)
+    token = auth.get("token") or _ACTIVE_OPERATOR_TOKEN
+    expiry = auth.get("token_expiry", 0.0)
+    return pipeline.start_mission(req, session_token=token, token_expiry=expiry)
 
 
 @app.post("/api/edge/mission/end")
@@ -1306,6 +1347,8 @@ def end_mission(auth: dict = Depends(verify_edge_auth)):
 
 @app.post("/api/edge/mission/toggle-ingest")
 def toggle_ingest(req: ToggleIngestRequest, auth: dict = Depends(verify_edge_auth)):
+    if auth.get("token"):
+        update_active_operator_token(auth.get("token"), auth.get("token_expiry", 0.0))
     enabled = pipeline.set_server_send(req.enabled)
     return {"server_send_enabled": enabled}
 
@@ -2055,7 +2098,8 @@ INGEST_BASE_URL = os.getenv("INGEST__URL", os.getenv("INGEST_URL", "https://4nrz
 
 @app.get("/api/ingest-server/status")
 async def proxy_ingest_status(auth: dict = Depends(verify_edge_auth)):
-    async with httpx.AsyncClient(timeout=2.0) as client:
+    tls_verify = os.getenv("INGEST__TLS_VERIFY", "true").lower() == "true"
+    async with httpx.AsyncClient(timeout=2.0, verify=tls_verify) as client:
         try:
             resp = await client.get(f"{INGEST_BASE_URL}/status")
             if resp.status_code == 200:
@@ -2067,7 +2111,8 @@ async def proxy_ingest_status(auth: dict = Depends(verify_edge_auth)):
 
 @app.get("/api/ingest-server/status/{drone_id}")
 async def proxy_ingest_drone_status(drone_id: str, auth: dict = Depends(verify_edge_auth)):
-    async with httpx.AsyncClient(timeout=2.0) as client:
+    tls_verify = os.getenv("INGEST__TLS_VERIFY", "true").lower() == "true"
+    async with httpx.AsyncClient(timeout=2.0, verify=tls_verify) as client:
         try:
             resp = await client.get(f"{INGEST_BASE_URL}/status/{drone_id}")
             if resp.status_code == 200:
