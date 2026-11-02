@@ -50,7 +50,7 @@ async def receive_notification(payload: dict, request: Request):
 
 
 async def _receive_incident(data: dict):
-    from models import Incident, Alert
+    from models import Incident
     from sqlalchemy import select
 
     incident_id = data.get("id")
@@ -81,13 +81,7 @@ async def _receive_incident(data: dict):
             location=location, timestamp=timestamp, mission_id=mission_id,
             drone_id=drone_id, status=data.get("status", "OPEN"), sent_to_ingest=True,
         ))
-        session.add(Alert(
-            id=incident_id, mission_id=mission_id or "EDGE",
-            jurisdiction=data.get("jurisdiction") or "Thiruvananthapuram",
-            drone_id=drone_id or "EDGE-STATION", type=display_title,
-            confidence=1.0, zone=location, ts=timestamp,
-            acknowledged_by=None, acknowledged_at=None,
-        ))
+        # No Alert copy (B16): the feed reads incidents from /api/incidents
         await session.commit()
 
     logger.info(f"Stored forwarded incident {incident_id} from peer")
@@ -99,18 +93,10 @@ async def _receive_incident(data: dict):
         "created_by": created_by, "timestamp": timestamp,
         "mission_id": mission_id, "drone_id": drone_id,
     })
-    alert_severity = "critical" if severity == "CRITICAL" else ("warning" if severity == "HIGH" else "info")
-    await hub.broadcast({
-        "type": "alert", "alert": {
-            "id": incident_id, "title": display_title, "type": display_title,
-            "severity": alert_severity, "drone_id": drone_id or "EDGE-STATION",
-            "mission_id": mission_id, "zone": location, "ts": timestamp,
-        }
-    })
 
 
 async def _receive_suggestion(data: dict):
-    from models import AIModelSuggestion, Alert
+    from models import AIModelSuggestion
     from sqlalchemy import select
 
     sugg_id = data.get("id")
@@ -144,14 +130,7 @@ async def _receive_suggestion(data: dict):
         models_str = ", ".join(model_names) if model_names else "AI Models"
         mission_tag = mission_id or (drone_id if drone_id else "Edge Mission")
         display_title = f"{mission_tag}: Suggests {models_str}"
-
-        session.add(Alert(
-            id=sugg_id, mission_id=mission_id or "EDGE",
-            jurisdiction=data.get("jurisdiction") or "Thiruvananthapuram",
-            drone_id=drone_id or "EDGE-STATION", type=display_title,
-            confidence=1.0, zone=location, ts=timestamp,
-            acknowledged_by=None, acknowledged_at=None,
-        ))
+        # No Alert copy (B16): the feed reads suggestions from /api/analytics/suggestions
         await session.commit()
 
     logger.info(f"Stored forwarded AI suggestion {sugg_id} from peer")
@@ -163,12 +142,4 @@ async def _receive_suggestion(data: dict):
         "models": models, "model_names": model_names,
         "priority": priority, "location": location,
         "suggested_by": suggested_by, "timestamp": timestamp,
-    })
-    await hub.broadcast({
-        "type": "alert", "alert": {
-            "id": sugg_id, "title": display_title, "type": display_title,
-            "severity": "warning" if priority in ("critical", "high") else "info",
-            "drone_id": drone_id or "EDGE-STATION",
-            "mission_id": mission_id or "EDGE", "zone": location, "ts": timestamp,
-        }
     })

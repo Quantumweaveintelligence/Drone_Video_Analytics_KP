@@ -169,20 +169,7 @@ async def create_incident(
             sent_to_ingest=sent_to_ingest,
         )
         session.add(new_inc)
-
-        new_alert = Alert(
-            id=incident_id,
-            mission_id=mission_id or "EDGE",
-            jurisdiction=user.get("jurisdiction") or "Thiruvananthapuram",
-            drone_id=drone_id or "EDGE-STATION",
-            type=display_title,
-            confidence=1.0,
-            zone=location,
-            ts=timestamp,
-            acknowledged_by=None,
-            acknowledged_at=None,
-        )
-        session.add(new_alert)
+        # No Alert copy (B16): the feed reads incidents from /api/incidents
         await session.commit()
 
     # Log to audit trail
@@ -219,25 +206,7 @@ async def create_incident(
     }
     await hub.broadcast(ws_incident)
 
-    # Also broadcast standard alert event so NotificationBell captures it
-    alert_severity = (
-        "critical" if severity == "CRITICAL"
-        else ("warning" if severity == "HIGH" else "info")
-    )
-    ws_alert = {
-        "type": "alert",
-        "alert": {
-            "id": incident_id,
-            "title": display_title,
-            "type": display_title,
-            "severity": alert_severity,
-            "drone_id": drone_id or "EDGE-STATION",
-            "mission_id": mission_id,
-            "zone": location,
-            "ts": timestamp,
-        }
-    }
-    await hub.broadcast(ws_alert)
+    # (No extra "alert" message: the bell and the feed handle "incident" themselves — B16)
 
     # Forward to peer DVAS backend (command side / friend's laptop) so their bell shows it
     import asyncio as _asyncio

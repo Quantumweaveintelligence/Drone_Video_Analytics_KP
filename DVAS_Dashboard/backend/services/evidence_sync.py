@@ -25,7 +25,7 @@ from audit_service import write_audit_v2
 from core.analytics_client import _service_headers
 from core.config import ANALYTICS_BASE, ANALYTICS_DATABASE_URL, EVIDENCE_RETENTION_DAYS
 from database import async_session_factory
-from models import Evidence, EvidenceSyncState, Mission
+from models import Alert, Evidence, EvidenceSyncState, Mission
 from services import evidence_vault
 from services.evidence_integrity import record_sha256
 from core.timeutil import iso_utc
@@ -273,7 +273,50 @@ async def create_evidence(session, ev: dict) -> Evidence:
     _apply_vault_result(row, vault_objects, status, integrity)
     row.record_sha256 = record_sha256(_evidence_dict(row))
     session.add(row)
+    session.add(alert_for(row))
     return row
+
+
+def alert_for(row: Evidence) -> Alert:
+    """R1: every confirmed AI event is also an alert (B10), linked to its evidence."""
+    attrs = row.attributes or {}
+    return Alert(
+        id=f"AI-{uuid.uuid4().hex[:12]}",
+        category="ai",
+        source_event_id=row.source_event_id,
+        evidence_id=row.id,
+        mission_id=row.mission_id,
+        jurisdiction=row.jurisdiction,
+        drone_id=row.drone_id,
+        type=row.event_type,
+        rule=row.event_type,
+        title=_event_type_label(row.event_type),
+        severity=row.severity or "medium",
+        confidence=row.confidence,
+        zone=str(attrs.get("zone_id") or attrs.get("zone") or "") or None,
+        lat=row.lat,
+        lon=row.lon,
+        ts=row.ts,
+    )
+
+
+async def _broadcast_created(rows: List[Evidence]) -> None:
+    """Live feed + evidence screen refresh (U1) without waiting for the poll."""
+    try:
+        from services.websocket_hub import hub
+    except Exception:
+        return
+    for row in rows:
+        try:
+            await hub.broadcast({"type": "alert", "alert": {
+                "id": f"evidence:{row.id}", "category": "ai", "type": row.event_type,
+                "title": _event_type_label(row.event_type), "severity": row.severity or "medium",
+                "drone_id": row.drone_id, "mission_id": row.mission_id, "evidence_id": row.id,
+                "confidence": row.confidence, "ts": row.ts}})
+            await hub.broadcast({"type": "evidence_created", "evidence_id": row.id,
+                                 "event_type": row.event_type, "mission_id": row.mission_id})
+        except Exception as exc:
+            logger.debug("Broadcast failed: %s", exc)
 
 
 async def _audit_evidence(row: Evidence, action: str, details: str) -> None:
@@ -376,7 +419,8 @@ async def _sync_once() -> int:
         except Exception as exc:
             logger.error("Audit entry for %s failed: %s", row.id, exc)
     if created_rows:
-        logger.info("Evidence sync: created %d evidence rows", len(created_rows))
+        logger.info("Evidence sync: created %d evidence rows (+ alerts)", len(created_rows))
+        await _broadcast_created(created_rows)
     return len(created_rows)
 
 

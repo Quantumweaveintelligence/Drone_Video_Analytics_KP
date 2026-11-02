@@ -1436,21 +1436,7 @@ async def create_model_suggestion(
             mission_id=mission_id,
         )
         session.add(new_sugg)
-
-        from models import Alert
-        new_alert = Alert(
-            id=sugg_id,
-            mission_id=mission_id or "EDGE",
-            jurisdiction=user.get("jurisdiction") or "Thiruvananthapuram",
-            drone_id=drone_id or "EDGE-STATION",
-            type=display_title,
-            confidence=1.0,
-            zone=location,
-            ts=ts,
-            acknowledged_by=None,
-            acknowledged_at=None,
-        )
-        session.add(new_alert)
+        # No Alert copy (B16): the feed reads suggestions from /api/analytics/suggestions
         await session.commit()
 
     # Log to audit trail
@@ -1488,20 +1474,7 @@ async def create_model_suggestion(
         "timestamp": ts,
     })
 
-    # Also broadcast standard alert event so NotificationBell captures it
-    await hub.broadcast({
-        "type": "alert",
-        "alert": {
-            "id": sugg_id,
-            "title": display_title,
-            "type": display_title,
-            "severity": "warning" if priority in ("critical", "high") else "info",
-            "drone_id": drone_id or "EDGE-STATION",
-            "mission_id": mission_id or "EDGE",
-            "zone": location,
-            "ts": ts,
-        }
-    })
+    # (No extra "alert" message: the bell and the feed handle "model_suggestion" themselves — B16)
 
     # Forward to peer DVAS backend (command side / friend's laptop) so their bell shows it
     import asyncio as _asyncio
@@ -1536,7 +1509,8 @@ async def update_suggestion_status(
         if res.rowcount == 0:
             raise HTTPException(404, "Model suggestion not found")
 
-        from models import Alert
+        from datetime import datetime, timezone   # was missing: every status change raised NameError
+        from models import Alert                  # old alert copies (pre-R1) carry the suggestion id
         await session.execute(
             update(Alert)
             .where(Alert.id == suggestion_id)

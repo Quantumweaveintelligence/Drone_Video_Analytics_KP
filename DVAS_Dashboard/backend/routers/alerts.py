@@ -12,7 +12,7 @@ from models import Alert, Case, CaseEvidence, Evidence, Export
 from core.security import get_current_user, scope_filter_for, _apply_scope_to_query, _row_to_dict, require_roles
 from audit_service import write_audit_v2
 from schemas.exports import ExportRequestIn, ExportDecisionIn
-from schemas.evidence import LegalHoldIn, LegalHoldReleaseIn, DirectExportIn, DisposeIn
+from schemas.evidence import AckIn, LegalHoldIn, LegalHoldReleaseIn, DirectExportIn, DisposeIn
 from core.config import PII_VIEW_ROLES
 from services import evidence_vault
 from services.evidence_integrity import record_sha256
@@ -23,29 +23,37 @@ logger = logging.getLogger("dvas")
 router = APIRouter(prefix="/api", tags=["Alerts, Evidence & Exports"])
 
 
+ALERT_CATEGORIES = ("ai", "manual", "incident", "suggestion")
+
+
 @router.get("/alerts")
-async def list_alerts(user: dict = Depends(get_current_user)):
+async def list_alerts(category: str = "ai,manual", user: dict = Depends(get_current_user)):
+    """Alerts feed. Default: AI detections + manual alerts. Incidents and suggestions have their
+    own endpoints; their pre-R1 copies here are category incident/suggestion (B16)."""
     role = user.get("role")
+    cats = [c for c in (x.strip() for x in category.split(",")) if c in ALERT_CATEGORIES] or ["ai", "manual"]
+    cat_filter = or_(Alert.category.in_(cats), Alert.category.is_(None)) if "manual" in cats \
+        else Alert.category.in_(cats)
     async with async_session_factory() as session:
+        base = select(Alert).where(cat_filter)
         if role in ("system_administrator", "senior_officer"):
-            stmt = select(Alert).order_by(Alert.ts.desc()).limit(200)
+            stmt = base.order_by(Alert.ts.desc()).limit(200)
         elif role == "control_room_officer":
             f = scope_filter_for(user)
-            if "__deny__" in f:
-                stmt = select(Alert).order_by(Alert.ts.desc()).limit(200)
+            jur = f.get("jurisdiction") if "__deny__" not in f else None
+            if jur:
+                stmt = base.where(or_(
+                    Alert.jurisdiction == jur,
+                    Alert.jurisdiction == "Kerala",
+                    Alert.jurisdiction == "State HQ",
+                    Alert.jurisdiction.is_(None)
+                )).order_by(Alert.ts.desc()).limit(200)
             else:
-                jur = f.get("jurisdiction")
-                if jur:
-                    stmt = select(Alert).where(or_(
-                        Alert.jurisdiction == jur,
-                        Alert.jurisdiction == "Kerala",
-                        Alert.jurisdiction == "State HQ",
-                        Alert.jurisdiction.is_(None)
-                    )).order_by(Alert.ts.desc()).limit(200)
-                else:
-                    stmt = select(Alert).order_by(Alert.ts.desc()).limit(200)
+                stmt = base.order_by(Alert.ts.desc()).limit(200)
         elif role == "drone_operator":
-            stmt = select(Alert).order_by(Alert.ts.desc()).limit(100)
+            scope = user.get("mission_scope") or []
+            stmt = base.where(Alert.mission_id.in_(scope) if scope else false()) \
+                .order_by(Alert.ts.desc()).limit(100)
         else:
             raise HTTPException(403, "Not permitted")
         result = await session.execute(stmt)
@@ -54,7 +62,8 @@ async def list_alerts(user: dict = Depends(get_current_user)):
 
 @router.post("/alerts/{alert_id}/ack")
 async def ack_alert(
-    alert_id: str, user: dict = Depends(get_current_user), request: Request = None
+    alert_id: str, body: Optional[AckIn] = Body(default=None),
+    user: dict = Depends(get_current_user), request: Request = None
 ):
     # CRO, SR, and sysadmin can acknowledge alerts
     if user["role"] not in ("control_room_officer", "senior_officer", "system_administrator"):
@@ -66,6 +75,8 @@ async def ack_alert(
             .values(
                 acknowledged_by=user.get("email") or user.get("name") or "Operator",
                 acknowledged_at=datetime.now(timezone.utc).isoformat(),
+                # R1: the basis for the detection-quality report
+                **({"disposition": body.disposition, "disposition_note": body.note} if body else {}),
             )
         )
         if result.rowcount == 0:
@@ -115,9 +126,10 @@ async def ack_alert(
         actor=user, action="alert_ack",
         target=alert_id, target_type="alert",
         target_id=alert_id,
-        details="acknowledged",
+        details="acknowledged" + (f" ({body.disposition})" if body and body.disposition else ""),
         before_values={"acknowledged_by": None},
-        after_values={"acknowledged_by": user.get("email") or user.get("name")},
+        after_values={"acknowledged_by": user.get("email") or user.get("name"),
+                      "disposition": body.disposition if body else None},
         source_endpoint="POST /api/alerts/{id}/ack",
         request=request,
     )

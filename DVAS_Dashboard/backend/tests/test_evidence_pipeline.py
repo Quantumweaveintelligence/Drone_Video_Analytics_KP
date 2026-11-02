@@ -526,3 +526,48 @@ def test_proxy_image_authenticates_with_cookie_only(env, monkeypatch):
     c.cookies.set("dvas_access_token", "cookie-jwt")
     r = c.get(url)
     assert r.status_code == 200 and r.content == b"plate"
+
+
+# ── R1: alerts from confirmed events ─────────────────────────────────────────
+def _alerts(env):
+    from sqlalchemy import select
+    from models import Alert
+
+    async def go():
+        async with env.factory() as s:
+            return (await s.execute(select(Alert))).scalars().all()
+    return env.run(go())
+
+
+def test_event_creates_one_alert_linked_to_evidence(env, monkeypatch):
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    gw = FakeGateway([make_event(env.s3, ts=now)])
+    monkeypatch.setattr(evidence_sync.httpx, "AsyncClient", lambda **kw: gw)
+    env.run(evidence_sync._sync_once())
+    env.run(evidence_sync._sync_once())                     # re-read overlap: no duplicates
+    alerts = _alerts(env)
+    assert len(alerts) == 1
+    a = alerts[0]
+    assert a.category == "ai" and a.severity == "critical" and a.rule == "intrusion_breach"
+    assert a.evidence_id and a.source_event_id == "11111111-1111-1111-1111-111111111111"
+    assert (a.lat, a.lon, a.zone) == (9.9, 76.2, "Z1")
+
+
+def test_ack_with_disposition_and_feed_categories(env):
+    from models import Alert
+
+    async def seed():
+        async with env.factory() as s:
+            s.add(Alert(id="AI-1", category="ai", type="intrusion_breach", ts="2026-11-02T10:00:00Z"))
+            s.add(Alert(id="INC-1", category="incident", type="x", ts="2026-11-02T10:00:00Z"))
+            s.add(Alert(id="OLD-1", category=None, type="x", ts="2026-11-02T09:00:00Z"))
+            await s.commit()
+    env.run(seed())
+    c = client_for(SENIOR)
+    assert [a["id"] for a in c.get("/api/alerts").json()] == ["AI-1", "OLD-1"]          # no incident copy
+    assert [a["id"] for a in c.get("/api/alerts?category=incident").json()] == ["INC-1"]
+    assert c.post("/api/alerts/AI-1/ack", json={"disposition": "false_positive", "note": "shadow"}).status_code == 200
+    assert c.post("/api/alerts/AI-1/ack", json={"disposition": "maybe"}).status_code == 422
+    a = next(x for x in c.get("/api/alerts").json() if x["id"] == "AI-1")
+    assert a["disposition"] == "false_positive" and a["acknowledged_by"] == "sr@test"
+    assert client_for(OPERATOR).get("/api/alerts").json() == []                          # no mission scope match

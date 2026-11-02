@@ -1,3 +1,5 @@
+from typing import Literal, Optional
+
 from pydantic import BaseModel, Field
 
 class LegalHoldIn(BaseModel):
@@ -12,3 +14,9 @@ class DirectExportIn(BaseModel):
 
 class DisposeIn(BaseModel):
     reason: str = Field(..., min_length=20)
+
+
+class AckIn(BaseModel):
+    """R1: optional disposition when acknowledging an alert."""
+    disposition: Optional[Literal["true_positive", "false_positive", "duplicate", "handled"]] = None
+    note: Optional[str] = Field(default=None, max_length=500)
