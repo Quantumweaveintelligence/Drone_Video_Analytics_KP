@@ -405,3 +405,38 @@ async def command_kpis(user: dict = Depends(get_current_user)):
         "exports_pending": exports_pending,
         "drones_online": drones_online,
     }
+
+
+# ---------- Command dashboard: per-district rollup (senior officers, CMD-05 / P4) ----------
+@router.get("/command/districts")
+async def command_districts(user: dict = Depends(require_roles("senior_officer"))):
+    """Counts per jurisdiction: alerts in the last 24 h, active missions, live drones, evidence."""
+    from datetime import timedelta
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    rows: dict = {}
+
+    def bucket(name):
+        key = name or "Unassigned"
+        return rows.setdefault(key, {"jurisdiction": key, "alerts_24h": 0, "active_missions": 0,
+                                     "drones_live": 0, "evidence": 0})
+
+    async with async_session_factory() as session:
+        for jur, n in (await session.execute(
+                select(Alert.jurisdiction, func.count()).where(
+                    Alert.ts >= since, or_(Alert.category.in_(["ai", "manual"]), Alert.category.is_(None)))
+                .group_by(Alert.jurisdiction))).all():
+            bucket(jur)["alerts_24h"] = n
+        for jur, n in (await session.execute(
+                select(Mission.jurisdiction, func.count()).where(Mission.status == "active")
+                .group_by(Mission.jurisdiction))).all():
+            bucket(jur)["active_missions"] = n
+        for jur, n in (await session.execute(
+                select(Drone.jurisdiction, func.count()).where(Drone.status == "live")
+                .group_by(Drone.jurisdiction))).all():
+            bucket(jur)["drones_live"] = n
+        for jur, n in (await session.execute(
+                select(Evidence.jurisdiction, func.count()).where(Evidence.status != "disposed")
+                .group_by(Evidence.jurisdiction))).all():
+            bucket(jur)["evidence"] = n
+    return {"generated_at": datetime.now(timezone.utc).isoformat(),
+            "districts": sorted(rows.values(), key=lambda r: (-r["alerts_24h"], r["jurisdiction"]))}

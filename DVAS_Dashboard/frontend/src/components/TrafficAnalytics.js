@@ -16,7 +16,8 @@ import {
 
 import { useJpegPoller } from '../hooks/useJpegPoller';
 import { useActiveStreams } from '../hooks/useActiveStreams';
-import { api } from '../lib/api';
+import { api, apiError } from '../lib/api';
+import { fmtIST } from '../lib/ist';
 
 /* ─── constants ─────────────────────────────────────────────────── */
 const POLL_TRACKS    = 5000;
@@ -53,6 +54,8 @@ function fmtAge(ts) {
   if (s < 3600) return `${Math.floor(s/60)}m ago`;
   return `${Math.floor(s/3600)}h ago`;
 }
+// Every fixed label nvt() can return (other raw types are passed through capitalised).
+const NVT_LABELS = ['Car', 'Truck', 'Bus', 'Van', '2-Wheeler', '3-Wheeler', 'Unknown'];
 function nvt(raw) {
   if (!raw) return 'Unknown';
   const l = raw.toLowerCase();
@@ -132,7 +135,7 @@ function Panel({ title, icon: Icon, iconClass = 'text-teal-400', children, right
 
 
 /* ─── Annotated Frame Viewer ─────────────────────────────────────── */
-function AnnotatedFrameViewer({ droneId, mode = 'vehicle', streamRunning, isLive }) {
+function AnnotatedFrameViewer({ droneId, mode = 'vehicle', streamRunning, isLive, modelLabel }) {
   const [fps, setFps] = useState(0);
   const fpsRef = useRef({ count: 0, ts: Date.now() });
   const prevAnnotatedRef = useRef(null);
@@ -253,7 +256,7 @@ function AnnotatedFrameViewer({ droneId, mode = 'vehicle', streamRunning, isLive
       {/* ── HUD: bottom-left model label ───────────────── */}
       {isAnnotated && (
         <div className="absolute bottom-3 left-3 z-10 pointer-events-none mono text-[10px] bg-black/85 px-2 py-1 rounded text-slate-400">
-          {mode === 'anpr' ? 'YOLOv8 + PaddleOCR' : 'YOLOv8 + ByteTrack'}
+          {modelLabel || (mode === 'anpr' ? 'ANPR detection' : 'Vehicle detection')}
         </div>
       )}
     </div>
@@ -460,7 +463,7 @@ function FlowChart({ data }) {
 }
 
 /* ─── ANPR Window ─────────────────────────────────────────────────── */
-function ANPRWindow({ plates, activeDrone, activeMissionId, anprStreamRunning }) {
+function ANPRWindow({ plates, activeDrone, activeMissionId, anprStreamRunning, modelLabel }) {
   const [view, setView] = useState('grid');
   const [selectedId, setSelectedId] = useState(null);
   const [search, setSearch] = useState('');
@@ -535,6 +538,12 @@ function ANPRWindow({ plates, activeDrone, activeMissionId, anprStreamRunning })
     const q = search.toUpperCase();
     arr = arr.filter(p => (p.plate_text || '').toUpperCase().includes(q));
   }
+  // Filter options use the same labels nvt() produces; any other label seen in the data is appended.
+  const typeOptions = [...NVT_LABELS];
+  for (const p of arr) {
+    const label = nvt(p.vehicle_type);
+    if (!typeOptions.includes(label)) typeOptions.push(label);
+  }
   if (typeFilter !== 'all') {
     arr = arr.filter(p => nvt(p.vehicle_type).toLowerCase() === typeFilter);
   }
@@ -579,10 +588,9 @@ function ANPRWindow({ plates, activeDrone, activeMissionId, anprStreamRunning })
           style={{ fontSize: 11 }}
         >
           <option value="all">All Vehicles</option>
-          <option value="car">Car</option>
-          <option value="truck">Truck</option>
-          <option value="bus">Bus</option>
-          <option value="motorcycle">Motorcycle</option>
+          {typeOptions.map(label => (
+            <option key={label} value={label.toLowerCase()}>{label}</option>
+          ))}
         </select>
 
         {/* Spacer */}
@@ -616,7 +624,7 @@ function ANPRWindow({ plates, activeDrone, activeMissionId, anprStreamRunning })
       {/* ── Content ── */}
       {view === 'annotated' ? (
         <div className="rounded-lg overflow-hidden" style={{ height: 320 }}>
-          <AnnotatedFrameViewer droneId={activeDrone} mode="anpr" streamRunning={anprStreamRunning} />
+          <AnnotatedFrameViewer droneId={activeDrone} mode="anpr" streamRunning={anprStreamRunning} modelLabel={modelLabel} />
         </div>
       ) : arr.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-8 gap-2 opacity-50">
@@ -782,7 +790,7 @@ function ANPRWindow({ plates, activeDrone, activeMissionId, anprStreamRunning })
 }
 
 /* ─── Watchlist Panel ─────────────────────────────────────────────── */
-function WatchlistPanel({ alerts, watchlist, onAdd, onRemove, adding }) {
+function WatchlistPanel({ alerts, watchlist, onAdd, onRemove, adding, error }) {
   const [inputPlate, setInputPlate] = useState('');
   const [inputReason, setInputReason] = useState('');
   const [searchPlate, setSearchPlate] = useState('');
@@ -949,12 +957,20 @@ function WatchlistPanel({ alerts, watchlist, onAdd, onRemove, adding }) {
             className="flex-1 mono text-xs px-2 py-1.5 rounded outline-none"
             style={{ background:'var(--dvas-surface-2)', border:'1px solid var(--dvas-border)', color:'var(--dvas-text)' }} />
           <button
-            onClick={() => { if (inputPlate.trim()) { onAdd(inputPlate.trim(), inputReason.trim()); setInputPlate(''); setInputReason(''); } }}
+            onClick={async () => {
+              if (!inputPlate.trim()) return;
+              // Inputs are cleared only when the server accepted the entry.
+              const ok = await onAdd(inputPlate.trim(), inputReason.trim());
+              if (ok) { setInputPlate(''); setInputReason(''); }
+            }}
             disabled={adding || !inputPlate.trim()}
             className="px-3 py-1.5 rounded bg-teal-600 hover:bg-teal-500 text-white text-xs font-semibold disabled:opacity-50 transition-colors flex items-center gap-1">
             <Plus size={12} /> Add
           </button>
         </div>
+        {error && (
+          <div className="mono text-[10px] text-red-400 px-1">{error}</div>
+        )}
       </div>
 
       {/* ── Current Watchlist ── */}
@@ -1084,31 +1100,70 @@ function MissionHistory() {
     return true;
   });
 
-  const handleDownloadCsv = () => {
-    if (!missionData || !missionData.vehicles || missionData.vehicles.length === 0) return;
-    const rows = [
-      ['Timestamp', 'Tracker ID', 'Vehicle Type', 'Colour', 'Speed KPH', 'Plate Text', 'OCR Confidence']
-    ];
-    missionData.vehicles.forEach(v => {
-      rows.push([
-        v.created_at ? new Date(v.created_at).toLocaleString() : '',
-        v.tracker_id || '',
-        v.vehicle_type || '',
-        v.colour || '',
-        v.speed_kph || '',
-        v.plate_text || '',
-        v.ocr_confidence ? `${(v.ocr_confidence * 100).toFixed(1)}%` : ''
-      ]);
-    });
+  // Export every row matching the current filters, not just the visible page.
+  // The backend caps one page at 200 rows, so pages are fetched in turn up to CSV_MAX_ROWS.
+  const CSV_MAX_ROWS = 5000;
+  const CSV_PAGE = 200;
+  const [csvExporting, setCsvExporting] = useState(false);
+  const [csvNote, setCsvNote] = useState(null);
 
-    const csvContent = rows.map(r => r.map(c => `"${c}"`).join(',')).join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `mission_${selectedMission.mission_id}_vehicles.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+  const handleDownloadCsv = async () => {
+    if (!selectedMission || !missionData?.vehicles?.length) return;
+    setCsvExporting(true);
+    setCsvNote(null);
+    try {
+      const all = [];
+      let pageOffset = 0;
+      let more = true;
+      while (more && all.length < CSV_MAX_ROWS) {
+        const params = {
+          plate_search: debouncedPlateSearch,
+          vehicle_type: vehicleType,
+          sort: sortBy,
+          limit: Math.min(CSV_PAGE, CSV_MAX_ROWS - all.length),
+          offset: pageOffset,
+        };
+        if (filterOnlyPlates) params.has_plate = 'true';
+        const res = await api.get(`/analytics/mission/${encodeURIComponent(selectedMission.mission_id)}/vehicles`, { params });
+        if (res.data?.error) throw new Error(res.data.error);
+        const page = res.data?.vehicles || [];
+        all.push(...page);
+        pageOffset += page.length;
+        more = Boolean(res.data?.has_more) && page.length > 0;
+      }
+      const capped = more && all.length >= CSV_MAX_ROWS;
+
+      const rows = [
+        ['Timestamp (IST)', 'Tracker ID', 'Vehicle Type', 'Colour', 'Speed KPH', 'Plate Text', 'OCR Confidence']
+      ];
+      all.forEach(v => {
+        rows.push([
+          v.created_at ? fmtIST(v.created_at) : '',
+          v.tracker_id ?? '',
+          v.vehicle_type || '',
+          v.colour || '',
+          v.speed_kph ?? '',
+          v.plate_text || '',
+          v.ocr_confidence ? `${(v.ocr_confidence * 100).toFixed(1)}%` : ''
+        ]);
+      });
+
+      const csvContent = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `mission_${selectedMission.mission_id}_vehicles.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setCsvNote(capped
+        ? { type: 'warn', text: `Export capped at ${CSV_MAX_ROWS} rows; ${missionData.total != null ? `${missionData.total} match` : 'more rows match'}. Narrow the filters to export the rest.` }
+        : { type: 'ok', text: `Exported ${all.length} rows.` });
+    } catch (err) {
+      setCsvNote({ type: 'error', text: apiError(err, 'CSV export failed') });
+    } finally {
+      setCsvExporting(false);
+    }
   };
 
   return (
@@ -1156,7 +1211,7 @@ function MissionHistory() {
                     <div className="mono text-[10px] text-slate-400">
                       {m.name} · {m.drone_id}
                       {m.operator_name && <span className="text-slate-500"> · {m.operator_name}</span>}
-                      {m.started_at && <span className="text-slate-600"> · {new Date(m.started_at).toLocaleDateString()}</span>}
+                      {m.started_at && <span className="text-slate-600"> · {fmtIST(m.started_at)}</span>}
                     </div>
                   </div>
                 ))
@@ -1272,13 +1327,19 @@ function MissionHistory() {
         {/* CSV */}
         <button
           onClick={handleDownloadCsv}
-          disabled={!missionData?.vehicles?.length}
+          disabled={csvExporting || !missionData?.vehicles?.length}
+          title="Export all rows matching the current filters"
           className="ml-auto mono text-[10px] px-2.5 py-1.5 rounded flex items-center gap-1 transition-colors disabled:opacity-50"
           style={{ background: 'rgba(20,184,166,0.1)', color: '#14b8a6', border: '1px solid rgba(20,184,166,0.3)' }}
         >
-          <Download size={12} /> CSV
+          {csvExporting ? <RefreshCw size={12} className="animate-spin" /> : <Download size={12} />} CSV
         </button>
       </div>
+      {csvNote && (
+        <div className={`mono text-[10px] px-1 ${csvNote.type === 'error' ? 'text-red-400' : csvNote.type === 'warn' ? 'text-amber-400' : 'text-slate-400'}`}>
+          {csvNote.text}
+        </div>
+      )}
 
       {/* Mission Summary */}
       {missionData && !missionData.error && (
@@ -1291,7 +1352,7 @@ function MissionHistory() {
             <div className="mono text-[10px] text-slate-400 mt-1">
               Status: <span className="text-emerald-400">{missionData.status}</span> · 
               Duration: {missionData.duration || 'N/A'} · 
-              Started: {missionData.time_range?.start ? new Date(missionData.time_range.start).toLocaleString() : 'N/A'}
+              Started: {missionData.time_range?.start ? fmtIST(missionData.time_range.start) : '—'}
             </div>
           </div>
           <div className="flex gap-4 text-center">
@@ -1362,7 +1423,7 @@ function MissionHistory() {
                     </span>
                     <span className="text-slate-500 font-mono flex items-center gap-1" style={{ fontSize: 9 }}>
                       <Clock size={9} className="opacity-60" />
-                      {p.created_at ? new Date(p.created_at).toLocaleTimeString() : '—'}
+                      {p.created_at ? fmtIST(p.created_at) : '—'}
                     </span>
                   </div>
 
@@ -1475,7 +1536,7 @@ function MissionHistory() {
     </div>
   );
 }
-export default function TrafficAnalytics({ drones, onNavigateTab }) {
+export default function TrafficAnalytics({ drones, droneId: propDroneId = '', onNavigateTab }) {
   const { streams, loading: dronesLoading } = useActiveStreams();
   const activeDrones = (streams && streams.length > 0
     ? streams.map(s => ({
@@ -1498,15 +1559,23 @@ export default function TrafficAnalytics({ drones, onNavigateTab }) {
         : [])
   ).filter(d => Boolean(d.drone_id));
 
-  const [activeDrone, setActiveDrone] = useState(null);
+  const [activeDrone, setActiveDrone] = useState(propDroneId || null);
   const [activeMissionId, setActiveMissionId] = useState(null); // current mission_id for selected drone
   const [feedMode, setFeedMode]       = useState('vehicle');
   const [serviceStatus, setServiceStatus] = useState({ vehicle: false, anpr: false });
+  const [serviceHealth, setServiceHealth] = useState({ vehicle: null, anpr: null });
+  const [streamError, setStreamError] = useState(null);
   const [adding, setAdding] = useState(false);
+  const [watchlistError, setWatchlistError] = useState(null);
 
-  // Auto-select first active drone once telemetry loads
+  // Follow the page's selected drone when one is given
   useEffect(() => {
-    if (activeDrones.length === 0) return;
+    if (propDroneId) setActiveDrone(propDroneId);
+  }, [propDroneId]);
+
+  // Auto-select first active drone once telemetry loads (only when the page did not pick one)
+  useEffect(() => {
+    if (propDroneId || activeDrones.length === 0) return;
     setActiveDrone(prev => {
       if (prev && activeDrones.find(d => (d.drone_id || d.id) === prev)) return prev; // keep if still active
       // Pick first drone with frames, else first in list
@@ -1536,7 +1605,7 @@ export default function TrafficAnalytics({ drones, onNavigateTab }) {
     : '/analytics/plates/recent?limit=50';
   const { data: plates }                          = usePoll(platesUrl, POLL_PLATES);
   const { data: alerts }                          = usePoll('/analytics/alerts/theft', POLL_ALERTS);
-  const { data: watchlist }                       = usePoll('/analytics/watchlist', POLL_WATCHLIST);
+  const { data: watchlist, mutate: refetchWatchlist } = usePoll('/analytics/watchlist', POLL_WATCHLIST);
 
   // Poll health of vehicle and ANPR stream workers
   useEffect(() => {
@@ -1550,6 +1619,10 @@ export default function TrafficAnalytics({ drones, onNavigateTab }) {
           vehicle: vh.status === 'fulfilled' && vh.value?.data?.stream_running === true,
           anpr:    ah.status === 'fulfilled' && ah.value?.data?.stream_running === true,
         });
+        setServiceHealth({
+          vehicle: vh.status === 'fulfilled' ? vh.value?.data || null : null,
+          anpr:    ah.status === 'fulfilled' ? ah.value?.data || null : null,
+        });
       } catch { /* ignore */ }
     };
     check();
@@ -1560,8 +1633,9 @@ export default function TrafficAnalytics({ drones, onNavigateTab }) {
   const toggleWorker = async (service) => {
     const isRunning = serviceStatus[service];
     const endpoint = isRunning ? `/analytics/${service}/stream/stop` : `/analytics/${service}/stream/start`;
+    setStreamError(null);
     try {
-      await api.get(endpoint);
+      await api.post(endpoint);
       setServiceStatus(prev => ({ ...prev, [service]: !isRunning }));
       try {
         await api.post('/models/sync-worker', { service, action: isRunning ? 'stop' : 'start' });
@@ -1569,21 +1643,38 @@ export default function TrafficAnalytics({ drones, onNavigateTab }) {
         console.warn('Sync worker failed:', e);
       }
     } catch (e) {
-      console.error(`Failed to toggle ${service} worker`, e);
+      setStreamError(apiError(e, `Failed to ${isRunning ? 'stop' : 'start'} ${service === 'anpr' ? 'ANPR' : 'vehicle'} stream`));
     }
   };
 
+  // Resolves true on success so the panel only clears its inputs when the plate was added.
   const handleAddWatchlist = async (plate, reason) => {
     setAdding(true);
-    try { await api.post('/analytics/watchlist', { plate, reason }); }
-    catch (e) { console.error(e); }
-    finally { setAdding(false); }
+    setWatchlistError(null);
+    try {
+      await api.post('/analytics/watchlist', { plate, reason });
+      await refetchWatchlist();
+      return true;
+    } catch (e) {
+      setWatchlistError(apiError(e, 'Could not add plate to watchlist'));
+      return false;
+    } finally {
+      setAdding(false);
+    }
   };
 
   const handleRemoveWatchlist = async (plate) => {
-    try { await api.delete(`/analytics/watchlist/${plate}`); }
-    catch (e) { console.error(e); }
+    setWatchlistError(null);
+    try {
+      await api.delete(`/analytics/watchlist/${encodeURIComponent(plate)}`);
+      await refetchWatchlist();
+    } catch (e) {
+      setWatchlistError(apiError(e, 'Could not remove plate from watchlist'));
+    }
   };
+
+  // Model label for the feed overlay, only when the analyzer reports one
+  const modelLabelOf = (h) => h?.model || h?.model_name || null;
 
   return (
     <div className="flex flex-col gap-4 p-4">
@@ -1681,6 +1772,14 @@ export default function TrafficAnalytics({ drones, onNavigateTab }) {
             )}
           </div>
         </div>
+        {streamError && (
+          <div className="px-4 py-1.5 mono text-[10px] text-red-400 flex items-center gap-2"
+            style={{ borderBottom:'1px solid var(--dvas-border)', background:'rgba(239,68,68,0.07)' }}>
+            <AlertTriangle size={11} className="shrink-0" />
+            <span className="flex-1">{streamError}</span>
+            <button onClick={() => setStreamError(null)} className="text-slate-400 hover:text-slate-200"><X size={11} /></button>
+          </div>
+        )}
         {(() => {
           const selectedDroneObj = activeDrones.find(d => (d.drone_id || d.id) === activeDrone);
           const remaining = selectedDroneObj?.consumer_lag ? Object.values(selectedDroneObj.consumer_lag).reduce((sum, v) => sum + v, 0) : (selectedDroneObj?.messages_ready ?? 0);
@@ -1712,6 +1811,7 @@ export default function TrafficAnalytics({ drones, onNavigateTab }) {
             droneId={activeDrone}
             mode={feedMode}
             streamRunning={feedMode === 'anpr' ? serviceStatus.anpr : serviceStatus.vehicle}
+            modelLabel={modelLabelOf(feedMode === 'anpr' ? serviceHealth.anpr : serviceHealth.vehicle)}
           />
         </div>
       </div>
@@ -1748,7 +1848,7 @@ export default function TrafficAnalytics({ drones, onNavigateTab }) {
             {serviceStatus.anpr ? 'Live':'Offline'}
           </span>
         }>
-        <ANPRWindow plates={plates} activeDrone={activeDrone} activeMissionId={activeMissionId} anprStreamRunning={serviceStatus.anpr} />
+        <ANPRWindow plates={plates} activeDrone={activeDrone} activeMissionId={activeMissionId} anprStreamRunning={serviceStatus.anpr} modelLabel={modelLabelOf(serviceHealth.anpr)} />
       </Panel>
 
       {/* Watchlist & Alerts */}
@@ -1757,6 +1857,7 @@ export default function TrafficAnalytics({ drones, onNavigateTab }) {
         <WatchlistPanel
           alerts={alerts} watchlist={watchlist}
           onAdd={handleAddWatchlist} onRemove={handleRemoveWatchlist} adding={adding}
+          error={watchlistError}
         />
       </Panel>
 

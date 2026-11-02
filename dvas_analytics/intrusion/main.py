@@ -937,6 +937,14 @@ async def zone_status(drone_id: str = ""):
 
 # ── Config update ──────────────────────────────────────────────────────────────
 
+@app.get("/intrusion/config")
+async def get_config(drone_id: str = ""):
+    """Current configuration of a drone (the defaults when it has none yet)."""
+    cfg = _configs.get(drone_id) if drone_id else None
+    return {"drone_id": drone_id or None, "saved": cfg is not None,
+            "config": (cfg or IntrusionConfig()).dict()}
+
+
 @app.post("/intrusion/config")
 async def update_config(request: Request, drone_id: str = ""):
     """Update intrusion detection runtime configuration."""

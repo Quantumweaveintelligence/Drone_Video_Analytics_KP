@@ -62,8 +62,9 @@ export function AuthProvider({ children }) {
   };
 
   const logout = async () => {
-    // Cloud build: there is no edge API in the pod, so skip the edge mission cleanup
-    if (!isCloud) {
+    // Cloud build: there is no edge API in the pod, so skip the edge mission cleanup.
+    // F5: only a drone operator has an edge mission to end.
+    if (!isCloud && user?.role === "drone_operator") {
     try {
       // If there is an active mission on the edge, properly end it so frames stop sending
       const activeResp = await authFetch('/edge-api/api/edge/mission/active');

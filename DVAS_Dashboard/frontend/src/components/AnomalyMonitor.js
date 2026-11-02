@@ -18,14 +18,16 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 import {
   AlertTriangle, ShieldAlert, Eye, Activity, Play, Square, RefreshCw,
   Clock, CheckCircle2, X, ChevronRight, Sliders, Filter, Search,
-  Download, Zap, ArrowUpRight, Compass, Shield, Users, Car, Package,
+  Download, Zap, ArrowUpRight, Shield, Users, Car, Package,
   VideoOff, Crosshair, Maximize2, Layers, Cpu, ShieldCheck
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip as RechartsTooltip,
   ResponsiveContainer, Cell, PieChart, Pie
 } from "recharts";
-import { api } from "@/lib/api";
+import { useNavigate } from "react-router-dom";
+import { api, apiError } from "@/lib/api";
+import { fmtIST } from "@/lib/ist";
 import { useJpegPoller } from "@/hooks/useJpegPoller";
 import { useActiveStreams } from "@/hooks/useActiveStreams";
 
@@ -108,7 +110,10 @@ const EVENT_TYPE_LABELS = {
   opposing_crowd_flow:          { label: "Opposing Crowd Flow", icon: Users, color: "#F59E0B" },
 };
 
+const POLL_MS = 800; // annotated-frame polling interval
+
 export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
+  const navigate = useNavigate();
   const { mergeWithDrones, streams, loading: streamsLoading } = useActiveStreams();
   const activeDrones = useMemo(() => {
     const merged = mergeWithDrones(drones || []);
@@ -136,6 +141,8 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
   const [activeMissionId, setActiveMissionId] = useState(null);
   const [streamRunning, setStreamRunning] = useState(true);
   const [togglingStream, setTogglingStream] = useState(false);
+  const [streamToggleError, setStreamToggleError] = useState("");
+  const [frameSize, setFrameSize] = useState(null); // real dimensions of the last annotated frame
 
   // Sync activeDrone when propDroneId changes from parent, but ONLY if it is an active stream
   useEffect(() => {
@@ -200,6 +207,7 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
 
   // Config state
   const [runtimeConfig, setRuntimeConfig] = useState(null);
+  const [appliedConfig, setAppliedConfig] = useState(null); // config as last read from / saved to the analyzer
   const [savingConfig, setSavingConfig] = useState(false);
   const [configFeedback, setConfigFeedback] = useState("");
 
@@ -209,7 +217,7 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
     return `/api/analytics/anomaly/annotated/latest?drone_id=${encodeURIComponent(activeDrone)}`;
   }, [activeDrone, streamRunning]);
 
-  const { blobUrl, hasFrame, feedDead, fps, ok: isStreaming, error: streamError } = useJpegPoller(streamUrl, 800, streamRunning);
+  const { blobUrl, hasFrame, feedDead, fps, ok: isStreaming, error: streamError } = useJpegPoller(streamUrl, POLL_MS, streamRunning);
 
   // Determine if stream is live or offline
   const selectedStreamObj = activeDrones.find(d => d.drone_id === activeDrone);
@@ -217,6 +225,15 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
     ? (selectedStreamObj.status === "live" || (selectedStreamObj.frames_received || 0) > 0 || (selectedStreamObj.messages_ready || 0) > 0)
     : false;
   const hasActiveStream = Boolean(activeDrone && streamRunning && blobUrl && !feedDead);
+  // Why there is no frame: inference paused by the user, drone streaming but no annotated
+  // frames yet, or the drone is not reaching ingest at all.
+  const feedState = hasActiveStream
+    ? "live"
+    : !streamRunning
+    ? "paused"
+    : isDroneLive
+    ? "no_frames"
+    : "disconnected";
 
   // Fetch all telemetry data
   const fetchData = useCallback(async () => {
@@ -258,6 +275,7 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
     try {
       const { data } = await api.get("/analytics/anomaly/config");
       setRuntimeConfig(data);
+      setAppliedConfig(data);
     } catch (err) {
       console.error("Failed to load anomaly config:", err);
     }
@@ -270,10 +288,11 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
   // Toggle stream on/off
   const handleToggleStream = async () => {
     setTogglingStream(true);
+    setStreamToggleError("");
     try {
       const nextState = !streamRunning;
       const endpoint = streamRunning ? "/analytics/anomaly/stream/stop" : "/analytics/anomaly/stream/start";
-      await api.get(endpoint);
+      await api.post(endpoint);
       setStreamRunning(nextState);
       try {
         await api.post("/models/sync-worker", { service: "anomaly", action: nextState ? "start" : "stop" });
@@ -281,7 +300,7 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
         console.warn("Anomaly model sync error:", syncErr);
       }
     } catch (err) {
-      console.error("Failed to toggle stream:", err);
+      setStreamToggleError(apiError(err, streamRunning ? "Failed to pause inference" : "Failed to resume inference"));
     } finally {
       setTogglingStream(false);
     }
@@ -319,14 +338,20 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
     setConfigFeedback("");
     try {
       await api.put("/analytics/anomaly/config", runtimeConfig);
+      setAppliedConfig(runtimeConfig);
       setConfigFeedback("Configuration updated successfully");
       setTimeout(() => setConfigFeedback(""), 3000);
     } catch (err) {
-      setConfigFeedback("Failed to update configuration");
+      setConfigFeedback(`Failed to update configuration: ${apiError(err, "request failed")}`);
     } finally {
       setSavingConfig(false);
     }
   };
+
+  // Alert gate (hysteresis enter threshold, configurable 50–90%) from the runtime config
+  const gatePct = typeof appliedConfig?.hysteresis_enter === "number"
+    ? Math.round(appliedConfig.hysteresis_enter * 100)
+    : null;
 
   // Filtered alerts
   const filteredAlerts = useMemo(() => {
@@ -425,6 +450,9 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
             {streamRunning ? <Square size={13} /> : <Play size={13} />}
             <span>{streamRunning ? "Pause Inference" : "Resume Inference"}</span>
           </button>
+          {streamToggleError && (
+            <span role="alert" className="mono text-[10px] text-red-400 max-w-[220px]">{streamToggleError}</span>
+          )}
 
           {/* Config Drawer Toggle */}
           <button
@@ -458,11 +486,11 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
             <span className="mono text-[10px] text-slate-500">in current view</span>
           </div>
           <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between mono text-[10px] text-slate-400 relative z-10">
-            <span className="text-sky-300 font-medium">P: {summaryStats?.live_persons ?? 0}</span>
+            <span className="text-sky-300 font-medium">P: {summaryStats?.live_persons ?? "—"}</span>
             <span>·</span>
-            <span className="text-indigo-300 font-medium">V: {summaryStats?.live_vehicles ?? 0}</span>
+            <span className="text-indigo-300 font-medium">V: {summaryStats?.live_vehicles ?? "—"}</span>
             <span>·</span>
-            <span className="text-amber-300 font-medium">Obj: {summaryStats?.live_objects ?? 0}</span>
+            <span className="text-amber-300 font-medium">Obj: {summaryStats?.live_objects ?? "—"}</span>
           </div>
         </div>
 
@@ -509,11 +537,11 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
             <span className="mono text-[10px] text-slate-500">passed 8 gates</span>
           </div>
           <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between mono text-[10px] text-slate-400 relative z-10">
-            <span className="text-red-400 font-bold">Crit: {summaryStats?.critical_alerts_24h ?? 0}</span>
+            <span className="text-red-400 font-bold">Crit: {summaryStats?.critical_alerts_24h ?? "—"}</span>
             <span>·</span>
-            <span className="text-orange-400 font-bold">High: {summaryStats?.high_alerts_24h ?? 0}</span>
+            <span className="text-orange-400 font-bold">High: {summaryStats?.high_alerts_24h ?? "—"}</span>
             <span>·</span>
-            <span className="text-amber-400 font-bold">Med: {summaryStats?.medium_alerts_24h ?? 0}</span>
+            <span className="text-amber-400 font-bold">Med: {summaryStats?.medium_alerts_24h ?? "—"}</span>
           </div>
         </div>
 
@@ -534,12 +562,12 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
               <span className="mono text-3xl font-black text-emerald-400 tracking-tight">
                 {typeof summaryStats?.avg_alert_confidence === "number" && summaryStats.avg_alert_confidence > 0
                   ? `${Math.round(summaryStats.avg_alert_confidence * 100)}%`
-                  : "0%"}
+                  : "—"}
               </span>
               <span className="mono text-[10px] text-slate-500">4-tier blended</span>
             </div>
             <span className="mono text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 font-bold">
-              Gate ≥ 72%
+              Gate ≥ {gatePct != null ? `${gatePct}%` : "—"}
             </span>
           </div>
 
@@ -550,10 +578,13 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
                 className="bg-gradient-to-r from-emerald-500 to-teal-400 h-2 rounded-full transition-all duration-500"
                 style={{ width: `${Math.min(100, Math.max(0, (summaryStats?.avg_alert_confidence ?? 0) * 100))}%` }}
               />
+              {gatePct != null && (
+                <div className="absolute top-0 h-2 w-0.5 bg-emerald-200/80" style={{ left: `${gatePct}%` }} />
+              )}
             </div>
             <div className="flex items-center justify-between mono text-[9px] text-slate-500 mt-1">
               <span>0%</span>
-              <span className="text-emerald-400 font-semibold">Gate: 72%</span>
+              <span className="text-emerald-400 font-semibold">Gate: {gatePct != null ? `${gatePct}%` : "—"}</span>
               <span>100%</span>
             </div>
           </div>
@@ -575,19 +606,19 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
               {hasActiveStream ? (
                 <span className="mono text-[9px] px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 flex items-center gap-1.5 font-bold">
                   <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                  LIVE (800ms)
+                  LIVE
                 </span>
               ) : (
                 <span className="mono text-[9px] px-2 py-0.5 rounded-full bg-red-500/15 text-red-400 border border-red-500/30 flex items-center gap-1.5 font-bold">
                   <span className="w-2 h-2 rounded-full bg-red-400" />
-                  FEED OFFLINE
+                  {feedState === "paused" ? "INFERENCE PAUSED" : "FEED OFFLINE"}
                 </span>
               )}
             </div>
             <div className="mono text-[10px] text-slate-500 flex items-center gap-2">
-              <span>60fps Tactical HUD</span>
+              <span>Received: {hasActiveStream && fps > 0 ? `${fps} frames/s` : "—"}</span>
               <span>·</span>
-              <span>Collision-Avoidant Labels</span>
+              <span>Polled every {POLL_MS} ms</span>
             </div>
           </div>
 
@@ -609,6 +640,10 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
                 src={blobUrl}
                 alt="Anomaly Tactical HUD"
                 className="w-full h-full object-contain select-none z-10"
+                onLoad={(e) => {
+                  const { naturalWidth: w, naturalHeight: h } = e.currentTarget;
+                  if (w && h) setFrameSize(prev => (prev && prev.w === w && prev.h === h ? prev : { w, h }));
+                }}
               />
             ) : (
               /* ── Canonical FEED OFFLINE — NO ACTIVE STREAM Tactical Screen ── */
@@ -623,21 +658,27 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
                   </div>
                   <div>
                     <p className="mono text-sm text-slate-300 font-extrabold tracking-widest uppercase">
-                      FEED OFFLINE — NO ACTIVE STREAM
+                      {feedState === "paused" ? "INFERENCE PAUSED" : "FEED OFFLINE — NO ACTIVE STREAM"}
                     </p>
                     <p className="mono text-[11px] text-slate-500 mt-1 leading-relaxed">
-                      {activeDrone ? (
-                        <>Drone <span className="text-orange-400 font-semibold">{activeDrone}</span> is not transmitting video frames to the ingest server.</>
-                      ) : (
+                      {!activeDrone ? (
                         <>Select an active drone stream to initiate cognitive anomaly perception.</>
+                      ) : feedState === "paused" ? (
+                        <>Anomaly inference is paused. Resume inference to see annotated frames for <span className="text-orange-400 font-semibold">{activeDrone}</span>.</>
+                      ) : feedState === "no_frames" ? (
+                        <>Drone <span className="text-orange-400 font-semibold">{activeDrone}</span> is streaming to ingest, but no annotated anomaly frames have been received.</>
+                      ) : (
+                        <>Drone <span className="text-orange-400 font-semibold">{activeDrone}</span> is not transmitting video frames to the ingest server.</>
                       )}
                     </p>
                   </div>
                   <div className="flex items-center gap-2 mt-1">
-                    <span className="mono text-[10px] px-2.5 py-1 rounded bg-slate-900 border border-slate-800 text-slate-400 flex items-center gap-1.5">
-                      <span className="w-1.5 h-1.5 rounded-full bg-red-500" />
-                      INGEST DISCONNECTED
-                    </span>
+                    {activeDrone && (
+                      <span className="mono text-[10px] px-2.5 py-1 rounded bg-slate-900 border border-slate-800 text-slate-400 flex items-center gap-1.5">
+                        <span className={`w-1.5 h-1.5 rounded-full ${feedState === "disconnected" ? "bg-red-500" : "bg-amber-400"}`} />
+                        {feedState === "paused" ? "INFERENCE PAUSED" : feedState === "no_frames" ? "INGEST CONNECTED · NO ANNOTATED FRAMES" : "INGEST DISCONNECTED"}
+                      </span>
+                    )}
                     {activeMissionId && (
                       <span className="mono text-[10px] px-2.5 py-1 rounded bg-slate-900 border border-slate-800 text-slate-400">
                         MSN: {activeMissionId}
@@ -676,20 +717,13 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
                   <span className="font-bold">{hasActiveStream ? "TELEMETRY SYNCHRONIZED" : "NO TELEMETRY"}</span>
                 </div>
                 <div className="mono text-[9px] bg-black/85 backdrop-blur-md px-2 py-1 rounded-md text-slate-400 border border-slate-800/80 shadow-lg">
-                  {fps > 0 ? `${fps} FPS · 1280×720` : "INACTIVE · 0 FPS"}
+                  {hasActiveStream && fps > 0
+                    ? `${fps} frames/s${frameSize ? ` · ${frameSize.w}×${frameSize.h}` : ""}`
+                    : "NO FRAMES"}
                 </div>
               </div>
             )}
 
-            {/* Floating HUD Chips: Bottom-Left Camera Motion Telemetry */}
-            {hasActiveStream && (
-              <div className="absolute bottom-4 left-4 z-20 pointer-events-none">
-                <div className="mono text-[9px] bg-black/85 backdrop-blur-md px-2 py-1 rounded-md text-slate-400 border border-slate-800/80 flex items-center gap-2 shadow-lg">
-                  <Compass size={11} className="text-orange-400" />
-                  <span>EGO-MOTION: STABLE (ORB-RANSAC)</span>
-                </div>
-              </div>
-            )}
           </div>
         </div>
 
@@ -859,7 +893,7 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
                         </span></span>
                       </div>
                       <div className="text-slate-500">
-                        {alert.ts ? new Date(alert.ts).toLocaleTimeString() : "Recent"}
+                        {alert.ts ? fmtIST(alert.ts) : "—"}
                       </div>
                     </div>
                   </div>
@@ -1119,13 +1153,18 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
                   >
                     <span>Copy Event ID</span>
                   </button>
-                  <a
-                    href={`/command/evidence?search=${encodeURIComponent(selectedAlert.event_id || "")}`}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const q = selectedAlert.event_id || selectedAlert.id || "";
+                      setSelectedAlert(null);
+                      navigate(`/command/evidence?q=${encodeURIComponent(q)}`);
+                    }}
                     className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-orange-500/15 text-orange-400 border border-orange-500/30 hover:bg-orange-500/25 mono text-[11px] font-bold transition-colors"
                   >
                     <span>View in Evidence Review</span>
                     <ArrowUpRight size={13} />
-                  </a>
+                  </button>
                 </div>
                 <div className="mono text-[9px] text-slate-500">
                   Section 65B metadata preserved in vault

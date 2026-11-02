@@ -1,12 +1,16 @@
 import React, { useState } from "react";
 import TrafficAnalytics from "@/components/TrafficAnalytics";
 import VesselAnalytics from "@/components/VesselAnalytics";
+import { useNavigate } from "react-router-dom";
 import { useCommand } from "@/context/CommandContext";
 import { Car, Ship } from "lucide-react";
 
 export default function TrafficPage() {
-  const { drones } = useCommand();
+  const { user, drones, selectedDrone } = useCommand();
+  const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState("vehicle");
+  const activeId = selectedDrone || drones[0]?.id || "";
+  const shared = { drones, droneId: activeId, user, onNavigateTab: (tab) => navigate(`/command/${tab}`) };
 
   return (
     <div className="w-full space-y-4">
@@ -37,16 +41,13 @@ export default function TrafficPage() {
           </button>
         </div>
 
-        <div className="flex items-center gap-2 text-xs text-slate-400">
-          <span className="inline-block w-2 h-2 rounded-full bg-cyan-400 dvas-live-dot"></span>
-          <span className="mono text-[11px] text-slate-300">Live Ingest Connected</span>
-        </div>
+        {/* CMD-03: ingest status is shown (measured) in the top bar; no static badge here */}
       </div>
 
       {activeTab === "vehicle" ? (
-        <TrafficAnalytics drones={drones} />
+        <TrafficAnalytics {...shared} />
       ) : (
-        <VesselAnalytics drones={drones} />
+        <VesselAnalytics {...shared} />
       )}
     </div>
   );

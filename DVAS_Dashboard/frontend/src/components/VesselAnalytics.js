@@ -22,7 +22,8 @@ import {
   PieChart, Pie, Cell, ResponsiveContainer, Tooltip as RechartsTooltip,
   BarChart, Bar, XAxis, YAxis
 } from "recharts";
-import { api, authFetch } from "@/lib/api";
+import { api, apiError } from "@/lib/api";
+import { fmtIST } from "@/lib/ist";
 import { useJpegPoller } from "@/hooks/useJpegPoller";
 import { useActiveStreams } from "@/hooks/useActiveStreams";
 
@@ -47,7 +48,7 @@ const CLASS_COLORS = {
   "Default": "#90CAF9"
 };
 
-export default function VesselAnalytics({ drones, droneId: propDroneId, onNavigateTab }) {
+export default function VesselAnalytics({ drones, droneId: propDroneId = '', onNavigateTab }) {
   const { streams, loading: dronesLoading } = useActiveStreams();
   const activeDrones = (streams && streams.length > 0
     ? streams.map(s => ({
@@ -73,9 +74,14 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
   const [activeDrone, setActiveDrone] = useState(propDroneId || null);
   const [activeMissionId, setActiveMissionId] = useState(null);
 
-  // Auto-select first active drone streaming from ingest telemetry
+  // Follow the page's selected drone when one is given
   useEffect(() => {
-    if (activeDrones.length === 0) return;
+    if (propDroneId) setActiveDrone(propDroneId);
+  }, [propDroneId]);
+
+  // Auto-select first active drone streaming from ingest telemetry (only when the page did not pick one)
+  useEffect(() => {
+    if (propDroneId || activeDrones.length === 0) return;
     setActiveDrone(prev => {
       if (prev && activeDrones.find(d => (d.drone_id || d.id) === prev)) return prev;
       const live = activeDrones.find(d => (d.frames_received || 0) > 0);
@@ -92,7 +98,10 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
   }, [activeDrone, activeDrones]);
 
   // ── State ──────────────────────────────────────────────────────────────────
-  const [streamRunning, setStreamRunning] = useState(true);
+  // null = not yet reported by the vessel analyzer health endpoint
+  const [streamRunning, setStreamRunning] = useState(null);
+  const [vesselHealth, setVesselHealth] = useState(null);
+  const [streamError, setStreamError] = useState(null);
   const [togglingStream, setTogglingStream] = useState(false);
   const [showHeatmap, setShowHeatmap] = useState(false);
 
@@ -138,7 +147,7 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
     ok: annotatedOk,
     meta: annotatedMeta,
     fps,
-  } = useJpegPoller(annotatedUrl, 800, hasDrone && streamRunning);
+  } = useJpegPoller(annotatedUrl, 800, hasDrone && streamRunning !== false);
 
   const displaySrc = annotatedOk ? annotatedSrc : rawSrc;
   const isAnnotated = annotatedOk && Boolean(annotatedSrc);
@@ -149,8 +158,10 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
     const check = async () => {
       try {
         const res = await api.get('/analytics/vessel/health');
-        if (res && res.stream_running !== undefined) {
-          setStreamRunning(Boolean(res.stream_running));
+        const h = res?.data;
+        setVesselHealth(h || null);
+        if (h && h.stream_running !== undefined) {
+          setStreamRunning(Boolean(h.stream_running));
         }
       } catch { /* ignore */ }
     };
@@ -225,12 +236,14 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
 
   // ── Stream Controls ────────────────────────────────────────────────────────
   const handleToggleStream = async () => {
+    if (streamRunning === null) return;
     setTogglingStream(true);
+    setStreamError(null);
+    const isRunning = streamRunning;
     try {
-      const isRunning = streamRunning;
       const endpoint = isRunning ? "/analytics/vessel/stream/stop" : "/analytics/vessel/stream/start";
-      await api.get(endpoint);
-      const nextState = !isRunning;
+      const res = await api.post(endpoint);
+      const nextState = typeof res?.data?.stream_running === 'boolean' ? res.data.stream_running : !isRunning;
       setStreamRunning(nextState);
       try {
         await api.post('/models/sync-worker', { service: 'vessel', action: nextState ? 'start' : 'stop' });
@@ -238,7 +251,7 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
         console.warn('Vessel model sync error:', syncErr);
       }
     } catch (e) {
-      console.error("Failed to toggle maritime stream:", e);
+      setStreamError(apiError(e, `Failed to ${isRunning ? 'stop' : 'start'} vessel stream`));
     } finally {
       setTogglingStream(false);
     }
@@ -430,7 +443,7 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
           {/* Stream Start/Stop */}
           <button
             onClick={handleToggleStream}
-            disabled={togglingStream}
+            disabled={togglingStream || streamRunning === null}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
               streamRunning
                 ? "bg-rose-950/40 border-rose-600/60 text-rose-300 hover:bg-rose-900/50"
@@ -438,7 +451,7 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
             }`}
           >
             {streamRunning ? <Square size={14} /> : <Play size={14} />}
-            <span>{togglingStream ? "Updating..." : streamRunning ? "Stop Stream" : "Start Stream"}</span>
+            <span>{togglingStream ? "Updating..." : streamRunning === null ? "Stream —" : streamRunning ? "Stop Stream" : "Start Stream"}</span>
           </button>
 
           {onNavigateTab && (
@@ -462,6 +475,14 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
           </button>
         </div>
       </div>
+
+      {streamError && (
+        <div className="px-4 py-2 bg-red-950/40 border border-red-500/40 rounded-xl flex items-center gap-2 text-xs text-red-300">
+          <AlertTriangle size={14} className="shrink-0" />
+          <span className="flex-1">{streamError}</span>
+          <button onClick={() => setStreamError(null)} className="text-slate-400 hover:text-slate-200"><X size={14} /></button>
+        </div>
+      )}
 
       {/* Draining Queue Banner */}
       {(() => {
@@ -572,7 +593,9 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
             <span className="text-xs text-slate-400">convergence events</span>
           </div>
           <div className="mt-1 text-[11px] text-slate-400">
-            Separation &lt; 90px threshold
+            {summaryStats.proximity_threshold_px != null
+              ? `Separation < ${summaryStats.proximity_threshold_px}px threshold`
+              : "Vessel pairs closer than the proximity threshold"}
           </div>
         </div>
       </div>
@@ -597,7 +620,7 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
                 )}
               </div>
               <div className="flex items-center gap-2 text-[11px] text-slate-400 font-mono">
-                <span>AGE: {annotatedMeta?.frameAge ? `${annotatedMeta.frameAge}` : "<1s"}</span>
+                <span>AGE: {isAnnotated && annotatedMeta?.frameAge ? `${annotatedMeta.frameAge}` : "—"}</span>
                 <span>•</span>
                 <span className={hasAnyFeed ? "text-cyan-400" : "text-slate-500"}>
                   {isAnnotated ? (annotatedMeta?.feedStatus === 'offline' ? 'STANDBY' : 'LIVE ANNOTATED') : rawOk ? 'LIVE RAW' : 'OFFLINE'}
@@ -685,7 +708,7 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
               {/* ── HUD: bottom-left model label ───────────────── */}
               {isAnnotated && (
                 <div className="absolute bottom-3 left-3 z-10 pointer-events-none mono text-[10px] bg-black/85 px-2 py-1 rounded text-slate-400">
-                  SeaDrone YOLOv8 + ByteTrack
+                  {vesselHealth?.model || vesselHealth?.model_name || "Vessel detection"}
                 </div>
               )}
 
@@ -705,7 +728,11 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
           <div className="p-4 bg-slate-900/90 border border-slate-800 rounded-xl shadow-lg">
             <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300 mb-3 flex items-center justify-between">
               <span>Vessel Class Taxonomy</span>
-              <span className="text-[11px] font-normal text-slate-400">9 Categories</span>
+              {classStats.length > 0 && (
+                <span className="text-[11px] font-normal text-slate-400">
+                  {classStats.length} {classStats.length === 1 ? "class" : "classes"} observed
+                </span>
+              )}
             </h3>
 
             {classStats && classStats.length > 0 ? (
@@ -796,7 +823,7 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
                       </div>
 
                       <div className="text-right flex-shrink-0 text-[10px] font-mono text-slate-400">
-                        {ev.ts ? new Date(ev.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : "--"}
+                        {ev.ts ? fmtIST(ev.ts) : "—"}
                       </div>
                     </div>
                   );
@@ -1056,7 +1083,7 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
                 </div>
                 <div className="p-2.5 bg-slate-800/60 rounded-lg border border-slate-700/60">
                   <span className="text-slate-400 block">Size Category:</span>
-                  <strong className="text-slate-200">{inspectedTrack.size_bucket || "Medium"}</strong>
+                  <strong className="text-slate-200">{inspectedTrack.size_bucket || "—"}</strong>
                 </div>
                 <div className="p-2.5 bg-slate-800/60 rounded-lg border border-slate-700/60">
                   <span className="text-slate-400 block">Tracking Duration:</span>
@@ -1064,7 +1091,7 @@ export default function VesselAnalytics({ drones, droneId: propDroneId, onNaviga
                 </div>
                 <div className="p-2.5 bg-slate-800/60 rounded-lg border border-slate-700/60">
                   <span className="text-slate-400 block">First Detected:</span>
-                  <span className="text-slate-300 font-mono text-[11px]">{inspectedTrack.first_seen || "--"}</span>
+                  <span className="text-slate-300 font-mono text-[11px]">{inspectedTrack.first_seen ? fmtIST(inspectedTrack.first_seen) : "—"}</span>
                 </div>
                 <div className="p-2.5 bg-slate-800/60 rounded-lg border border-slate-700/60">
                   <span className="text-slate-400 block">Confidence Score:</span>

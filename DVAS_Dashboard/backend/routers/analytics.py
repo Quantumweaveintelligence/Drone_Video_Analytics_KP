@@ -1257,6 +1257,14 @@ async def intrusion_missions(
     return await _analytics_get(f"{INTRUSION_URL}/intrusion/missions")
 
 
+@router.get("/analytics/intrusion/config")
+async def intrusion_config_get(drone_id: str = "", user: dict = Depends(get_current_user)):
+    """Saved intrusion sensitivity of a drone (MON-07), for the config tab to show."""
+    if user["role"] not in ("senior_officer", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    return await _analytics_get(f"{INTRUSION_URL}/intrusion/config?drone_id={quote(drone_id)}")
+
+
 @router.post("/analytics/intrusion/config")
 async def intrusion_config_update(
     request: Request,

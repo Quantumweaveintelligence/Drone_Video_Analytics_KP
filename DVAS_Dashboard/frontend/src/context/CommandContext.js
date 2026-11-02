@@ -1,10 +1,14 @@
 import React, { createContext, useContext, useState, useEffect, useRef } from "react";
-import { api, downloadSigned } from "@/lib/api";
+import { api, apiError, downloadSigned } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { useDvasSocket } from "@/lib/useDvasSocket";
 import { useActiveStreams } from "@/hooks/useActiveStreams";
 
 const CommandContext = createContext(null);
+
+// F3: older rows stored incidents/suggestions a second time as INC-* / SUGG-* alerts;
+// they are listed under Incidents / Suggestions, never as detections.
+const isCopiedAlert = (a) => /^(INC|SUGG)-/.test(String(a?.id || ""));
 
 export function CommandProvider({ children }) {
   const { user } = useAuth();
@@ -18,7 +22,6 @@ export function CommandProvider({ children }) {
   const [evidence, setEvidence] = useState([]);
   const [missions, setMissions] = useState([]);
   const [exports, setExports] = useState([]);
-  const [crowd, setCrowd] = useState([]);
   const [playing, setPlaying] = useState(null);
   // U1: one modal for every evidence action ({ kind, evidence }), see components/evidence/ActionModal.js
   const [action, setAction] = useState(null);
@@ -43,7 +46,8 @@ export function CommandProvider({ children }) {
   const [loadingMoreEvidence, setLoadingMoreEvidence] = useState(false);
   const [evidenceDetail, setEvidenceDetail] = useState(null);
   const [reports, setReports] = useState([]);
-  const [generatingReport, setGeneratingReport] = useState(null);
+  const [generatingReport, setGeneratingReport] = useState(null);   // mission id whose AAR is being built
+  const generatingReportIdRef = useRef(null);
 
   const evidenceFiltersRef = useRef(evidenceFilters);
   evidenceFiltersRef.current = evidenceFilters;
@@ -58,13 +62,12 @@ export function CommandProvider({ children }) {
 
   const load = async () => {
     try {
-      const [k, dR, aR, mR, xR, cR, rptR, incR, sugR, metaR] = await Promise.all([
+      const [k, dR, aR, mR, xR, rptR, incR, sugR, metaR] = await Promise.all([
         api.get("/command/kpis").catch(() => ({ data: {} })),
         api.get("/drones").catch(() => ({ data: [] })),
         api.get("/alerts").catch(() => ({ data: [] })),
         api.get("/missions").catch(() => ({ data: [] })),
         api.get("/exports").catch(() => ({ data: [] })),
-        api.get("/analytics/crowd").catch(() => ({ data: { series: [] } })),
         api.get("/reports").catch(() => ({ data: [] })),
         api.get("/incidents").catch(() => ({ data: [] })),
         api.get("/analytics/suggestions").catch(() => ({ data: [] })),
@@ -72,13 +75,12 @@ export function CommandProvider({ children }) {
       ]);
       if (k?.data) setKpis(k.data);
       if (dR?.data) setDrones(dR.data);
-      if (aR?.data) setAlerts(aR.data);
+      if (Array.isArray(aR?.data)) setAlerts(aR.data.filter((a) => !isCopiedAlert(a)));
       if (incR?.data && Array.isArray(incR.data)) setIncidents(incR.data);
       if (sugR?.data && Array.isArray(sugR.data)) setSuggestions(sugR.data);
       if (metaR?.data) setEvidenceMeta(metaR.data);
       if (mR?.data) setMissions(mR.data);
       if (xR?.data) setExports(xR.data);
-      if (cR?.data) setCrowd(cR.data.series || []);
       if (rptR?.data) setReports(rptR.data || []);
     } catch (e) {
       console.error("CommandContext poll error:", e);
@@ -126,13 +128,9 @@ export function CommandProvider({ children }) {
         return brandNew.length > 0 ? [...updated, ...brandNew] : updated;
       });
     } else if (msg.type === "alert" && msg.alert) {
+      // F4: the hub already filters live alerts per user (jurisdiction / mission scope)
       const a = msg.alert;
-      const inScope =
-        user?.role === "senior_officer" ||
-        user?.role === "control_room_officer" ||
-        user?.role === "system_administrator" ||
-        ((user?.mission_scope || []).includes(a.mission_id));
-      if (inScope) setAlerts((prev) => [a, ...prev].slice(0, 200));
+      if (!isCopiedAlert(a)) setAlerts((prev) => [a, ...prev.filter((x) => x.id !== a.id)].slice(0, 200));
     } else if (msg.type === "model_suggestion") {
       const s = msg.suggestion || msg;
       setSuggestions((prev) => [s, ...prev.filter(x => x.id !== s.id)]);
@@ -143,6 +141,23 @@ export function CommandProvider({ children }) {
       setIncidents((prev) => prev.map(x => x.id === msg.incident_id ? { ...x, status: "ACKNOWLEDGED" } : x));
     } else if (msg.type === "model_suggestion_status") {
       setSuggestions((prev) => prev.map(x => x.id === msg.suggestion_id ? { ...x, status: msg.status } : x));
+    } else if (msg.type === "incident_deleted") {
+      // F2: deletes and clears made elsewhere disappear without a reload
+      setIncidents((prev) => prev.filter((x) => x.id !== msg.incident_id));
+    } else if (msg.type === "incidents_cleared") {
+      const ids = msg.incident_ids;
+      setIncidents((prev) => (ids ? prev.filter((x) => !ids.includes(x.id)) : []));
+    } else if (msg.type === "model_suggestion_deleted") {
+      setSuggestions((prev) => prev.filter((x) => x.id !== msg.suggestion_id));
+    } else if (msg.type === "model_suggestions_cleared") {
+      const ids = msg.suggestion_ids;
+      setSuggestions((prev) => (ids ? prev.filter((x) => !ids.includes(x.id)) : []));
+    } else if (["report_ready", "report_failed"].includes(msg.type) && msg.report_id === generatingReportIdRef.current) {
+      // MON-29: the AAR spinner stops when the report job finishes
+      generatingReportIdRef.current = null;
+      setGeneratingReport(null);
+      if (msg.type === "report_failed") alert(`Report failed: ${msg.error || "unknown error"}`);
+      scheduleRefresh(false);
     } else if (["evidence_created", "export_decided", "report_ready", "report_failed"].includes(msg.type)) {
       scheduleRefresh(msg.type === "evidence_created");
     }
@@ -159,22 +174,26 @@ export function CommandProvider({ children }) {
     }, 1500);
   };
 
+  // MON-28: failures (403, 500) are shown, not swallowed
   const ackAlert = async (id, disposition) => {
-    try { await api.post(`/alerts/${id}/ack`, disposition ? { disposition } : undefined); load(); } catch (e) {}
+    try {
+      await api.post(`/alerts/${encodeURIComponent(id)}/ack`, disposition ? { disposition } : undefined);
+      load();
+    } catch (e) { alert(apiError(e, "Could not acknowledge the alert")); }
   };
 
   const ackIncident = async (id) => {
     try {
-      await api.post(`/incidents/${id}/ack`);
+      await api.post(`/incidents/${encodeURIComponent(id)}/ack`);
       setIncidents((prev) => prev.map(x => x.id === id ? { ...x, status: "ACKNOWLEDGED" } : x));
-    } catch (e) {}
+    } catch (e) { alert(apiError(e, "Could not acknowledge the incident")); }
   };
 
   const ackSuggestion = async (id) => {
     try {
-      await api.post(`/analytics/suggestions/${id}/status`, { status: "ACKNOWLEDGED" });
+      await api.post(`/analytics/suggestions/${encodeURIComponent(id)}/status`, { status: "ACKNOWLEDGED" });
       setSuggestions((prev) => prev.map(x => x.id === id ? { ...x, status: "ACKNOWLEDGED" } : x));
-    } catch (e) {}
+    } catch (e) { alert(apiError(e, "Could not acknowledge the suggestion")); }
   };
 
   const requestExport = (ev) => openAction("request_export", ev);
@@ -184,7 +203,7 @@ export function CommandProvider({ children }) {
       await api.post(`/exports/${id}/decision`, { decision, comment: `${decision} by ${user?.email}` });
       load();
     } catch (e) {
-      alert(e.response?.data?.detail || "failed");
+      alert(apiError(e, "Decision failed"));
     }
   };
 
@@ -236,11 +255,18 @@ export function CommandProvider({ children }) {
   const generateMissionReport = async (missionId) => {
     try {
       setGeneratingReport(missionId);
-      await api.post("/reports/generate", { report_type: "mission_after_action", params: { mission_id: missionId } });
+      const { data } = await api.post("/reports/generate", { report_type: "mission_after_action", params: { mission_id: missionId } });
+      generatingReportIdRef.current = data?.id || null;
+      if (data?.status === "requested") alert("AAR requested. A senior officer must approve it before it is generated.");
+      if (!data?.id || ["ready", "failed", "requested"].includes(data.status)) {
+        // already finished, or waiting for approval: nothing to wait for here
+        generatingReportIdRef.current = null;
+        setGeneratingReport(null);
+      }
       load();
-      setTimeout(() => setGeneratingReport(null), 3000);
     } catch (e) {
-      alert(e.response?.data?.detail || "Failed");
+      alert(apiError(e, "Report request failed"));
+      generatingReportIdRef.current = null;
       setGeneratingReport(null);
     }
   };
@@ -250,12 +276,12 @@ export function CommandProvider({ children }) {
       const res = await api.get(`/evidence/${evidenceId}`);
       setEvidenceDetail(res.data);
     } catch (e) {
-      alert(e.response?.data?.detail || "Failed");
+      alert(apiError(e, "Could not open the evidence"));
     }
   };
 
   const downloadReport = (reportId) => {
-    downloadSigned("report", reportId).catch((e) => alert(e.response?.data?.detail || "Download failed"));
+    downloadSigned("report", reportId).catch((e) => alert(apiError(e, "Download failed")));
   };
 
   const value = {
@@ -267,7 +293,6 @@ export function CommandProvider({ children }) {
     suggestions,
     missions,
     exports,
-    crowd,
     reports,
     evidence,
     evidenceTotal,

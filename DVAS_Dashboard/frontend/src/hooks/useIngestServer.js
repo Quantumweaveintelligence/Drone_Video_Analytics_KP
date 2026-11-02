@@ -152,7 +152,11 @@ export function useIngestServer() {
       setReadiness(data);
       return data;
     } catch (err) {
-      const result = { reachable: false, ready: false, detail: "Connection failed" };
+      // MON-30: readiness details are admin-only; a 403 is not a connection failure
+      const status = err?.response?.status;
+      const result = status === 403
+        ? { reachable: null, ready: null, detail: "Readiness details are visible to administrators only" }
+        : { reachable: false, ready: false, detail: status ? `Ingest server error (${status})` : "Connection failed" };
       setReadiness(result);
       return result;
     }

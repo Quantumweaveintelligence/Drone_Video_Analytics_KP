@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useCommand } from "@/context/CommandContext";
 import { useAuth } from "@/context/AuthContext";
+import { fmtIST } from "@/lib/ist";
 import {
   ClipboardList,
   Search,
@@ -87,7 +88,7 @@ export default function MissionsPage() {
                     {m.mission_id}
                   </td>
                   <td className="px-3.5 py-2.5 border-b border-slate-800/60 text-slate-100 font-medium">
-                    {m.name || "Tactical Surveillance"}
+                    {m.name || "—"}
                   </td>
                   <td className="px-3.5 py-2.5 border-b border-slate-800/60">
                     <span className={`px-2 py-0.5 text-[10px] rounded border font-semibold ${
@@ -115,13 +116,13 @@ export default function MissionsPage() {
                   <td className="px-3.5 py-2.5 border-b border-slate-800/60 text-slate-400">
                     <div className="flex items-center gap-1.5">
                       <MapPin size={12} className="text-slate-500" />
-                      <span>{m.location || m.jurisdiction || "Kerala"}</span>
+                      <span>{m.location || m.jurisdiction || "—"}</span>
                     </div>
                   </td>
                   <td className="px-3.5 py-2.5 border-b border-slate-800/60 text-slate-500">
                     <div className="flex items-center gap-1">
                       <Clock size={11} />
-                      <span>{m.start_time ? new Date(m.start_time).toLocaleString() : "—"}</span>
+                      <span>{fmtIST(m.started_at || m.start_time)}</span>
                     </div>
                   </td>
                   <td className="px-3.5 py-2.5 border-b border-slate-800/60">

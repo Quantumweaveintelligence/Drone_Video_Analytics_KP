@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { api } from "@/lib/api";
-import { useAuth } from "@/context/AuthContext";
+import { api, apiError } from "@/lib/api";
 import {
   Cpu,
   RefreshCw,
@@ -45,7 +44,6 @@ const actionLabel = (a) => {
 };
 
 export default function ModelsPage() {
-  const { user } = useAuth();
   const [cfg, setCfg] = useState(null);
   const [selected, setSelected] = useState([]);
   const [saving, setSaving] = useState(false);
@@ -60,7 +58,7 @@ export default function ModelsPage() {
       setCfg(data);
       if (!cfg) setSelected(data.active);
     } catch (e) {
-      console.error(e);
+      setMsg({ text: apiError(e, "Could not load the model configuration"), ok: false });
     } finally {
       setRefreshing(false);
     }
@@ -92,7 +90,7 @@ export default function ModelsPage() {
       }
       load(true);
     } catch (e) {
-      setMsg({ text: e.response?.data?.detail || "Deploy failed", ok: false });
+      setMsg({ text: apiError(e, "Deploy failed"), ok: false });
     } finally {
       setSaving(false);
     }
@@ -128,22 +126,24 @@ export default function ModelsPage() {
           </div>
           <div>
             <div className="text-sm font-bold" style={{ color: "var(--dvas-text)" }}>
-              {cfg.cluster_label || "Kerala Police Analytics Node (H100)"}
+              {cfg.cluster_label || "Analytics GPU node"}
             </div>
             <div className="mono text-[10px] text-slate-500 mt-0.5">
-              Target inference latency: {cfg.max_latency_ms || 120} ms · Stream format: RTSP/MJPEG
+              {cfg.read_only
+                ? "View only — senior officers and administrators change the shared model set"
+                : `Last change: ${cfg.updated_by || "—"}`}
             </div>
           </div>
         </div>
 
         <div className="flex items-center gap-6">
           <div className="text-right">
-            <div className="dvas-label text-[10px]">Allocated GPU Load</div>
+            <div className="dvas-label text-[10px]" title="Sum of the per-model planning estimates, not a measurement">Estimated GPU share</div>
             <div className={`mono text-lg font-extrabold ${gpuUsed > 80 ? "text-amber-400" : "text-emerald-400"}`}>
               {gpuUsed}%
             </div>
           </div>
-          {cfg.gpu_metrics && (
+          {cfg.gpu_metrics?.total_gb != null && (
             <div className="text-right">
               <div className="dvas-label text-[10px]">Host VRAM Free</div>
               <div className="mono text-lg font-extrabold text-emerald-400">
@@ -227,18 +227,22 @@ export default function ModelsPage() {
                     {isRunning ? (
                       <span className="mono text-[9px] px-1.5 py-0.2 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
                         <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block" style={{ animation: "pulse 2s infinite" }} />
-                        GPU ACTIVE
+                        RUNNING
+                      </span>
+                    ) : m.stream_running === false ? (
+                      <span className="mono text-[9px] px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-400 border border-slate-700">
+                        STOPPED
                       </span>
                     ) : (
-                      <span className="mono text-[9px] px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-400 border border-slate-700">
-                        CPU OFFLOADED
+                      <span className="mono text-[9px] px-1.5 py-0.2 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/30">
+                        SERVICE UNREACHABLE
                       </span>
                     )}
                   </div>
                   <div className="mono text-[10px] text-slate-500 mt-1 flex items-center gap-2">
-                    <span>GPU <span className="text-slate-300 font-semibold">{m.gpu_pct}%</span></span>
+                    <span title="Planning estimate">est. GPU <span className="text-slate-300 font-semibold">~{m.gpu_pct}%</span></span>
                     <span>·</span>
-                    <span>Peak <span className="text-slate-300 font-semibold">{m.throughput_fps} fps</span></span>
+                    <span title="Planning estimate">est. <span className="text-slate-300 font-semibold">~{m.throughput_fps} fps</span></span>
                     {lastAction && (
                       <>
                         <span>·</span>

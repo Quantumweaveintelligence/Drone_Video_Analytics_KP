@@ -453,7 +453,7 @@ export default function EvidencePage() {
 
           <input
             type="text"
-            placeholder="Search tags / label…"
+            placeholder="Search label, ID, mission, drone…"
             value={evidenceFilters.search}
             onChange={e => {
               const f = { ...evidenceFilters, search: e.target.value };
@@ -520,7 +520,7 @@ export default function EvidencePage() {
                       </div>
                       <div className="mono text-[10px] text-slate-400 flex items-center gap-2 mt-0.5">
                         <span>
-                          Activity: {new Date(group.minTs).toLocaleDateString()} {new Date(group.minTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} – {new Date(group.maxTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          Activity: {fmtIST(group.minTs)} – {fmtIST(group.maxTs)}
                         </span>
                         {droneList.length > 0 && (
                           <>

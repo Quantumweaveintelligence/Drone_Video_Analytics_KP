@@ -35,7 +35,8 @@ import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
   CartesianGrid, Legend
 } from 'recharts';
-import { api, authFetch } from '@/lib/api';
+import { api, apiError } from '@/lib/api';
+import { fmtIST } from '@/lib/ist';
 import { useAnalyticsFetch, useAnalyticsSSE } from '@/lib/useAnalytics';
 import { useActiveStreams } from '@/hooks/useActiveStreams';
 import { useJpegPoller } from '@/hooks/useJpegPoller';
@@ -43,7 +44,8 @@ import { useJpegPoller } from '@/hooks/useJpegPoller';
 
 
 /* ─── Main IntrusionAnalytics Component ───────────────────────────── */
-export default function IntrusionAnalytics({ activeDrone: propActiveDrone, droneId, drones = [], missions: initialMissions = [], user = {}, onNavigateTab }) {
+export default function IntrusionAnalytics({ activeDrone: propActiveDrone, droneId = '', drones = [], missions: initialMissions = [], user, onNavigateTab }) {
+  const role = user?.role || '';
   const initialDrone = propActiveDrone || droneId;
   const { streams, streamMap } = useActiveStreams();
 
@@ -119,8 +121,9 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
 
   const [selectedDrone, setSelectedDrone] = useState(initialDrone || null);
 
-  // Auto-select first live drone or first available drone
+  // Auto-select first live drone or first available drone (only when the page did not pick one)
   useEffect(() => {
+    if (initialDrone) return;
     if (droneList.length === 0) {
       setSelectedDrone(null);
       return;
@@ -130,7 +133,7 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
       const live = droneList.find(d => d.isLive || d.status === 'live' || d.status === 'draining');
       return (live || droneList[0])?.id || null;
     });
-  }, [droneList]);
+  }, [droneList, initialDrone]);
 
   // Keep selectedDrone in sync if initialDrone changes
   useEffect(() => {
@@ -168,6 +171,7 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
 
   // ─── Real-time SSE alerts ──────────────────────────────────────────
   const [liveAlerts, setLiveAlerts] = useState([]);
+  const [modelWeights, setModelWeights] = useState(null);
   const [liveStats, setLiveStats] = useState({
     activeIntrusions: 0,
     totalBreachesToday: 0,
@@ -189,7 +193,7 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
             trackId: e.track_id || 'N/A',
             className: e.track_class || 'Target',
             state: (e.state_to || e.state || 'INSIDE').toUpperCase(),
-            confidence: Number(e.confidence || 0.85),
+            confidence: e.confidence != null ? Number(e.confidence) : null,
             dwell: Number(e.dwell_duration_s || 0),
             latitude: e.latitude,
             longitude: e.longitude,
@@ -222,6 +226,10 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
       const stream = raw.stream;
       const payload = raw.payload || raw;
 
+      // Model weights reported in the event's evidence block, when present
+      const weights = payload?.evidence?.model?.weights || payload?.attributes?.evidence?.model?.weights;
+      if (weights) setModelWeights(weights);
+
       // Case 1: Confirmed intrusion event from drone:events:confirmed (or direct alert)
       if (
         payload.event_type === 'intrusion_alert' ||
@@ -234,7 +242,7 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
           trackId: payload.track_id || payload.id || 'N/A',
           className: payload.track_class || payload.class_name || payload.class || 'Target',
           state: (payload.state_to || payload.state || 'INSIDE').toUpperCase(),
-          confidence: Number(payload.confidence || 0.85),
+          confidence: payload.confidence != null ? Number(payload.confidence) : null,
           dwell: Number(payload.dwell_duration_s || payload.dwell || 0),
           latitude: payload.latitude,
           longitude: payload.longitude,
@@ -272,7 +280,7 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
             trackId: b.track_id,
             className: b.class || b.track_class || 'Target',
             state: (b.intrusion_state || b.state || 'INSIDE').toUpperCase(),
-            confidence: Number(b.confidence || 0.85),
+            confidence: b.confidence != null ? Number(b.confidence) : null,
             dwell: Number(b.dwell_duration_s || 0),
           }));
 
@@ -295,19 +303,24 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
     }
   }, []);
 
-  useAnalyticsSSE(handleSSEEvent, selectedDrone);
+  const { connected: sseConnected } = useAnalyticsSSE(handleSSEEvent, selectedDrone);
 
   // ─── Annotated Frame Poller ────────────────────────────────────────
   const pollUrl = selectedDrone ? `/api/analytics/intrusion/annotated?drone_id=${encodeURIComponent(selectedDrone)}` : null;
   const { blobUrl, hasFrame, feedDead, fps } = useJpegPoller(pollUrl, 800, subTab === 'live');
+  // Resolution of the frame actually received (read from the decoded image)
+  const [frameRes, setFrameRes] = useState(null);
+  useEffect(() => { setFrameRes(null); }, [selectedDrone]);
 
   // ─── Stream Control Actions ────────────────────────────────────────
   const [streamToggling, setStreamToggling] = useState(false);
+  const [streamError, setStreamError] = useState(null);
 
   const handleStartStream = async () => {
     setStreamToggling(true);
+    setStreamError(null);
     try {
-      await api.get('/analytics/intrusion/stream/start');
+      await api.post('/analytics/intrusion/stream/start');
       mutateHealth();
       try {
         await api.post('/models/sync-worker', { service: 'intrusion', action: 'start' });
@@ -315,7 +328,7 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
         console.warn('Sync worker failed:', e);
       }
     } catch (err) {
-      console.error('Failed to start intrusion stream:', err);
+      setStreamError(apiError(err, 'Failed to start intrusion stream'));
     } finally {
       setStreamToggling(false);
     }
@@ -323,8 +336,9 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
 
   const handleStopStream = async () => {
     setStreamToggling(true);
+    setStreamError(null);
     try {
-      await api.get('/analytics/intrusion/stream/stop');
+      await api.post('/analytics/intrusion/stream/stop');
       mutateHealth();
       try {
         await api.post('/models/sync-worker', { service: 'intrusion', action: 'stop' });
@@ -332,7 +346,7 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
         console.warn('Sync worker failed:', e);
       }
     } catch (err) {
-      console.error('Failed to stop intrusion stream:', err);
+      setStreamError(apiError(err, 'Failed to stop intrusion stream'));
     } finally {
       setStreamToggling(false);
     }
@@ -570,7 +584,7 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
       let timeKey = '00:00';
       try {
         if (e.ts) {
-          timeKey = new Date(e.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+          timeKey = new Date(e.ts).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false });
         }
       } catch (err) {
         timeKey = '00:00';
@@ -628,21 +642,52 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
   const [minConfidence, setMinConfidence] = useState(0.25);
   const [savingConfig, setSavingConfig] = useState(false);
   const [configFeedback, setConfigFeedback] = useState(null);
+  // 'loading' | 'loaded' | 'unavailable' — whether the sliders show the saved server values
+  const [configSource, setConfigSource] = useState('loading');
+
+  const applyConfigToForm = useCallback((cfg) => {
+    if (!cfg || typeof cfg !== 'object') return false;
+    if (cfg.preset != null) setConfigPreset(cfg.preset);
+    if (cfg.confirm_frames != null) setConfirmFrames(Number(cfg.confirm_frames));
+    if (cfg.dwell_threshold_s != null) setDwellThreshold(Number(cfg.dwell_threshold_s));
+    if (cfg.min_confidence != null) setMinConfidence(Number(cfg.min_confidence));
+    return true;
+  }, []);
+
+  // Load the saved config for the selected drone so the sliders reflect it
+  useEffect(() => {
+    if (role !== 'senior_officer') return;
+    let active = true;
+    setConfigSource('loading');
+    api.get('/analytics/intrusion/config', { params: selectedDrone ? { drone_id: selectedDrone } : {} })
+      .then(res => {
+        if (!active) return;
+        const cfg = res.data?.config || res.data;
+        setConfigSource(applyConfigToForm(cfg) ? 'loaded' : 'unavailable');
+      })
+      .catch(() => { if (active) setConfigSource('unavailable'); });
+    return () => { active = false; };
+  }, [selectedDrone, role, applyConfigToForm]);
 
   const handleApplyConfig = async () => {
     setSavingConfig(true);
+    setConfigFeedback(null);
     try {
-      await api.post('/analytics/intrusion/config', {
+      const res = await api.post('/analytics/intrusion/config', {
         preset: configPreset,
         confirm_frames: Number(confirmFrames),
         dwell_threshold_s: Number(dwellThreshold),
         min_confidence: Number(minConfidence),
+      }, { params: selectedDrone ? { drone_id: selectedDrone } : {} });
+      if (applyConfigToForm(res.data?.config)) setConfigSource('loaded');
+      setConfigFeedback({
+        type: 'success',
+        text: selectedDrone
+          ? `Sensitivity configuration saved for ${selectedDrone}.`
+          : 'Sensitivity configuration saved for all drones currently known to the analyzer.',
       });
-      setConfigFeedback({ type: 'success', text: 'Sensitivity configuration updated successfully.' });
-      setTimeout(() => setConfigFeedback(null), 3500);
     } catch (err) {
-      setConfigFeedback({ type: 'error', text: 'Failed to update sensitivity configuration.' });
-      setTimeout(() => setConfigFeedback(null), 3500);
+      setConfigFeedback({ type: 'error', text: apiError(err, 'Failed to update sensitivity configuration.') });
     } finally {
       setSavingConfig(false);
     }
@@ -670,8 +715,6 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
                 </span>
               </div>
               <div className="text-xs text-slate-400 flex items-center gap-3">
-                <span>PORT 8105</span>
-                <span>•</span>
                 <span className="flex items-center gap-1">
                   <span className={`w-2 h-2 rounded-full ${isServiceHealthy ? 'bg-emerald-400' : 'bg-red-400'}`} />
                   {isServiceHealthy ? 'SERVICE ONLINE' : 'SERVICE OFFLINE'}
@@ -770,7 +813,7 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
               <BarChart3 className="w-3.5 h-3.5" />
               <span>Mission Review</span>
             </button>
-            {user?.role === 'senior_officer' && (
+            {role === 'senior_officer' && (
               <button
                 onClick={() => setSubTab('config')}
                 className={`px-3 py-1.5 rounded text-xs font-semibold flex items-center gap-1.5 transition-all ${
@@ -819,6 +862,14 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
         </div>
       </div>
 
+      {streamError && (
+        <div className="px-4 py-2 rounded-lg text-xs font-mono border bg-red-500/10 border-red-500/40 text-red-300 flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 shrink-0" />
+          <span className="flex-1">{streamError}</span>
+          <button onClick={() => setStreamError(null)} className="text-slate-400 hover:text-slate-200">✕</button>
+        </div>
+      )}
+
       {/* ── MODE 1: LIVE MONITORING & REAL-TIME ALERTS ───────────────── */}
       {subTab === 'live' && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -842,7 +893,7 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
                     FPS: <strong className="text-emerald-400">{fps}</strong>
                   </span>
                   <span className="bg-slate-950 px-2 py-0.5 rounded border border-slate-800">
-                    3840×2160
+                    {hasFrame && frameRes ? `${frameRes.w}×${frameRes.h}` : '—'}
                   </span>
                 </div>
               </div>
@@ -881,6 +932,10 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
                     src={blobUrl}
                     alt="Live Intrusion Video"
                     className="w-full h-full object-contain max-h-[560px]"
+                    onLoad={e => {
+                      const { naturalWidth: w, naturalHeight: h } = e.currentTarget;
+                      if (w && h) setFrameRes(prev => (prev && prev.w === w && prev.h === h ? prev : { w, h }));
+                    }}
                   />
                 ) : (
                   <div className="flex flex-col items-center justify-center gap-3 text-slate-500 p-8 text-center">
@@ -919,7 +974,7 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
                 </div>
                 <div>
                   <span className="text-slate-500">MODEL: </span>
-                  <span className="text-slate-300">geotrax_hbb_yolov8s_1920_v1.pt</span>
+                  <span className="text-slate-300">{health?.model || health?.model_name || modelWeights || '—'}</span>
                 </div>
               </div>
             </div>
@@ -1032,7 +1087,7 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
                         </div>
                         <span className="text-[10px] opacity-70 flex items-center gap-1">
                           <Clock className="w-3 h-3" />
-                          {a.ts ? new Date(a.ts).toLocaleTimeString() : 'NOW'}
+                          {a.ts ? fmtIST(a.ts) : '—'}
                         </span>
                       </div>
 
@@ -1047,7 +1102,7 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
                         </div>
                         <div>
                           <span className="opacity-60">CONF:</span>{' '}
-                          <span>{(a.confidence * 100).toFixed(0)}%</span>
+                          <span>{a.confidence != null && !isNaN(a.confidence) ? `${(a.confidence * 100).toFixed(0)}%` : '—'}</span>
                         </div>
                         <div>
                           <span className="opacity-60">DWELL:</span>{' '}
@@ -1063,10 +1118,11 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
             {/* Health & Socket Footer */}
             <div className="px-3 py-2 bg-slate-950 border-t border-slate-800 text-[11px] font-mono flex items-center justify-between text-slate-400">
               <span className="flex items-center gap-1">
-                <Server className="w-3 h-3 text-cyan-400" />
-                GATEWAY SSE CONNECTED
+                <Server className={`w-3 h-3 ${sseConnected ? 'text-cyan-400' : 'text-red-400'}`} />
+                <span className={sseConnected ? 'text-slate-400' : 'text-red-400'}>
+                  {sseConnected ? 'LIVE EVENT STREAM CONNECTED' : 'LIVE EVENT STREAM DISCONNECTED — RECONNECTING'}
+                </span>
               </span>
-              <span className="text-slate-500">PORT 8100/8105</span>
             </div>
 
           </div>
@@ -1268,7 +1324,7 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
                             : '—'}
                         </td>
                         <td className="px-4 py-2.5 text-slate-400">
-                          {ev.ts ? (() => { try { return new Date(ev.ts).toLocaleString(); } catch { return String(ev.ts); } })() : '—'}
+                          {ev.ts ? fmtIST(ev.ts) : '—'}
                         </td>
                       </tr>
                     ))
@@ -1307,7 +1363,7 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
       )}
 
       {/* ── MODE 3: CONFIGURATION & SENSITIVITY (Senior Officer) ───────── */}
-      {subTab === 'config' && user?.role === 'senior_officer' && (
+      {subTab === 'config' && role === 'senior_officer' && (
         <div
           className="rounded-xl p-6 flex flex-col gap-6 max-w-3xl"
           style={{ background: 'var(--dvas-surface)', border: '1px solid var(--dvas-border)' }}
@@ -1321,6 +1377,12 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
               Adjust algorithm sensitivity, hysteresis thresholds, and model confidence for restricted zones.
             </p>
           </div>
+
+          {configSource === 'unavailable' && (
+            <div className="p-3 rounded-lg text-xs font-mono border bg-amber-500/10 border-amber-500/40 text-amber-300">
+              The saved configuration could not be loaded; the values below are defaults until you apply settings.
+            </div>
+          )}
 
           {configFeedback && (
             <div

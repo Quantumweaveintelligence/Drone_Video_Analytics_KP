@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { fmtIST } from "@/lib/ist";
 import { useCommand } from "@/context/CommandContext";
 import { useI18n } from "@/context/I18nContext";
 import {
@@ -30,11 +31,11 @@ export default function AlertsFeedPage() {
     const modelList = (s.model_names && s.model_names.length > 0)
       ? s.model_names.join(", ")
       : (s.models || []).map(m => m.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())).join(", ") || "AI Model";
-    const missionPrefix = s.mission_id || "Mission";
+    const missionPrefix = s.mission_id ? `${s.mission_id}: ` : "";     // same wording as the bell
     return {
       id: s.id,
       category: "suggestion",
-      title: `${missionPrefix}: Suggests ${modelList}`,
+      title: `${missionPrefix}Suggests ${modelList}`,
       subtitle: `${s.suggested_by || "Edge Operator"} · ${s.location || "Ground Station"}`,
       ts: s.timestamp || s.created_at,
       severity: s.priority === "critical" ? "critical" : s.priority === "high" ? "warning" : "info",
@@ -199,7 +200,7 @@ export default function AlertsFeedPage() {
                 </span>
                 <span className="mono text-[10px] text-slate-500 ml-auto shrink-0 flex items-center gap-1">
                   <Clock size={10} />
-                  {item.ts ? new Date(item.ts).toLocaleTimeString() : "—"}
+                  {fmtIST(item.ts)}
                 </span>
               </div>
               <div className="text-[11px] text-slate-400 flex items-center gap-2">

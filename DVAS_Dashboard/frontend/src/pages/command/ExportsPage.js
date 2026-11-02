@@ -1,4 +1,5 @@
 import React from "react";
+import { fmtIST } from "@/lib/ist";
 import { useCommand } from "@/context/CommandContext";
 import { useAuth } from "@/context/AuthContext";
 import { downloadSigned } from "@/lib/api";
@@ -125,7 +126,7 @@ export default function ExportsPage() {
                   <td className="px-3 py-2.5 border-b border-slate-800/60 text-slate-300">{r.id}</td>
                   <td className="px-3 py-2.5 border-b border-slate-800/60 text-slate-400">{(r.report_type || "").replace(/_/g, " ")}</td>
                   <td className="px-3 py-2.5 border-b border-slate-800/60 text-slate-200 max-w-[200px] truncate">{r.title}</td>
-                  <td className="px-3 py-2.5 border-b border-slate-800/60 text-slate-500">{r.generated_at ? new Date(r.generated_at).toLocaleString() : "—"}</td>
+                  <td className="px-3 py-2.5 border-b border-slate-800/60 text-slate-500">{fmtIST(r.generated_at)}</td>
                   <td className="px-3 py-2.5 border-b border-slate-800/60 text-slate-500">{r.file_size_bytes ? `${(r.file_size_bytes / 1024).toFixed(1)} KB` : "—"}</td>
                   <td className="px-3 py-2.5 border-b border-slate-800/60">
                     {user?.role === "senior_officer" ? (
@@ -136,7 +137,7 @@ export default function ExportsPage() {
                         <Download size={10} /> Download PDF
                       </button>
                     ) : (
-                      <span className="text-[10px] text-slate-500 italic">SR Only</span>
+                      <span className="text-[10px] text-slate-500 italic">Senior officer decides</span>
                     )}
                   </td>
                 </tr>

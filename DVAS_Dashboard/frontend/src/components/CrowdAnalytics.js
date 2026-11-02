@@ -28,7 +28,8 @@ import {
 } from '../lib/useAnalytics';
 import { useActiveStreams } from '../hooks/useActiveStreams';
 import { useJpegPoller } from '../hooks/useJpegPoller';
-import { api } from '../lib/api';
+import { api, apiError, downloadBlob } from '../lib/api';
+import { fmtIST } from '../lib/ist';
 
 /* ───────────────────────────────────────────────────────────────
    CONSTANTS
@@ -141,7 +142,8 @@ function ServiceBadge({ online }) {
    ────────────────────────────────────────────────────────────── */
 function ModelSelector({ activeModel, onSwitch, switching }) {
   const [open, setOpen] = useState(false);
-  const current = MODEL_OPTIONS.find(m => m.value === activeModel) || MODEL_OPTIONS[0];
+  const current = MODEL_OPTIONS.find(m => m.value === activeModel)
+    || { value: activeModel, short: activeModel ? activeModel : 'Model —' };
 
   return (
     <div className="relative">
@@ -205,9 +207,10 @@ function LiveFeedSection({
   startingStream,
   onFrameCount,
   onNavigateTab,
+  canControlStream = true,
 }) {
   const hasDrone = !!activeDrone;
-  const modelLabel = MODEL_OPTIONS.find(m => m.value === activeModel)?.label || 'CSRNet Part A';
+  const modelLabel = MODEL_OPTIONS.find(m => m.value === activeModel)?.label || activeModel || 'Crowd model';
   const [fps, setFps] = useState(0);
   const fpsRef = useRef({ count: 0, ts: Date.now() });
   const prevAnnotatedRef = useRef(null);
@@ -266,7 +269,9 @@ function LiveFeedSection({
               return (
                 <button
                   key={d.id}
-                  onClick={() => setActiveDrone(d.id)}
+                  onClick={() => setActiveDrone && setActiveDrone(d.id)}
+                  disabled={!setActiveDrone}
+                  title={!setActiveDrone ? 'Drone is selected at the top of the page' : undefined}
                   className="mono text-[10px] px-2.5 py-1 rounded transition-all font-semibold flex items-center gap-1"
                   style={{
                     background: activeDrone === d.id ? 'rgba(56,189,248,0.15)' : 'var(--dvas-surface-2)',
@@ -292,7 +297,7 @@ function LiveFeedSection({
         <div className="flex-1" />
 
         {/* Stream start/stop controls */}
-        {!streamRunning ? (
+        {!canControlStream ? null : !streamRunning ? (
           <button
             onClick={onStartStream}
             disabled={startingStream}
@@ -330,7 +335,7 @@ function LiveFeedSection({
 
         {onNavigateTab && (
           <button
-            onClick={() => onNavigateTab("models")}
+            onClick={() => onNavigateTab('models')}
             className="mono text-[10px] px-2.5 py-1.5 rounded-lg flex items-center gap-1 transition-all text-slate-400 hover:text-sky-300 hover:bg-slate-800 ml-2"
             style={{ border: '1px solid var(--dvas-border)' }}
             title="Configure models in Detection Models"
@@ -382,8 +387,7 @@ function LiveFeedSection({
                 <div className="mono text-[10px] bg-black/85 px-2 py-1 rounded flex items-center gap-1.5">
                   <span className="w-2 h-2 rounded-full" style={{ background: liveLevel?.color }} />
                   <span style={{ color: liveLevel?.color }} className="font-semibold">{liveLevel?.label}</span>
-                  <span className="text-slate-200 ml-1 font-bold">{Math.round(liveCount)} persons</span>
-                  <span className="text-slate-400 ml-1">({(liveCount / 200).toFixed(2)} p/m²)</span>
+                  <span className="text-slate-200 ml-1 font-bold">{liveCount != null ? `${Math.round(liveCount)} persons` : '— persons'}</span>
                 </div>
               )}
               <div className="mono text-[10px] bg-black/85 px-2 py-1 rounded text-teal-300">
@@ -435,7 +439,7 @@ function LiveFeedSection({
 /* ───────────────────────────────────────────────────────────────
    SECTION 2 — KPI Strip (Current Count, Peak Count, Alerts, Density Status)
    ────────────────────────────────────────────────────────────── */
-function CrowdKPIStrip({ liveCount, peakCount, peakTimestamp, alertCount, avgDensity, densityLevel, trend, sseConnected }) {
+function CrowdKPIStrip({ liveCount, peakCount, peakTimestamp, alertCount, densityLevel, trend, sseConnected }) {
   const TrendIcon = trend === 'up' ? TrendingUp : trend === 'down' ? TrendingDown : Minus;
   const trendColor = trend === 'up' ? 'text-emerald-400' : trend === 'down' ? 'text-red-400' : 'text-slate-500';
 
@@ -444,7 +448,7 @@ function CrowdKPIStrip({ liveCount, peakCount, peakTimestamp, alertCount, avgDen
       label: 'Current Count',
       value: (
         <div className="flex items-center gap-2">
-          <span>{Math.round(liveCount).toLocaleString()}</span>
+          <span>{liveCount != null ? Math.round(liveCount).toLocaleString() : '—'}</span>
           <TrendIcon size={16} className={trendColor} />
         </div>
       ),
@@ -457,7 +461,7 @@ function CrowdKPIStrip({ liveCount, peakCount, peakTimestamp, alertCount, avgDen
       value: Math.round(peakCount).toLocaleString(),
       tone: '#f59e0b',
       icon: TrendingUp,
-      sub: peakTimestamp ? `at ${new Date(peakTimestamp).toLocaleTimeString()}` : 'No peak recorded',
+      sub: peakTimestamp ? `at ${fmtIST(peakTimestamp)}` : 'No peak recorded',
     },
     {
       label: 'Drone Alerts Active',
@@ -471,7 +475,8 @@ function CrowdKPIStrip({ liveCount, peakCount, peakTimestamp, alertCount, avgDen
       value: densityLevel.label,
       tone: densityLevel.color,
       icon: Thermometer,
-      sub: `${avgDensity} p/m² avg density`,
+      // No ground area is known for the frame, so no p/m² figure: the level is count-based
+      sub: liveCount != null ? `${Math.round(liveCount)} people in frame (count-based level)` : 'No reading',
     },
   ];
 
@@ -630,7 +635,7 @@ function DroneStatusGrid({ readings, droneList }) {
             </div>
             <div className="flex items-center justify-between">
               <span className="mono text-[10px]" style={{ color: 'var(--dvas-text-dim)' }}>
-                {hasData ? (count / 200).toFixed(2) : '0.00'} p/m²
+                {hasData ? `${Math.round(count)} people in frame` : '—'}
               </span>
               <span className="mono text-[10px]" style={{ color: 'var(--dvas-text-dim)' }}>
                 {hasData ? (r.ts ? fmtAge(r.ts) : 'Live') : d.last_seen ? fmtAge(d.last_seen) : 'Standby'}
@@ -646,41 +651,37 @@ function DroneStatusGrid({ readings, droneList }) {
 /* ───────────────────────────────────────────────────────────────
    SECTION 6 — Mission Report Export
    ────────────────────────────────────────────────────────────── */
-function MissionExport({ hasData, activeModel }) {
+function MissionExport({ hasData }) {
   const [meta, setMeta] = useState({ operator: '', location: '', mission_id: '' });
   const [exporting, setExporting] = useState(null);
+  const [exportError, setExportError] = useState(null);
 
+  // Cookie auth via the shared axios client (withCredentials); no token in headers or URLs.
+  // The PDF route takes operator/location/mission_id. The CSV route takes no parameters
+  // (it exports the analyzer's current session samples), so none are sent for CSV.
   const exportFile = async (type) => {
     setExporting(type);
+    setExportError(null);
     try {
-      const token = localStorage.getItem('dvas_token') || '';
-      const params = new URLSearchParams();
-      if (meta.operator) params.set('operator', meta.operator);
-      if (meta.location) params.set('location', meta.location);
-      if (meta.mission_id) params.set('mission_id', meta.mission_id);
-      if (activeModel) params.set('model_type', activeModel);
-
-      const url = type === 'pdf'
-        ? `/api/analytics/crowd/export/pdf?${params.toString()}`
-        : `/api/analytics/crowd/export/csv?${params.toString()}`;
-
-      const res = await fetch(url, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-        credentials: 'include',
-      });
-
-      if (res.ok) {
-        const blob = await res.blob();
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = type === 'pdf'
-          ? `crowd_mission_report_${meta.mission_id || 'export'}.pdf`
-          : 'crowd_report.csv';
-        a.click();
-        URL.revokeObjectURL(a.href);
+      if (type === 'pdf') {
+        const params = {};
+        if (meta.operator) params.operator = meta.operator;
+        if (meta.location) params.location = meta.location;
+        if (meta.mission_id) params.mission_id = meta.mission_id;
+        await downloadBlob('/analytics/crowd/export/pdf', params, `crowd_mission_report_${meta.mission_id || 'export'}.pdf`);
+      } else {
+        await downloadBlob('/analytics/crowd/export/csv', {}, 'crowd_report.csv');
       }
     } catch (err) {
-      console.error('Export failed:', err);
+      // Blob responses carry the FastAPI error JSON as a Blob; decode it for apiError
+      let e = err;
+      const blob = err?.response?.data;
+      if (blob instanceof Blob) {
+        try {
+          e = { ...err, response: { ...err.response, data: JSON.parse(await blob.text()) } };
+        } catch { /* not JSON */ }
+      }
+      setExportError(`${type.toUpperCase()} export failed: ${apiError(e, 'request failed')}`);
     } finally {
       setExporting(null);
     }
@@ -745,6 +746,15 @@ function MissionExport({ hasData, activeModel }) {
           {exporting === 'csv' ? 'Exporting…' : 'Export CSV Data'}
         </button>
       </div>
+      <div className="mono text-[10px] mt-2" style={{ color: 'var(--dvas-text-dim)' }}>
+        CSV contains the current analysis session samples; operator, location and mission ID apply to the PDF report only.
+      </div>
+      {exportError && (
+        <div className="mono text-[11px] mt-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/30 text-red-300 flex items-center gap-2" role="alert">
+          <AlertTriangle size={12} className="shrink-0" />
+          <span>{exportError}</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -752,11 +762,15 @@ function MissionExport({ hasData, activeModel }) {
 /* ───────────────────────────────────────────────────────────────
    MAIN EXPORT
    ────────────────────────────────────────────────────────────── */
-export default function CrowdAnalytics({ crowdSeries, drones, onNavigateTab }) {
+export default function CrowdAnalytics({ crowdSeries, drones, droneId = '', user, onNavigateTab }) {
   const { streams } = useActiveStreams();
-  const [activeDrone, setActiveDrone] = useState(null);
+  // The page's drone selector wins; our own pill selection is only a fallback when it is empty.
+  const [selectedDrone, setSelectedDrone] = useState(null);
+  const activeDrone = droneId || selectedDrone;
+  const canControlStream = user?.role !== 'drone_operator';
+  const [notice, setNotice] = useState(null); // { type: 'error' | 'ok', text }
   const [activeMissionId, setActiveMissionId] = useState(null);
-  const [activeModel, setActiveModel] = useState('csrnet_parta');
+  const [activeModel, setActiveModel] = useState('');
   const [modelSwitching, setModelSwitching] = useState(false);
   const [streamRunning, setStreamRunning] = useState(false);
   const [startingStream, setStartingStream] = useState(false);
@@ -770,17 +784,17 @@ export default function CrowdAnalytics({ crowdSeries, drones, onNavigateTab }) {
 
   // Auto-select first active drone once discovered
   useEffect(() => {
-    if (droneList.length === 0) return;
-    setActiveDrone(prev => {
+    if (droneId || droneList.length === 0) return;
+    setSelectedDrone(prev => {
       if (prev && droneList.some(d => d.id === prev)) return prev;
       const live = droneList.find(d => d.status === 'live' || (d.frame_count || 0) > 0 || (d.messages_ready || 0) > 0);
       return (live || droneList[0])?.id || null;
     });
-  }, [droneList]);
+  }, [droneList, droneId]);
 
   // Track mission ID for selected drone
   useEffect(() => {
-    if (!activeDrone || !droneList.length) return;
+    if (!activeDrone) { setActiveMissionId(null); return; }
     const droneObj = droneList.find(d => d.id === activeDrone);
     const mId = droneObj?.mission_id || null;
     setActiveMissionId(mId);
@@ -803,8 +817,8 @@ export default function CrowdAnalytics({ crowdSeries, drones, onNavigateTab }) {
   const { data: readingsData, loading: readingsLoading } = useCrowdReadings(activeDrone || '', 4000);
   const { data: timelineData }    = useCrowdTimeline(activeDrone || '', 24);
   const { data: sessionSummary }  = useCrowdSessionSummary(10000);
-  const { data: modelInfo }       = useCrowdModel(30000);
-  const { data: healthData }      = useCrowdHealth(10000);
+  const { data: modelInfo, refetch: refetchModel } = useCrowdModel(30000);
+  const { data: healthData, refetch: refetchHealth } = useCrowdHealth(10000);
 
   // Sync stream running state from health check
   useEffect(() => {
@@ -873,35 +887,43 @@ export default function CrowdAnalytics({ crowdSeries, drones, onNavigateTab }) {
   const activeDroneReading = readings.find(r => r.drone_id === activeDrone || (activeDrone && r.drone_id && (r.drone_id.includes(activeDrone) || activeDrone.includes(r.drone_id))));
   const polledCount = activeDroneReading?.estimated_count ?? activeDroneReading?.people_count ?? (readings.length > 0 ? readings[0]?.estimated_count : null);
 
-  // Live count prioritization: frame header count (realtimeCount) > SSE count > recent DB reading
+  // Live count prioritization: frame header count (realtimeCount) > SSE count > recent DB reading.
+  // null = no reading yet (shown as "—", never as 0).
   const liveCount = realtimeCount !== null
     ? realtimeCount
-    : (polledCount != null ? Number(polledCount) : 0);
-  const liveLevel = getDensityLevel(liveCount);
+    : (polledCount != null ? Number(polledCount) : null);
+  const liveLevel = liveCount != null ? getDensityLevel(liveCount) : { label: '—', color: '#64748b' };
   const trend = computeTrend(recentCounts.length > 0 ? recentCounts : (readings.length > 0 ? readings.slice(0, 5).map(r => Number(r.estimated_count || 0)) : []));
-  const avgDensity = (liveCount / 200).toFixed(2);
 
   const serviceOnline = sseConnected || !readingsLoading || (healthData?.status === 'ok');
 
-  // Model switching handler
+  // Model switching handler: refetch the server's model after a switch so the selector
+  // shows what the analyzer is really running; show failures instead of reverting silently.
   const handleModelSwitch = async (modelType) => {
     if (modelType === activeModel) return;
     setModelSwitching(true);
+    setNotice(null);
     try {
-      await switchCrowdModel(modelType);
-      setActiveModel(modelType);
+      const res = await switchCrowdModel(modelType);
+      if (res && typeof res === 'object' && res.error) {
+        throw new Error(typeof res.detail === 'string' ? res.detail : String(res.error));
+      }
+      setActiveModel(res?.model_type || modelType);
+      setNotice({ type: 'ok', text: `Crowd model switched to ${MODEL_OPTIONS.find(m => m.value === (res?.model_type || modelType))?.label || modelType}` });
     } catch (err) {
-      console.error('Model switch failed:', err);
+      setNotice({ type: 'error', text: `Model switch failed: ${apiError(err, 'request failed')}` });
     } finally {
       setModelSwitching(false);
+      refetchModel && refetchModel();
     }
   };
 
-  // Start stream handler
+  // Start stream handler (POST only on the backend)
   const handleStartStream = async () => {
     setStartingStream(true);
+    setNotice(null);
     try {
-      await api.get('/analytics/crowd/stream/start');
+      await api.post('/analytics/crowd/stream/start');
       setStreamRunning(true);
       setSseWindow([]);
       setRecentCounts([]);
@@ -910,27 +932,31 @@ export default function CrowdAnalytics({ crowdSeries, drones, onNavigateTab }) {
       try {
         await api.post('/models/sync-worker', { service: 'crowd', action: 'start' });
       } catch (e) {
-        console.warn('Sync worker failed:', e);
+        setNotice({ type: 'error', text: `Crowd analysis started, but worker sync failed: ${apiError(e, 'request failed')}` });
       }
     } catch (err) {
-      console.error('Failed to start stream:', err);
+      setNotice({ type: 'error', text: `Failed to start crowd analysis: ${apiError(err, 'request failed')}` });
     } finally {
       setStartingStream(false);
+      refetchHealth && refetchHealth();
     }
   };
 
   // Stop stream handler
   const handleStopStream = async () => {
+    setNotice(null);
     try {
-      await api.get('/analytics/crowd/stream/stop');
+      await api.post('/analytics/crowd/stream/stop');
       setStreamRunning(false);
       try {
         await api.post('/models/sync-worker', { service: 'crowd', action: 'stop' });
       } catch (e) {
-        console.warn('Sync worker failed:', e);
+        setNotice({ type: 'error', text: `Crowd analysis stopped, but worker sync failed: ${apiError(e, 'request failed')}` });
       }
     } catch (err) {
-      console.error('Failed to stop stream:', err);
+      setNotice({ type: 'error', text: `Failed to stop crowd analysis: ${apiError(err, 'request failed')}` });
+    } finally {
+      refetchHealth && refetchHealth();
     }
   };
 
@@ -965,11 +991,23 @@ export default function CrowdAnalytics({ crowdSeries, drones, onNavigateTab }) {
         <ServiceBadge online={sseConnected || serviceOnline} />
       </div>
 
+      {notice && (
+        <div className={`rounded-lg px-3 py-2 mono text-xs flex items-center gap-2 border ${
+          notice.type === 'error'
+            ? 'bg-red-500/10 border-red-500/30 text-red-300'
+            : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+        }`} role={notice.type === 'error' ? 'alert' : 'status'}>
+          {notice.type === 'error' && <AlertTriangle size={13} className="shrink-0" />}
+          <span className="flex-1">{notice.text}</span>
+          <button onClick={() => setNotice(null)} className="text-slate-400 hover:text-white" title="Close">×</button>
+        </div>
+      )}
+
       {/* LIVE FEED & HEATMAP STREAM */}
       <LiveFeedSection
         activeDrone={activeDrone}
         droneList={droneList}
-        setActiveDrone={setActiveDrone}
+        setActiveDrone={droneId ? null : setSelectedDrone}
         liveCount={liveCount}
         liveLevel={liveLevel}
         streamRunning={streamRunning}
@@ -980,6 +1018,7 @@ export default function CrowdAnalytics({ crowdSeries, drones, onNavigateTab }) {
         startingStream={startingStream}
         onFrameCount={handleFrameCount}
         onNavigateTab={onNavigateTab}
+        canControlStream={canControlStream}
       />
 
       {/* KPI STRIP */}
@@ -988,7 +1027,6 @@ export default function CrowdAnalytics({ crowdSeries, drones, onNavigateTab }) {
         peakCount={peakCount}
         peakTimestamp={peakTimestamp}
         alertCount={alertCount}
-        avgDensity={avgDensity}
         densityLevel={liveLevel}
         trend={trend}
         sseConnected={sseConnected}
@@ -1021,7 +1059,7 @@ export default function CrowdAnalytics({ crowdSeries, drones, onNavigateTab }) {
       <SessionStatsRow summary={sessionSummary} />
 
       {/* MISSION REPORT EXPORT */}
-      <MissionExport hasData={sessionSummary?.total_frames > 0} activeModel={activeModel} />
+      <MissionExport hasData={sessionSummary?.total_frames > 0} />
 
     </div>
   );

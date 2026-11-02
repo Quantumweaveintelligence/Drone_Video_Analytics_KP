@@ -181,7 +181,7 @@ export default function LiveMap({ drones, height = 480, selectedDroneId = null }
                     </div>
                     <div className="text-slate-700"><b>Mission:</b> {d.mission_id || "—"}</div>
                     {d.mission_name && <div className="text-slate-600"><b>Name:</b> {d.mission_name}</div>}
-                    <div className="text-slate-700"><b>Jurisdiction:</b> {d.jurisdiction || "State HQ / Central"}</div>
+                    <div className="text-slate-700"><b>Jurisdiction:</b> {d.jurisdiction || "—"}</div>
                     
                     <div className="my-1 border-t border-slate-200 pt-1 text-slate-800">
                       <div><b>Lat:</b> {d.lat.toFixed(6)}°</div>
@@ -193,7 +193,7 @@ export default function LiveMap({ drones, height = 480, selectedDroneId = null }
                       <div><b>Abs Alt:</b> {d.abs_alt != null ? `${d.abs_alt.toFixed(1)}m` : "—"}</div>
                       <div><b>Gimbal Yaw:</b> {d.gb_yaw != null ? `${d.gb_yaw}°` : "—"}</div>
                       <div><b>Gimbal Pitch:</b> {d.gb_pitch != null ? `${d.gb_pitch}°` : "—"}</div>
-                      <div><b>Speed:</b> {d.speed_mps != null ? `${d.speed_mps} m/s` : "0 m/s"}</div>
+                      <div><b>Speed:</b> {d.speed_mps != null ? `${d.speed_mps} m/s` : "—"}</div>
                       <div><b>Battery:</b> {d.battery_pct != null ? `${d.battery_pct}%` : "—"}</div>
                     </div>
 

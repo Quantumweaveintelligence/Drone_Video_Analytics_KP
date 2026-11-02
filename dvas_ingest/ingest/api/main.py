@@ -1179,6 +1179,7 @@ async def get_active_streams():
                 "operator":        meta.get("operator") or _active_missions.get(drone_id, {}).get("operator"),
                 "location":        meta.get("location") or _active_missions.get(drone_id, {}).get("location"),
                 "last_seen":       last_seen_str,
+                "started_at":      active_mission_info.get("started_at"),   # mission start (dashboard uptime)
                 "latitude":        meta.get("latitude"),
                 "longitude":       meta.get("longitude"),
                 "battery_pct":     meta.get("battery_pct"),

@@ -15,28 +15,6 @@ import {
   Video, Compass, Clock, Scan, Image, Archive, Server, ClipboardList, Settings, Cpu, X
 } from "lucide-react";
 
-const NAV = {
-  drone_operator: [
-    { to: "/edge/dashboard", labelKey: "nav.edgeDashboard", labelFallback: "Dashboard", Icon: LayoutDashboard },
-    { to: "/edge/mission-control", labelKey: "nav.missionControl", labelFallback: "Mission Control", Icon: Target },
-    { to: "/edge/live-monitoring", labelKey: "nav.liveMonitoring", labelFallback: "Live Monitoring", Icon: Video },
-    { to: "/edge/gps-telemetry", labelKey: "nav.gpsTelemetry", labelFallback: "GPS & Telemetry", Icon: Compass },
-    { to: "/edge/buffer-and-change", labelKey: "nav.bufferAndChange", labelFallback: "Buffer and Change", Icon: Scan },
-    { to: "/edge/frame-selection", labelKey: "nav.frameSelection", labelFallback: "Frame Selection Analytics", Icon: Image },
-    { to: "/edge/incidents", labelKey: "nav.incidents", labelFallback: "Incidents", Icon: AlertTriangle },
-    { to: "/edge/evidence-management", labelKey: "nav.evidenceManagement", labelFallback: "Evidence Management", Icon: Archive },
-    { to: "/edge/system-health", labelKey: "nav.systemHealth", labelFallback: "System Health", Icon: Server },
-    { to: "/edge/logs-audit", labelKey: "nav.logsAudit", labelFallback: "Logs & Audit", Icon: ClipboardList },
-    { to: "/edge/settings", labelKey: "nav.settings", labelFallback: "Settings", Icon: Settings },
-  ],
-  system_administrator:  [{ to: "/ingest", labelKey: "nav.ingest",  Icon: Gauge },
-                          { to: "/admin",  labelKey: "nav.admin",   Icon: ShieldCheck }],
-  // CRO inherits former field_supervisor mission/evidence access + former CRO command view
-  control_room_officer:  [{ to: "/command",labelKey: "nav.command", Icon: MapIcon }],
-  // Senior Officer inherits former supervisory_officer admin access + existing SR command+admin
-  senior_officer:        [{ to: "/command",labelKey: "nav.command", Icon: MapIcon },
-                          { to: "/admin",  labelKey: "nav.admin",   Icon: ShieldCheck }],
-};
 
 const SB_KEY = "dvas_sidebar_collapsed";
 

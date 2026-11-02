@@ -41,7 +41,8 @@ import {
 } from '../lib/useAnalytics';
 import { useActiveStreams } from '../hooks/useActiveStreams';
 import { useJpegPoller } from '../hooks/useJpegPoller';
-import { api } from '../lib/api';
+import { api, apiError } from '../lib/api';
+import { fmtIST } from '../lib/ist';
 
 function playAlertChime() {
   try {
@@ -84,23 +85,6 @@ function fmtAge(isoTs) {
   if (s < 60)   return `${s}s ago`;
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
   return `${Math.floor(s / 3600)}h ago`;
-}
-
-function fmtIST(isoTs) {
-  if (!isoTs) return '—';
-  try {
-    const d = new Date(isoTs);
-    return d.toLocaleString('en-IN', {
-      timeZone: 'Asia/Kolkata',
-      day: '2-digit',
-      month: 'short',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: true,
-    });
-  } catch {
-    return isoTs;
-  }
 }
 
 /**
@@ -237,7 +221,9 @@ function AnnotatedPersonFeedViewer({ activeDrone, setActiveDrone, drones, stream
           {droneList.map(d => {
             const isDraining = d.status === 'draining';
             return (
-              <button key={d.id} onClick={() => setActiveDrone(d.id)}
+              <button key={d.id} onClick={() => setActiveDrone && setActiveDrone(d.id)}
+                disabled={!setActiveDrone}
+                title={!setActiveDrone ? 'Drone is selected at the top of the page' : undefined}
                 className="mono text-[10px] px-2 py-1 rounded transition-all flex items-center gap-1"
                 style={{
                   background: activeDrone === d.id ? 'rgba(56,189,248,0.15)' : 'var(--dvas-surface-2)',
@@ -287,9 +273,9 @@ function AnnotatedPersonFeedViewer({ activeDrone, setActiveDrone, drones, stream
             </button>
           </div>
         )}
-        {!modelActive && !streamRunning && (
+        {!modelActive && !streamRunning && (onNavigateTab ? (
           <button
-            onClick={() => onNavigateTab ? onNavigateTab("models") : onStartStream()}
+            onClick={() => onNavigateTab('models')}
             className="mono text-[10px] px-2.5 py-1 rounded-lg transition-all hover:bg-slate-700/60 cursor-pointer flex items-center"
             style={{ color: '#94a3b8', background: 'var(--dvas-surface-2)', border: '1px solid var(--dvas-border)' }}
             title="Configure and enable Person Detection in Detection Models"
@@ -297,10 +283,17 @@ function AnnotatedPersonFeedViewer({ activeDrone, setActiveDrone, drones, stream
             <Cpu size={10} className="inline mr-1 -mt-0.5 text-sky-400" />
             Enable in Detection Models
           </button>
-        )}
-        {onNavigateTab && (
+        ) : (
+          <span className="mono text-[10px] px-2.5 py-1 rounded-lg flex items-center"
+            style={{ color: '#94a3b8', background: 'var(--dvas-surface-2)', border: '1px solid var(--dvas-border)' }}
+            title="The person detection model is not loaded on the analytics server">
+            <Cpu size={10} className="inline mr-1 -mt-0.5 text-slate-500" />
+            Person model not loaded
+          </span>
+        ))}
+        {onNavigateTab && (modelActive || streamRunning) && (
           <button
-            onClick={() => onNavigateTab("models")}
+            onClick={() => onNavigateTab('models')}
             className="flex items-center gap-1 px-2.5 py-1 rounded-lg mono text-[10px] font-bold text-slate-400 hover:text-sky-300 hover:bg-slate-800 transition-colors"
             title="Open Detection Models Configuration"
             style={{ border: '1px solid var(--dvas-border)' }}
@@ -345,8 +338,8 @@ function AnnotatedPersonFeedViewer({ activeDrone, setActiveDrone, drones, stream
           <span className="mono text-[9px] font-bold text-slate-400 tracking-wider uppercase">HUD OVERLAYS</span>
         </div>
         {[
-          { key: 'person_boxes',     label: 'Persons',      icon: Users,         desc: 'YOLO Person Bounding Boxes' },
-          { key: 'face_boxes',       label: 'Faces',        icon: Eye,           desc: 'YOLO Face Bounding Boxes' },
+          { key: 'person_boxes',     label: 'Persons',      icon: Users,         desc: 'Person bounding boxes' },
+          { key: 'face_boxes',       label: 'Faces',        icon: Eye,           desc: 'Face bounding boxes' },
           { key: 'track_ids',        label: 'Track IDs',    icon: UserCheck,     desc: 'Unique Tracker IDs' },
           { key: 'confidence',       label: 'Confidence',   icon: Zap,           desc: 'Detection & Match Confidence %' },
           { key: 'watchlist_alerts', label: 'Watchlist',    icon: Shield,        desc: 'Tactical Watchlist Crosshairs & Brackets' },
@@ -413,7 +406,7 @@ function AnnotatedPersonFeedViewer({ activeDrone, setActiveDrone, drones, stream
               {isAnnotated ? `ANNOTATED${fps > 0 ? ` · ${fps}fps` : ''}` : hasAnyFeed ? 'LIVE · RAW' : 'CONNECTING'}
             </div>
             <div className="absolute bottom-3 left-3 z-10 pointer-events-none mono text-[10px] bg-black/85 px-2 py-1 rounded text-slate-400">
-              YOLOv8m Person · YOLOv8n-face · ResNet50 Re-ID
+              Person · Face · Re-ID
             </div>
             <div className="absolute bottom-3 right-3 z-10 pointer-events-none mono text-[10px] bg-black/85 px-2 py-1 rounded"
               style={{ color: modelStatusColor }}>
@@ -1573,7 +1566,7 @@ function DeduplicationSection({ missions, dedupProgress, onDeduplicate, dedupDat
    SECTION 6 — Face Recognition Watchlist & Reverse Search Components
    ────────────────────────────────────────────────────────────── */
 
-function WatchlistAlertCard({ alert, onConfirm, onDismiss, onOpenPreview }) {
+function WatchlistAlertCard({ alert, onConfirm, onDismiss, onOpenPreview, canReview = true, busy = false }) {
   const categoryColors = {
     wanted:  { bg: 'rgba(239,68,68,0.12)', border: 'rgba(239,68,68,0.35)', text: '#ef4444', badge: 'bg-red-500/20 text-red-300 border-red-500/30' },
     missing: { bg: 'rgba(251,146,60,0.12)', border: 'rgba(251,146,60,0.35)', text: '#fb923c', badge: 'bg-orange-500/20 text-orange-300 border-orange-500/30' },
@@ -1582,7 +1575,10 @@ function WatchlistAlertCard({ alert, onConfirm, onDismiss, onOpenPreview }) {
   };
   const cat = (alert.category || 'wanted').toLowerCase();
   const colors = categoryColors[cat] || categoryColors.wanted;
-  const matchPct = Math.round((alert.confidence || 0) * 100);
+  const matchPct = alert.confidence != null ? Math.round(alert.confidence * 100) : null;
+  // Only claim evidence when the stored alert row carries the Sec 65B packet key + hashes
+  // (live SSE alerts do not; the 5 s poll fills these fields in once the row is read back).
+  const hasEvidence = !!(alert.evidence_packet_key && (alert.face_crop_sha256 || alert.frame_sha256));
 
   return (
     <div className="rounded-xl p-3.5 flex gap-3.5 transition-all relative overflow-hidden"
@@ -1616,7 +1612,7 @@ function WatchlistAlertCard({ alert, onConfirm, onDismiss, onOpenPreview }) {
               {cat}
             </span>
             <span className="mono text-[11px] font-bold text-amber-300">
-              {matchPct}% match
+              {matchPct != null ? `${matchPct}% match` : '— match'}
             </span>
             {alert.is_confirmed && (
               <span className="mono text-[9px] bg-emerald-500/20 text-emerald-300 px-1.5 py-0.5 rounded border border-emerald-500/30 flex items-center gap-1">
@@ -1637,18 +1633,25 @@ function WatchlistAlertCard({ alert, onConfirm, onDismiss, onOpenPreview }) {
           )}
         </div>
 
-        {/* Section 65B indicator */}
-        <div className="mono text-[9px] text-slate-500 flex items-center gap-1 mt-1">
-          <FileCheck size={10} className="text-emerald-400" />
-          <span>Sec 65B Evidence Logged</span>
-        </div>
+        {/* Section 65B indicator — only when the alert carries an evidence reference */}
+        {hasEvidence ? (
+          <div className="mono text-[9px] text-slate-500 flex items-center gap-1 mt-1" title={alert.evidence_packet_key}>
+            <FileCheck size={10} className="text-emerald-400" />
+            <span>Sec 65B evidence packet stored</span>
+          </div>
+        ) : (
+          <div className="mono text-[9px] text-slate-600 flex items-center gap-1 mt-1">
+            <span>Not yet in evidence</span>
+          </div>
+        )}
       </div>
 
       {/* Action buttons */}
-      {!alert.is_confirmed && (
+      {!alert.is_confirmed && canReview && (
         <div className="flex flex-col justify-center gap-2 pl-2 border-l border-slate-700/40">
           <button
             onClick={() => onConfirm(alert.id)}
+            disabled={busy}
             title="Confirm Match (Operator Verification)"
             className="p-2 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/35 text-emerald-400 border border-emerald-500/40 transition-all cursor-pointer"
           >
@@ -1656,6 +1659,7 @@ function WatchlistAlertCard({ alert, onConfirm, onDismiss, onOpenPreview }) {
           </button>
           <button
             onClick={() => onDismiss(alert.id)}
+            disabled={busy}
             title="Dismiss Alert (False Positive)"
             className="p-2 rounded-lg bg-slate-800/60 hover:bg-red-500/20 text-slate-400 hover:text-red-400 border border-slate-700 hover:border-red-500/30 transition-all cursor-pointer"
           >
@@ -1790,14 +1794,41 @@ function EnrollmentModal({ isOpen, onClose, onEnrolled, arcfaceLoaded = true, ar
     onClose && onClose();
   }, [previewUrl, onClose]);
 
-  const handleFileChange = (e) => {
-    const f = e.target.files?.[0];
+  const [dragOver, setDragOver] = useState(false);
+
+  // Shared by the click picker and drag-and-drop
+  const selectFile = (f) => {
     if (!f) return;
+    if (!/^image\/(jpeg|jpg|png)$/i.test(f.type || '')) {
+      setErrorMsg('Please use a JPEG or PNG photograph');
+      return;
+    }
     setFile(f);
     if (previewUrl) URL.revokeObjectURL(previewUrl);
     setPreviewUrl(URL.createObjectURL(f));
     setErrorMsg(null);
     setSuccessMsg(null);
+  };
+
+  const handleFileChange = (e) => selectFile(e.target.files?.[0]);
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!dragOver) setDragOver(true);
+  };
+
+  const handleDragLeave = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+    selectFile(e.dataTransfer?.files?.[0]);
   };
 
   const handleSubmit = async (e) => {
@@ -1825,8 +1856,8 @@ function EnrollmentModal({ isOpen, onClose, onEnrolled, arcfaceLoaded = true, ar
     try {
       const res = await api.post('/analytics/person/watchlist/enroll', formData);
       if (res.data?.status === 'enrolled') {
-        const embCount = res.data.embeddings_stored || 3;
-        setSuccessMsg(`Subject "${res.data.name || name}" enrolled successfully with ${embCount} biometric face embeddings!`);
+        const embCount = res.data.embeddings_stored ?? '—';
+        setSuccessMsg(`Subject "${res.data.name || name}" enrolled successfully (face embeddings stored: ${embCount}).`);
         setTimeout(() => {
           onEnrolled && onEnrolled(res.data);
           handleClose();
@@ -1835,7 +1866,7 @@ function EnrollmentModal({ isOpen, onClose, onEnrolled, arcfaceLoaded = true, ar
         setErrorMsg(res.data?.detail || 'Enrollment failed');
       }
     } catch (err) {
-      setErrorMsg(err.response?.data?.detail || err.message || 'Failed to enroll person');
+      setErrorMsg(apiError(err, 'Failed to enroll person'));
     } finally {
       setSubmitting(false);
     }
@@ -1872,7 +1903,7 @@ function EnrollmentModal({ isOpen, onClose, onEnrolled, arcfaceLoaded = true, ar
           {!arcfaceLoaded && (
             <div className="p-3 rounded-lg bg-amber-500/15 border border-amber-500/30 text-amber-300 mono text-xs flex items-center gap-2">
               <AlertTriangle size={15} className="shrink-0 text-amber-400" />
-              <span>Face recognition model (ArcFace R100) is not loaded on the server. Enrollment is temporarily unavailable.</span>
+              <span>Face recognition model is not loaded on the server. Enrollment is temporarily unavailable.</span>
             </div>
           )}
           {errorMsg && (
@@ -1897,8 +1928,12 @@ function EnrollmentModal({ isOpen, onClose, onEnrolled, arcfaceLoaded = true, ar
               </label>
               <div
                 onClick={() => fileInputRef.current?.click()}
+                onDragOver={handleDragOver}
+                onDragEnter={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
                 className="w-full h-44 rounded-xl border-2 border-dashed hover:border-sky-500/60 flex flex-col items-center justify-center cursor-pointer transition-colors overflow-hidden relative group"
-                style={{ background: 'var(--dvas-surface-2)', borderColor: 'var(--dvas-border)' }}
+                style={{ background: 'var(--dvas-surface-2)', borderColor: dragOver ? 'rgba(56,189,248,0.6)' : 'var(--dvas-border)' }}
               >
                 {previewUrl ? (
                   <>
@@ -2261,8 +2296,26 @@ function FaceSearchPanel({ missions, onOpenPreview }) {
 /* ───────────────────────────────────────────────────────────────
    MAIN EXPORT
    ────────────────────────────────────────────────────────────── */
-export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
-  const [activeDrone, setActiveDrone] = useState(null);
+/** Soft-proxied routes answer 200 with {error, detail} when the analyzer fails. */
+function ensureOk(res) {
+  const d = res?.data;
+  if (d && typeof d === 'object' && !Array.isArray(d) && d.error) {
+    throw new Error(typeof d.detail === 'string' ? d.detail : String(d.error));
+  }
+  return res;
+}
+
+const ALERT_REVIEW_ROLES = ['system_administrator', 'senior_officer', 'control_room_officer'];
+
+export default function PersonTrackingAnalytics({ drones, droneId = '', user, onNavigateTab }) {
+  // The page's drone selector wins; our own pill selection is only a fallback when it is empty.
+  const [selectedDrone, setSelectedDrone] = useState(null);
+  const activeDrone = droneId || selectedDrone;
+  const canReviewAlerts = !user?.role || ALERT_REVIEW_ROLES.includes(user.role);
+
+  // Inline status line for action results / failures (shown at the top of the page)
+  const [notice, setNotice] = useState(null); // { type: 'error' | 'ok', text }
+  const showError = useCallback((err, fallback) => setNotice({ type: 'error', text: `${fallback}: ${apiError(err, 'request failed')}` }), []);
 
   // Active streams hook
   const { streams: activeStreams, streamMap } = useActiveStreams();
@@ -2274,15 +2327,16 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
         : []);
 
   useEffect(() => {
+    if (droneId) return; // page-selected drone is authoritative
     if (!validDrones || validDrones.length === 0) {
-      setActiveDrone(null);
+      if (selectedDrone !== null) setSelectedDrone(null);
       return;
     }
-    const currentStillValid = validDrones.some(d => d.id === activeDrone);
-    if (!activeDrone || !currentStillValid) {
-      setActiveDrone(validDrones[0].id);
+    const currentStillValid = validDrones.some(d => d.id === selectedDrone);
+    if (!selectedDrone || !currentStillValid) {
+      setSelectedDrone(validDrones[0].id);
     }
-  }, [validDrones, activeDrone]);
+  }, [validDrones, selectedDrone, droneId]);
 
   const [reidLoading,         setReidLoading]         = useState(false);
   const [sseWindow,           setSseWindow]           = useState([]);
@@ -2308,7 +2362,7 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
   const [watchlistCategoryFilter, setWatchlistCategoryFilter] = useState('');
 
   // Health
-  const { data: healthData } = useAnalyticsFetch('/analytics/person/health', 5000);
+  const { data: healthData, refetch: refetchHealth } = useAnalyticsFetch('/analytics/person/health', 5000);
   const streamRunning   = healthData?.stream_running ?? false;
   const modelActive     = healthData?.model_loaded  ?? false;
   const arcfaceLoaded   = healthData?.arcface_loaded ?? false;
@@ -2324,14 +2378,15 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
   }, [serverAnnotationConfig]);
 
   const handleToggleAnnotation = useCallback(async (key) => {
-    const updated = { ...annotationConfig, [key]: !annotationConfig[key] };
-    setAnnotationConfig(updated);
+    const prevVal = !!annotationConfig[key];
+    setAnnotationConfig(c => ({ ...c, [key]: !prevVal }));
     try {
-      await api.put('/analytics/person/annotation/config', { [key]: updated[key] });
+      ensureOk(await api.put('/analytics/person/annotation/config', { [key]: !prevVal }));
     } catch (err) {
-      console.error('Failed to update annotation config:', err);
+      setAnnotationConfig(c => ({ ...c, [key]: prevVal })); // roll back the optimistic toggle
+      showError(err, 'HUD overlay change failed');
     }
-  }, [annotationConfig]);
+  }, [annotationConfig, showError]);
 
   // Active mission from stream map or health data (only for live/draining drones)
   const activeMissionId = (() => {
@@ -2358,7 +2413,10 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
 
   // Watchlist & Alerts hooks
   const { data: watchlistData, loading: watchlistLoading, refetch: refreshWatchlist } = usePersonWatchlist(watchlistCategoryFilter, 15000);
-  const { data: alertsData } = usePersonWatchlistAlerts(activeDrone || '', 20, 5000);
+  const { data: alertsData, refetch: refetchAlerts } = usePersonWatchlistAlerts(activeDrone || '', 20, 5000);
+  // Alerts the operator dismissed/hid this session; the 5 s poll must not bring them back.
+  const dismissedIdsRef = useRef(new Set());
+  const [alertBusy, setAlertBusy] = useState(false);
 
   // Normalise arrays
   const tracks     = Array.isArray(tracksData)            ? tracksData
@@ -2385,10 +2443,16 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
       : Array.isArray(alertsData) ? alertsData : [];
     if (arr.length > 0) {
       setAlertsList(prev => {
-        const validItems = arr.filter(a => !a.notes || !a.notes.toLowerCase().includes('dismiss'));
+        const hidden = dismissedIdsRef.current;
+        const validItems = arr.filter(a => !hidden.has(a.id) && (!a.notes || !a.notes.toLowerCase().includes('dismiss')));
+        const polledById = new Map(validItems.map(a => [a.id, a]));
+        // Refresh alerts we already show with the stored row (evidence keys, confirmation state)
+        const kept = prev
+          .filter(a => !hidden.has(a.id))
+          .map(a => (polledById.has(a.id) ? { ...a, ...polledById.get(a.id) } : a));
         const existingIds = new Set(prev.map(a => a.id));
         const newItems = validItems.filter(a => !existingIds.has(a.id));
-        return [...newItems, ...prev].slice(0, 30);
+        return [...newItems, ...kept].slice(0, 30);
       });
     }
   }, [alertsData]);
@@ -2399,11 +2463,11 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
 
   const handleDeduplicate = useCallback(async (missionId) => {
     try {
-      await api.post('/analytics/person/deduplicate', { mission_id: missionId });
+      ensureOk(await api.post('/analytics/person/deduplicate', { mission_id: missionId }));
     } catch (err) {
-      console.error('Mission dedup trigger failed:', err);
+      showError(err, `Deduplication of ${missionId} failed`);
     }
-  }, []);
+  }, [showError]);
 
   // Clear SSE detection window and live counter on active drone switch
   useEffect(() => {
@@ -2434,14 +2498,14 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
     // ── Watchlist match alert ──────────────────────────────────────
     if (stream === 'person_alert' || payload?.type === 'watchlist_match') {
       const alertData = payload;
-      if (alertData) {
+      if (alertData && !(alertData.id && dismissedIdsRef.current.has(alertData.id))) {
         setAlertsList(prev => [
           {
             id: alertData.id || `alert-${Date.now()}`,
             watchlist_id: alertData.watchlist_id,
             name: alertData.name,
             category: alertData.category,
-            confidence: alertData.similarity ?? alertData.confidence ?? 0.8,
+            confidence: alertData.similarity ?? alertData.confidence ?? null,
             drone_id: alertData.drone_id,
             mission_id: alertData.mission_id,
             tracker_id: alertData.tracker_id,
@@ -2484,82 +2548,141 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
   const { connected: sseConnected } = useAnalyticsSSE(handleSSEEvent);
 
   const handleConfirmAlert = useCallback(async (alertId) => {
+    setAlertBusy(true);
     try {
-      await api.post(`/analytics/person/watchlist/alerts/${alertId}/confirm`, { notes: 'Verified by Operator' });
+      ensureOk(await api.post(`/analytics/person/watchlist/alerts/${alertId}/confirm`, { notes: 'Verified by Operator' }));
       setAlertsList(prev => prev.map(a => a.id === alertId ? { ...a, is_confirmed: true, notes: 'Verified by Operator' } : a));
+      refetchAlerts && refetchAlerts();
     } catch (err) {
-      console.error('Failed to confirm alert:', err);
+      showError(err, 'Confirm alert failed');
+    } finally {
+      setAlertBusy(false);
     }
-  }, []);
+  }, [refetchAlerts, showError]);
 
   const handleDismissAlert = useCallback(async (alertId) => {
-    try {
-      await api.post(`/analytics/person/watchlist/alerts/${alertId}/dismiss`, { notes: 'Dismissed by Operator' });
+    if (typeof alertId !== 'string' || alertId.startsWith('alert-')) {
+      // Live-only alert without a server id: nothing to dismiss server-side, hide it here
+      dismissedIdsRef.current.add(alertId);
       setAlertsList(prev => prev.filter(a => a.id !== alertId));
-    } catch (err) {
-      console.error('Failed to dismiss alert:', err);
+      return;
     }
-  }, []);
+    setAlertBusy(true);
+    try {
+      ensureOk(await api.post(`/analytics/person/watchlist/alerts/${alertId}/dismiss`, { notes: 'Dismissed by Operator' }));
+      dismissedIdsRef.current.add(alertId);
+      setAlertsList(prev => prev.filter(a => a.id !== alertId));
+      refetchAlerts && refetchAlerts();
+    } catch (err) {
+      showError(err, 'Dismiss alert failed');
+    } finally {
+      setAlertBusy(false);
+    }
+  }, [refetchAlerts, showError]);
+
+  // Dismiss All: unconfirmed alerts are dismissed on the server (same endpoint as the
+  // per-card X); confirmed alerts stay confirmed on the server and are only hidden here.
+  // Alerts that only arrived over SSE without a server id can only be hidden locally.
+  const handleDismissAll = useCallback(async () => {
+    const isServerId = (id) => typeof id === 'string' && !id.startsWith('alert-');
+    const toDismiss = alertsList.filter(a => !a.is_confirmed && isServerId(a.id));
+    const hideOnly = alertsList.filter(a => a.is_confirmed || !isServerId(a.id));
+    setAlertBusy(true);
+    const results = await Promise.allSettled(toDismiss.map(a =>
+      api.post(`/analytics/person/watchlist/alerts/${a.id}/dismiss`, { notes: 'Dismissed by Operator (bulk)' }).then(ensureOk)
+    ));
+    const failed = [];
+    results.forEach((r, i) => {
+      if (r.status === 'fulfilled') dismissedIdsRef.current.add(toDismiss[i].id);
+      else failed.push(r.reason);
+    });
+    hideOnly.forEach(a => dismissedIdsRef.current.add(a.id));
+    setAlertsList(prev => prev.filter(a => !dismissedIdsRef.current.has(a.id)));
+    setAlertBusy(false);
+    if (failed.length > 0) {
+      showError(failed[0], `${failed.length} of ${toDismiss.length} alerts could not be dismissed`);
+    }
+    refetchAlerts && refetchAlerts();
+  }, [alertsList, refetchAlerts, showError]);
 
   const handleRemoveWatchlist = useCallback(async (id, name) => {
     if (!window.confirm(`Are you sure you want to remove "${name}" from the watchlist?`)) return;
     try {
-      await api.delete(`/analytics/person/watchlist/${id}`);
+      ensureOk(await api.delete(`/analytics/person/watchlist/${id}`));
       refreshWatchlist && refreshWatchlist();
     } catch (err) {
-      console.error('Failed to remove from watchlist:', err);
+      showError(err, `Removing "${name}" from the watchlist failed`);
     }
-  }, [refreshWatchlist]);
+  }, [refreshWatchlist, showError]);
 
-  // Stream start/stop
+  // Stream start/stop (POST only on the backend)
   const handleStartStream = useCallback(async () => {
     setStartingStream(true);
+    setNotice(null);
     try {
-      await api.get('/analytics/person/stream/start');
+      ensureOk(await api.post('/analytics/person/stream/start'));
       try {
         await api.post('/models/sync-worker', { service: 'person', action: 'start' });
       } catch (e) {
-        console.warn('Sync worker failed:', e);
+        setNotice({ type: 'error', text: `Person detection started, but worker sync failed: ${apiError(e, 'request failed')}` });
       }
+      refetchHealth && refetchHealth();
     } catch (err) {
-      console.error('Failed to start person stream:', err);
+      showError(err, 'Failed to start person detection');
     } finally {
-      setTimeout(() => setStartingStream(false), 3000);
+      setStartingStream(false);
     }
-  }, []);
+  }, [refetchHealth, showError]);
 
   const handleStopStream = useCallback(async () => {
+    setNotice(null);
     try {
-      await api.get('/analytics/person/stream/stop');
+      ensureOk(await api.post('/analytics/person/stream/stop'));
       try {
         await api.post('/models/sync-worker', { service: 'person', action: 'stop' });
       } catch (e) {
-        console.warn('Sync worker failed:', e);
+        setNotice({ type: 'error', text: `Person detection stopped, but worker sync failed: ${apiError(e, 'request failed')}` });
       }
+      refetchHealth && refetchHealth();
     } catch (err) {
-      console.error('Failed to stop person stream:', err);
+      showError(err, 'Failed to stop person detection');
     }
-  }, []);
+  }, [refetchHealth, showError]);
 
-  // Re-ID
+  // Re-ID: spinner lasts exactly as long as the request
   const handleReidTrigger = async () => {
     setReidLoading(true);
     try {
-      await api.post('/analytics/person/reid');
+      ensureOk(await api.post('/analytics/person/reid'));
+      setNotice({ type: 'ok', text: 'Global Re-ID clustering triggered' });
     } catch (err) {
-      console.error('Re-ID trigger failed:', err);
+      showError(err, 'Global Re-ID trigger failed');
     } finally {
-      setTimeout(() => setReidLoading(false), 3000);
+      setReidLoading(false);
     }
   };
 
   return (
     <div className="flex flex-col gap-5" style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }}>
 
+      {notice && (
+        <div className={`rounded-lg px-3 py-2 mono text-xs flex items-center gap-2 border ${
+          notice.type === 'error'
+            ? 'bg-red-500/10 border-red-500/30 text-red-300'
+            : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+        }`} role={notice.type === 'error' ? 'alert' : 'status'}>
+          {notice.type === 'error' ? <AlertTriangle size={13} className="shrink-0" /> : <Check size={13} className="shrink-0" />}
+          <span className="flex-1">{notice.text}</span>
+          <button onClick={() => setNotice(null)} className="text-slate-400 hover:text-white cursor-pointer" title="Close">
+            <X size={13} />
+          </button>
+        </div>
+      )}
+
       {/* LIVE ANNOTATED FEED */}
       <AnnotatedPersonFeedViewer
         activeDrone={activeDrone}
-        setActiveDrone={setActiveDrone}
+        setActiveDrone={droneId ? null : setSelectedDrone}
         drones={drones}
         streamRunning={streamRunning}
         onStartStream={handleStartStream}
@@ -2596,12 +2719,16 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
                 <span className="w-2 h-2 rounded-full bg-red-400 shadow-sm shadow-red-400" />
                 LIVE MATCH
               </span>
-              <button
-                onClick={() => setAlertsList([])}
-                className="mono text-[10px] text-slate-500 hover:text-slate-400 transition-colors cursor-pointer"
-              >
-                Dismiss All
-              </button>
+              {canReviewAlerts && (
+                <button
+                  onClick={handleDismissAll}
+                  disabled={alertBusy}
+                  title="Dismiss all unconfirmed alerts on the server; confirmed alerts are hidden from this panel only"
+                  className="mono text-[10px] text-slate-500 hover:text-slate-400 transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  {alertBusy ? 'Dismissing…' : 'Dismiss All'}
+                </button>
+              )}
             </div>
           }
         >
@@ -2613,6 +2740,8 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
                 onConfirm={handleConfirmAlert}
                 onDismiss={handleDismissAlert}
                 onOpenPreview={setPreviewModalItem}
+                canReview={canReviewAlerts}
+                busy={alertBusy}
               />
             ))}
           </div>
@@ -2738,7 +2867,7 @@ export default function PersonTrackingAnalytics({ drones, onNavigateTab }) {
         iconClass="text-violet-400"
         right={
           <span className="mono text-[10px]" style={{ color: 'var(--dvas-text-dim)' }}>
-            ArcFace 512-dim + ResNet50 2048-dim
+            Face embedding similarity
           </span>
         }
       >

@@ -192,10 +192,11 @@ def _build_service_map():
 async def _fetch_single_status(client: httpx.AsyncClient, key: str, url: str) -> tuple:
     try:
         r = await client.get(url, timeout=5.0, headers=_service_headers())
-        data = r.json() if r.status_code == 200 else {}
-        return key, bool(data.get("stream_running", False))
+        if r.status_code != 200:
+            return key, None                       # service answered but not healthy: unknown
+        return key, bool(r.json().get("stream_running", False))
     except Exception:
-        return key, False
+        return key, None                           # unreachable: unknown, not "stopped"
 
 
 async def _get_service_stream_status() -> dict:
@@ -220,7 +221,7 @@ async def _get_service_stream_status() -> dict:
         for res in results:
             if isinstance(res, tuple):
                 status[res[0]] = res[1]
-    status["face"] = status.get("person", False)  # face shares person-analyzer
+    status["face"] = status.get("person")  # face shares person-analyzer
     return status
 
 
@@ -308,36 +309,29 @@ async def _get_model_config(scope: str = CLUSTER_SCOPE):
         return _row_to_dict(obj)
 
 
-@router.get("/models")
-async def list_models(user: dict = Depends(get_current_user)):
-    if user["role"] not in ("control_room_officer", "senior_officer", "system_administrator"):
-        raise HTTPException(403, "Not permitted")
-    cfg = await _get_model_config(CLUSTER_SCOPE)
-    gpu_total = sum(m["gpu_pct"] for m in AVAILABLE_MODELS if m["key"] in cfg["active"])
-
-    # Fetch real stream_running status from each analytics service in parallel
+async def _models_payload(cfg: dict, user: dict) -> dict:
+    """Model config plus measured state, shared by GET and POST /models (CMD-06)."""
     stream_status = await _get_service_stream_status()
-
-    # Annotate each model with its real running state
     available_with_status = [
         {
             **m,
-            "stream_running": stream_status.get(m["key"], False),
+            "stream_running": stream_status.get(m["key"]),     # None = service unreachable
+            # gpu_pct / throughput_fps are planning estimates per model, not measurements
+            "estimate": True,
         }
         for m in AVAILABLE_MODELS
     ]
 
-    # Fetch real system hardware telemetry
-    gpu_metrics = {"gpu_pct": 0, "used_gb": 0.0, "total_gb": 4.0, "free_gb": 4.0}
+    # Measured GPU figures (None when NVML / nvidia-smi is unavailable)
+    gpu_metrics = {"gpu_pct": None, "used_gb": None, "total_gb": None, "free_gb": None}
     try:
         infra = await collect_system_hardware()
-        used = infra.get("gpu_used_gb", 0.0)
-        tot = infra.get("gpu_total_gb", 4.0)
+        used, tot = infra.get("gpu_mem_used_gb"), infra.get("gpu_mem_total_gb")
         gpu_metrics = {
-            "gpu_pct": infra.get("gpu_pct", 0),
+            "gpu_pct": infra.get("gpu_pct"),
             "used_gb": used,
             "total_gb": tot,
-            "free_gb": max(0.0, round(tot - used, 1)),
+            "free_gb": max(0.0, round(tot - used, 1)) if used is not None and tot else None,
         }
     except Exception:
         pass
@@ -347,12 +341,21 @@ async def list_models(user: dict = Depends(get_current_user)):
         "active": cfg["active"],
         "stream_status": stream_status,
         "scope": CLUSTER_SCOPE,
-        "gpu_total_pct": gpu_total,
+        "gpu_total_pct": sum(m["gpu_pct"] for m in AVAILABLE_MODELS if m["key"] in cfg["active"]),
         "gpu_metrics": gpu_metrics,
         "updated_at": cfg.get("updated_at"),
         "updated_by": cfg.get("updated_by"),
-        "read_only": False,
+        "cluster_label": runtime.gpu_name_nvml(),
+        # control room officers see the shared cluster config but cannot change it (M9)
+        "read_only": user["role"] not in MODEL_ADMIN_ROLES,
     }
+
+
+@router.get("/models")
+async def list_models(user: dict = Depends(get_current_user)):
+    if user["role"] not in ("control_room_officer", "senior_officer", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    return await _models_payload(await _get_model_config(CLUSTER_SCOPE), user)
 
 
 MODEL_ADMIN_ROLES = ("senior_officer", "system_administrator")   # M9: shared cluster config
@@ -419,44 +422,9 @@ async def update_models(
     request: Request = None,
 ):
     stream_results = await apply_model_config(body.active, user, request)
-
     updated_cfg = await _get_model_config(CLUSTER_SCOPE)
-    stream_status = await _get_service_stream_status()
-    gpu_total = sum(m["gpu_pct"] for m in AVAILABLE_MODELS if m["key"] in updated_cfg["active"])
-
-    available_with_status = [
-        {
-            **m,
-            "stream_running": stream_status.get(m["key"], False),
-        }
-        for m in AVAILABLE_MODELS
-    ]
-
-    # Fetch real system hardware telemetry
-    gpu_metrics = {"gpu_pct": 0, "used_gb": 0.0, "total_gb": 4.0, "free_gb": 4.0}
-    try:
-        infra = await collect_system_hardware()
-        used = infra.get("gpu_used_gb", 0.0)
-        tot = infra.get("gpu_total_gb", 4.0)
-        gpu_metrics = {
-            "gpu_pct": infra.get("gpu_pct", 0),
-            "used_gb": used,
-            "total_gb": tot,
-            "free_gb": max(0.0, round(tot - used, 1)),
-        }
-    except Exception:
-        pass
-
-    return {
-        **updated_cfg,
-        "available": available_with_status,
-        "stream_status": stream_status,
-        "stream_actions": stream_results,
-        "gpu_total_pct": gpu_total,
-        "gpu_metrics": gpu_metrics,
-        "deploy_ok": True,
-        "read_only": False,
-    }
+    return {**updated_cfg, **await _models_payload(updated_cfg, user),
+            "stream_actions": stream_results, "deploy_ok": True}
 
 
 @router.post("/models/sync-worker")

@@ -159,6 +159,16 @@ def _scope_evidence(stmt, user: dict):
     return stmt if clause is None else stmt.where(clause)
 
 
+def _ist_day_bound(value: str, end: bool):
+    """Start (or the next day's start, for `end`) of an IST calendar date; None if not a bare date."""
+    import re
+    from core.timeutil import ist_day_bounds
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value or ""):
+        return None
+    start, stop = ist_day_bounds(value)
+    return stop if end else start
+
+
 @router.get("/evidence")
 async def list_evidence(
     drone_id: str = "",
@@ -194,10 +204,12 @@ async def list_evidence(
             stmt = stmt.where(Evidence.mission_id == mission_id)
         if event_type:
             stmt = stmt.where(Evidence.event_type == event_type)
+        # CMD-08: a bare YYYY-MM-DD is an IST calendar day; "to" includes that whole day
         if from_ts:
-            stmt = stmt.where(Evidence.ts >= from_ts)
+            stmt = stmt.where(Evidence.ts >= (_ist_day_bound(from_ts, end=False) or from_ts))
         if to_ts:
-            stmt = stmt.where(Evidence.ts <= to_ts)
+            bound = _ist_day_bound(to_ts, end=True)
+            stmt = stmt.where(Evidence.ts < bound) if bound else stmt.where(Evidence.ts <= to_ts)
         if legal_hold_only:
             stmt = stmt.where(Evidence.legal_hold == True)
         if search:

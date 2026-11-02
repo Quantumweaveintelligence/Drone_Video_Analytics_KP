@@ -14,7 +14,7 @@ import {
   Image as ImageIcon
 } from "lucide-react";
 
-import { api, downloadSigned } from "@/lib/api";
+import { api, apiError, downloadSigned } from "@/lib/api";
 import { fmtIST } from "@/lib/ist";
 import EvidenceImage from "@/components/EvidenceImage";
 import ActionModal from "@/components/evidence/ActionModal";
@@ -55,7 +55,7 @@ function CommandInner() {
   const runVerify = async (id) => {
     setVerify({ busy: true });
     try { setVerify((await api.get(`/evidence/${id}/verify`)).data); }
-    catch (e) { setVerify({ error: e.response?.data?.detail || "Verification failed" }); }
+    catch (e) { setVerify({ error: apiError(e, "Verification failed") }); }
   };
   const ev = evidenceDetail?.evidence;
   const act = (kind) => { openAction(kind, ev); setEvidenceDetail(null); setVerify(null); };
@@ -75,17 +75,10 @@ function CommandInner() {
         }}
       >
         <h1 className="text-lg font-extrabold tracking-tight uppercase font-sans" style={{ color: "var(--dvas-text)" }}>
-          Thiruvananthapuram{" "}
+          {/* P12: the user's own scope, not a fixed district */}
+          {user?.role === "senior_officer" ? "All districts" : (user?.jurisdiction || "No jurisdiction assigned")}{" "}
           <span className="mx-2 font-light" style={{ color: "var(--dvas-text-dim)" }}>|</span>{" "}
-          <span className="text-xs font-semibold">
-            {new Date().toLocaleString("en-US", {
-              month: "long",
-              day: "numeric",
-              year: "numeric",
-              hour: "numeric",
-              minute: "numeric"
-            })}
-          </span>
+          <span className="text-xs font-semibold">{fmtIST(new Date().toISOString())}</span>
         </h1>
         <div className="font-bold uppercase tracking-widest text-[11px]" style={{ color: "var(--dvas-accent)" }}>
           Kerala Police Command Center
@@ -242,7 +235,7 @@ function CommandInner() {
                   ["Integrity", evidenceDetail.evidence?.integrity],
                   ["Record SHA-256", evidenceDetail.evidence?.record_sha256 ? `${evidenceDetail.evidence.record_sha256.slice(0, 24)}…` : "—"],
                   ["Legal Hold", evidenceDetail.evidence?.legal_hold ? `Yes — ${evidenceDetail.evidence.legal_hold_reason || ""}` : "No"],
-                  ["Retention Until", evidenceDetail.evidence?.retention_until ? new Date(evidenceDetail.evidence.retention_until).toLocaleDateString() : "-"]
+                  ["Retention Until", evidenceDetail.evidence?.retention_until ? fmtIST(evidenceDetail.evidence.retention_until) : "-"]
                 ].map(([k, v]) => (
                   <div key={k}>
                     <span className="dvas-label text-[10px]">{k}</span>
@@ -259,7 +252,7 @@ function CommandInner() {
                   <div className="text-slate-400 mt-1">Reason: {evidenceDetail.evidence.legal_hold_reason}</div>
                   <div className="text-slate-500 mt-0.5">
                     Placed by: {evidenceDetail.evidence.legal_hold_by} on{" "}
-                    {evidenceDetail.evidence.legal_hold_at ? new Date(evidenceDetail.evidence.legal_hold_at).toLocaleString() : "-"}
+                    {evidenceDetail.evidence.legal_hold_at ? fmtIST(evidenceDetail.evidence.legal_hold_at) : "-"}
                   </div>
                 </div>
               )}
@@ -282,7 +275,7 @@ function CommandInner() {
                         {x.status === "approved" && (
                           <button
                             type="button"
-                            onClick={() => downloadSigned("bundle", x.id).catch((e) => alert(e.response?.data?.detail || "Download failed"))}
+                            onClick={() => downloadSigned("bundle", x.id).catch((e) => alert(apiError(e, "Download failed")))}
                             className="text-sky-400 hover:text-sky-300 text-[10px]"
                           >
                             Download Evidence Bundle
@@ -329,6 +322,11 @@ function CommandInner() {
                 {user?.role === "senior_officer" && (
                   <button onClick={() => act("direct_export")} className="px-3 py-1.5 border border-emerald-600/60 text-emerald-300 hover:bg-emerald-500/10 text-xs rounded">
                     Direct Export
+                  </button>
+                )}
+                {user?.role === "senior_officer" && (
+                  <button onClick={() => act(ev?.legal_hold ? "release_hold" : "legal_hold")} className="px-3 py-1.5 border border-amber-600/60 text-amber-300 hover:bg-amber-500/10 text-xs rounded flex items-center gap-1">
+                    <FolderLock size={12} /> {ev?.legal_hold ? "Release legal hold" : "Legal hold"}
                   </button>
                 )}
                 {["senior_officer", "system_administrator"].includes(user?.role) && (

@@ -142,8 +142,9 @@ export function useActiveStreams() {
             operator_name: stream.operator ?? null,
             jurisdiction:  stream.location ?? null,
             messages_ready: stream.messages_ready ?? 0,
-            signal_strength: 85,
-            uptime_min:    0,
+            // No signal reading or start time from ingest: leave unknown (UI shows "—")
+            signal_pct:    stream.signal_pct ?? null,
+            started_at:    stream.started_at ?? stream.mission_started_at ?? null,
             last_analytics: null,
           });
         }
@@ -176,6 +177,8 @@ export function useActiveStreams() {
           mission_name:  stream.mission_name   ?? drone.mission_name,
           operator_name: stream.operator       ?? drone.operator_name,
           jurisdiction:  stream.location       ?? drone.jurisdiction,
+          signal_pct:    stream.signal_pct     ?? drone.signal_pct,
+          started_at:    stream.started_at     ?? stream.mission_started_at ?? drone.started_at,
           last_seen:     stream.last_seen,
           messages_ready: stream.messages_ready ?? drone.messages_ready ?? 0,
           frame_count:   stream.frame_count    ?? stream.frames_received ?? 0,

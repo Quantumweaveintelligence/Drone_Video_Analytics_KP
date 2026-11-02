@@ -7,7 +7,10 @@
  */
 
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
-import { API } from "@/lib/api";
+import { API, api, apiError } from "@/lib/api";
+import { fmtIST } from "@/lib/ist";
+import { useAuth } from "@/context/AuthContext";
+import EvidenceImage from "@/components/EvidenceImage";
 import {
   Radio,
   Battery,
@@ -82,28 +85,33 @@ function toProxiedUrl(objectKeyOrUrl, bucket = "dvas-faces") {
 }
 
 /* ─────────────────────────────────────────────
-   STATIC / FALLBACK DATA
-   (merged with live API props)
-   ───────────────────────────────────────────── */
-/* ─────────────────────────────────────────────
-   HELPERS
-   ───────────────────────────────────────────── */
-
-const MOCK_EVENTS = []; // Removed — no mock events; live alerts only
-
-const MOCK_DRONES = [];
-
-/* ─────────────────────────────────────────────
    HELPERS
    ───────────────────────────────────────────── */
 function fmtAge(isoTs) {
-  const diff = Math.floor((Date.now() - new Date(isoTs)) / 1000);
+  if (!isoTs) return "—";
+  const t = new Date(isoTs).getTime();
+  if (Number.isNaN(t)) return "—";
+  const diff = Math.max(0, Math.floor((Date.now() - t) / 1000));
   if (diff < 60) return `${diff}s ago`;
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
   return `${Math.floor(diff / 3600)}h ago`;
 }
 
+// Roles allowed to purge a stream queue (backend returns 403 to everyone else)
+const PURGE_ROLES = ["senior_officer", "system_administrator"];
+
+const EVENT_WINDOW_MS = 2 * 60 * 60 * 1000; // event log shows the last 2 h
+
+/** Minutes since an ISO start time, or null when no real start time is known */
+function minutesSince(isoTs) {
+  if (!isoTs) return null;
+  const t = new Date(isoTs).getTime();
+  if (Number.isNaN(t)) return null;
+  return Math.max(0, Math.floor((Date.now() - t) / 60000));
+}
+
 function BatteryIcon({ pct }) {
+  if (typeof pct !== "number") return <Battery size={12} className="text-slate-500" />;
   if (pct <= 20) return <BatteryLow size={12} className="text-red-400" />;
   if (pct <= 50) return <BatteryMedium size={12} className="text-amber-400" />;
   return <BatteryFull size={12} className="text-emerald-400" />;
@@ -190,45 +198,6 @@ function Sparkline({ values, color = "#14b8a6" }) {
 }
 
 /* ─────────────────────────────────────────────
-   HEATMAP MOCK  (pure CSS gradient)
-   ───────────────────────────────────────────── */
-function HeatmapGraphic({ density = "High" }) {
-  const intensity = { High: 0.9, Medium: 0.55, Low: 0.2 }[density] ?? 0.5;
-  return (
-    <div className="relative w-full h-[80px] rounded-lg overflow-hidden border border-slate-700/40">
-      {/* base grid */}
-      <div
-        className="absolute inset-0"
-        style={{
-          background:
-            "radial-gradient(ellipse 80% 60% at 35% 55%, rgba(239,68,68,0.55) 0%, rgba(245,158,11,0.35) 45%, rgba(20,184,166,0.15) 75%, transparent 100%)",
-          opacity: intensity,
-        }}
-      />
-      <div
-        className="absolute inset-0"
-        style={{
-          background:
-            "radial-gradient(ellipse 40% 35% at 70% 35%, rgba(245,158,11,0.4) 0%, transparent 65%)",
-          opacity: intensity * 0.7,
-        }}
-      />
-      <div
-        className="absolute inset-0"
-        style={{
-          backgroundImage:
-            "linear-gradient(rgba(20,184,166,0.08) 1px, transparent 1px), linear-gradient(90deg, rgba(20,184,166,0.08) 1px, transparent 1px)",
-          backgroundSize: "12px 12px",
-        }}
-      />
-      <div className="absolute bottom-1 right-2 mono text-[8px] text-teal-400/70 font-semibold">
-        DENSITY MAP
-      </div>
-    </div>
-  );
-}
-
-/* ─────────────────────────────────────────────
    SIGNAL BAR
    ───────────────────────────────────────────── */
 function SignalBars({ strength }) {
@@ -266,7 +235,7 @@ function useDroneFeed(droneId, disabled, intervalMs = 700) {
   return useJpegPoller(url, intervalMs, !disabled);
 }
 
-function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge }) {
+function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge, canPurge }) {
   const isDegraded = drone.status === "degraded";
   const isOffline  = drone.status === "offline";
   const isOtherSelected = hasSelection && !isSelected;
@@ -295,6 +264,11 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge }) {
 
   const missionLabel  = drone.mission_name  || (drone.mission_id ? `Mission ${drone.mission_id}` : null);
   const operatorLabel = drone.operator_name || null;
+  // DB column is signal_pct; ingest-only drones carry no signal reading
+  const signal = typeof drone.signal_pct === "number"
+    ? drone.signal_pct
+    : typeof drone.signal_strength === "number" ? drone.signal_strength : null;
+  const uptimeMin = minutesSince(drone.started_at);
 
   return (
     <div
@@ -390,8 +364,7 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge }) {
         {/* Top-right: Status pill + streaming dot + Purge button */}
         <div className="absolute top-3 right-3 z-10 flex flex-col items-end gap-1.5">
           <div className="flex items-center gap-1.5">
-            {(drone.status === "draining" || (drone.messages_ready && drone.messages_ready > 0)) && (
-              // TODO: restrict to senior_officer/system_administrator
+            {canPurge && (drone.status === "draining" || (drone.messages_ready && drone.messages_ready > 0)) && (
               <button
                 onClick={(e) => {
                   e.stopPropagation();
@@ -424,7 +397,7 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge }) {
         >
           <div className="flex items-center gap-1">
             <Wind size={9} className="text-slate-500" />
-            <span className="mono text-[9px] text-slate-400">{drone.altitude_m}m</span>
+            <span className="mono text-[9px] text-slate-400">{drone.altitude_m != null ? `${drone.altitude_m}m` : "—"}</span>
           </div>
           <div className="flex items-center gap-1">
             <Activity size={9} className="text-slate-500" />
@@ -437,8 +410,8 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge }) {
             </span>
           </div>
           <div className="flex items-center gap-1 ml-auto">
-            <SignalBars strength={drone.signal_strength} />
-            <span className="mono text-[9px] text-slate-500">{drone.signal_strength}%</span>
+            {signal != null && <SignalBars strength={signal} />}
+            <span className="mono text-[9px] text-slate-500">{signal != null ? `${signal}%` : "—"}</span>
           </div>
         </div>
       </div>
@@ -448,10 +421,10 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge }) {
         {/* Row 1: Zone name */}
         <div className="flex items-center gap-1.5">
           <MapPin size={9} style={{ color: "var(--dvas-text-dim)" }} className="shrink-0" />
-          <span className="mono text-[9px] truncate uppercase tracking-wide" style={{ color: "var(--dvas-text-muted)" }}>{drone.jurisdiction}</span>
+          <span className="mono text-[9px] truncate uppercase tracking-wide" style={{ color: "var(--dvas-text-muted)" }}>{drone.jurisdiction || "—"}</span>
           <span className="ml-auto flex items-center gap-1 shrink-0">
             <Clock size={9} style={{ color: "var(--dvas-text-dim)" }} />
-            <span className="mono text-[9px]" style={{ color: "var(--dvas-text-muted)" }}>{drone.uptime_min}m</span>
+            <span className="mono text-[9px]" style={{ color: "var(--dvas-text-muted)" }}>{uptimeMin != null ? `${uptimeMin}m` : "—"}</span>
           </span>
         </div>
 
@@ -466,14 +439,16 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge }) {
               <BatteryIcon pct={drone.battery_pct} />
               <span
                 className={`mono text-[11px] font-bold ${
-                  drone.battery_pct <= 20
+                  typeof drone.battery_pct !== "number"
+                    ? "text-slate-500"
+                    : drone.battery_pct <= 20
                     ? "text-red-500"
                     : drone.battery_pct <= 50
                     ? "text-amber-500"
                     : "text-emerald-500"
                 }`}
               >
-                {drone.battery_pct}%
+                {typeof drone.battery_pct === "number" ? `${drone.battery_pct}%` : "—"}
               </span>
             </div>
             <span className="mono text-[8px]" style={{ color: "var(--dvas-text-dim)" }}>Battery</span>
@@ -674,7 +649,7 @@ function BiometricsGalleryModal({ galleryType, onClose, effectiveDroneId }) {
 /* ─────────────────────────────────────────────
    ANALYTICS ROW (End-to-End Live Processing Feeds)
    ───────────────────────────────────────────── */
-function AnalyticsRow({ selectedDrone, drones, onOpenGallery, effectiveDroneId: passedDroneId }) {
+function AnalyticsRow({ selectedDrone, drones, onOpenGallery, effectiveDroneId: passedDroneId, jurisdiction }) {
   const [stolenSearch, setStolenSearch] = useState("");
   const drone = drones.find((d) => d.id === selectedDrone) || drones[0];
   const effectiveDroneId = passedDroneId || drone?.id || "";
@@ -695,10 +670,11 @@ function AnalyticsRow({ selectedDrone, drones, onOpenGallery, effectiveDroneId: 
   const crowdCount = (typeof crowdData?.count === "number")
     ? crowdData.count
     : (Array.isArray(crowdData?.readings) && crowdData.readings.length > 0)
-    ? (crowdData.readings[0]?.count ?? 0)
-    : (drone?.last_analytics?.crowd_count ?? 0);
+    ? (crowdData.readings[0]?.count ?? null)
+    : (drone?.last_analytics?.crowd_count ?? null);
+  const hasCrowd = typeof crowdCount === "number";
 
-  const densityLevel = crowdCount >= 150 ? "Critical" : crowdCount >= 75 ? "High" : crowdCount >= 25 ? "Medium" : "Low";
+  const densityLevel = !hasCrowd ? null : crowdCount >= 150 ? "Critical" : crowdCount >= 75 ? "High" : crowdCount >= 25 ? "Medium" : "Low";
   const densityColor = {
     Critical: "text-red-500",
     High: "text-orange-400",
@@ -706,30 +682,37 @@ function AnalyticsRow({ selectedDrone, drones, onOpenGallery, effectiveDroneId: 
     Low: "text-emerald-400",
   }[densityLevel] || "text-slate-400";
 
-  const activePersons = personCount?.active_tracks ?? personCount?.total_persons ?? (drone?.last_analytics?.crowd_count ?? 0);
-  const densityPct = Math.min(100, Math.max(12, Math.round((crowdCount / 150) * 100)));
+  const activePersons = personCount?.active_tracks ?? personCount?.total_persons ?? (drone?.last_analytics?.crowd_count ?? null);
+  const densityPct = hasCrowd ? Math.min(100, Math.max(0, Math.round((crowdCount / 150) * 100))) : 0;
 
   // 2. Vehicle Metrics Live Hooks
   const { data: vehicleTracks } = useVehicleTracks(effectiveDroneId, 5000);
   const { data: vehicleStats } = useVehicleStats(15000);
-  const liveVehicleList = Array.isArray(vehicleTracks?.tracks) ? vehicleTracks.tracks : [];
-  const carsCount = vehicleStats?.cars ?? (liveVehicleList.filter(t => (t.class_name || t.type || "").toLowerCase().includes("car")).length || (drone?.last_analytics?.cars ?? 0));
-  const twoWheelersCount = vehicleStats?.two_wheelers ?? (liveVehicleList.filter(t => ["motorcycle", "bicycle", "2-wheeler", "scooter"].some(k => (t.class_name || t.type || "").toLowerCase().includes(k))).length || (drone?.last_analytics?.two_wheelers ?? 0));
-  const totalVehicles = carsCount + twoWheelersCount + (vehicleStats?.heavy ?? 0);
-  const trafficState = totalVehicles > 60 ? "Congested" : totalVehicles > 20 ? "Moderate" : "Clear";
+  // Live counts come from this drone's active vehicle tracks. /analytics/vehicle/stats returns
+  // { total_detected, total_tracked, total_plates, by_type, avg_speed_kmh } (all drones, all time),
+  // so it is shown separately rather than as this drone's live count.
+  const hasVehicleTracks = Array.isArray(vehicleTracks?.tracks);
+  const liveVehicleList = hasVehicleTracks ? vehicleTracks.tracks : [];
+  const vClass = (t) => (t.class_name || t.vehicle_type || t.type || "").toLowerCase();
+  const TWO_WHEELERS = ["motorcycle", "motor", "bicycle", "two-wheeler", "2-wheeler", "scooter"];
+  const carsCount = hasVehicleTracks ? liveVehicleList.filter(t => vClass(t) === "car" || vClass(t) === "van").length : null;
+  const twoWheelersCount = hasVehicleTracks ? liveVehicleList.filter(t => TWO_WHEELERS.includes(vClass(t))).length : null;
+  const totalVehicles = hasVehicleTracks ? liveVehicleList.length : null;
+  const trafficState = totalVehicles == null ? null : totalVehicles > 60 ? "Congested" : totalVehicles > 20 ? "Moderate" : "Clear";
   const trafficColor = {
     Congested: "text-red-400",
     Moderate: "text-amber-400",
     Clear: "text-emerald-400",
   }[trafficState] || "text-slate-400";
 
-  // 3. GPU Pipeline Load & Model Status
+  // 3. Analytics engine status (from each service's /health via /analytics/models/status).
+  // No per-engine GPU load is measured, so only running/standby state is shown.
   const { data: modelsStatus } = useModelsStatus(10000);
   const engineRoster = [
-    { key: "person", label: "Person Det.", pct: 87, color: "#14b8a6" },
-    { key: "vehicle", label: "Vehicle Det.", pct: 72, color: "#818cf8" },
-    { key: "crowd", label: "CSRNet Crowd", pct: 64, color: "#f59e0b" },
-    { key: "anpr", label: "Live ANPR", pct: 55, color: "#34d399" },
+    { key: "person", label: "Person Det." },
+    { key: "vehicle", label: "Vehicle Det." },
+    { key: "crowd", label: "CSRNet Crowd" },
+    { key: "anpr", label: "Live ANPR" },
   ];
 
   // 4. Live ANPR Feed Hooks
@@ -764,6 +747,11 @@ function AnalyticsRow({ selectedDrone, drones, onOpenGallery, effectiveDroneId: 
   } : null);
 
   const hasStolenMatch = !!matchedRecord;
+  // Real hit count: theft alerts plus live plate reads that match the watchlist
+  const watchlistHitCount = theftAlerts.length + livePlates.filter(p => {
+    const text = (p.plate_text || p.plate || "").toUpperCase();
+    return p.is_watchlist || p.is_stolen || (text && watchlist.some(w => (w.plate_text || "").toUpperCase() === text));
+  }).length;
 
   /* shared panel shell */
   const Panel = ({ children, borderColor = "var(--dvas-border)", className = "", style = {} }) => (
@@ -822,7 +810,7 @@ function AnalyticsRow({ selectedDrone, drones, onOpenGallery, effectiveDroneId: 
             <Activity size={11} className="text-emerald-400" /> Live Ingest Sync
           </span>
           <span className="text-slate-500">·</span>
-          <span>Thiruvananthapuram Sector</span>
+          <span>{jurisdiction || "—"}</span>
         </div>
       </div>
 
@@ -843,23 +831,18 @@ function AnalyticsRow({ selectedDrone, drones, onOpenGallery, effectiveDroneId: 
                 className="w-full h-full object-cover opacity-90"
               />
             ) : (
-              <div className="absolute inset-0 flex flex-col items-center justify-center">
-                <div className="absolute inset-0" style={{
-                  background: "radial-gradient(ellipse 80% 60% at 35% 55%, rgba(239,68,68,0.40) 0%, rgba(245,158,11,0.25) 45%, rgba(20,184,166,0.10) 75%, transparent 100%)",
-                  opacity: { High: 0.9, Medium: 0.55, Low: 0.2 }[densityLevel] ?? 0.5,
-                }} />
-                <div className="absolute inset-0" style={{
-                  backgroundImage: "linear-gradient(rgba(20,184,166,0.07) 1px,transparent 1px),linear-gradient(90deg,rgba(20,184,166,0.07) 1px,transparent 1px)",
-                  backgroundSize: "12px 12px",
-                }} />
+              <div className="absolute inset-0 flex items-center justify-center">
+                <span className="mono text-[9px] text-slate-500">No frame received</span>
               </div>
             )}
-            <span className="absolute bottom-0.5 right-1.5 mono text-teal-400 text-[9px] font-bold px-1 bg-black/70 rounded">
-              CSRNet · {densityLevel.toUpperCase()}
-            </span>
+            {hasCrowdHeatmap && crowdHeatmapUrl && densityLevel && (
+              <span className="absolute bottom-0.5 right-1.5 mono text-teal-400 text-[9px] font-bold px-1 bg-black/70 rounded">
+                CSRNet · {densityLevel.toUpperCase()}
+              </span>
+            )}
           </div>
 
-          <MetricRow label="Crowd Density" value={densityLevel} valueClass={densityColor} />
+          <MetricRow label="Crowd Density" value={densityLevel} valueClass={densityLevel ? densityColor : undefined} />
           <MetricRow label="Active Persons" value={activePersons} />
           <Bar
             pct={densityPct}
@@ -887,39 +870,38 @@ function AnalyticsRow({ selectedDrone, drones, onOpenGallery, effectiveDroneId: 
             <div key={label} className="flex flex-col gap-1">
               <div className="flex justify-between items-center">
                 <span className="mono text-slate-500 text-xs">{label}</span>
-                <span className="mono font-bold text-sm text-slate-100">{count}</span>
+                <span className="mono font-bold text-sm text-slate-100">{count ?? "—"}</span>
               </div>
-              <Bar pct={Math.min(100, (count / max) * 100)} color={color} />
+              <Bar pct={count != null ? Math.min(100, (count / max) * 100) : 0} color={color} />
             </div>
           ))}
 
-          <MetricRow label="Traffic State" value={trafficState} valueClass={trafficColor} />
+          <MetricRow label="Traffic State" value={trafficState} valueClass={trafficState ? trafficColor : undefined} />
+          <MetricRow label="Detected (all drones, all time)" value={typeof vehicleStats?.total_detected === "number" ? vehicleStats.total_detected : null} />
         </Panel>
 
-        {/* ── C: GPU Pipeline Load ── */}
+        {/* ── C: Analytics Engine Status ── */}
         <Panel className="col-span-1">
           <SectionHead
             icon={<BarChart2 size={13} className="text-teal-400" />}
-            label="GPU Pipeline Load"
-            right="Active Batch"
+            label="Analytics Engines"
           />
 
           <div className="flex flex-col gap-2 mt-1">
-            {engineRoster.map(({ key, label, pct, color }) => {
+            {engineRoster.map(({ key, label }) => {
               const svcHealth = modelsStatus?.[key];
-              const isRunning = svcHealth?.stream_running === true || svcHealth?.status === "ok";
+              const known = svcHealth && typeof svcHealth === "object";
+              const isRunning = svcHealth?.stream_running === true;
+              const stateLabel = !known ? "—" : isRunning ? "RUNNING" : svcHealth?.status === "ok" ? "STANDBY" : "UNAVAILABLE";
               return (
-                <div key={label} className="flex flex-col gap-1">
-                  <div className="flex justify-between items-center">
-                    <span className="mono text-[11px] flex items-center gap-1" style={{ color: "var(--dvas-text-muted)" }}>
-                      <span className={`w-1.5 h-1.5 rounded-full ${isRunning ? "bg-emerald-400" : "bg-amber-400/80"}`} />
-                      {label}
-                    </span>
-                    <span className="mono font-semibold text-xs" style={{ color: "var(--dvas-text)" }}>
-                      {isRunning ? `${pct}%` : "STANDBY"}
-                    </span>
-                  </div>
-                  <Bar pct={isRunning ? pct : 15} color={color === "#14b8a6" ? "var(--dvas-cyan)" : color} />
+                <div key={label} className="flex justify-between items-center">
+                  <span className="mono text-[11px] flex items-center gap-1" style={{ color: "var(--dvas-text-muted)" }}>
+                    <span className={`w-1.5 h-1.5 rounded-full ${!known ? "bg-slate-500" : isRunning ? "bg-emerald-400" : "bg-amber-400/80"}`} />
+                    {label}
+                  </span>
+                  <span className="mono font-semibold text-xs" style={{ color: "var(--dvas-text)" }}>
+                    {stateLabel}
+                  </span>
                 </div>
               );
             })}
@@ -974,13 +956,13 @@ function AnalyticsRow({ selectedDrone, drones, onOpenGallery, effectiveDroneId: 
             <div className="flex-1 flex flex-col items-center p-2 rounded" style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border)" }}>
               <div className="mono text-[9px] mb-1" style={{ color: "var(--dvas-text-muted)" }}>PERSONS DETECTED</div>
               <div className="mono font-semibold text-base" style={{ color: "var(--dvas-text)" }}>
-                {personCount?.total_persons ?? personCount?.active_tracks ?? (effectiveDroneId ? "0" : "—")}
+                {personCount?.total_persons ?? personCount?.active_tracks ?? "—"}
               </div>
             </div>
             <div className="flex-1 flex flex-col items-center p-2 rounded" style={{ background: "var(--dvas-surface-2)", border: "1px solid var(--dvas-border)" }}>
               <div className="mono text-[9px] mb-1" style={{ color: "var(--dvas-text-muted)" }}>FACES CAPTURED</div>
               <div className="mono font-semibold text-base" style={{ color: "var(--dvas-text)" }}>
-                {personCount?.total_faces ?? personCount?.faces_captured ?? (effectiveDroneId ? "0" : "—")}
+                {personCount?.total_faces ?? personCount?.faces_captured ?? "—"}
               </div>
             </div>
           </div>
@@ -1080,7 +1062,7 @@ function AnalyticsRow({ selectedDrone, drones, onOpenGallery, effectiveDroneId: 
               <ShieldCheck size={28} className="mb-2 text-emerald-400 opacity-80" />
               <span className="mono text-[10px] tracking-widest text-emerald-400 font-bold">WATCHLIST ARMED</span>
               <span className="mono text-[9px] opacity-70 mt-1">
-                {watchlist.length > 0 ? `${watchlist.length} Vehicles Monitored` : "Active Hotlist Synced"} · 0 Active Hits
+                {Array.isArray(watchlistData?.watchlist) ? `${watchlist.length} Vehicles Monitored` : "Watchlist —"} · {watchlistHitCount} Active Hits
               </span>
             </div>
           )}
@@ -1093,7 +1075,14 @@ function AnalyticsRow({ selectedDrone, drones, onOpenGallery, effectiveDroneId: 
 /* ─────────────────────────────────────────────
    EVENT TIMELINE
    ───────────────────────────────────────────── */
-function EventTimeline({ events, onPlay }) {
+function EventTimeline({ events: allEvents, onPlay }) {
+  // Only events from the last 2 h (the label below says so)
+  const cutoff = Date.now() - EVENT_WINDOW_MS;
+  const events = allEvents.filter((e) => {
+    const t = e.ts ? new Date(e.ts).getTime() : NaN;
+    return !Number.isNaN(t) && t >= cutoff;
+  });
+
   const severityIcon = {
     critical: <AlertTriangle size={11} className="text-red-400 shrink-0" />,
     warning: <AlertTriangle size={11} className="text-amber-400 shrink-0" />,
@@ -1158,7 +1147,7 @@ function EventTimeline({ events, onPlay }) {
                 <div className="flex items-center gap-1.5">
                   {React.cloneElement(severityIcon[evt.severity] || severityIcon.info, { size: 12 })}
                   <span className="mono text-[10px] font-medium flex-1 truncate" style={{ color: "var(--dvas-text-muted)" }}>
-                    {fmtAge(evt.ts)}
+                    <span title={fmtIST(evt.ts)}>{fmtAge(evt.ts)}</span>
                   </span>
                   <span
                     className="mono text-[9px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wide"
@@ -1193,9 +1182,9 @@ function EventTimeline({ events, onPlay }) {
                         Conf:{" "}
                         <span
                           className="font-bold"
-                          style={{ color: evt.confidence >= 90 ? "var(--dvas-safe)" : "var(--dvas-warn)" }}
+                          style={{ color: evt.confidence == null ? "var(--dvas-text-dim)" : evt.confidence >= 90 ? "var(--dvas-safe)" : "var(--dvas-warn)" }}
                         >
-                          {evt.confidence}%
+                          {evt.confidence != null ? `${evt.confidence}%` : "—"}
                         </span>
                       </span>
                     </div>
@@ -1209,9 +1198,10 @@ function EventTimeline({ events, onPlay }) {
                       color: "var(--dvas-safe)",
                     }}
                     data-testid={`play-evidence-${evt.id}`}
+                    title={evt.evidence_id ? "View stored evidence for this event" : "No stored clip for this event; shows the drone's live frame"}
                   >
-                    <Play size={10} />
-                    Clip
+                    {evt.evidence_id ? <Camera size={10} /> : <Eye size={10} />}
+                    {evt.evidence_id ? "Evidence" : "Live frame"}
                   </button>
                 </div>
               </div>
@@ -1226,10 +1216,12 @@ function EventTimeline({ events, onPlay }) {
 /* ─────────────────────────────────────────────
    GLOBAL HEADER BAR (inside multidrone view)
    ───────────────────────────────────────────── */
-function GlobalHeader({ drones, alerts, connected, onNavigateTab }) {
+function GlobalHeader({ drones, alerts, connected, onNavigateTab, jurisdiction }) {
   const online = drones.filter((d) => d.status === "live").length;
-  const activeMissions = [...new Set(drones.map((d) => d.mission_id))].length;
-  const sysAlerts = alerts?.length ?? 1010;
+  const activeMissions = new Set(
+    drones.map((d) => (d.mission_id == null ? "" : String(d.mission_id).trim())).filter(Boolean)
+  ).size;
+  const sysAlerts = Array.isArray(alerts) ? alerts.length : "—";
 
   const metrics = [
     {
@@ -1252,13 +1244,6 @@ function GlobalHeader({ drones, alerts, connected, onNavigateTab }) {
       tone: "text-red-400",
       icon: <AlertTriangle size={12} className="text-red-400" />,
       glow: "rgba(239,68,68,0.1)",
-    },
-    {
-      label: "GPU Analytics",
-      value: "Processing",
-      tone: "text-teal-400",
-      icon: <Cpu size={12} className="text-teal-400" />,
-      glow: "rgba(20,184,166,0.12)",
     },
   ];
 
@@ -1296,7 +1281,7 @@ function GlobalHeader({ drones, alerts, connected, onNavigateTab }) {
       >
         <MapPin size={10} style={{ color: "var(--dvas-text-dim)" }} />
         <span className="mono text-[9px] font-medium" style={{ color: "var(--dvas-text-muted)" }}>
-          Jurisdiction: <span className="font-bold" style={{ color: "var(--dvas-text)" }}>Thiruvananthapuram</span>
+          Jurisdiction: <span className="font-bold" style={{ color: "var(--dvas-text)" }}>{jurisdiction || "—"}</span>
         </span>
       </div>
 
@@ -1360,7 +1345,12 @@ function GlobalHeader({ drones, alerts, connected, onNavigateTab }) {
 /* ─────────────────────────────────────────────
    MAIN EXPORT
    ───────────────────────────────────────────── */
-export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts, connected, onNavigateTab }) {
+export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts, connected, user, onSelectDrone, onNavigateTab }) {
+  const auth = useAuth();
+  const currentUser = user || auth?.user || null;
+  const canPurge = PURGE_ROLES.includes(currentUser?.role);
+  const userJurisdiction = currentUser?.jurisdiction || null;
+
   // Use active ingest streams to discover real drones and enrich with live metadata
   const { mergeWithDrones, streams } = useActiveStreams();
 
@@ -1387,9 +1377,10 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
         drone_id: a.drone_id,
         mission_id: a.mission_id || "—",
         event_type: (a.type || "Unknown").replace(/_/g, " "),
-        confidence: Math.round((a.confidence || 0) * 100) || 80,
+        confidence: typeof a.confidence === "number" ? Math.round(a.confidence * 100) : null,
         zone: a.zone || "—",
         severity: a.severity || "info",
+        evidence_id: a.evidence_id || null,
       }))
     : [];
 
@@ -1399,23 +1390,25 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
   const [purgeConfirm, setPurgeConfirm] = useState(null);
   const [toast, setToast] = useState(null);
 
+  const showToast = useCallback((kind, msg) => {
+    setToast({ kind, msg });
+    setTimeout(() => setToast(null), 5000);
+  }, []);
+
   const handlePurgeStream = useCallback(async (droneId) => {
     try {
-      const token = localStorage.getItem("dvas_token") || "";
-      const res = await fetch(`${API}/ingest-server/streams/${encodeURIComponent(droneId)}/purge`, {
-        method: "POST",
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-        credentials: "include",
-      });
-      if (res.ok) {
-        setPurgedDrones(prev => new Set(prev).add(droneId));
-        setToast(`Stream purged for ${droneId}`);
-        setTimeout(() => setToast(null), 4000);
-      }
+      await api.post(`/ingest-server/streams/${encodeURIComponent(droneId)}/purge`);
+      setPurgedDrones(prev => new Set(prev).add(droneId));
+      showToast("ok", `Stream purged for ${droneId}`);
     } catch (e) {
-      console.error("Failed to purge stream", e);
+      showToast("error", `Purge failed for ${droneId}: ${apiError(e, "request failed")}`);
     }
-  }, []);
+  }, [showToast]);
+
+  const handleSelectDrone = useCallback((droneId) => {
+    setSelectedDroneId(droneId);
+    if (droneId && onSelectDrone) onSelectDrone(droneId);
+  }, [onSelectDrone]);
 
   // Clock tick for "X min ago" labels
   const [, setTick] = useState(0);
@@ -1431,7 +1424,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
       style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }}
     >
       {/* ── 1. Global Header ── */}
-      <GlobalHeader drones={drones} alerts={liveAlerts} connected={connected} onNavigateTab={onNavigateTab} />
+      <GlobalHeader drones={drones} alerts={liveAlerts} connected={!!connected} onNavigateTab={onNavigateTab} jurisdiction={userJurisdiction} />
 
       {/* ── 2. Drone Cards Grid (tiled CSS grid format) ── */}
       <div className="flex-1 overflow-y-auto dvas-scrollbar min-h-[60vh] xl:min-h-[500px]">
@@ -1459,8 +1452,9 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
                   drone={d}
                   isSelected={isSelected}
                   hasSelection={!!selectedDroneId}
-                  onSelect={setSelectedDroneId}
+                  onSelect={handleSelectDrone}
                   onPurge={setPurgeConfirm}
+                  canPurge={canPurge}
                 />
               </div>
             );
@@ -1476,6 +1470,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
         drones={drones}
         onOpenGallery={setGalleryType}
         effectiveDroneId={selectedDroneId || (drones[0]?.id || "")}
+        jurisdiction={userJurisdiction}
       />
 
       {/* ── 4. Event Timeline ── */}
@@ -1484,7 +1479,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
         onPlay={setPlayingEvent} 
       />
 
-      {/* ── Evidence Clip Modal ── */}
+      {/* ── Evidence Modal: stored evidence image if the event has one, else the live frame (labelled) ── */}
       {playingEvent && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-6"
@@ -1511,7 +1506,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
                   {playingEvent.event_type}
                 </div>
                 <div className="mono text-[10px] text-slate-500 mt-0.5">
-                  {playingEvent.drone_id} · {playingEvent.zone} · {fmtAge(playingEvent.ts)}
+                  {playingEvent.drone_id} · {playingEvent.zone} · {fmtIST(playingEvent.ts)}
                 </div>
               </div>
               <button
@@ -1528,17 +1523,28 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
             <div
               className="aspect-video flex flex-col items-center justify-center relative bg-[#040c18] overflow-hidden"
             >
-              {playingEvent.drone_id ? (
+              {playingEvent.evidence_id ? (
+                <EvidenceImage
+                  evidenceId={playingEvent.evidence_id}
+                  role="primary"
+                  alt="Stored evidence"
+                  className="absolute inset-0 w-full h-full object-contain"
+                  onError={(e) => { if (e?.target) e.target.style.display = "none"; }}
+                />
+              ) : playingEvent.drone_id ? (
                 <img
                   src={`${API}/ingest-server/frame/${encodeURIComponent(playingEvent.drone_id)}/latest`}
-                  alt="Evidence frame"
+                  alt="Live frame"
                   className="absolute inset-0 w-full h-full object-cover opacity-90"
                   onError={(e) => { e.target.style.display = "none"; }}
                 />
               ) : null}
-              <div className="relative z-10 flex flex-col items-center bg-black/70 px-4 py-2.5 rounded-lg backdrop-blur-md border border-teal-500/30">
-                <Play size={20} className="text-teal-400 mb-1" />
-                <div className="mono text-[11px] text-teal-300 font-semibold">Evidence Capture · {playingEvent.drone_id}</div>
+              <div className="absolute bottom-2 left-2 z-10 flex flex-col bg-black/70 px-3 py-1.5 rounded-lg backdrop-blur-md border border-teal-500/30">
+                {playingEvent.evidence_id ? (
+                  <div className="mono text-[11px] text-teal-300 font-semibold">Stored evidence · {playingEvent.evidence_id}</div>
+                ) : (
+                  <div className="mono text-[11px] text-amber-300 font-semibold">Live frame (no stored clip) · {playingEvent.drone_id || "—"}</div>
+                )}
                 <div className="mono text-[9px] text-slate-400 mt-0.5">{playingEvent.event_type} · {playingEvent.zone}</div>
               </div>
             </div>
@@ -1550,7 +1556,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
             >
               <span className="mono text-[10px] text-slate-500">
                 Confidence:{" "}
-                <span className="text-emerald-400 font-bold">{playingEvent.confidence}%</span>
+                <span className="text-emerald-400 font-bold">{playingEvent.confidence != null ? `${playingEvent.confidence}%` : "—"}</span>
               </span>
               <span className="mono text-[10px] text-slate-500">
                 Mission: <span className="text-slate-300">{playingEvent.mission_id}</span>
@@ -1613,8 +1619,15 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
 
       {/* ── Toast Notification ── */}
       {toast && (
-        <div className="fixed bottom-6 right-6 z-[100] bg-emerald-900/90 border border-emerald-600/40 text-emerald-200 px-4 py-3 rounded-lg shadow-xl text-sm flex items-center gap-2 animate-fade-in">
-          <Check className="w-4 h-4" /> {toast}
+        <div
+          role="status"
+          className={`fixed bottom-6 right-6 z-[100] px-4 py-3 rounded-lg shadow-xl text-sm flex items-center gap-2 animate-fade-in border ${
+            toast.kind === "error"
+              ? "bg-red-900/90 border-red-600/40 text-red-200"
+              : "bg-emerald-900/90 border-emerald-600/40 text-emerald-200"
+          }`}
+        >
+          {toast.kind === "error" ? <AlertTriangle className="w-4 h-4" /> : <Check className="w-4 h-4" />} {toast.msg}
         </div>
       )}
 

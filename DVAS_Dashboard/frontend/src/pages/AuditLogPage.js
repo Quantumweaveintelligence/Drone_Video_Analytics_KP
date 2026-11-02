@@ -2159,7 +2159,7 @@ export default function AuditLogPage() {
     targetTypeFilter || sourceModuleFilter || complianceTagFilter || legalHoldOnly
   );
 
-  const isSuperAdmin = authUser?.role === 'system_administrator' || authUser?.role === 'admin';
+  const isSuperAdmin = authUser?.role === 'system_administrator';
 
   return (
     <AppShell
@@ -2812,7 +2812,7 @@ export default function AuditLogPage() {
             }}
           >
             <option value="">All Roles</option>
-            {(rolesList.length ? rolesList : ['system_administrator', 'senior_officer', 'operator', 'analyst', 'external_auditor']).map((r) => (
+            {(rolesList.length ? rolesList : ['system_administrator', 'senior_officer', 'control_room_officer', 'drone_operator']).map((r) => (
               <option key={r} value={r}>{r.replace(/_/g, ' ')}</option>
             ))}
           </select>
