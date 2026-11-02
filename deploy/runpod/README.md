@@ -59,3 +59,29 @@ deploy/runpod/tools/smoke_public.py --url https://<POD_ID>-80.proxy.runpod.net [
 ```
 
 Tests: `python -m pytest deploy/runpod/tests -q`
+
+## Role & API audit changes (2026-11)
+
+Fixes for `DVAS_ROLE_AND_API_AUDIT_COMBINED.md` and `DEAD_UI_FINDINGS.md` (edge pages excluded).
+Things that change behaviour for operators, integrators and the DVAS Edge application:
+
+- **Browser auth is cookie-only.** The login and refresh responses carry the access token only
+  when the request comes from an origin in `EDGE_CLIENT_ORIGINS` (the Edge app). WebSockets accept
+  `?token=` only on the handshake; services and the Edge app keep using `Authorization: Bearer`.
+- **API docs** (`/docs`, `/openapi.json`) are off unless `DVAS_API_DOCS=1`.
+- **Analytics stream control is POST-only:** `POST /api/analytics/<service>/stream/start|stop`
+  (vehicle, anpr, crowd, person, intrusion, vessel, anomaly). GET returns 405.
+- **Analytics services** require `X-Internal-Service-Key` on every route except `/health`.
+- **Roles:** mission delete is senior officer / administrator only (409 if evidence or alerts
+  reference it); audit sync (`POST /api/audit-logs/sync`) accepts only the caller's own rows,
+  at most 500 per call, and re-chains them; `/api/edge/status` is removed; model deployment
+  (`POST /api/models`) is senior officer / administrator; control room officers see models read-only;
+  administrators cannot view evidence images; the full audit log is senior officer / administrator,
+  others see their own entries; `/command/aggregated` and `/api/command/districts` are senior officer only.
+- **New endpoints:** `/api/admin/{sessions,settings,policy,compliance}`, `/api/admin/users/{id}/logout`,
+  `/api/audit-logs/aggregate`, `/api/infra/alerts/{id}/ack`, `/api/command/districts`,
+  `GET /api/analytics/intrusion/config`, `/api/ingest-server/health/detail` (admin).
+- **Settings** (Admin → System settings, table `system_settings`, applied by a startup migration):
+  evidence, report-PDF and audit retention days and the daily retention job time (IST).
+  Token lifetimes stay in Keycloak; TLS stays at the RunPod / Cloudflare edge.
+- **NOC telemetry** shows only measured values; anything not instrumented is `null` ("—" in the UI).
