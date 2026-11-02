@@ -39,6 +39,9 @@ from shared.redis_client import (
     get_latest_stream_frame
 )
 from shared import minio_client as minio
+from shared.db import write_confirmed_event
+from shared.evidence import evidence_block, frame_context, model_info
+from shared.redis_client import publish_confirmed_event
 
 # SeaDrone Perception Engine & Taxonomy
 try:
@@ -364,10 +367,25 @@ async def _stream_loop():
                         })
 
                     # 3. Proximity Clustering Alert Detection
+                    # (cooldown 30 s per pair inside _check_proximity_clusters)
                     proximity_pairs = _check_proximity_clusters(drone_id, tracked_objects)
                     for (o1, o2, dist) in proximity_pairs:
                         try:
-                            await write_vessel_event(
+                            # Evidence: the source frame, hashed, uploaded before the event
+                            snap_obj = await minio.upload_object(
+                                BUCKET_VESSELS,
+                                minio.make_key("vessels", drone_id,
+                                               f"proximity_{o1['track_id']}_{o2['track_id']}.jpg",
+                                               mission_id=frame_mission_id or ""),
+                                img_bytes, "image/jpeg", kind="source_frame",
+                            )
+                            details = {
+                                "target_1": o1["track_id"],
+                                "target_2": o2["track_id"],
+                                "distance_px": round(dist, 1),
+                                "message": f"Convergence detected ({round(dist, 0)}px separation)"
+                            }
+                            vessel_event_id = await write_vessel_event(
                                 pool=pool,
                                 drone_id=drone_id,
                                 mission_id=frame_mission_id,
@@ -375,14 +393,44 @@ async def _stream_loop():
                                 event_type="proximity_alert",
                                 class_name=f"{o1['class_name']} & {o2['class_name']}",
                                 confidence=min(o1["confidence"], o2["confidence"]),
-                                snapshot_key=None,
-                                details={
-                                    "target_1": o1["track_id"],
-                                    "target_2": o2["track_id"],
-                                    "distance_px": round(dist, 1),
-                                    "message": f"Convergence detected ({round(dist, 0)}px separation)"
-                                }
+                                snapshot_key=snap_obj["key"] if snap_obj else None,
+                                details=details,
                             )
+                            if vessel_event_id:
+                                # Confirmed event (B28), same id as vessel_events
+                                ctx = frame_context(f)
+                                geo = ctx["geo"] or {}
+                                await write_confirmed_event(
+                                    drone_id=drone_id,
+                                    event_type="vessel_proximity",
+                                    confidence=min(o1["confidence"], o2["confidence"]),
+                                    ts=frame_ts,
+                                    attributes={
+                                        **details,
+                                        "classes": [o1["class_name"], o2["class_name"]],
+                                        "mission_id": frame_mission_id,
+                                        "source_table": "vessel_events",
+                                        "evidence": evidence_block(
+                                            [snap_obj], ctx,
+                                            detection={"track_id": o1["track_id"], "class": o1["class_name"],
+                                                       "bbox_xyxy": o1.get("bbox_xyxy"),
+                                                       "confidence": o1["confidence"]},
+                                            model=model_info("vessel", VESSEL_MODEL_PATH),
+                                        ),
+                                    },
+                                    mission_id=frame_mission_id,
+                                    latitude=geo.get("lat"),
+                                    longitude=geo.get("lon"),
+                                    event_id=vessel_event_id,
+                                )
+                                await publish_confirmed_event({
+                                    "event_id": vessel_event_id,
+                                    "event_type": "vessel_proximity",
+                                    "drone_id": drone_id,
+                                    "mission_id": frame_mission_id,
+                                    "ts": frame_ts.isoformat(),
+                                    **details,
+                                })
                         except Exception as ex:
                             log.warning("Proximity alert error: %s", ex)
 

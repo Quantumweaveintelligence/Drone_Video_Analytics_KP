@@ -356,10 +356,8 @@ async def _stream_loop():
                             drone_id, None, "vehicle", ts, ts,
                             tracker_id=tracker_id, mission_id=frame_mission_id
                         )
-                        await write_confirmed_event(
-                            drone_id=drone_id, event_type="vehicle_detected",
-                            confidence=veh["confidence"], ts=ts, track_id=track_id,
-                        )
+                        # No confirmed event per vehicle per frame (B29): detections stay in
+                        # tracks / vehicle_attributes; vehicle incidents come from ANPR (theft_alert).
 
                         colour_label = (veh.get("colour_top3") or [{}])[0].get("colour", "")
                         crop_bytes   = veh.pop("crop_bytes", None)

@@ -187,6 +187,8 @@ LABEL org.opencontainers.image.source="https://github.com/Quantumweaveintelligen
       org.opencontainers.image.revision="${GIT_SHA}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       dvas.base-image="${BASE_IMAGE}"
+# Recorded in evidence model_info and on export certificates (evidence plan E1/E4)
+ENV DVAS_GIT_SHA=${GIT_SHA}
 
 EXPOSE 80 22
 HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \

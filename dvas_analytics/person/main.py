@@ -45,6 +45,7 @@ from shared.redis_client import (
     scan_active_stream_drones,
 )
 from shared import minio_client as minio
+from shared.evidence import evidence_block, frame_context, model_info
 from person.analyzer import PersonFaceAnalyzer
 from person.deduplicator import (
     cluster_embeddings, find_duplicates_in_clusters, load_resnet_model,
@@ -324,6 +325,7 @@ async def _process_watchlist_alert(
     drone_id: str,
     mission_id: Optional[str],
     _ts_alert: datetime,
+    ctx: Optional[dict] = None,
 ):
     """
     Process a confirmed watchlist match:
@@ -357,10 +359,12 @@ async def _process_watchlist_alert(
             mission_id=mission_id or "",
         )
 
-        # 1. Upload evidence images to MinIO
-        await asyncio.gather(
-            minio.upload_bytes(cfg.BUCKET_FACES, _alert_face_key, face_crop_bytes, "image/jpeg"),
-            minio.upload_bytes(cfg.BUCKET_EVIDENCE, _alert_frame_key, _frame_bytes, "image/jpeg"),
+        # 1. Upload evidence images to MinIO (hashed; the event is written only after this)
+        face_obj, frame_obj = await asyncio.gather(
+            minio.upload_object(cfg.BUCKET_FACES, _alert_face_key, face_crop_bytes, "image/jpeg",
+                                kind="face_crop"),
+            minio.upload_object(cfg.BUCKET_EVIDENCE, _alert_frame_key, _frame_bytes, "image/jpeg",
+                                kind="source_frame"),
         )
 
         # 2. Write alert to DB first to acquire true UUID alert_id
@@ -396,6 +400,34 @@ async def _process_watchlist_alert(
         import json as _json_mod
         _evidence_json = _json_mod.dumps(_evidence_meta, indent=2, default=str).encode("utf-8")
         await minio.upload_bytes(cfg.BUCKET_EVIDENCE, _evidence_key, _evidence_json, "application/json")
+
+        # 3b. Confirmed event (B28): the person incident, with the exact crops as evidence
+        ctx = ctx or {}
+        geo = ctx.get("geo") or {}
+        await write_confirmed_event(
+            drone_id=drone_id,
+            event_type="face_watchlist_match",
+            confidence=match.similarity,
+            ts=_ts_alert,
+            attributes={
+                "watchlist_alert_id": alert_id,
+                "watchlist_id": match.watchlist_id,
+                "name": match.name,
+                "category": match.category,
+                "similarity": match.similarity,
+                "tracker_id": tid,
+                "mission_id": mission_id,
+                "evidence": evidence_block(
+                    [face_obj, frame_obj], ctx,
+                    detection={"track_id": tid, "class": "face", "confidence": match.similarity},
+                    model=model_info("person", cfg.ARCFACE_MODEL_PATH),
+                ),
+            },
+            mission_id=mission_id,
+            latitude=geo.get("lat"),
+            longitude=geo.get("lon"),
+            event_id=alert_id,
+        )
 
         # 4. Publish real-time alert via Redis for gateway SSE multiplexer
         await publish_analytics_result("person_alert", {
@@ -544,6 +576,7 @@ async def _stream_loop():
                                         drone_id=drone_id,
                                         mission_id=mission_id,
                                         _ts_alert=_ts_alert,
+                                        ctx=frame_context(f),
                                     ))
 
                     # Tag result with recognition data for SSE consumers
@@ -659,19 +692,16 @@ async def _stream_loop():
                     )
 
                     # ── Database updates (isolated so DB errors don't crash stream) ──
+                    # No confirmed event per person per frame (B29): the person incident is
+                    # a face-watchlist match (_process_watchlist_alert).
                     try:
                         for person in result["persons"]:
                             tracker_id = person.get("tracker_id")
                             if person["confidence"] >= 0.15:
-                                track_id = await upsert_track(
+                                await upsert_track(
                                     drone_id, None, "person", ts, ts,
                                     tracker_id=tracker_id,
                                     mission_id=mission_id,
-                                )
-                                await write_confirmed_event(
-                                    drone_id=drone_id, event_type="person_detected",
-                                    confidence=person["confidence"], ts=ts,
-                                    track_id=track_id,
                                 )
                     except Exception as db_exc:
                         log.warning("Person track/event write error: %s", db_exc)

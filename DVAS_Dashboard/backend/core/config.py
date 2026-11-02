@@ -25,6 +25,16 @@ ADMIN_CLIENT_ID = os.environ.get("ADMIN_CLIENT_ID", "dvas-admin-service")
 ADMIN_CLIENT_SECRET = os.environ.get("ADMIN_CLIENT_SECRET", "")
 KEYCLOAK_ADMIN = os.environ.get("KEYCLOAK_ADMIN", "admin")
 
+# ---------- Evidence (evidence plan E2/E5) ----------
+# New env vars (flagged in docs/evidence-reports/README.md):
+#   EVIDENCE_RETENTION_DAYS — default object-lock / retention period for evidence (Q2; 90 = today's value)
+#   PII_VIEW_ROLES          — roles that may view face / plate images (Q5)
+EVIDENCE_VAULT_BUCKET = "dvas-evidence-vault"     # object lock + versioning, created by the backend
+EVIDENCE_RETENTION_DAYS = int(os.getenv("EVIDENCE_RETENTION_DAYS", "90"))
+PII_VIEW_ROLES = frozenset(
+    r.strip() for r in os.getenv("PII_VIEW_ROLES", "control_room_officer,senior_officer").split(",") if r.strip()
+)
+
 # ---------- Analytics microservices ----------
 # Analytics Postgres (asyncpg DSN). Set by dvas-init.sh on RunPod and by
 # docker-compose locally; empty → image resolution / mission discovery skipped.

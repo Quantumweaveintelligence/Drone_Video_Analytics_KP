@@ -5,11 +5,12 @@ Provides upload, presigned-URL generation, and bucket management.
 Uses miniopy-async (S3-compatible API).
 """
 import asyncio
+import hashlib
 import io
 import logging
 import time
 import uuid
-from typing import Optional
+from typing import Dict, Optional
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +72,42 @@ async def ensure_all_buckets() -> None:
         await ensure_bucket(bucket)
 
 
+async def upload_object(
+    bucket: str,
+    key: str,
+    data: bytes,
+    content_type: str = "application/octet-stream",
+    kind: str = "",
+) -> Optional[Dict]:
+    """
+    Upload raw bytes to MinIO with their SHA-256 in x-amz-meta-sha256 (evidence plan E3).
+
+    Returns {"bucket", "key", "content_type", "sha256", "bytes", "kind"} on success,
+    None on failure — callers store a key only when this returned a result (B30).
+    """
+    client = get_client()
+    if client is None:
+        log.debug("MinIO not available — skipping upload for %s/%s", bucket, key)
+        return None
+    digest = hashlib.sha256(data).hexdigest()
+    try:
+        await ensure_bucket(bucket)
+        await client.put_object(
+            bucket_name=bucket,
+            object_name=key,
+            data=io.BytesIO(data),
+            length=len(data),
+            content_type=content_type,
+            metadata={"sha256": digest},
+        )
+        log.debug("MinIO upload OK: %s/%s (%d bytes)", bucket, key, len(data))
+    except Exception as exc:
+        log.error("MinIO upload failed (%s/%s): %s", bucket, key, exc)
+        return None
+    return {"bucket": bucket, "key": key, "content_type": content_type,
+            "sha256": digest, "bytes": len(data), "kind": kind}
+
+
 async def upload_bytes(
     bucket: str,
     key: str,
@@ -81,25 +118,8 @@ async def upload_bytes(
     Upload raw bytes to MinIO.
     Returns the object key on success, None on failure.
     """
-    client = get_client()
-    if client is None:
-        log.debug("MinIO not available — skipping upload for %s/%s", bucket, key)
-        return None
-    try:
-        await ensure_bucket(bucket)
-        stream = io.BytesIO(data)
-        await client.put_object(
-            bucket_name=bucket,
-            object_name=key,
-            data=stream,
-            length=len(data),
-            content_type=content_type,
-        )
-        log.debug("MinIO upload OK: %s/%s (%d bytes)", bucket, key, len(data))
-        return key
-    except Exception as exc:
-        log.error("MinIO upload failed (%s/%s): %s", bucket, key, exc)
-        return None
+    result = await upload_object(bucket, key, data, content_type)
+    return result["key"] if result else None
 
 
 async def get_presigned_url(

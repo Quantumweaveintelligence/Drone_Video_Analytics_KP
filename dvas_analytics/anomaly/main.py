@@ -40,6 +40,8 @@ from shared.redis_client import (
     scan_active_stream_drones, get_latest_stream_frame
 )
 from shared import minio_client as minio
+from shared.db import write_confirmed_event
+from shared.evidence import bbox_xyxy, evidence_block, frame_context, model_info
 from analyzer import AnomalyAnalyzer
 
 logging.basicConfig(
@@ -258,11 +260,16 @@ async def _stream_loop():
                         severity = alert.get("level", "HIGH")
                         summary_msg = alert.get("summary_explanation", "")
 
-                        # Snapshot upload to MinIO
+                        # Snapshot upload to MinIO: source frame + the alert snapshot, hashed,
+                        # under make_key (mission / time / uuid — B30), before the event is written
                         snapshot_key = ""
+                        evidence_objects = [await minio.upload_object(
+                            BUCKET_ANOMALY,
+                            minio.make_key("anomaly", drone_id, "source.jpg", mission_id=mission_id),
+                            img_bytes, "image/jpeg", kind="source_frame",
+                        )]
                         evidence_img = alert.get("evidence_image")
                         if evidence_img:
-                            snapshot_key = f"alerts/{drone_id}/{evidence_img}"
                             # Read snapshot if written by alert_manager, or encode current frame
                             snapshot_path = os.path.join(analyzer.alert_manager.output_dir, evidence_img)
                             if os.path.exists(snapshot_path):
@@ -271,7 +278,14 @@ async def _stream_loop():
                             else:
                                 snap_bytes = jpeg_buf.tobytes() if success else b""
                             if snap_bytes:
-                                await minio.upload_bytes(BUCKET_ANOMALY, snapshot_key, snap_bytes, "image/jpeg")
+                                snap_obj = await minio.upload_object(
+                                    BUCKET_ANOMALY,
+                                    minio.make_key("anomaly", drone_id, os.path.basename(evidence_img),
+                                                   mission_id=mission_id),
+                                    snap_bytes, "image/jpeg", kind="annotated_frame",
+                                )
+                                snapshot_key = snap_obj["key"] if snap_obj else ""
+                                evidence_objects.append(snap_obj)
 
                         # Write to drone_postgres.anomaly_events
                         confidences = alert.get("confidences", {})
@@ -302,6 +316,50 @@ async def _stream_loop():
                             details=alert,
                             mission_id=mission_id,
                         )
+
+                        # Confirmed event (B28): every gated anomaly alert, same id as anomaly_events
+                        ctx = frame_context(f)
+                        geo = ctx["geo"] or {}
+                        if alert.get("gps_lat") is not None and alert.get("gps_lon") is not None:
+                            geo = {"lat": alert.get("gps_lat"), "lon": alert.get("gps_lon"),
+                                   "alt_m": None, "heading_deg": None}
+                        if event_id:
+                            try:
+                                await write_confirmed_event(
+                                    drone_id=drone_id,
+                                    event_type=canonical_type,
+                                    confidence=confidences.get("alert_confidence", 0.75),
+                                    ts=frame_ts,
+                                    attributes={
+                                        "severity": severity,
+                                        "title": f"Anomaly: {alert.get('event', 'Suspicious Activity')}",
+                                        "summary": summary_msg,
+                                        "reasons": alert.get("reasons", []),
+                                        "evidence_groups": alert.get("evidence_groups", []),
+                                        "confidences": confidences,
+                                        "class_name": obj_info.get("class", ""),
+                                        "tracker_id": obj_info.get("track_id"),
+                                        "mission_id": mission_id or None,
+                                        "source_table": "anomaly_events",
+                                        "evidence": evidence_block(
+                                            evidence_objects, ctx,
+                                            detection={"track_id": obj_info.get("track_id"),
+                                                       "class": obj_info.get("class", ""),
+                                                       "bbox_xyxy": bbox_xyxy(obj_info.get("bbox")),
+                                                       "confidence": confidences.get("detector_confidence")},
+                                            model=model_info("anomaly", os.getenv(
+                                                "ANOMALY_MODEL_PRIMARY",
+                                                "/analytics/anomaly/models/weights/visdrone-yolov11x.pt")),
+                                            geo=geo or None,
+                                        ),
+                                    },
+                                    mission_id=mission_id or None,
+                                    latitude=geo.get("lat"),
+                                    longitude=geo.get("lon"),
+                                    event_id=event_id,
+                                )
+                            except Exception as ce_err:
+                                log.warning("Confirmed anomaly event write failed: %s", ce_err)
 
                         # Publish to drone:events:confirmed (for evidence_sync & live alerts feed)
                         await publish_confirmed_event({

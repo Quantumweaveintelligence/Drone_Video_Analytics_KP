@@ -25,9 +25,10 @@ from services.seed_service import seed_data
 from services.telemetry_pump import start_telemetry_pump
 from services.audit_sync import start_audit_sync_service
 from services.evidence_sync import start_evidence_sync
+from services.retention import start_retention_job
 from ingest_proxy import ingest_api
 
-from routers import auth, drones, alerts, audit, analytics, edge, infra, ws, incidents, reports, push
+from routers import auth, drones, alerts, audit, analytics, edge, infra, ws, incidents, reports, push, cases, downloads
 
 # ---------- App ----------
 logging.basicConfig(level=logging.INFO)
@@ -71,6 +72,10 @@ async def _start_evidence_sync():
     start_evidence_sync()
 
 @app.on_event("startup")
+async def _start_retention_job():
+    start_retention_job()
+
+@app.on_event("startup")
 async def _sync_models_on_startup():
     async def _do_sync():
         await asyncio.sleep(5)
@@ -92,6 +97,8 @@ async def root():
 app.include_router(auth.router)
 app.include_router(drones.router)
 app.include_router(alerts.router)
+app.include_router(cases.router)
+app.include_router(downloads.router)
 app.include_router(audit.router)
 app.include_router(analytics.router)
 app.include_router(edge.router)

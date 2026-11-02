@@ -29,13 +29,14 @@ from ultralytics import YOLO
 
 sys.path.insert(0, "/analytics")
 from shared.config import cfg, get_drone_aliases
-from shared.db import close_pool, ensure_drone, get_pool
+from shared.db import close_pool, ensure_drone, get_pool, write_confirmed_event
 from shared.redis_client import (
     close_client, publish_analytics_result, publish_confirmed_event,
     xread_frames, xreadgroup_frames, ack_frames, scan_active_stream_drones, get_client,
     get_latest_stream_frame,
 )
 from shared import minio_client as minio
+from shared.evidence import EventGate, bbox_xyxy, evidence_block, frame_context, model_info
 
 from intrusion.projection import CameraProjection
 from intrusion.state_machine import IntrusionState, IntrusionStateMachine
@@ -94,6 +95,8 @@ def resolve_model_class_names(model) -> Dict[int, str]:
 
 # ── Service state ──────────────────────────────────────────────────────────────
 yolo_model = None
+# One intrusion_breach confirmed event per track per zone per 60 s (evidence plan E1)
+_breach_gate = EventGate(cooldown_s=60.0)
 _stream_task: Optional[asyncio.Task] = None
 _stream_running = False
 _frames_processed = 0
@@ -562,23 +565,31 @@ async def _stream_loop():
                                 tid, det["class"], prev_state_str, cur_state_str,
                             )
 
-                            # Q1: Upload JPEG snapshot on ENTERING/DWELLING
+                            # Q1: Upload JPEG snapshot on ENTERING/DWELLING (source frame + annotated),
+                            # hashed, before any event is written
                             snapshot_key = None
+                            evidence_objects = []
+                            zone_ref = str(gm.zone_id) if gm.zone_id else "RESTRICTED_ZONE_01"
                             if cur_state_str in ("ENTERING", "DWELLING"):
                                 ts_ms = int(ts_s * 1000)
                                 s_key = f"intrusion/{drone_id}/{mission_id}/event_{tid}_{ts_ms}.jpg"
-                                try:
-                                    snapshot_key = await minio.upload_bytes(
-                                        cfg.BUCKET_INTRUSION, s_key,
-                                        jpeg_bytes, "image/jpeg",
-                                    )
-                                except Exception as e:
-                                    log.warning("MinIO snapshot upload failed: %s", e)
+                                src_obj = await minio.upload_object(
+                                    cfg.BUCKET_INTRUSION,
+                                    f"intrusion/{drone_id}/{mission_id}/event_{tid}_{ts_ms}_source.jpg",
+                                    img_bytes, "image/jpeg", kind="source_frame",
+                                )
+                                ann_obj = await minio.upload_object(
+                                    cfg.BUCKET_INTRUSION, s_key, jpeg_bytes, "image/jpeg",
+                                    kind="annotated_frame",
+                                )
+                                snapshot_key = ann_obj["key"] if ann_obj else None
+                                evidence_objects = [src_obj, ann_obj]
 
                             # Write to intrusion_events table
+                            intrusion_event_id = None
                             try:
                                 await ensure_drone(drone_id)
-                                await pool.execute(
+                                intrusion_event_id = await pool.fetchval(
                                     """INSERT INTO intrusion_events (
                                         drone_id, mission_id, zone_id, track_id,
                                         track_class, state_from, state_to,
@@ -588,7 +599,7 @@ async def _stream_loop():
                                     ) VALUES (
                                         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
                                         $11,$12,$13,$14,$15,$16,$17
-                                    )""",
+                                    ) RETURNING event_id::text""",
                                     drone_id,
                                     str(mission_id) if mission_id else None,
                                     str(gm.zone_id) if gm.zone_id else "RESTRICTED_ZONE_01",
@@ -612,11 +623,53 @@ async def _stream_loop():
                             except Exception as db_err:
                                 log.warning("DB insert error: %s", db_err)
 
-                            # Publish confirmed event on intrusion transitions
+                            # Confirmed event (B28): ENTERING / DWELLING, one per track per zone per 60 s,
+                            # same id as the intrusion_events row and the Valkey message
+                            confirmed_id = None
+                            if (intrusion_event_id and cur_state_str in ("ENTERING", "DWELLING")
+                                    and _breach_gate.allow((drone_id, int(tid), zone_ref))):
+                                try:
+                                    target_geo = {"lat": float(det["geolocation"]["latitude"]),
+                                                  "lon": float(det["geolocation"]["longitude"]),
+                                                  "alt_m": None, "heading_deg": None}
+                                    confirmed_id = await write_confirmed_event(
+                                        drone_id=drone_id,
+                                        event_type="intrusion_breach",
+                                        confidence=float(det["confidence"]),
+                                        ts=ts,
+                                        attributes={
+                                            "zone_id": zone_ref,
+                                            "tracker_id": int(tid),
+                                            "track_class": str(det["class"]),
+                                            "state_from": prev_state_str,
+                                            "state_to": cur_state_str,
+                                            "dwell_duration_s": float(ts_obj.dwell_duration_s),
+                                            "mission_id": str(mission_id) if mission_id else None,
+                                            "source_table": "intrusion_events",
+                                            "evidence": evidence_block(
+                                                evidence_objects, frame_context(f),
+                                                detection={"track_id": int(tid), "class": str(det["class"]),
+                                                           "bbox_xyxy": bbox_xyxy(det.get("bbox")),
+                                                           "confidence": float(det["confidence"])},
+                                                model=model_info("intrusion", INTRUSION_MODEL),
+                                                geo=target_geo,
+                                            ),
+                                        },
+                                        mission_id=str(mission_id) if mission_id else None,
+                                        zone_ref=zone_ref,
+                                        latitude=target_geo["lat"],
+                                        longitude=target_geo["lon"],
+                                        event_id=intrusion_event_id,
+                                    )
+                                except Exception as ce_err:
+                                    log.warning("Confirmed intrusion event write failed: %s", ce_err)
+
+                            # Publish on intrusion transitions (live feed); confirmed ones carry the real id
                             if cur_state_str in ("ENTERING", "INSIDE", "DWELLING", "EXITED"):
                                 try:
                                     await publish_confirmed_event({
-                                        "event_id": str(uuid.uuid4()),
+                                        "event_id": confirmed_id or str(uuid.uuid4()),
+                                        "confirmed": bool(confirmed_id),
                                         "event_type": "intrusion_alert",
                                         "drone_id": drone_id,
                                         "mission_id": str(mission_id) if mission_id else "",

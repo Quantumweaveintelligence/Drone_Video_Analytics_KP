@@ -4,7 +4,6 @@ import AppShell from "@/components/layout/AppShell";
 import { CommandProvider, useCommand } from "@/context/CommandContext";
 import { useAuth } from "@/context/AuthContext";
 import { useI18n } from "@/context/I18nContext";
-import { API } from "@/lib/api";
 import {
   X,
   Play,
@@ -12,7 +11,8 @@ import {
   Image as ImageIcon
 } from "lucide-react";
 
-import { resolveMinioImageUrl } from "@/lib/api";
+import { downloadSigned } from "@/lib/api";
+import EvidenceImage from "@/components/EvidenceImage";
 
 function KPI({ label, value, tone = "text-sky-500" }) {
   return (
@@ -106,8 +106,9 @@ function CommandInner() {
             {(playing.primary_image_key || playing.thumbnail) ? (
               <div className="w-full aspect-video bg-slate-900 flex items-center justify-center gap-4 p-4">
                 <div className={`relative flex flex-col items-center justify-center h-full ${playing.secondary_image_key ? 'max-w-[48%]' : 'max-w-[85%]'}`}>
-                  <img
-                    src={resolveMinioImageUrl(playing.primary_image_key || playing.thumbnail, playing.image_bucket)}
+                  <EvidenceImage
+                    evidenceId={playing.id}
+                    role="primary"
                     alt="Primary Evidence"
                     className="max-h-[calc(100%-24px)] object-contain rounded border border-slate-700 shadow-md"
                     onError={(e) => {
@@ -127,8 +128,9 @@ function CommandInner() {
                 </div>
                 {playing.secondary_image_key ? (
                   <div className="relative flex flex-col items-center justify-center h-full max-w-[48%]">
-                    <img
-                      src={resolveMinioImageUrl(playing.secondary_image_key, playing.secondary_image_key.startsWith('plates/') ? 'dvas-plates' : (playing.image_bucket === 'dvas-vehicles' ? 'dvas-plates' : 'dvas-faces'))}
+                    <EvidenceImage
+                      evidenceId={playing.id}
+                      role="secondary"
                       alt="Secondary Evidence"
                       className="max-h-[calc(100%-24px)] object-contain rounded border border-slate-700 shadow-md"
                       onError={(e) => {
@@ -181,8 +183,9 @@ function CommandInner() {
               {(evidenceDetail.evidence?.primary_image_key || evidenceDetail.evidence?.thumbnail) && (
                 <div className="w-full bg-slate-900/80 rounded-lg p-3 flex items-center justify-center gap-4 border border-slate-800">
                   <div className="relative flex flex-col items-center">
-                    <img
-                      src={resolveMinioImageUrl(evidenceDetail.evidence.primary_image_key || evidenceDetail.evidence.thumbnail, evidenceDetail.evidence.image_bucket)}
+                    <EvidenceImage
+                      evidenceId={evidenceDetail.evidence.id}
+                      role="primary"
                       alt="Primary Capture"
                       className="max-h-48 object-contain rounded border border-slate-700 shadow"
                       onError={(e) => { e.target.style.display = 'none'; }}
@@ -193,8 +196,9 @@ function CommandInner() {
                   </div>
                   {evidenceDetail.evidence?.secondary_image_key ? (
                     <div className="relative flex flex-col items-center">
-                      <img
-                        src={resolveMinioImageUrl(evidenceDetail.evidence.secondary_image_key, evidenceDetail.evidence.secondary_image_key.startsWith('plates/') ? 'dvas-plates' : 'dvas-faces')}
+                      <EvidenceImage
+                        evidenceId={evidenceDetail.evidence.id}
+                        role="secondary"
                         alt="Secondary Capture"
                         className="max-h-48 object-contain rounded border border-slate-700 shadow"
                         onError={(e) => { e.target.style.display = 'none'; }}
@@ -261,12 +265,13 @@ function CommandInner() {
                           {x.status}
                         </span>
                         {x.status === "approved" && (
-                          <a
-                            href={`${API}/exports/${x.id}/bundle?token=${encodeURIComponent(localStorage.getItem("dvas_token") || "")}`}
+                          <button
+                            type="button"
+                            onClick={() => downloadSigned("bundle", x.id).catch((e) => alert(e.response?.data?.detail || "Download failed"))}
                             className="text-sky-400 hover:text-sky-300 text-[10px]"
                           >
-                            Download 65B Bundle
-                          </a>
+                            Download Evidence Bundle
+                          </button>
                         )}
                       </div>
                     ))}

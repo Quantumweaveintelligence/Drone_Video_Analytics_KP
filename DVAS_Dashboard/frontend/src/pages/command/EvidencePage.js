@@ -1,7 +1,7 @@
 import React, { useRef, useState, useMemo } from "react";
 import { useCommand } from "@/context/CommandContext";
 import { useAuth } from "@/context/AuthContext";
-import { resolveMinioImageUrl } from "@/lib/api";
+import EvidenceImage from "@/components/EvidenceImage";
 import {
   Film,
   UserSearch,
@@ -107,8 +107,9 @@ export default function EvidencePage() {
     >
       <div className="relative aspect-video bg-slate-950 overflow-hidden">
         {(ev.thumbnail || ev.primary_image_key) ? (
-          <img
-            src={resolveMinioImageUrl(ev.thumbnail || ev.primary_image_key, ev.image_bucket)}
+          <EvidenceImage
+            evidenceId={ev.id}
+            role="primary"
             alt=""
             className="w-full h-full object-cover opacity-90 transition-opacity hover:opacity-100"
             onError={(e) => {

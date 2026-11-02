@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useRef } from "react";
-import { api, API } from "@/lib/api";
+import { api, downloadSigned } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { useDvasSocket } from "@/lib/useDvasSocket";
 import { useActiveStreams } from "@/hooks/useActiveStreams";
@@ -247,10 +247,13 @@ export function CommandProvider({ children }) {
   };
 
   const directExport = async (ev) => {
+    const caseNumber = prompt("Case / crime number for this export (required):");
+    if (!caseNumber || !caseNumber.trim()) return;
     const just = prompt("Enter justification for direct export:");
     if (!just) return;
     try {
-      await api.post(`/evidence/${ev.id}/direct-export`, { justification: just });
+      const res = await api.post(`/evidence/${ev.id}/direct-export`, { justification: just, case_number: caseNumber.trim() });
+      if (res.data?.bundle_error) alert(`Export approved, but the bundle could not be built: ${res.data.bundle_error}`);
       load();
     } catch (e) {
       alert(e.response?.data?.detail || "Failed");
@@ -292,8 +295,7 @@ export function CommandProvider({ children }) {
   };
 
   const downloadReport = (reportId) => {
-    const token = localStorage.getItem("dvas_token") || "";
-    window.open(`${API}/reports/${reportId}/download?token=${encodeURIComponent(token)}`, "_blank");
+    downloadSigned("report", reportId).catch((e) => alert(e.response?.data?.detail || "Download failed"));
   };
 
   const value = {

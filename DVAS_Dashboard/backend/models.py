@@ -178,6 +178,59 @@ class Evidence(Base):
     legal_hold_at = Column(String, nullable=True)
     # Phase 10: Analytics confirmed-event dedup key
     source_event_id = Column(String, nullable=True, unique=True, index=True)
+    # Evidence plan E1 (migrations/evidence_v2.sql): copied from the analyzer's event
+    attributes = Column(JSONB, nullable=False, default=dict)
+    objects = Column(JSONB, nullable=False, default=list)       # vault objects: role/bucket/key/sha256/kind/source
+    image_match = Column(String, nullable=False, default="none")  # exact | heuristic | none
+    capture_ts = Column(String, nullable=True)
+    lat = Column(Float, nullable=True)
+    lon = Column(Float, nullable=True)
+    severity = Column(String, nullable=True)
+    model_info = Column(JSONB, nullable=True)
+    # E2: vault copy + disposal
+    vault_status = Column(String, nullable=True)                # copied | partial | failed | none; NULL = legacy
+    status = Column(String, nullable=False, default="active")   # active | disposed
+    disposed_at = Column(String, nullable=True)
+    disposed_by = Column(String, nullable=True)
+    disposal_reason = Column(Text, nullable=True)
+    # E3 (migrations/evidence_v3_integrity.sql)
+    record_sha256 = Column(String, nullable=True)
+    integrity = Column(String, nullable=False, default="unverified")  # ok | mismatch | missing | unverified
+    integrity_checked_at = Column(String, nullable=True)
+
+
+class EvidenceSyncState(Base):
+    """Persistent cursor of the confirmed-event sync (one row, id=1)."""
+    __tablename__ = "evidence_sync_state"
+
+    id = Column(Integer, primary_key=True)
+    last_ts = Column(String, nullable=True)
+    last_event_id = Column(String, nullable=True)
+    updated_at = Column(String, nullable=True)
+
+
+class Case(Base):
+    """Evidence plan E4 (migrations/exports_v2.sql)."""
+    __tablename__ = "cases"
+
+    id = Column(String, primary_key=True)
+    case_number = Column(String, nullable=False, unique=True)
+    fir_number = Column(String, nullable=True)
+    police_station = Column(String, nullable=True)
+    jurisdiction = Column(String, nullable=True)
+    title = Column(String, nullable=True)
+    created_by = Column(String, nullable=False)
+    created_at = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="open")     # open | closed
+
+
+class CaseEvidence(Base):
+    __tablename__ = "case_evidence"
+
+    case_id = Column(String, ForeignKey("cases.id"), primary_key=True)
+    evidence_id = Column(String, ForeignKey("evidence.id"), primary_key=True)
+    added_by = Column(String, nullable=False)
+    added_at = Column(String, nullable=False)
 
 
 class Export(Base):
@@ -194,6 +247,16 @@ class Export(Base):
     decision_by = Column(String, nullable=True)
     decision_at = Column(String, nullable=True)
     decision_comment = Column(Text, nullable=True)
+    # Evidence plan E4 (migrations/exports_v2.sql)
+    case_id = Column(String, ForeignKey("cases.id"), nullable=True)
+    case_number = Column(String, nullable=True)
+    evidence_ids = Column(JSONB, nullable=True)                 # frozen at approval
+    bundle_key = Column(String, nullable=True)
+    bundle_sha256 = Column(String, nullable=True)
+    bundle_bytes = Column(BigInteger, nullable=True)
+    certificate_sha256 = Column(String, nullable=True)
+    bundle_error = Column(Text, nullable=True)
+    self_approved = Column(Boolean, nullable=False, default=False)
 
 
 class ModelConfig(Base):
@@ -259,6 +322,7 @@ class Report(Base):
     generated_at = Column(String, nullable=True)
     error_message = Column(Text, nullable=True)
     watermark_text = Column(String, nullable=True)
+    sha256 = Column(String, nullable=True)                      # E3: hash of the stored PDF
 
 
 class User(Base):

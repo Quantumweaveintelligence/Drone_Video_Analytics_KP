@@ -1,320 +1,141 @@
 """
-Evidence sync — periodically polls the analytics gateway for confirmed events
-and creates Evidence rows in the dashboard database.
+Evidence sync — turns analytics confirmed events into Evidence rows (evidence plan E1–E3).
+
+* Pages the gateway's /events/confirmed with a persistent (ts, event_id) cursor
+  (table evidence_sync_state), oldest first, re-reading a short overlap window so
+  events committed late are not lost; source_event_id makes it idempotent.
+* Copies the analyzer's `evidence` block verbatim (exact objects, frame, GPS, model).
+  Events without a block (legacy / single-frame HTTP analysis) get images only from
+  an exact match (event_id or track_id); nothing is guessed (B2).
+* Copies every object into the object-locked evidence vault, re-checking the
+  analyzer's SHA-256, then stores the record hash and writes an audit entry.
 """
 import asyncio
+import json
 import logging
 import uuid
 from datetime import datetime, timezone, timedelta
-
-import httpx
-
-from database import async_session_factory
-from models import Evidence, Mission
-from sqlalchemy import select
-from core.config import ANALYTICS_BASE
+from typing import Dict, List, Optional, Tuple
 
 import asyncpg
+import httpx
+from sqlalchemy import select
 
-from core.config import ANALYTICS_DATABASE_URL
-
-_warned_no_analytics_db = False
-
-
-async def _resolve_image_keys(event_type, event_id, track_id, drone_id, ts, mission_id=""):
-    """Resolve real MinIO image keys from the analytics DB.
-
-    Exact matches (event_id / track_id) first. A nearest-in-time match from the
-    same drone or mission is accepted only within ±10 s; there is no "latest image"
-    fallback, so an event with no matching image gets none (B2, until E1 stores the
-    exact key with the event).
-    """
-    global _warned_no_analytics_db
-    primary_key = ""
-    secondary_key = ""
-    bucket = ""
-    if not ANALYTICS_DATABASE_URL:
-        if not _warned_no_analytics_db:
-            logger.error("ANALYTICS_DATABASE_URL is not set; evidence images will not be resolved")
-            _warned_no_analytics_db = True
-        return primary_key, secondary_key, bucket
-    
-    ts_dt = None
-    if isinstance(ts, str) and ts:
-        try:
-            ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        except Exception:
-            ts_dt = None
-    elif isinstance(ts, datetime):
-        ts_dt = ts
-    if not ts_dt:
-        ts_dt = datetime.now(timezone.utc)
-        
-    try:
-        conn = await asyncpg.connect(ANALYTICS_DATABASE_URL)
-        try:
-            if event_type == "person_detected":
-                # Tier 1: Check person_embeddings or face_embeddings by track_id
-                if track_id:
-                    try:
-                        row = await conn.fetchrow(
-                            "SELECT object_key FROM person_embeddings WHERE track_id = $1::uuid AND object_key IS NOT NULL AND object_key != '' LIMIT 1",
-                            track_id
-                        )
-                        if row and row['object_key']:
-                            primary_key = row['object_key']
-                            bucket = "dvas-faces"
-                    except Exception:
-                        pass
-                    
-                    if not primary_key:
-                        try:
-                            frow = await conn.fetchrow(
-                                "SELECT object_key, person_object_key FROM face_embeddings WHERE track_id = $1::uuid LIMIT 1",
-                                track_id
-                            )
-                            if frow:
-                                primary_key = frow['person_object_key'] or frow['object_key'] or ""
-                                secondary_key = frow['object_key'] if frow['person_object_key'] else ""
-                                bucket = "dvas-faces"
-                        except Exception:
-                            pass
-
-                # Tier 2: Check person_identities for matching drone_id, ordered by time proximity to ts_dt
-                if not primary_key:
-                    if drone_id:
-                        prow = await conn.fetchrow(
-                            """SELECT best_person_image_key, best_image_key 
-                               FROM person_identities 
-                               WHERE drone_id = $1 AND ((best_person_image_key IS NOT NULL AND best_person_image_key != '') OR (best_image_key IS NOT NULL AND best_image_key != ''))
-                               AND abs(extract(epoch from (last_seen - $2))) <= 10
-                               ORDER BY abs(extract(epoch from (last_seen - $2))) ASC LIMIT 1""",
-                            drone_id, ts_dt
-                        )
-                    else:
-                        prow = None
-                        
-                    if prow:
-                        primary_key = prow['best_person_image_key'] or prow['best_image_key'] or ""
-                        secondary_key = prow['best_image_key'] if prow['best_person_image_key'] and prow['best_image_key'] else ""
-                        bucket = "dvas-faces"
-
-
-            elif event_type in ("vehicle_detected", "theft_alert", "vehicle_anomaly", "wrong_way"):
-                bucket = "dvas-vehicles"
-                
-                # 1. Try track_id direct lookup in plate_reads (provides both vehicle & plate)
-                if track_id:
-                    try:
-                        p_row = await conn.fetchrow(
-                            "SELECT vehicle_image_key, plate_image_key FROM plate_reads WHERE track_id = $1::uuid LIMIT 1",
-                            track_id
-                        )
-                        if p_row:
-                            if not primary_key and p_row['vehicle_image_key']:
-                                primary_key = p_row['vehicle_image_key']
-                            if not secondary_key and p_row['plate_image_key']:
-                                secondary_key = p_row['plate_image_key']
-                    except Exception:
-                        pass
-
-                # 2. Try tracks table for vehicle_image_key
-                if track_id and not primary_key:
-                    try:
-                        trow = await conn.fetchrow(
-                            "SELECT metadata->>'vehicle_image_key' AS vk FROM tracks WHERE track_id = $1::uuid AND metadata->>'vehicle_image_key' IS NOT NULL AND metadata->>'vehicle_image_key' != '' LIMIT 1",
-                            track_id
-                        )
-                        if trow and trow['vk']:
-                            primary_key = trow['vk']
-                    except Exception:
-                        pass
-
-                # 3. If primary_key is known, look up vehicle_plate_links or plate_reads by vehicle_image_key for plate
-                if primary_key and not secondary_key:
-                    try:
-                        vlink = await conn.fetchrow(
-                            "SELECT plate_image_key FROM vehicle_plate_links WHERE vehicle_image_key = $1 AND plate_image_key IS NOT NULL AND plate_image_key != '' LIMIT 1",
-                            primary_key
-                        )
-                        if vlink and vlink['plate_image_key']:
-                            secondary_key = vlink['plate_image_key']
-                    except Exception:
-                        pass
-
-                    if not secondary_key:
-                        try:
-                            pr_row = await conn.fetchrow(
-                                "SELECT plate_image_key FROM plate_reads WHERE vehicle_image_key = $1 AND plate_image_key IS NOT NULL AND plate_image_key != '' LIMIT 1",
-                                primary_key
-                            )
-                            if pr_row and pr_row['plate_image_key']:
-                                secondary_key = pr_row['plate_image_key']
-                        except Exception:
-                            pass
-
-                # 4. Check event_id in plate_reads
-                if (not primary_key or not secondary_key) and event_id:
-                    try:
-                        erow = await conn.fetchrow(
-                            "SELECT vehicle_image_key, plate_image_key FROM plate_reads WHERE event_id = $1::uuid LIMIT 1",
-                            event_id
-                        )
-                        if erow:
-                            if not primary_key and erow['vehicle_image_key']:
-                                primary_key = erow['vehicle_image_key']
-                            if not secondary_key and erow['plate_image_key']:
-                                secondary_key = erow['plate_image_key']
-                    except Exception:
-                        pass
-
-                # 5. Check mission_id & time proximity in plate_reads
-                if (not primary_key or not secondary_key) and mission_id:
-                    try:
-                        mrow = await conn.fetchrow(
-                            """SELECT vehicle_image_key, plate_image_key 
-                               FROM plate_reads 
-                               WHERE mission_id_str = $1 
-                               AND abs(extract(epoch from (created_at - $2))) <= 10
-                               ORDER BY abs(extract(epoch from (created_at - $2))) ASC LIMIT 1""",
-                            mission_id, ts_dt
-                        )
-                        if mrow:
-                            if not primary_key and mrow['vehicle_image_key']:
-                                primary_key = mrow['vehicle_image_key']
-                            if not secondary_key and mrow['plate_image_key']:
-                                secondary_key = mrow['plate_image_key']
-                    except Exception:
-                        pass
-
-
-
-            elif event_type.startswith("intrusion") or event_type == "perimeter_intrusion":
-                irow = None
-                if event_id:
-                    try:
-                        irow = await conn.fetchrow(
-                            "SELECT snapshot_key FROM intrusion_events WHERE event_id = $1::uuid LIMIT 1",
-                            event_id
-                        )
-                    except Exception:
-                        pass
-                if not irow and drone_id:
-                    irow = await conn.fetchrow(
-                        """SELECT snapshot_key FROM intrusion_events 
-                           WHERE drone_id = $1 AND snapshot_key IS NOT NULL AND snapshot_key != '' 
-                           AND abs(extract(epoch from (ts - $2))) <= 10
-                           ORDER BY abs(extract(epoch from (ts - $2))) ASC LIMIT 1""",
-                        drone_id, ts_dt
-                    )
-                if irow and irow['snapshot_key']:
-                    primary_key = irow['snapshot_key']
-                    bucket = "dvas-intrusion"
-
-            elif event_type.startswith("vessel") or event_type in ("vessel_detected", "vessel_proximity", "vessel_loitering"):
-                v_row = None
-                if event_id:
-                    try:
-                        v_row = await conn.fetchrow(
-                            "SELECT snapshot_key FROM vessel_events WHERE event_id = $1::uuid LIMIT 1",
-                            event_id
-                        )
-                    except Exception:
-                        pass
-                if not v_row and track_id:
-                    try:
-                        t_row = await conn.fetchrow(
-                            "SELECT thumbnail_key FROM vessel_tracks WHERE tracker_id = $1::int LIMIT 1",
-                            int(track_id)
-                        )
-                        if t_row and t_row['thumbnail_key']:
-                            primary_key = t_row['thumbnail_key']
-                            bucket = "dvas-vessels-maritime"
-                    except Exception:
-                        pass
-                if not v_row and not primary_key and drone_id:
-                    v_row = await conn.fetchrow(
-                        """SELECT snapshot_key FROM vessel_events 
-                           WHERE drone_id = $1 AND snapshot_key IS NOT NULL AND snapshot_key != '' 
-                           AND abs(extract(epoch from (ts - $2))) <= 10
-                           ORDER BY abs(extract(epoch from (ts - $2))) ASC LIMIT 1""",
-                        drone_id, ts_dt
-                    )
-                if v_row and v_row['snapshot_key']:
-                    primary_key = v_row['snapshot_key']
-                    bucket = "dvas-vessels-maritime"
-
-            elif event_type in ("crowd_threshold", "crowd_surge"):
-                crow = None
-                if drone_id:
-                    crow = await conn.fetchrow(
-                        """SELECT heatmap_object_key FROM crowd_density_readings 
-                           WHERE drone_id = $1 AND heatmap_object_key IS NOT NULL AND heatmap_object_key != ''
-                           AND abs(extract(epoch from (ts - $2))) <= 10
-                           ORDER BY abs(extract(epoch from (ts - $2))) ASC LIMIT 1""",
-                        drone_id, ts_dt
-                    )
-                if crow and crow['heatmap_object_key']:
-                    primary_key = crow['heatmap_object_key']
-                    bucket = "dvas-heatmaps"
-
-            elif event_type in (
-                "abandoned_object", "suspicious_loitering", "person_fall",
-                "suspicious_following", "crowd_dispersal", "vehicle_wrong_way",
-                "vehicle_abrupt_stop", "suspicious_dropoff", "weapon_aiming",
-                "anomaly_alert", "suspicious_activity"
-            ) or event_type.startswith("anomaly_"):
-                a_row = None
-                if event_id:
-                    try:
-                        a_row = await conn.fetchrow(
-                            "SELECT snapshot_key FROM anomaly_events WHERE event_id = $1::uuid LIMIT 1",
-                            event_id
-                        )
-                    except Exception:
-                        pass
-                if not a_row and track_id:
-                    try:
-                        t_row = await conn.fetchrow(
-                            "SELECT snapshot_key FROM anomaly_tracks WHERE track_id = $1::int LIMIT 1",
-                            int(track_id)
-                        )
-                        if t_row and t_row['snapshot_key']:
-                            primary_key = t_row['snapshot_key']
-                            bucket = "dvas-anomaly"
-                    except Exception:
-                        pass
-                if not a_row and not primary_key and drone_id:
-                    a_row = await conn.fetchrow(
-                        """SELECT snapshot_key FROM anomaly_events 
-                           WHERE drone_id = $1 AND snapshot_key IS NOT NULL AND snapshot_key != '' 
-                           AND abs(extract(epoch from (ts - $2))) <= 10
-                           ORDER BY abs(extract(epoch from (ts - $2))) ASC LIMIT 1""",
-                        drone_id, ts_dt
-                    )
-                if a_row and a_row['snapshot_key']:
-                    primary_key = a_row['snapshot_key']
-                    bucket = "dvas-anomaly"
-
-        finally:
-            await conn.close()
-    except Exception as exc:
-        logger.debug("Image key resolution failed for %s/%s: %s", event_type, event_id, exc)
-    
-    return primary_key, secondary_key, bucket
+from audit_service import write_audit_v2
+from core.analytics_client import _service_headers
+from core.config import ANALYTICS_BASE, ANALYTICS_DATABASE_URL, EVIDENCE_RETENTION_DAYS
+from database import async_session_factory
+from models import Evidence, EvidenceSyncState, Mission
+from services import evidence_vault
+from services.evidence_integrity import record_sha256
 
 logger = logging.getLogger("dvas.evidence_sync")
 
-_last_sync_ts: str = ""
 _SYNC_INTERVAL_S = 30
+_PAGE_SIZE = 200
+_MAX_PAGES_PER_RUN = 20
+_OVERLAP = timedelta(minutes=2)          # analyzers commit out of ts order; re-read, dedup on source_event_id
+_INITIAL_LOOKBACK = timedelta(hours=24)
+_VAULT_RETRY_BATCH = 20
+
+SYSTEM_ACTOR = {"id": "system:evidence-sync", "email": "system@dvas", "role": "system",
+                "name": "DVAS evidence sync"}
+
+_warned_no_analytics_db = False
+
+# Severity when the analyzer gives none (R1 refines this per rule)
+_DEFAULT_SEVERITY = {
+    "intrusion_breach": "critical", "theft_alert": "critical", "face_watchlist_match": "critical",
+    "crowd_threshold": "high", "vessel_proximity": "high",
+}
 
 
+# ── Legacy events: exact image match only ─────────────────────────────────────
+async def _legacy_objects(event_type: str, event_id: str, track_id: str) -> List[Dict]:
+    """Objects for an event without an `evidence` block: event_id / track_id matches only."""
+    global _warned_no_analytics_db
+    if not ANALYTICS_DATABASE_URL:
+        if not _warned_no_analytics_db:
+            logger.error("ANALYTICS_DATABASE_URL is not set; legacy evidence images will not be resolved")
+            _warned_no_analytics_db = True
+        return []
+
+    found: List[Tuple[str, str, str]] = []      # (role, bucket, key)
+
+    async def one(conn, sql, *args):
+        try:
+            return await conn.fetchrow(sql, *args)
+        except Exception:
+            return None
+
+    try:
+        conn = await asyncpg.connect(ANALYTICS_DATABASE_URL)
+    except Exception as exc:
+        logger.debug("Legacy image lookup: analytics DB unreachable: %s", exc)
+        return []
+    try:
+        track_uuid = track_id if track_id and len(track_id) == 36 else ""
+        if event_type == "person_detected" and track_uuid:
+            row = await one(conn, "SELECT object_key FROM person_embeddings WHERE track_id = $1::uuid "
+                                  "AND COALESCE(object_key, '') <> '' LIMIT 1", track_uuid)
+            if row:
+                found.append(("primary", "dvas-faces", row["object_key"]))
+            else:
+                row = await one(conn, "SELECT object_key, person_object_key FROM face_embeddings "
+                                      "WHERE track_id = $1::uuid LIMIT 1", track_uuid)
+                if row and (row["person_object_key"] or row["object_key"]):
+                    found.append(("primary", "dvas-faces", row["person_object_key"] or row["object_key"]))
+                    if row["person_object_key"] and row["object_key"]:
+                        found.append(("secondary", "dvas-faces", row["object_key"]))
+        elif event_type in ("vehicle_detected", "theft_alert", "vehicle_anomaly", "wrong_way"):
+            row = None
+            if track_uuid:
+                row = await one(conn, "SELECT vehicle_image_key, plate_image_key FROM plate_reads "
+                                      "WHERE track_id = $1::uuid LIMIT 1", track_uuid)
+            if not row and event_id:
+                row = await one(conn, "SELECT vehicle_image_key, plate_image_key FROM plate_reads "
+                                      "WHERE event_id = $1::uuid LIMIT 1", event_id)
+            vehicle_key = row["vehicle_image_key"] if row else None
+            plate_key = row["plate_image_key"] if row else None
+            if not vehicle_key and track_uuid:
+                trow = await one(conn, "SELECT metadata->>'vehicle_image_key' AS vk FROM tracks "
+                                       "WHERE track_id = $1::uuid", track_uuid)
+                vehicle_key = trow["vk"] if trow else None
+            if vehicle_key:
+                found.append(("primary", "dvas-vehicles", vehicle_key))
+            if plate_key:
+                found.append(("secondary" if vehicle_key else "primary", "dvas-plates", plate_key))
+        elif event_type.startswith("intrusion") and event_id:
+            row = await one(conn, "SELECT snapshot_key FROM intrusion_events WHERE event_id = $1::uuid LIMIT 1",
+                            event_id)
+            if row and row["snapshot_key"]:
+                found.append(("primary", "dvas-intrusion", row["snapshot_key"]))
+        elif event_type.startswith("vessel") and event_id:
+            row = await one(conn, "SELECT snapshot_key FROM vessel_events WHERE event_id = $1::uuid LIMIT 1",
+                            event_id)
+            if row and row["snapshot_key"]:
+                found.append(("primary", "dvas-vessels-maritime", row["snapshot_key"]))
+        elif event_id:
+            row = await one(conn, "SELECT snapshot_key FROM anomaly_events WHERE event_id = $1::uuid LIMIT 1",
+                            event_id)
+            if row and row["snapshot_key"]:
+                found.append(("primary", "dvas-anomaly", row["snapshot_key"]))
+    finally:
+        await conn.close()
+    return [{"role": r, "bucket": b, "key": k, "content_type": "image/jpeg", "kind": "legacy_lookup"}
+            for r, b, k in found if k]
+
+
+# ── Event → evidence ──────────────────────────────────────────────────────────
 def _event_type_label(event_type: str) -> str:
     """Human-readable label for confirmed event types."""
     labels = {
         "crowd_threshold": "Crowd surge detected",
         "theft_alert": "Stolen/watchlisted vehicle",
         "intrusion_alert": "Perimeter intrusion",
+        "intrusion_breach": "Perimeter intrusion",
+        "face_watchlist_match": "Face watchlist match",
+        "vessel_proximity": "Vessel convergence",
         "vehicle_detected": "Vehicle of interest",
         "abandoned_object": "Unattended / Abandoned Object",
         "suspicious_loitering": "Suspicious Loitering",
@@ -329,112 +150,274 @@ def _event_type_label(event_type: str) -> str:
     return labels.get(event_type, f"Confirmed {event_type.replace('_', ' ')}")
 
 
-async def _sync_once():
-    global _last_sync_ts
-    
-    since = _last_sync_ts or (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    
+def _epoch_to_iso(value) -> Optional[str]:
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{ANALYTICS_BASE}/events/confirmed",
-                params={"since": since, "limit": 100}
-            )
-            if resp.status_code != 200:
-                logger.warning("Evidence sync: gateway returned %d", resp.status_code)
-                return
-            data = resp.json()
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _parse_attrs(raw) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            return {}
+    return {}
+
+
+def build_evidence_fields(ev: dict) -> dict:
+    """Evidence column values from one confirmed event (no I/O). `objects` are source objects."""
+    attrs = _parse_attrs(ev.get("attributes"))
+    block = attrs.get("evidence") if isinstance(attrs.get("evidence"), dict) else None
+    drone_id = ev.get("drone_id", "") or ""
+    mission_id = str(ev.get("mission_id") or attrs.get("mission_id") or "")
+    if not mission_id and drone_id.startswith("DRN-MSN-"):
+        mission_id = drone_id[4:]
+    event_type = ev.get("event_type", "unknown") or "unknown"
+    ts = str(ev.get("ts", ""))
+    geo = (block or {}).get("geo") or {}
+    frame = (block or {}).get("frame") or {}
+    return {
+        "event_type": event_type,
+        "drone_id": drone_id,
+        "mission_id": mission_id,
+        "confidence": float(ev.get("confidence") or 0),
+        "ts": ts,
+        "capture_ts": _epoch_to_iso(frame.get("capture_ts")) or ts,
+        "lat": ev.get("latitude") if ev.get("latitude") is not None else geo.get("lat"),
+        "lon": ev.get("longitude") if ev.get("longitude") is not None else geo.get("lon"),
+        "severity": (str(attrs["severity"]).lower() if attrs.get("severity")
+                     else _DEFAULT_SEVERITY.get(event_type)),
+        "model_info": (block or {}).get("model") or None,
+        "attributes": attrs,
+        "objects": list((block or {}).get("objects") or []),
+        "has_block": block is not None,
+        "duration_s": int(attrs.get("duration_s") or attrs.get("dwell_duration_s") or 0),
+    }
+
+
+async def _jurisdiction_for(session, mission_id: str) -> str:
+    if mission_id:
+        res = await session.execute(select(Mission.jurisdiction).where(Mission.mission_id == mission_id))
+        jur = res.scalar_one_or_none()
+        if jur:
+            return jur
+    return "Thiruvananthapuram"
+
+
+def _apply_vault_result(row: Evidence, vault_objects: List[Dict], status: str, integrity: str) -> None:
+    row.objects = vault_objects
+    row.vault_status = status
+    row.integrity = integrity
+    row.integrity_checked_at = datetime.now(timezone.utc).isoformat()
+    primary = next((o for o in vault_objects if o.get("role") == "primary"), None)
+    secondary = next((o for o in vault_objects if o.get("role") == "secondary"), None)
+    # Old columns kept so the current UI keeps working (filled from objects)
+    row.primary_image_key = primary["key"] if primary else ""
+    row.thumbnail = row.primary_image_key
+    row.image_bucket = primary["bucket"] if primary else ""
+    row.secondary_image_key = secondary["key"] if secondary else ""
+
+
+def _evidence_dict(row: Evidence) -> dict:
+    return {c.name: getattr(row, c.name) for c in row.__table__.columns}
+
+
+async def create_evidence(session, ev: dict) -> Evidence:
+    """Create (but not commit) the Evidence row for one event, with its vault copy."""
+    event_id = str(ev.get("event_id", ""))
+    f = build_evidence_fields(ev)
+    objects = f["objects"]
+    if not f["has_block"]:
+        objects = await _legacy_objects(f["event_type"], event_id, str(ev.get("track_id") or ""))
+    image_match = "exact" if objects else "none"
+
+    evidence_id = f"EVI-{uuid.uuid4().hex[:12]}"
+    retain_until = datetime.now(timezone.utc) + timedelta(days=EVIDENCE_RETENTION_DAYS)
+    row = Evidence(
+        id=evidence_id,
+        label=f"{_event_type_label(f['event_type'])} — {f['drone_id']}",
+        mission_id=f["mission_id"],
+        jurisdiction=await _jurisdiction_for(session, f["mission_id"]),
+        drone_id=f["drone_id"],
+        event_type=f["event_type"],
+        confidence=f["confidence"],
+        duration_s=f["duration_s"],
+        ts=f["ts"],
+        capture_ts=f["capture_ts"],
+        lat=f["lat"],
+        lon=f["lon"],
+        severity=f["severity"],
+        model_info=f["model_info"],
+        attributes=f["attributes"],
+        image_match=image_match,
+        legal_hold=False,
+        retention_until=retain_until.isoformat(),
+        source_event_id=event_id,
+        status="active",
+    )
+    try:
+        vault_objects, status, integrity = await asyncio.to_thread(
+            evidence_vault.copy_into_vault, evidence_id, objects, retain_until, False)
     except Exception as exc:
-        logger.debug("Evidence sync: gateway unreachable: %s", exc)
-        return
-    
-    events = data.get("events", [])
-    if not events:
-        return
-    
-    created = 0
+        logger.error("Vault copy for %s failed: %s", evidence_id, exc)
+        vault_objects = [dict(o, copy="pending", source={"bucket": o.get("bucket"), "key": o.get("key"),
+                                                          "sha256": o.get("sha256")}) for o in objects]
+        status, integrity = ("failed" if objects else "none"), "unverified"
+    _apply_vault_result(row, vault_objects, status, integrity)
+    row.record_sha256 = record_sha256(_evidence_dict(row))
+    session.add(row)
+    return row
+
+
+async def _audit_evidence(row: Evidence, action: str, details: str) -> None:
+    await write_audit_v2(
+        actor=SYSTEM_ACTOR,
+        action=action,
+        category="evidence",
+        target=row.id, target_type="evidence", target_id=row.id, target_name=row.label or "",
+        details=details,
+        after_values={
+            "record_sha256": row.record_sha256,
+            "source_event_id": row.source_event_id,
+            "objects": [{"role": o.get("role"), "key": o.get("key"), "sha256": o.get("sha256")}
+                        for o in (row.objects or [])],
+            "vault_status": row.vault_status,
+            "integrity": row.integrity,
+        },
+        source_module="evidence_sync",
+    )
+
+
+# ── Cursor + paging ───────────────────────────────────────────────────────────
+async def _load_cursor(session) -> Tuple[str, str]:
+    state = await session.get(EvidenceSyncState, 1)
+    if state and state.last_ts:
+        return state.last_ts, state.last_event_id or ""
+    return (datetime.now(timezone.utc) - _INITIAL_LOOKBACK).isoformat(), ""
+
+
+async def _save_cursor(session, ts: str, event_id: str) -> None:
+    state = await session.get(EvidenceSyncState, 1)
+    now = datetime.now(timezone.utc).isoformat()
+    if state is None:
+        session.add(EvidenceSyncState(id=1, last_ts=ts, last_event_id=event_id, updated_at=now))
+    else:
+        state.last_ts, state.last_event_id, state.updated_at = ts, event_id, now
+
+
+def _ts_key(ts: str) -> datetime:
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+async def _fetch_page(client: httpx.AsyncClient, after_ts: str, after_id: str) -> Optional[List[dict]]:
+    resp = await client.get(
+        f"{ANALYTICS_BASE}/events/confirmed",
+        params={"order": "asc", "after_ts": after_ts, "after_id": after_id, "limit": _PAGE_SIZE},
+        headers=_service_headers(),
+    )
+    if resp.status_code != 200:
+        logger.warning("Evidence sync: gateway returned %d", resp.status_code)
+        return None
+    return resp.json().get("events", [])
+
+
+async def _sync_once() -> int:
+    """One sync pass. Returns the number of evidence rows created."""
     async with async_session_factory() as session:
-        for ev in events:
-            event_id = str(ev.get("event_id", ""))
-            if not event_id:
+        cursor_ts, cursor_id = await _load_cursor(session)
+
+    after_ts = (_ts_key(cursor_ts) - _OVERLAP).isoformat()
+    after_id = ""
+    newest = (cursor_ts, cursor_id)
+    created_rows: List[Evidence] = []
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            for _ in range(_MAX_PAGES_PER_RUN):
+                events = await _fetch_page(client, after_ts, after_id)
+                if not events:
+                    break
+                async with async_session_factory() as session:
+                    for ev in events:
+                        event_id = str(ev.get("event_id", ""))
+                        if not event_id:
+                            continue
+                        exists = await session.execute(
+                            select(Evidence.id).where(Evidence.source_event_id == event_id))
+                        if exists.scalar_one_or_none() is None:
+                            created_rows.append(await create_evidence(session, ev))
+                        key = (str(ev.get("ts", "")), event_id)
+                        if (_ts_key(key[0]), key[1]) > (_ts_key(newest[0]), newest[1]):
+                            newest = key
+                    await _save_cursor(session, newest[0], newest[1])
+                    await session.commit()
+                last = events[-1]
+                after_ts, after_id = str(last.get("ts", "")), str(last.get("event_id", ""))
+                if len(events) < _PAGE_SIZE:
+                    break
+    except httpx.HTTPError as exc:
+        logger.debug("Evidence sync: gateway unreachable: %s", exc)
+
+    for row in created_rows:
+        try:
+            await _audit_evidence(row, "evidence_create",
+                                  f"From confirmed event {row.source_event_id} ({row.event_type}); "
+                                  f"image_match={row.image_match}")
+        except Exception as exc:
+            logger.error("Audit entry for %s failed: %s", row.id, exc)
+    if created_rows:
+        logger.info("Evidence sync: created %d evidence rows", len(created_rows))
+    return len(created_rows)
+
+
+async def _retry_vault_copies() -> None:
+    """Retry vault copies that failed (MinIO briefly down). Source objects expire in 3–14 days."""
+    retried = []
+    async with async_session_factory() as session:
+        res = await session.execute(
+            select(Evidence).where(Evidence.vault_status == "failed", Evidence.status == "active")
+            .order_by(Evidence.ts.desc()).limit(_VAULT_RETRY_BATCH))
+        for row in res.scalars().all():
+            sources = [dict(o.get("source") or {}, role=o.get("role"), kind=o.get("kind"),
+                            content_type=o.get("content_type")) for o in (row.objects or [])]
+            sources = [s for s in sources if s.get("bucket") and s.get("key")]
+            try:
+                vault_objects, status, integrity = await asyncio.to_thread(
+                    evidence_vault.copy_into_vault, row.id, sources,
+                    _ts_key(row.retention_until or ""), bool(row.legal_hold))
+            except Exception as exc:
+                logger.debug("Vault retry for %s failed: %s", row.id, exc)
                 continue
-            
-            # Check if already synced (dedup on source_event_id)
-            existing = await session.execute(
-                select(Evidence).where(Evidence.source_event_id == event_id)
-            )
-            if existing.scalar_one_or_none():
+            if status == "failed":
                 continue
-            
-            # Determine thumbnail from attributes
-            attrs = ev.get("attributes") or {}
-            if isinstance(attrs, str):
-                try:
-                    import json
-                    attrs = json.loads(attrs)
-                except Exception:
-                    attrs = {}
-            
-            drone_id = ev.get("drone_id", "")
-            mission_id = str(ev.get("mission_id", "")) if ev.get("mission_id") else ""
-            if not mission_id and drone_id.startswith("DRN-MSN-"):
-                mission_id = drone_id[4:]
-            
-            # Enrich jurisdiction from mission or default to Thiruvananthapuram
-            jurisdiction = "Thiruvananthapuram"
-            if mission_id:
-                msn_res = await session.execute(
-                    select(Mission.jurisdiction).where(Mission.mission_id == mission_id)
-                )
-                m_jur = msn_res.scalar_one_or_none()
-                if m_jur:
-                    jurisdiction = m_jur
-            
-            event_type = ev.get("event_type", "unknown")
-            confidence = float(ev.get("confidence", 0))
-            ts = str(ev.get("ts", ""))
-            
-            primary_key, secondary_key, bucket = await _resolve_image_keys(
-                event_type, event_id, str(ev.get("track_id", "")), drone_id, ts, mission_id
-            )
-            
-            evidence_row = Evidence(
-                id=f"EVI-{uuid.uuid4().hex[:8]}",
-                label=f"{_event_type_label(event_type)} — {drone_id}",
-                mission_id=mission_id,
-                jurisdiction=jurisdiction,
-                drone_id=drone_id,
-                event_type=event_type,
-                confidence=confidence,
-                duration_s=int(attrs.get("duration_s", 0)),
-                primary_image_key=primary_key,
-                image_bucket=bucket,
-                secondary_image_key=secondary_key,
-                thumbnail=primary_key,
-                ts=ts,
-                legal_hold=False,
-                retention_until=(datetime.now(timezone.utc) + timedelta(days=90)).isoformat(),
-                source_event_id=event_id,
-            )
-            session.add(evidence_row)
-            created += 1
-        
-        if created:
+            _apply_vault_result(row, vault_objects, status, integrity)
+            row.record_sha256 = record_sha256(_evidence_dict(row))
+            retried.append(row)
+        if retried:
             await session.commit()
-            logger.info("Evidence sync: created %d new evidence rows", created)
-    
-    # Update last sync timestamp to the newest event's ts
-    newest_ts = max((e.get("ts", "") for e in events), default="")
-    if newest_ts:
-        _last_sync_ts = str(newest_ts)
+    for row in retried:
+        await _audit_evidence(row, "evidence_vault_copy", f"Vault copy completed on retry: {row.vault_status}")
 
 
 async def _evidence_sync_loop():
     """Background loop that runs evidence sync every 30s."""
     logger.info("Evidence sync started (interval=%ds)", _SYNC_INTERVAL_S)
+    try:
+        await asyncio.to_thread(evidence_vault.ensure_vault)
+    except Exception as exc:
+        logger.error("Evidence vault not ready (will retry per copy): %s", exc)
     while True:
         try:
             await _sync_once()
+            await _retry_vault_copies()
         except Exception as exc:
             logger.error("Evidence sync error: %s", exc)
         await asyncio.sleep(_SYNC_INTERVAL_S)

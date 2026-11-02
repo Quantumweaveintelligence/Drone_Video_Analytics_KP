@@ -1,7 +1,7 @@
 import React from "react";
 import { useCommand } from "@/context/CommandContext";
 import { useAuth } from "@/context/AuthContext";
-import { API } from "@/lib/api";
+import { downloadSigned } from "@/lib/api";
 import { ExternalLink, FileText, Download } from "lucide-react";
 
 export default function ExportsPage() {
@@ -73,13 +73,14 @@ export default function ExportsPage() {
                       </div>
                     )}
                     {x.status === "approved" && ["control_room_officer", "senior_officer"].includes(user?.role) && (
-                      <a
+                      <button
+                        type="button"
                         data-testid={`bundle-${x.id}`}
-                        href={`${API}/exports/${x.id}/bundle?token=${encodeURIComponent(localStorage.getItem("dvas_token") || "")}`}
+                        onClick={() => downloadSigned("bundle", x.id).catch((e) => alert(e.response?.data?.detail || "Download failed"))}
                         className="px-2 py-1 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 inline-flex items-center gap-1 rounded text-[10px]"
                       >
-                        <ExternalLink size={12} /> 65B Bundle
-                      </a>
+                        <ExternalLink size={12} /> Evidence Bundle
+                      </button>
                     )}
                   </td>
                 </tr>

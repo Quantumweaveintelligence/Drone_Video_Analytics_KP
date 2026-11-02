@@ -11,6 +11,7 @@ from sqlalchemy import select, update
 from database import async_session_factory
 from models import Drone, ModelConfig
 from core.security import get_current_user, require_roles, _row_to_dict
+from core.config import PII_VIEW_ROLES
 from core.config import (
     CROWD_URL, PERSON_URL, VEHICLE_URL, ANPR_URL, INTRUSION_URL, VESSEL_URL, ANOMALY_URL,
     MINIO_PROXY_ENDPOINT, MINIO_PROXY_ACCESS, MINIO_PROXY_SECRET, MINIO_PROXY_SECURE,
@@ -477,23 +478,32 @@ async def infra_overview(user: dict = Depends(require_roles("system_administrato
     }
 
 
+# Live analytics buckets the analytics pages may show (evidence copies are served only by
+# GET /api/evidence/{id}/objects/{role}; the vault is never reachable here — E5)
+_PROXY_BUCKETS = {
+    "dvas-plates", "dvas-vehicles", "dvas-evidence", "dvas-faces",
+    "dvas-heatmaps", "dvas-intrusion", "dvas-watchlist", "dvas-vessels-maritime",
+    "dvas-anomaly"
+}
+_PROXY_PII_BUCKETS = {"dvas-faces", "dvas-plates", "dvas-watchlist"}
+
+
 @router.get("/minio/image")
-async def minio_image_proxy(bucket: str, key: str, _user=Depends(get_current_user)):
+async def minio_image_proxy(bucket: str, key: str, user=Depends(get_current_user)):
     """
     Securely proxy MinIO object downloads through the backend.
     Requires authentication — no direct MinIO exposure to browsers.
+    Face / plate / watchlist images only for PII_VIEW_ROLES (Q5); short private cache.
     """
     if not bucket or not key:
         raise HTTPException(status_code=400, detail="bucket and key are required")
 
-    # Security: only allow known buckets
-    ALLOWED_BUCKETS = {
-        "dvas-plates", "dvas-vehicles", "dvas-evidence", "dvas-faces",
-        "dvas-heatmaps", "dvas-intrusion", "dvas-watchlist", "dvas-vessels-maritime",
-        "dvas-anomaly"
-    }
-    if bucket not in ALLOWED_BUCKETS:
+    if bucket not in _PROXY_BUCKETS:
         raise HTTPException(status_code=403, detail=f"Bucket '{bucket}' not allowed")
+    if bucket in _PROXY_PII_BUCKETS and user.get("role") not in PII_VIEW_ROLES:
+        raise HTTPException(status_code=403, detail="Face and plate images are restricted for this role")
+    if user.get("role") == "drone_operator" and bucket == "dvas-evidence":
+        raise HTTPException(status_code=403, detail="Not permitted")
 
     # Sanitize key to prevent path traversal
     if ".." in key or key.startswith("/"):
@@ -520,7 +530,7 @@ async def minio_image_proxy(bucket: str, key: str, _user=Depends(get_current_use
             content=img_bytes,
             media_type=ct,
             headers={
-                "Cache-Control": "public, max-age=86400",  # cache images for 24h
+                "Cache-Control": "private, max-age=60",
                 "X-Content-Type-Options": "nosniff",
             },
         )

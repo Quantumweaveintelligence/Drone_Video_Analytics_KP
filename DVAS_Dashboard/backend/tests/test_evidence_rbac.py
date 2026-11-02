@@ -69,6 +69,10 @@ class FakeSession:
         self.db.statements.append(stmt)
         return 0
 
+    async def get(self, model, key):
+        rows = self.db.results.pop(0) if self.db.results else []
+        return rows[0] if rows else None
+
     def add(self, obj):
         self.db.added.append(obj)
 
@@ -152,11 +156,12 @@ def test_delete_evidence_rejects_short_reason(db, audit):
 
 
 def test_delete_evidence_with_reason_is_audited(db, audit):
-    db.results = [[evidence()]]
+    ev = evidence()
+    db.results = [[ev]]
     reason = "Duplicate capture confirmed by the investigating officer"
     r = make_client(SENIOR).request("DELETE", "/api/evidence/EV1", json={"reason": reason})
     assert r.status_code == 200
-    assert len(db.deleted) == 1
+    assert ev.status == "disposed" and db.deleted == []      # E2: disposal, never a hard delete
     assert audit[0]["action"] == "evidence_delete"
     assert reason in audit[0]["details"]
     assert audit[0]["before_values"]["id"] == "EV1"
@@ -192,18 +197,19 @@ def _approved_export():
     return Export(id="X1", evidence_id="EV1", evidence_label="Person", jurisdiction="Kochi",
                   requested_by="cro@test", requested_at="2026-11-01T00:00:00+00:00",
                   justification="court", status="approved", decision_by="sr@test",
-                  decision_at="2026-11-01T01:00:00+00:00")
+                  decision_at="2026-11-01T01:00:00+00:00",
+                  bundle_key="exports/X1/bundle.zip", bundle_sha256="abc")
 
 
 @pytest.fixture
 def bundle_deps(monkeypatch, audit):
-    monkeypatch.setattr(alerts, "_make_65b_pdf", lambda *a: b"%PDF-1.4 test")
-    monkeypatch.setattr(alerts, "_get_minio_client", lambda: None)
+    # The bundle is already built (E4); these tests cover who may download it
+    monkeypatch.setattr(alerts, "read_bundle", lambda exp: b"PK-zip")
 
 
 def test_bundle_senior_via_query_token(db, bundle_deps, token_roles):
     token_roles(["supervisor"], "sr@test")
-    db.results = [[], [_approved_export()], [evidence()]]   # [] = user hydration lookup
+    db.results = [[], [_approved_export()]]   # [] = user hydration lookup, then the export
     r = make_client().get("/api/exports/X1/bundle?token=t")
     assert r.status_code == 200
     assert r.headers["content-type"] == "application/zip"
@@ -306,7 +312,5 @@ def test_image_resolution_skipped_without_analytics_db_url(monkeypatch, caplog):
     monkeypatch.setattr(evidence_sync, "_warned_no_analytics_db", False)
     monkeypatch.setattr(evidence_sync.asyncpg, "connect", _never)
     for _ in range(2):
-        keys = asyncio.run(evidence_sync._resolve_image_keys(
-            "person_detected", "e1", "", "D1", "2026-11-01T00:00:00+00:00"))
-        assert keys == ("", "", "")
+        assert asyncio.run(evidence_sync._legacy_objects("person_detected", "e1", "")) == []
     assert sum("ANALYTICS_DATABASE_URL" in r.message for r in caplog.records) == 1

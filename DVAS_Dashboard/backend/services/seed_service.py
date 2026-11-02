@@ -62,6 +62,25 @@ SEED_USERS = [
 ]
 
 
+# Idempotent schema migrations for tables the ORM already creates on a fresh DB.
+# They run right after create_all, before any request, so the ORM's new columns
+# exist on old databases too (create_all never adds columns to existing tables).
+STARTUP_MIGRATIONS = ("evidence_v2.sql", "evidence_v3_integrity.sql", "exports_v2.sql")
+_MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "migrations")
+
+
+async def _apply_startup_migrations(conn) -> None:
+    if conn.dialect.name != "postgresql":
+        return
+    raw = await conn.get_raw_connection()
+    for name in STARTUP_MIGRATIONS:
+        with open(os.path.join(_MIGRATIONS_DIR, name), encoding="utf-8") as fh:
+            sql = fh.read()
+        # asyncpg simple-query protocol: the whole multi-statement file in one call
+        await raw.driver_connection.execute(sql)
+        logger.info("Startup migration applied: %s", name)
+
+
 def _seed_demo_enabled() -> bool:
     """Demo missions/drones/evidence/audit rows on an empty DB. DVAS_SEED_DEMO=0 disables them."""
     return os.environ.get("DVAS_SEED_DEMO", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -83,6 +102,7 @@ async def seed_data():
                 END IF;
             END $$;
         """))
+        await _apply_startup_migrations(conn)
 
     async with async_session_factory() as session:
         user_ids_by_email = {u["email"]: "seed-id" for u in SEED_USERS}

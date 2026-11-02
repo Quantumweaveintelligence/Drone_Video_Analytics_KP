@@ -31,6 +31,7 @@ from shared.redis_client import (
     get_latest_stream_frame,
 )
 from shared import minio_client as minio
+from shared.evidence import ThresholdGate, evidence_block, frame_context, model_info
 from crowd.analyzer import CrowdAnalyzer
 from crowd.stream_policy import FrameRateCap, is_cuda_failure, parse_mission_id
 from crowd.schema import CrowdAnalysisResult, StreamStatus, CrowdTimelineItem, ModelSwitchRequest, ModelInfo, SessionSummary
@@ -75,6 +76,9 @@ _frames_processed = 0
 _rate_cap = FrameRateCap(cfg.CROWD_MAX_FPS)
 _frames_skipped = 0                    # frames ACKed without inference (rate cap)
 HEATMAP_EVERY_N_FRAMES = 10            # heatmap PNG/base64 is only uploaded every Nth frame
+# One crowd_threshold event per surge (B29): re-armed after the count falls below
+# 0.8 x threshold and 60 s have passed — not one event per analysed frame.
+_surge_gate = ThresholdGate(cooldown_s=60.0, rearm_ratio=0.8)
 
 # ── Annotated-feed recovery (RunPod plan F21 / Phase-26 parity) ───────────────
 LIVE_FRAME_MAX_AGE_S = 6.0             # older cached frames are reported as offline
@@ -222,7 +226,8 @@ async def _process_crowd_frame(drone_id: str, f: dict) -> None:
         log.debug("Undecodable frame for %s skipped", drone_id)
         return
 
-    mission_id = parse_mission_id(f)
+    ctx = frame_context(f)
+    mission_id = ctx["mission_id"] or parse_mission_id(f)
     want_heatmap = _frames_processed % HEATMAP_EVERY_N_FRAMES == 0
 
     # Run inference in worker thread pool so FastAPI event loop is never blocked
@@ -236,14 +241,16 @@ async def _process_crowd_frame(drone_id: str, f: dict) -> None:
     ts = datetime.now(timezone.utc)
 
     heatmap_key = None
+    heatmap_obj = None
     if want_heatmap and result.get("heatmap_b64"):
         heatmap_bytes = base64.b64decode(result["heatmap_b64"])
         key = minio.make_key("heatmaps", drone_id,
                              f"heatmap_{int(ts.timestamp()*1000)}.png",
                              mission_id=mission_id)
-        heatmap_key = await minio.upload_bytes(
-            cfg.BUCKET_HEATMAPS, key, heatmap_bytes, "image/png"
+        heatmap_obj = await minio.upload_object(
+            cfg.BUCKET_HEATMAPS, key, heatmap_bytes, "image/png", kind="heatmap"
         )
+        heatmap_key = heatmap_obj["key"] if heatmap_obj else None
 
     await write_crowd_reading(
         drone_id=drone_id,
@@ -252,17 +259,32 @@ async def _process_crowd_frame(drone_id: str, f: dict) -> None:
         heatmap_object_key=heatmap_key,
     )
 
-    if result["alert_triggered"]:
+    threshold = analyzer.alert_threshold
+    if _surge_gate.update(drone_id, result["estimated_count"], threshold):
+        # Evidence = the frame exactly as received, uploaded BEFORE the event is written
+        stamp = int(ts.timestamp() * 1000)
+        objects = [await minio.upload_object(
+            cfg.BUCKET_EVIDENCE,
+            minio.make_key("crowd", drone_id, f"surge_{stamp}.jpg", mission_id=mission_id),
+            img_bytes, "image/jpeg", kind="source_frame")]
+        objects.append(heatmap_obj)        # None (no heatmap this frame) is dropped
+        attrs = {
+            "estimated_count": result["estimated_count"],
+            "density_label":   result["density_label"],
+            "threshold":       threshold,
+            "mission_id":      mission_id or None,
+            "evidence": evidence_block(objects, ctx, model=model_info("crowd", analyzer._model_path or "")),
+        }
+        geo = ctx["geo"] or {}
         event_id = await write_confirmed_event(
             drone_id=drone_id,
             event_type="crowd_threshold",
-            confidence=min(result["estimated_count"] / 200, 1.0),
+            confidence=min(result["estimated_count"] / max(threshold, 1), 1.0),
             ts=ts,
-            attributes={
-                "estimated_count": result["estimated_count"],
-                "density_label":   result["density_label"],
-                "mission_id":      mission_id or None,
-            },
+            attributes=attrs,
+            mission_id=mission_id,
+            latitude=geo.get("lat"),
+            longitude=geo.get("lon"),
         )
         await publish_confirmed_event({
             "event_id":   event_id,

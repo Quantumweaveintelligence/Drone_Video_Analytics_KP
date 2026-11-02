@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import AsyncGenerator, Dict, Any, Optional
 
 import httpx
-from fastapi import Depends, FastAPI, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, PlainTextResponse
 
@@ -230,38 +230,65 @@ async def dashboard_live():
     }
 
 
-@app.get("/events/confirmed")
+@app.get("/events/confirmed", dependencies=[Depends(verify_service_key)])
 async def list_confirmed_events(
     since: str = "",
     drone_id: str = "",
     limit: int = 100,
+    after_ts: str = "",
+    after_id: str = "",
+    order: str = "desc",
 ):
-    """List recent confirmed events for evidence sync pipeline."""
+    """List confirmed events for the evidence sync pipeline.
+
+    Cursor paging (evidence plan E1): order=asc with after_ts/after_id returns
+    events with (ts, event_id) > (after_ts, after_id), oldest first, so a caller
+    can page until empty without losing events that share a timestamp.
+    Without them the old behaviour (newest first, optional `since`) is unchanged.
+    `mission_id` is the text mission id when the analyzer wrote one.
+    """
     pool = await get_pool()
-    
-    query = "SELECT event_id::text, mission_id::text, drone_id, track_id::text, event_type, confidence, ts, latitude, longitude, attributes::text, status, created_at FROM confirmed_events"
+    limit = max(1, min(int(limit), 500))
+
+    query = (
+        "SELECT event_id::text, COALESCE(mission_id_str, mission_id::text) AS mission_id, drone_id, "
+        "track_id::text, event_type, confidence, ts, latitude, longitude, zone_ref, "
+        "attributes::text, status, created_at FROM confirmed_events"
+    )
     params = []
     conditions = []
-    
-    if since:
+
+    def _parse_ts(value: str):
         try:
-            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
         except (ValueError, TypeError):
-            since_dt = datetime.now(timezone.utc)
+            return None
+
+    if since:
+        since_dt = _parse_ts(since) or datetime.now(timezone.utc)
         conditions.append(f"ts >= ${len(params) + 1}::timestamptz")
         params.append(since_dt)
+    if after_ts:
+        after_dt = _parse_ts(after_ts)
+        if after_dt is None:
+            raise HTTPException(400, "after_ts must be ISO-8601")
+        conditions.append(
+            f"(ts, event_id) > (${len(params) + 1}::timestamptz, ${len(params) + 2}::uuid)"
+        )
+        params.extend([after_dt, after_id or "00000000-0000-0000-0000-000000000000"])
     if drone_id:
         conditions.append(f"drone_id = ${len(params) + 1}")
         params.append(drone_id)
-    
+
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
-    
-    query += f" ORDER BY ts DESC LIMIT ${len(params) + 1}"
+
+    direction = "ASC" if order.lower() == "asc" else "DESC"
+    query += f" ORDER BY ts {direction}, event_id {direction} LIMIT ${len(params) + 1}"
     params.append(limit)
-    
+
     rows = await pool.fetch(query, *params)
-    
+
     events = []
     for r in rows:
         d = dict(r)
@@ -279,7 +306,7 @@ async def list_confirmed_events(
             except Exception:
                 pass
         events.append(d)
-    
+
     return {"events": events, "count": len(events)}
 
 

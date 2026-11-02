@@ -38,6 +38,15 @@ export const resolveMinioImageUrl = (key, explicitBucket = "") => {
   return `/api/minio/image?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(cleanKey)}${tokenParam}`;
 };
 
+/**
+ * Download a file through a single-use, 60-second signed link (evidence plan E5):
+ * kind = "bundle" | "report" | "evidence_object". No token is put in the URL.
+ */
+export const downloadSigned = async (kind, id, role) => {
+  const res = await api.post("/downloads", { kind, id, role });
+  window.location.assign(`${BACKEND_URL}${res.data.url}`);
+};
+
 export const getAuthHeaders = () => {
   const token = getAuthToken();
   return token ? { Authorization: `Bearer ${token}` } : {};

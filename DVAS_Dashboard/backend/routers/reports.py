@@ -20,6 +20,7 @@ from services.pdf_service import (
     _make_mission_aar_pdf,
 )
 from core.analytics_client import _get_minio_client
+from services.evidence_integrity import sha256_hex
 
 router = APIRouter(prefix="/api", tags=["Reports"])
 logger = logging.getLogger("dvas")
@@ -137,6 +138,7 @@ async def _generate_report_task(report_id: str, report_type: str, params: dict, 
                     status="ready",
                     file_key=file_key,
                     file_size_bytes=len(pdf_bytes),
+                    sha256=sha256_hex(pdf_bytes),        # E3
                     generated_at=now_str
                 )
             )
@@ -244,9 +246,12 @@ async def get_report(report_id: str, user: dict = Depends(require_roles("control
 
 
 @router.get("/reports/{report_id}/download")
-async def download_report(report_id: str, request: Request, token: str = ""):
+async def download_report(report_id: str, request: Request):
     user = await get_current_user(request)
+    return await stream_report(report_id, user, request)
 
+
+async def stream_report(report_id: str, user: dict, request) -> StreamingResponse:
     # Only senior_officer can download reports directly
     if user.get("role") not in ("senior_officer", "system_administrator"):
         raise HTTPException(403, "Only Senior Officers can download reports directly")
@@ -278,22 +283,30 @@ async def download_report(report_id: str, request: Request, token: str = ""):
         
     if not pdf_bytes:
         raise HTTPException(404, "Report file not found")
-        
+
+    digest = sha256_hex(pdf_bytes)
+    if rep.get("sha256") and rep["sha256"] != digest:
+        await write_audit_v2(actor=user, action="report_download", severity="critical", target=report_id,
+                             target_type="report", target_id=report_id, status="failure",
+                             details="Stored report does not match its SHA-256", request=request)
+        raise HTTPException(409, "Stored report failed its integrity check")
     await write_audit_v2(
         actor=user,
         action="report_download",
         target=report_id,
         target_type="report",
         target_id=report_id,
-        details="Downloaded PDF",
+        details=f"Downloaded PDF {digest}",
+        after_values={"sha256": digest},
         source_endpoint="GET /api/reports/{id}/download",
         request=request
     )
-    
+
     return StreamingResponse(
         io.BytesIO(pdf_bytes),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{report_id}.pdf"'}
+        headers={"Content-Disposition": f'attachment; filename="{report_id}.pdf"',
+                 "X-Content-SHA256": digest, "Cache-Control": "private, no-store"}
     )
 
 

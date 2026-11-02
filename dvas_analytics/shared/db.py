@@ -162,17 +162,31 @@ async def write_confirmed_event(
     ts,
     track_id: Optional[str] = None,
     attributes: Optional[Dict] = None,
+    mission_id: Optional[str] = None,
+    zone_ref: Optional[str] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    event_id: Optional[str] = None,
 ) -> str:
+    """Insert one confirmed event (an incident, not a detection — B29).
+
+    event_id: pass the id of the module row (intrusion/anomaly/vessel event) so
+    the confirmed event, the module row and the Valkey message share one id.
+    track_id must be a tracks.track_id UUID; integer tracker ids go in attributes.
+    """
+    await ensure_drone(drone_id)      # confirmed_events.drone_id → drones FK
     pool = await get_pool()
-    event_id = str(uuid.uuid4())
+    event_id = event_id or str(uuid.uuid4())
     await pool.execute(
         """
         INSERT INTO confirmed_events
-            (event_id, drone_id, event_type, confidence, ts, track_id, attributes)
-        VALUES ($1::uuid, $2, $3, $4, $5, $6::uuid, $7::jsonb)
+            (event_id, drone_id, event_type, confidence, ts, track_id, attributes,
+             mission_id_str, zone_ref, latitude, longitude)
+        VALUES ($1::uuid, $2, $3, $4, $5, $6::uuid, $7::jsonb, $8, $9, $10, $11)
         """,
-        event_id, drone_id, event_type, confidence, ts,
-        track_id, json.dumps(attributes or {}),
+        event_id, drone_id, event_type, max(0.0, min(1.0, float(confidence or 0))), ts,
+        track_id, json.dumps(attributes or {}, default=str),
+        mission_id or None, zone_ref, latitude, longitude,
     )
     return event_id
 

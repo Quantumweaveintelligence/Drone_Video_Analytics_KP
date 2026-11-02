@@ -36,6 +36,7 @@ from shared.redis_client import (
     scan_active_stream_drones, get_latest_stream_frame,
 )
 from shared import minio_client as minio
+from shared.evidence import EventGate, bbox_xyxy, evidence_block, frame_context, model_info
 from anpr.analyzer import ANPRAnalyzer
 from anpr.schema import ANPRFrameResult, WatchlistEntry, TheftAlert
 
@@ -64,6 +65,8 @@ analyzer: Optional[ANPRAnalyzer] = None
 _stream_task: Optional[asyncio.Task] = None
 _stream_running = False
 _watchlist_task: Optional[asyncio.Task] = None
+# One theft_alert per plate per mission per 5 min (B29), not one per frame
+_theft_gate = EventGate(cooldown_s=300.0)
 WATCHLIST_REFRESH_S = 60.0   # picks up rows changed in the DB or expired
 _frames_processed = 0
 
@@ -487,6 +490,7 @@ async def _stream_loop():
                             tracker_id=tracker_id, mission_id=frame_mission_id
                         )
                         plate_image_key = None
+                        plate_obj = None
                         plate_crop_b64  = plate.get("plate_crop_b64")
                         if plate_crop_b64:
                             plate_bytes_data = base64.b64decode(plate_crop_b64)
@@ -496,12 +500,14 @@ async def _stream_loop():
                                 f"plate_{plate_name_part}_{int(ts.timestamp()*1000)}.jpg",
                                 mission_id=frame_mission_id or "",
                             )
-                            plate_image_key = await minio.upload_bytes(
-                                cfg.BUCKET_PLATES, key, plate_bytes_data, "image/jpeg"
+                            plate_obj = await minio.upload_object(
+                                cfg.BUCKET_PLATES, key, plate_bytes_data, "image/jpeg", kind="plate_crop"
                             )
+                            plate_image_key = plate_obj["key"] if plate_obj else None
 
                         # Upload vehicle image if available
                         vehicle_image_key = None
+                        vehicle_obj = None
                         veh_img_b64 = plate.get("vehicle_image_b64")
                         if veh_img_b64:
                             veh_bytes_data = base64.b64decode(veh_img_b64)
@@ -510,9 +516,10 @@ async def _stream_loop():
                                 f"anpr_veh_{tracker_id}_{int(ts.timestamp()*1000)}.jpg",
                                 mission_id=frame_mission_id or "",
                             )
-                            vehicle_image_key = await minio.upload_bytes(
-                                cfg.BUCKET_VEHICLES, key, veh_bytes_data, "image/jpeg"
+                            vehicle_obj = await minio.upload_object(
+                                cfg.BUCKET_VEHICLES, key, veh_bytes_data, "image/jpeg", kind="vehicle_crop"
                             )
+                            vehicle_image_key = vehicle_obj["key"] if vehicle_obj else None
 
                         if plate_image_key or has_valid_plate:
                             await write_plate_read(
@@ -575,7 +582,8 @@ async def _stream_loop():
                                 mission_id=frame_mission_id,
                             )
 
-                        if plate.get("is_watchlisted"):
+                        if plate.get("is_watchlisted") and _theft_gate.allow(
+                                (plate["plate_text"], frame_mission_id or drone_id)):
                             pool = await get_pool()
                             await pool.execute(
                                 """
@@ -588,7 +596,41 @@ async def _stream_loop():
                                 plate["plate_text"], track_id, drone_id, ts,
                                 plate["ocr_confidence"], plate.get("vehicle_type", "unknown"),
                             )
+                            # Confirmed event (B28) with the exact crops; objects were uploaded above
+                            ctx = frame_context(f)
+                            geo = ctx["geo"] or {}
+                            wl_row = await pool.fetchrow(
+                                "SELECT reason, case_ref FROM plate_watchlist WHERE plate_text=$1",
+                                plate["plate_text"],
+                            )
+                            event_id = await write_confirmed_event(
+                                drone_id=drone_id,
+                                event_type="theft_alert",
+                                confidence=plate.get("ocr_confidence") or 0.0,
+                                ts=ts,
+                                track_id=track_id,
+                                attributes={
+                                    "plate_text":   plate["plate_text"],
+                                    "ocr_confidence": plate.get("ocr_confidence"),
+                                    "vehicle_type": plate.get("vehicle_type"),
+                                    "tracker_id":   tracker_id,
+                                    "watchlist_reason": wl_row["reason"] if wl_row else None,
+                                    "case_ref":     wl_row["case_ref"] if wl_row else None,
+                                    "mission_id":   frame_mission_id,
+                                    "evidence": evidence_block(
+                                        [vehicle_obj, plate_obj], ctx,
+                                        detection={"track_id": tracker_id, "class": "vehicle",
+                                                   "bbox_xyxy": bbox_xyxy(plate.get("vehicle_bbox")),
+                                                   "confidence": plate.get("ocr_confidence")},
+                                        model=model_info("anpr", LP_MODEL),
+                                    ),
+                                },
+                                mission_id=frame_mission_id,
+                                latitude=geo.get("lat"),
+                                longitude=geo.get("lon"),
+                            )
                             await publish_confirmed_event({
+                                "event_id":    event_id,
                                 "event_type":  "theft_alert",
                                 "drone_id":    drone_id,
                                 "mission_id":  frame_mission_id,
