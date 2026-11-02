@@ -39,6 +39,13 @@ PII_VIEW_ROLES = frozenset(
 # Analytics Postgres (asyncpg DSN). Set by dvas-init.sh on RunPod and by
 # docker-compose locally; empty → image resolution / mission discovery skipped.
 ANALYTICS_DATABASE_URL = os.getenv("ANALYTICS_DATABASE_URL", "")
+# Reports read the analytics DB through a SELECT-only role (R2 / Q6). New env var,
+# set by dvas-init.sh on RunPod; without it reports use ANALYTICS_DATABASE_URL with
+# read-only sessions.
+ANALYTICS_REPORT_DATABASE_URL = os.getenv("ANALYTICS_REPORT_DATABASE_URL", "")
+# Optional offline base map for report maps (R3 / Q7): an .mbtiles raster file. New env var.
+REPORT_BASEMAP_MBTILES = os.getenv("REPORT_BASEMAP_MBTILES", "")
+REPORTS_BUCKET = "dvas-reports"
 ANALYTICS_BASE = os.getenv("ANALYTICS_GATEWAY_URL", "http://analytics-gateway:8100")
 CROWD_URL = os.getenv("CROWD_ANALYTICS_URL", "http://crowd-analyzer:8101")
 PERSON_URL = os.getenv("PERSON_ANALYTICS_URL", "http://person-analyzer:8102")

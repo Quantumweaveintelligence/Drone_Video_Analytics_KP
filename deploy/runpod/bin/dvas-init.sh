@@ -27,7 +27,7 @@ chmod 700 "$VOL/secrets" "$VOL/backups" 2>/dev/null || log "WARNING: chmod 700 o
 # Postgres refuses). See bin/pg-volume.sh. The cluster itself is prepared in step 5.
 
 # ── 1) Secrets: generated once onto the volume; real env vars win ───────────
-[ -s "$VOL/secrets/dvas.env" ] && [ -s "$VOL/secrets/users.json" ] || "$BIN/gen-secrets.sh" "$VOL/secrets"
+"$BIN/gen-secrets.sh" "$VOL/secrets"     # idempotent: creates missing files / appends missing keys only
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in ''|\#*) continue ;; esac
   key="${line%%=*}"; val="${line#*=}"
@@ -42,6 +42,8 @@ export DVAS_DEPLOYMENT=cloud DVAS_RUNTIME=supervisor DVAS_VOLUME="$VOL"
 case "$PUBLIC_BASE_URL" in https://*) export SECURE_COOKIES=true ;; *) export SECURE_COOKIES=false ;; esac
 export ANALYTICS_DATABASE_URL="postgresql://dvas:${DVAS_DB_PASSWORD}@127.0.0.1:5432/dvas?sslmode=disable"
 export DASHBOARD_DATABASE_URL="postgresql+asyncpg://dvas:${DVAS_DB_PASSWORD}@127.0.0.1:5432/dvas_dashboard"
+# Reports read the analytics DB through a SELECT-only role (created by dvas-bootstrap.sh)
+export ANALYTICS_REPORT_DATABASE_URL="postgresql://dvas_report_ro:${DVAS_REPORT_DB_PASSWORD}@127.0.0.1:5432/dvas?sslmode=disable"
 export REDIS_URL="redis://127.0.0.1:6379/0" MINIO_ENDPOINT="127.0.0.1:9000" MINIO_SECURE=false MINIO_PUBLIC_URL=""
 export KEYCLOAK_URL="http://127.0.0.1:8080" KC_REALM=kerala-police-drone KC_CLIENT_ID=drone-ingest-client
 export CORS_ORIGINS="${PUBLIC_BASE_URL},http://localhost:8765" ALLOWED_ORIGINS="${PUBLIC_BASE_URL},http://localhost:8765"

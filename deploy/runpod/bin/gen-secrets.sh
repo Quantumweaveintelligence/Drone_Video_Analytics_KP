@@ -37,6 +37,12 @@ ENV
   echo "[gen-secrets] wrote $DIR/dvas.env"
 fi
 
+# Keys added after a pod's first boot are appended (existing values are never changed)
+add_missing() { # KEY VALUE
+  grep -q "^$1=" "$DIR/dvas.env" || { echo "$1=$2" >> "$DIR/dvas.env"; echo "[gen-secrets] added $1"; }
+}
+add_missing DVAS_REPORT_DB_PASSWORD "$(rand 32)"   # read-only analytics login for reports (R2 / Q6)
+
 if [ ! -s "$DIR/users.json" ]; then
   "$PY" - "$DIR/users.json" <<'PYEOF'
 import json, secrets, string, sys

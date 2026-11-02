@@ -26,6 +26,7 @@ from services.telemetry_pump import start_telemetry_pump
 from services.audit_sync import start_audit_sync_service
 from services.evidence_sync import start_evidence_sync
 from services.retention import start_retention_job
+from services.report_jobs import start_report_worker
 from ingest_proxy import ingest_api
 
 from routers import auth, drones, alerts, audit, analytics, edge, infra, ws, incidents, reports, push, cases, downloads
@@ -74,6 +75,10 @@ async def _start_evidence_sync():
 @app.on_event("startup")
 async def _start_retention_job():
     start_retention_job()
+
+@app.on_event("startup")
+async def _start_report_worker():
+    start_report_worker()
 
 @app.on_event("startup")
 async def _sync_models_on_startup():

@@ -255,24 +255,7 @@ def test_evidence_meta_is_scoped(db):
     assert db.statements and all("evidence.jurisdiction" in db.where(i) for i in range(len(db.statements)))
 
 
-# ── B12: AAR data ─────────────────────────────────────────────────────────────
-def test_aar_without_window_does_not_borrow_drone_data(db):
-    mission = {"mission_id": "M1", "drone_id": "D1", "started_at": "2026-11-01T00:00:00+00:00",
-               "ended_at": None}
-    alerts_, ev, window = asyncio.run(reports._load_aar_data(FakeSession(db), mission))
-    assert (alerts_, ev, window) == ([], [], [])
-    assert len(db.statements) == 2
-    assert all("drone_id" not in db.where(i) for i in range(2))
-
-
-def test_aar_window_alerts_are_untagged_same_drone_in_window(db):
-    mission = {"mission_id": "M1", "drone_id": "D1", "started_at": "2026-11-01T00:00:00+00:00",
-               "ended_at": "2026-11-01T02:00:00+00:00"}
-    asyncio.run(reports._load_aar_data(FakeSession(db), mission))
-    assert len(db.statements) == 3
-    where = db.where(2)
-    assert "alerts.drone_id" in where and "alerts.mission_id IS NULL" in where
-    assert "alerts.ts >=" in where and "alerts.ts <=" in where
+# ── B12: AAR data → tests/test_reports.py (mission_after_action collector)
 
 
 # ── B26: GET /missions is read-only ──────────────────────────────────────────

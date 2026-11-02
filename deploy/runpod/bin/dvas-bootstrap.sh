@@ -78,6 +78,24 @@ fi
 runuser -u postgres -- psql -X -h /run/postgresql -q -d dvas \
   -c "SET ROLE dvas" -c "SELECT dvas_ensure_monthly_partitions(3)" >/dev/null
 
+# Read-only reporting role on the analytics DB (R2 / Q6): SELECT only, read-only
+# sessions, 30 s statement limit. Re-applied every boot (new tables, password).
+if [ -n "${DVAS_REPORT_DB_PASSWORD:-}" ]; then
+  runuser -u postgres -- psql -X -h /run/postgresql -v ON_ERROR_STOP=1 -q -d dvas \
+    -v ro_pw="$DVAS_REPORT_DB_PASSWORD" <<'SQL'
+SELECT format('CREATE ROLE dvas_report_ro LOGIN PASSWORD %L', :'ro_pw')
+ WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'dvas_report_ro') \gexec
+SELECT format('ALTER ROLE dvas_report_ro LOGIN PASSWORD %L', :'ro_pw') \gexec
+ALTER ROLE dvas_report_ro SET default_transaction_read_only = on;
+ALTER ROLE dvas_report_ro SET statement_timeout = '30s';
+GRANT CONNECT ON DATABASE dvas TO dvas_report_ro;
+GRANT USAGE ON SCHEMA public TO dvas_report_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO dvas_report_ro;
+ALTER DEFAULT PRIVILEGES FOR ROLE dvas IN SCHEMA public GRANT SELECT ON TABLES TO dvas_report_ro;
+SQL
+  log "reporting role dvas_report_ro: SELECT-only on dvas"
+fi
+
 # Dashboard: the backend creates its tables (SQLAlchemy create_all) on start;
 # the audit SQL (hash-chain columns, immutability triggers, legal holds) follows.
 for _ in $(seq 1 60); do

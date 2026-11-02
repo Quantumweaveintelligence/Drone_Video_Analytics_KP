@@ -336,6 +336,13 @@ class Report(Base):
     error_message = Column(Text, nullable=True)
     watermark_text = Column(String, nullable=True)
     sha256 = Column(String, nullable=True)                      # E3: hash of the stored PDF
+    # R4 (migrations/reports_v2.sql): requested | queued | running | ready | failed | rejected
+    attempts = Column(Integer, nullable=False, default=0)
+    started_at = Column(UTCDateTime, nullable=True)
+    finished_at = Column(UTCDateTime, nullable=True)
+    decided_by = Column(String, nullable=True)
+    decided_at = Column(UTCDateTime, nullable=True)
+    file_bucket = Column(String, nullable=True)
 
 
 class User(Base):
