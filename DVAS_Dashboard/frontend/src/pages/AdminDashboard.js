@@ -104,7 +104,7 @@ export default function AdminDashboard() {
       }
     };
     fetchHealth();
-    const iv = setInterval(fetchHealth, 15000);
+    const iv = setInterval(() => { if (!document.hidden) fetchHealth(); }, 15000);
     return () => { mounted = false; clearInterval(iv); };
   }, [user.role]);
 

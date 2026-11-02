@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "@/context/AuthContext";
 import { useCommand } from "@/context/CommandContext";
-import { api, downloadSigned } from "@/lib/api";
+import { api, apiError, downloadSigned } from "@/lib/api";
 import { istDate, istDaysAgo, istMonday, fmtIST } from "@/lib/ist";
 import { useDvasSocket } from "@/lib/useDvasSocket";
 import { FileText, Download, RefreshCw, CheckCircle, XCircle, Eye, Send, X } from "lucide-react";
@@ -23,6 +23,7 @@ const STATUS_STYLE = {
   ready: "text-emerald-400 border-emerald-500/40 bg-emerald-500/10",
   failed: "text-red-400 border-red-500/40 bg-red-500/10",
   rejected: "text-slate-400 border-slate-500/40 bg-slate-500/10",
+  expired: "text-slate-500 border-slate-600/40 bg-slate-700/10",      // PDF deleted by retention
 };
 
 const input = "bg-slate-800 border border-slate-700 text-xs px-2 py-1 rounded text-slate-200";
@@ -229,12 +230,14 @@ export default function ReportsPage() {
                   <span className={`px-1.5 py-0.5 border rounded text-[10px] ${STATUS_STYLE[r.status] || ""}`}>
                     {["queued", "running"].includes(r.status) && <RefreshCw size={9} className="inline animate-spin mr-1" />}{r.status}
                   </span>
-                  {r.status === "failed" && r.error_message && <div className="text-[10px] text-red-400 mt-1">{r.error_message}</div>}
+                  {["failed", "expired"].includes(r.status) && r.error_message && (
+                    <div className={`text-[10px] mt-1 ${r.status === "failed" ? "text-red-400" : "text-slate-500"}`}>{r.error_message}</div>
+                  )}
                 </td>
                 <td className="px-3 py-2 mono text-[10px] text-slate-500" title={r.sha256 || ""}>{r.sha256 ? `${r.sha256.slice(0, 16)}…` : "—"}</td>
                 <td className="px-3 py-2 text-right">
                   {r.status === "ready" && (
-                    <button onClick={() => downloadSigned("report", r.id).catch((e) => setError(e.response?.data?.detail || "Download failed"))}
+                    <button onClick={() => downloadSigned("report", r.id).catch((e) => setError(apiError(e, "Download failed")))}
                       className="px-2 py-1 border border-emerald-600/60 text-emerald-300 rounded text-[10px] inline-flex items-center gap-1">
                       <Download size={11} /> PDF
                     </button>)}

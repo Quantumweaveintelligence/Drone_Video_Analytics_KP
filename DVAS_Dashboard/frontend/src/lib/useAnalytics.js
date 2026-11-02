@@ -21,7 +21,7 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { api } from './api';
+import { api, apiError, refreshSession } from './api';
 
 // ── Generic polling fetch hook ─────────────────────────────────────────────
 export function useAnalyticsFetch(path, intervalMs = 5000, enabled = true) {
@@ -45,7 +45,7 @@ export function useAnalyticsFetch(path, intervalMs = 5000, enabled = true) {
     } catch (err) {
       if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
       if (mountedRef.current) {
-        setError(err?.response?.data?.detail || err.message || 'Fetch error');
+        setError(apiError(err, 'Fetch error'));
       }
     } finally {
       if (mountedRef.current) setLoading(false);
@@ -56,16 +56,21 @@ export function useAnalyticsFetch(path, intervalMs = 5000, enabled = true) {
     mountedRef.current = true;
     setLoading(true);
     doFetch();
-    if (!intervalMs) return;
-    const id = setInterval(doFetch, intervalMs);
+    // Polls pause while the tab is hidden and catch up when it is shown again
+    const tick = () => { if (!document.hidden) doFetch(); };
+    const onVisible = () => { if (!document.hidden) doFetch(); };
+    const id = intervalMs ? setInterval(tick, intervalMs) : null;
+    document.addEventListener('visibilitychange', onVisible);
     return () => {
       abortRef.current?.abort();
       mountedRef.current = false;
-      clearInterval(id);
+      if (id) clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisible);
     };
   }, [doFetch, intervalMs]);
 
-  return { data, loading, error, refetch: doFetch };
+  // `mutate` is the name some components use (SWR-style) for a manual refetch
+  return { data, loading, error, refetch: doFetch, mutate: doFetch };
 }
 
 // ── SSE stream hook ────────────────────────────────────────────────────────
@@ -85,10 +90,9 @@ export function useAnalyticsSSE(onEvent, droneId = '') {
     let cancelled = false;
 
     const buildUrl = () => {
-      const token = localStorage.getItem('dvas_token') || localStorage.getItem('token') || '';
+      // Cookie auth (same origin): no token in the URL
       let url = '/api/analytics/events/stream';
       if (droneId) url += `?drone_id=${encodeURIComponent(droneId)}`;
-      if (token) url += `${droneId ? '&' : '?'}token=${encodeURIComponent(token)}`;
       return url;
     };
 
@@ -130,11 +134,7 @@ export function useAnalyticsSSE(onEvent, droneId = '') {
 
         // Attempt silent token refresh before reconnect
         try {
-          const refreshRes = await api.post('/auth/refresh');
-          if (refreshRes?.data?.access_token) {
-            localStorage.setItem('dvas_token', refreshRes.data.access_token);
-            retriesRef.current = 0; // Fresh token acquired, reset backoff
-          }
+          await refreshSession();
         } catch (_) {
           // Refresh failed — will retry with existing token or back off
         }

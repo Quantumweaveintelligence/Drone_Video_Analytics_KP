@@ -1,4 +1,5 @@
 import axios from "axios";
+import { isEdge } from "@/lib/deployment";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "";
 export const API = `${BACKEND_URL}/api`;
@@ -8,8 +9,33 @@ export const api = axios.create({
   withCredentials: true,
 });
 
+/**
+ * Browser auth is the httpOnly dvas_access_token cookie only. The DVAS Edge application
+ * (another origin) receives the token in the login body and keeps it in localStorage;
+ * every other build returns "" so no token is ever put in headers or URLs.
+ */
 export const getAuthToken = () => {
+  if (!isEdge) return "";
   return localStorage.getItem("dvas_token") || localStorage.getItem("token") || "";
+};
+
+const storeEdgeToken = (token) => {
+  if (isEdge && token) localStorage.setItem("dvas_token", token);
+};
+
+// One refresh at a time: parallel 401s (polls, SSE, WebSocket) share the same request.
+let refreshInFlight = null;
+export const refreshSession = () => {
+  if (!refreshInFlight) {
+    refreshInFlight = api.post("/auth/refresh")
+      .then((res) => { storeEdgeToken(res?.data?.access_token); return res; })
+      .finally(() => { setTimeout(() => { refreshInFlight = null; }, 0); });
+  }
+  return refreshInFlight;
+};
+
+const goToLogin = () => {
+  if (window.location.pathname !== "/login") window.location.href = "/login";
 };
 
 export const resolveMinioBucket = (key, explicitBucket = "") => {
@@ -45,6 +71,19 @@ export const downloadSigned = async (kind, id, role) => {
   const res = await api.post("/downloads", { kind, id, role });
   window.location.assign(`${BACKEND_URL}${res.data.url}`);
 };
+
+/** Absolute ws(s):// URL for an API path; the httpOnly cookie authenticates the handshake. */
+export const wsUrl = (path) => {
+  const base = API.startsWith("http")
+    ? API.replace(/^http/, "ws")
+    : `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}${API}`;
+  const token = getAuthToken();                 // edge build only
+  const url = `${base}${path}`;
+  return token ? `${url}${url.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}` : url;
+};
+
+/** Reconnect delay: 2 s, 4 s, 8 s … capped at 30 s, with jitter. */
+export const backoffMs = (attempt) => Math.min(30000, 2000 * 2 ** attempt) * (0.8 + Math.random() * 0.4);
 
 /** Fetch a file through the API (cookie auth) and save it under `filename`. */
 export const downloadBlob = async (path, params = {}, filename = "download") => {
@@ -90,12 +129,8 @@ export const authFetch = async (url, options = {}) => {
 
   if (response.status === 401 && !url.includes("/auth/")) {
     try {
-      const refreshRes = await api.post("/auth/refresh");
-      const newToken = refreshRes?.data?.access_token;
-      if (newToken) {
-        localStorage.setItem("dvas_token", newToken);
-      }
-      const retryToken = newToken || getAuthToken();
+      await refreshSession();
+      const retryToken = getAuthToken();
       const retryHeaders = {
         ...(options.headers || {}),
         ...(retryToken ? { Authorization: `Bearer ${retryToken}` } : {}),
@@ -106,9 +141,7 @@ export const authFetch = async (url, options = {}) => {
         credentials: "include",
       });
     } catch (e) {
-      if (window.location.pathname !== "/login") {
-        window.location.href = "/login";
-      }
+      goToLogin();
     }
   }
 
@@ -137,16 +170,12 @@ api.interceptors.response.use(
     ) {
       originalRequest._retry = true;
       try {
-        const refreshRes = await api.post("/auth/refresh");
-        if (refreshRes?.data?.access_token) {
-          localStorage.setItem("dvas_token", refreshRes.data.access_token);
-          originalRequest.headers.Authorization = `Bearer ${refreshRes.data.access_token}`;
-        }
+        await refreshSession();
+        const token = getAuthToken();
+        if (token) originalRequest.headers.Authorization = `Bearer ${token}`;
         return api(originalRequest);
       } catch (refreshError) {
-        if (window.location.pathname !== "/login") {
-          window.location.href = "/login";
-        }
+        goToLogin();
         return Promise.reject(refreshError);
       }
     }

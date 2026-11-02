@@ -39,7 +39,7 @@ function useIngestHealth() {
       }
     };
     tick();
-    const t = setInterval(tick, 10000);
+    const t = setInterval(() => { if (!document.hidden) tick(); }, 15000);
     return () => { mounted = false; clearInterval(t); };
   }, []);
   return state;
@@ -247,7 +247,8 @@ function NotificationBell() {
   useEffect(() => {
     if (isEdgeOperator) return;
     loadNotifications();
-    const interval = setInterval(loadNotifications, 5000);
+    // The WebSocket keeps the bell live; this poll is only a fallback and pauses on hidden tabs
+    const interval = setInterval(() => { if (!document.hidden) loadNotifications(); }, 60000);
     return () => clearInterval(interval);
   }, [user, isEdgeOperator]);
 

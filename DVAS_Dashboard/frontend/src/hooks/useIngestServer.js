@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { api, API } from "@/lib/api";
+import { api, backoffMs, refreshSession, wsUrl } from "@/lib/api";
 
 /**
  * useIngestServer — custom hook for real-time ingest server monitoring.
@@ -33,7 +33,8 @@ export function useIngestServer() {
     let mounted = true;
     const fetchHealth = async () => {
       try {
-        const { data } = await api.get("/ingest-server/health");
+        // admin-only detail (version, uptime, URL); the public /health is status-only
+        const { data } = await api.get("/ingest-server/health/detail");
         if (mounted) {
           setHealth(data);
           setLoading(false);
@@ -46,7 +47,7 @@ export function useIngestServer() {
       }
     };
     fetchHealth();
-    const interval = setInterval(fetchHealth, 10000);
+    const interval = setInterval(() => { if (!document.hidden) fetchHealth(); }, 10000);
     return () => { mounted = false; clearInterval(interval); };
   }, []);
 
@@ -62,7 +63,7 @@ export function useIngestServer() {
       }
     };
     fetchStatus();
-    const interval = setInterval(fetchStatus, 5000);
+    const interval = setInterval(() => { if (!document.hidden) fetchStatus(); }, 5000);
     return () => { mounted = false; clearInterval(interval); };
   }, []);
 
@@ -80,21 +81,16 @@ export function useIngestServer() {
     let closed = false;
     let heartbeat;
 
-    const connect = async () => {
+    let attempt = 0;
+    let retryTimer;
+
+    const connect = () => {
       if (closed) return;
-      let token = localStorage.getItem("dvas_token") || localStorage.getItem("token") || "";
-      if (!token) {
-        if (!closed) setTimeout(connect, 4000);
-        return;
-      }
-
-      const wsBase = API.replace(/^http/, "ws");
-      const url = `${wsBase}/ingest-server/ws?token=${encodeURIComponent(token)}`;
-
-      const ws = new WebSocket(url);
+      const ws = new WebSocket(wsUrl("/ingest-server/ws"));   // cookie auth, no token in the URL
       wsRef.current = ws;
 
       ws.onopen = () => {
+        attempt = 0;
         setWsConnected(true);
         heartbeat = setInterval(() => {
           try { ws.send("ping"); } catch {}
@@ -123,13 +119,10 @@ export function useIngestServer() {
         clearInterval(heartbeat);
         if (closed) return;
 
-        // If auth expired (code 4401/4403/1008), attempt silent token refresh
-        if (ev.code === 4401 || ev.code === 4403 || ev.code === 1008) {
-          try {
-            await api.post("/auth/refresh");
-          } catch {}
+        if (ev.code === 4401) {
+          try { await refreshSession(); } catch {}
         }
-        setTimeout(connect, 4000);
+        retryTimer = setTimeout(connect, backoffMs(attempt++));
       };
 
       ws.onerror = () => {
@@ -141,6 +134,7 @@ export function useIngestServer() {
     return () => {
       closed = true;
       clearInterval(heartbeat);
+      clearTimeout(retryTimer);
       try { wsRef.current?.close(); } catch {}
     };
   }, []);

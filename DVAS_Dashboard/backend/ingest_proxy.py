@@ -217,6 +217,18 @@ async def ingest_health():
         return {"reachable": False, "status": "unreachable"}
 
 
+@ingest_api.get("/health/detail", summary="Proxy: ingest server health with details (admin)")
+async def ingest_health_detail(user: dict = Depends(_admin_user)):
+    """Full upstream /health payload plus the configured URL, for the Ingest dashboard."""
+    try:
+        data = await _proxy_get("/health", timeout=3.0)
+        return {"reachable": True, "status": "ok", "url": INGEST_SERVER_URL,
+                **(data if isinstance(data, dict) else {})}
+    except HTTPException as exc:
+        return {"reachable": False, "status": "unreachable", "url": INGEST_SERVER_URL,
+                "detail": str(exc.detail)}
+
+
 @ingest_api.get("/ready", summary="Proxy: ingest server readiness")
 async def ingest_ready(user: dict = Depends(_admin_user)):
     """

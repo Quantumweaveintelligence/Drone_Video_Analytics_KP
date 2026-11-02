@@ -111,7 +111,7 @@ export function CommandProvider({ children }) {
   useEffect(() => {
     load();
     loadFilteredEvidence(evidenceFiltersRef.current, evidenceCategoryRef.current, evidenceDedupRef.current);
-    const t = setInterval(load, 60000);          // fallback; WebSocket events refresh sooner
+    const t = setInterval(() => { if (!document.hidden) load(); }, 60000);   // fallback; WebSocket events refresh sooner
     return () => clearInterval(t);
   }, []);
 

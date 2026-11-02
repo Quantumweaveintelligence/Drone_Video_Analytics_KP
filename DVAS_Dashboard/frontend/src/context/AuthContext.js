@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import { api, authFetch } from "@/lib/api";
-import { isCloud, roleAllowedHere, wrongAppMessage } from "@/lib/deployment";
+import { isCloud, isEdge, roleAllowedHere, wrongAppMessage } from "@/lib/deployment";
 
 const AuthCtx = createContext(null);
 
@@ -51,9 +51,12 @@ export function AuthProvider({ children }) {
     }
     setAccessError("");
     const loginTs = new Date().toISOString();
-    if (data?.access_token) {
+    // Only the edge application gets (and keeps) a token; the browser uses the httpOnly cookie
+    if (isEdge && data?.access_token) {
       localStorage.setItem("dvas_token", data.access_token);
-      localStorage.setItem("token", data.access_token);
+    } else {
+      localStorage.removeItem("dvas_token");
+      localStorage.removeItem("token");
     }
     localStorage.setItem("dvas_login_ts", loginTs);
     const enrichedUser = { ...data, login_ts: loginTs };

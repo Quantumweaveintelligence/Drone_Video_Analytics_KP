@@ -47,4 +47,3 @@ geofence_context.md
 *.docx
 *.pptx
 *.zip
-**/server_monolith_backup.py

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import AppShell from "@/components/layout/AppShell";
+import { useNavigate } from "react-router-dom";
 import { api, apiError, ROLE_LABELS } from "@/lib/api";
 import { fmtIST } from "@/lib/ist";
 import { useI18n } from "@/context/I18nContext";
@@ -77,7 +78,6 @@ export default function IngestDashboard() {
   const [ov, setOv] = useState(null);
   const [tick, setTick] = useState(0);
   const [audit, setAudit] = useState([]);
-  const [users, setUsers] = useState([]);
   const ingestSrv = useIngestServer();
   const [feedFilter, setFeedFilter] = useState("all");
   const [feedSort, setFeedSort] = useState("drone_id");
@@ -171,18 +171,19 @@ export default function IngestDashboard() {
       setAudit([]);
     }
   };
-  const loadUsers = async () => {
-    try { const { data } = await api.get("/users"); setUsers(data); } catch (e) {}
-  };
+
 
   useEffect(() => {
     load(); loadOverview(); loadIncidents(); loadModelSuggestions();
-    const t = setInterval(() => { load(); if (page === "overview") loadOverview(); setTick(x => x + 1); }, 4000);
+    // 10 s: each poll samples host metrics and probes services server-side; paused on hidden tabs
+    const t = setInterval(() => {
+      if (document.hidden) return;
+      load(); if (page === "overview") loadOverview(); setTick(x => x + 1);
+    }, 10000);
     return () => clearInterval(t);
   }, [page]);
   useEffect(() => {
     if (page === "audit") loadAudit();
-    if (page === "users") loadUsers();
     if (page === "alerts") loadIncidents();
     if (page === "gpu") loadModelSuggestions();
   }, [page]);
@@ -382,7 +383,7 @@ export default function IngestDashboard() {
             />
           )}
           {page === "audit" && <AuditPage audit={audit} />}
-          {page === "users" && <UsersPage users={users} reload={loadUsers} />}
+          {page === "users" && <UsersPage />}
         </div>
       </div>
     </AppShell>
@@ -1812,85 +1813,14 @@ function AuditPage({ audit }) {
   );
 }
 
-function UsersPage({ users, reload }) {
-  const [form, setForm] = useState({ email: "", name: "", password: "", role: "drone_operator", jurisdiction: "", mission_scope: "" });
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState("");
-
-  const submit = async (e) => {
-    e.preventDefault(); setBusy(true); setMsg("");
-    try {
-      await api.post("/users", {
-        ...form,
-        mission_scope: form.mission_scope.split(",").map(s => s.trim()).filter(Boolean),
-      });
-      setForm({ email: "", name: "", password: "", role: "drone_operator", jurisdiction: "", mission_scope: "" });
-      setMsg("User created successfully."); reload();
-    } catch (e) { setMsg(e.response?.data?.detail || "Failed"); } finally { setBusy(false); }
-  };
-
-  const suspend = async (id) => {
-    if (!window.confirm("Suspend this user?")) return;
-    try { await api.delete(`/users/${id}`); reload(); } catch (e) { alert("failed"); }
-  };
-
+// F6l: users are managed in one place (Admin → Users); this tab only links there
+function UsersPage() {
+  const navigate = useNavigate();
   return (
-    <div className="space-y-4">
-      <div className="border border-slate-800 bg-slate-900">
-        <div className="p-3 border-b border-slate-800 text-sm flex items-center gap-2">
-          <Plus size={16} className="text-sky-400" /> Create User (every change is auto-logged)
-        </div>
-        <form onSubmit={submit} className="p-3 grid grid-cols-1 md:grid-cols-6 gap-2">
-          <input data-testid="user-email" required type="email" placeholder="email" value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono" />
-          <input data-testid="user-name" required placeholder="full name" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono" />
-          <input data-testid="user-password" required type="password" placeholder="initial password" value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono" />
-          <select data-testid="user-role" value={form.role} onChange={e => setForm({ ...form, role: e.target.value })} className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono">
-            {Object.entries(ROLE_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-          </select>
-          <input data-testid="user-jurisdiction" placeholder="jurisdiction" value={form.jurisdiction} onChange={e => setForm({ ...form, jurisdiction: e.target.value })} className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono" />
-          <input data-testid="user-missions" placeholder="mission scope (M-101,M-102)" value={form.mission_scope} onChange={e => setForm({ ...form, mission_scope: e.target.value })} className="col-span-2 bg-slate-950 border border-slate-700 px-2 py-2 text-xs mono" />
-          <button data-testid="user-create" disabled={busy} className="col-span-6 md:col-span-6 bg-sky-600 hover:bg-sky-500 text-white text-xs py-2">
-            {busy ? "Creating…" : "Create User"}
-          </button>
-          {msg && <div className="col-span-6 mono text-[11px] text-slate-300">{msg}</div>}
-        </form>
-      </div>
-
-      <div className="border border-slate-800 bg-slate-900">
-        <div className="p-3 border-b border-slate-800 text-sm flex items-center gap-2">
-          <Users size={16} className="text-sky-400" /> User Directory
-        </div>
-        <table className="w-full text-xs">
-          <thead className="bg-slate-950/60">
-            <tr>{["Name","Email","Role","Jurisdiction","Mission Scope","Status","Actions"].map(h => (
-              <th key={h} className="text-left px-3 py-2 dvas-label border-b border-slate-800" style={{ fontSize: 10 }}>{h}</th>
-            ))}</tr>
-          </thead>
-          <tbody className="mono">
-            {users.map(u => (
-              <tr key={u.id} data-testid={`user-row-${u.email}`} className="hover:bg-slate-800/40">
-                <td className="px-3 py-2 border-b border-slate-800/60 text-slate-100">{u.name}</td>
-                <td className="px-3 py-2 border-b border-slate-800/60">{u.email}</td>
-                <td className="px-3 py-2 border-b border-slate-800/60">
-                  <span className="px-1.5 py-0.5 border border-sky-500/40 bg-sky-500/10 text-sky-300 text-[10px]">{ROLE_LABELS[u.role]}</span>
-                </td>
-                <td className="px-3 py-2 border-b border-slate-800/60">{u.jurisdiction}</td>
-                <td className="px-3 py-2 border-b border-slate-800/60 text-slate-400">{(u.mission_scope || []).join(", ") || "-"}</td>
-                <td className="px-3 py-2 border-b border-slate-800/60">
-                  {u.suspended ? <span className="text-red-400">suspended</span> : <span className="text-emerald-400">active</span>}
-                </td>
-                <td className="px-3 py-2 border-b border-slate-800/60">
-                  {!u.suspended && (
-                    <button data-testid={`suspend-${u.email}`} onClick={() => suspend(u.id)} className="px-2 py-1 border border-red-600/60 text-red-300 hover:bg-red-500/10 inline-flex items-center gap-1">
-                      <Trash2 size={11} /> Suspend
-                    </button>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+    <div className="border border-slate-800 bg-slate-900 p-6 text-xs text-slate-300 flex items-center justify-between gap-4">
+      <span>User accounts are created, suspended and reviewed on the Admin page.</span>
+      <button onClick={() => { try { sessionStorage.setItem("dvas_adm_page", "users"); } catch {} navigate("/admin"); }}
+        className="px-3 py-1.5 bg-sky-600 hover:bg-sky-500 text-white rounded">Open Admin → Users</button>
     </div>
   );
 }
