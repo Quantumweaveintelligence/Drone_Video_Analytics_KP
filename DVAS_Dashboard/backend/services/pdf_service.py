@@ -568,7 +568,8 @@ def _make_drone_utilisation_pdf(user: dict, missions: list, drones: list, period
 
 
 # 4. Mission After-Action Report (AAR)
-def _make_mission_aar_pdf(user: dict, mission: dict, alerts: list, evidence_items: list) -> bytes:
+def _make_mission_aar_pdf(user: dict, mission: dict, alerts: list, evidence_items: list,
+                          window_alerts: list = None) -> bytes:
     name, role_label, email, jur = _format_officer_info(user)
     pdf = FPDF()
     pdf.add_page()
@@ -667,6 +668,24 @@ def _make_mission_aar_pdf(user: dict, mission: dict, alerts: list, evidence_item
             pdf.cell(30, 6, _s(conf), border=1)
             pdf.cell(35, 6, _s(status), border=1, ln=1)
     pdf.ln(4)
+
+    # Untagged alerts from the same drone inside the mission window — listed apart,
+    # not counted in the KPIs above, because they are not linked to this mission
+    if window_alerts:
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 6, _s(f"Other Alerts from {drone_id} in the Mission Window (not tagged to this mission)"), ln=1)
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.cell(40, 6, "Timestamp", border=1)
+        pdf.cell(60, 6, "Incident Classification", border=1)
+        pdf.cell(30, 6, "Confidence", border=1)
+        pdf.cell(60, 6, "Disposition", border=1, ln=1)
+        pdf.set_font("Helvetica", "", 8)
+        for a in window_alerts[:15]:
+            pdf.cell(40, 6, _s(str(a.get("ts", ""))[:19]), border=1)
+            pdf.cell(60, 6, _s(str(a.get("type", "anomaly")).replace("_", " ").title()[:28]), border=1)
+            pdf.cell(30, 6, _s(f"{float(a.get('confidence') or 0):.2f}"), border=1)
+            pdf.cell(60, 6, _s("Acknowledged" if a.get("acknowledged_at") else "Open"), border=1, ln=1)
+        pdf.ln(4)
     
     # Evidence Vault Items
     pdf.set_font("Helvetica", "B", 10)

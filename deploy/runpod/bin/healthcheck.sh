@@ -2,10 +2,13 @@
 # healthcheck.sh — probes every service endpoint inside the pod. Exit 1 if any fails.
 set -u
 fail=0
-check() { # name url
-  local code
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$2")"
-  if [ "$code" = "200" ]; then printf '  %-12s OK   %s\n' "$1" "$2"
+check() { # name url — HTTP 200 and, for analyzers, no "model_loaded": false
+  local code body
+  body="$(curl -s -w '\n%{http_code}' --max-time 5 "$2")"
+  code="${body##*$'\n'}"; body="${body%$'\n'*}"
+  if [ "$code" = "200" ] && ! grep -Eq '"model_loaded": ?false' <<<"$body"; then
+    printf '  %-12s OK   %s\n' "$1" "$2"
+  elif [ "$code" = "200" ]; then printf '  %-12s FAIL %s (model not loaded)\n' "$1" "$2"; fail=1
   else printf '  %-12s FAIL %s (HTTP %s)\n' "$1" "$2" "$code"; fail=1; fi
 }
 check nginx      http://127.0.0.1:80/healthz

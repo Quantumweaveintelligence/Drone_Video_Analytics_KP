@@ -16,13 +16,28 @@ from core.config import ANALYTICS_BASE
 
 import asyncpg
 
-DRONE_DB_URL = "postgresql://dvas:dvas_secret@drone_postgres:5432/dvas"
+from core.config import ANALYTICS_DATABASE_URL
+
+_warned_no_analytics_db = False
+
 
 async def _resolve_image_keys(event_type, event_id, track_id, drone_id, ts, mission_id=""):
-    """Resolve real MinIO image keys from analytics tables in drone_postgres."""
+    """Resolve real MinIO image keys from the analytics DB.
+
+    Exact matches (event_id / track_id) first. A nearest-in-time match from the
+    same drone or mission is accepted only within ±10 s; there is no "latest image"
+    fallback, so an event with no matching image gets none (B2, until E1 stores the
+    exact key with the event).
+    """
+    global _warned_no_analytics_db
     primary_key = ""
     secondary_key = ""
     bucket = ""
+    if not ANALYTICS_DATABASE_URL:
+        if not _warned_no_analytics_db:
+            logger.error("ANALYTICS_DATABASE_URL is not set; evidence images will not be resolved")
+            _warned_no_analytics_db = True
+        return primary_key, secondary_key, bucket
     
     ts_dt = None
     if isinstance(ts, str) and ts:
@@ -36,7 +51,7 @@ async def _resolve_image_keys(event_type, event_id, track_id, drone_id, ts, miss
         ts_dt = datetime.now(timezone.utc)
         
     try:
-        conn = await asyncpg.connect(DRONE_DB_URL)
+        conn = await asyncpg.connect(ANALYTICS_DATABASE_URL)
         try:
             if event_type == "person_detected":
                 # Tier 1: Check person_embeddings or face_embeddings by track_id
@@ -72,6 +87,7 @@ async def _resolve_image_keys(event_type, event_id, track_id, drone_id, ts, miss
                             """SELECT best_person_image_key, best_image_key 
                                FROM person_identities 
                                WHERE drone_id = $1 AND ((best_person_image_key IS NOT NULL AND best_person_image_key != '') OR (best_image_key IS NOT NULL AND best_image_key != ''))
+                               AND abs(extract(epoch from (last_seen - $2))) <= 10
                                ORDER BY abs(extract(epoch from (last_seen - $2))) ASC LIMIT 1""",
                             drone_id, ts_dt
                         )
@@ -83,18 +99,6 @@ async def _resolve_image_keys(event_type, event_id, track_id, drone_id, ts, miss
                         secondary_key = prow['best_image_key'] if prow['best_person_image_key'] and prow['best_image_key'] else ""
                         bucket = "dvas-faces"
 
-                # Tier 3: General person identity fallback
-                if not primary_key:
-                    prow = await conn.fetchrow(
-                        """SELECT best_person_image_key, best_image_key 
-                           FROM person_identities 
-                           WHERE best_person_image_key IS NOT NULL AND best_person_image_key != '' 
-                           ORDER BY last_seen DESC LIMIT 1"""
-                    )
-                    if prow:
-                        primary_key = prow['best_person_image_key'] or ""
-                        secondary_key = prow['best_image_key'] or ""
-                        bucket = "dvas-faces"
 
             elif event_type in ("vehicle_detected", "theft_alert", "vehicle_anomaly", "wrong_way"):
                 bucket = "dvas-vehicles"
@@ -171,6 +175,7 @@ async def _resolve_image_keys(event_type, event_id, track_id, drone_id, ts, miss
                             """SELECT vehicle_image_key, plate_image_key 
                                FROM plate_reads 
                                WHERE mission_id_str = $1 
+                               AND abs(extract(epoch from (created_at - $2))) <= 10
                                ORDER BY abs(extract(epoch from (created_at - $2))) ASC LIMIT 1""",
                             mission_id, ts_dt
                         )
@@ -182,18 +187,6 @@ async def _resolve_image_keys(event_type, event_id, track_id, drone_id, ts, miss
                     except Exception:
                         pass
 
-                # 6. Fallback from latest plate_reads or tracks
-                if not primary_key:
-                    try:
-                        fb = await conn.fetchrow(
-                            "SELECT vehicle_image_key, plate_image_key FROM plate_reads WHERE vehicle_image_key IS NOT NULL ORDER BY created_at DESC LIMIT 1"
-                        )
-                        if fb:
-                            primary_key = fb['vehicle_image_key'] or ""
-                            if not secondary_key:
-                                secondary_key = fb['plate_image_key'] or ""
-                    except Exception:
-                        pass
 
 
             elif event_type.startswith("intrusion") or event_type == "perimeter_intrusion":
@@ -210,12 +203,9 @@ async def _resolve_image_keys(event_type, event_id, track_id, drone_id, ts, miss
                     irow = await conn.fetchrow(
                         """SELECT snapshot_key FROM intrusion_events 
                            WHERE drone_id = $1 AND snapshot_key IS NOT NULL AND snapshot_key != '' 
+                           AND abs(extract(epoch from (ts - $2))) <= 10
                            ORDER BY abs(extract(epoch from (ts - $2))) ASC LIMIT 1""",
                         drone_id, ts_dt
-                    )
-                if not irow:
-                    irow = await conn.fetchrow(
-                        "SELECT snapshot_key FROM intrusion_events WHERE snapshot_key IS NOT NULL AND snapshot_key != '' ORDER BY ts DESC LIMIT 1"
                     )
                 if irow and irow['snapshot_key']:
                     primary_key = irow['snapshot_key']
@@ -246,6 +236,7 @@ async def _resolve_image_keys(event_type, event_id, track_id, drone_id, ts, miss
                     v_row = await conn.fetchrow(
                         """SELECT snapshot_key FROM vessel_events 
                            WHERE drone_id = $1 AND snapshot_key IS NOT NULL AND snapshot_key != '' 
+                           AND abs(extract(epoch from (ts - $2))) <= 10
                            ORDER BY abs(extract(epoch from (ts - $2))) ASC LIMIT 1""",
                         drone_id, ts_dt
                     )
@@ -259,19 +250,9 @@ async def _resolve_image_keys(event_type, event_id, track_id, drone_id, ts, miss
                     crow = await conn.fetchrow(
                         """SELECT heatmap_object_key FROM crowd_density_readings 
                            WHERE drone_id = $1 AND heatmap_object_key IS NOT NULL AND heatmap_object_key != ''
+                           AND abs(extract(epoch from (ts - $2))) <= 10
                            ORDER BY abs(extract(epoch from (ts - $2))) ASC LIMIT 1""",
                         drone_id, ts_dt
-                    )
-                if not crow:
-                    crow = await conn.fetchrow(
-                        """SELECT heatmap_object_key FROM crowd_density_readings 
-                           WHERE heatmap_object_key IS NOT NULL AND heatmap_object_key != ''
-                           ORDER BY abs(extract(epoch from (ts - $1))) ASC LIMIT 1""",
-                        ts_dt
-                    )
-                if not crow:
-                    crow = await conn.fetchrow(
-                        "SELECT heatmap_object_key FROM crowd_density_readings WHERE heatmap_object_key IS NOT NULL AND heatmap_object_key != '' ORDER BY ts DESC LIMIT 1"
                     )
                 if crow and crow['heatmap_object_key']:
                     primary_key = crow['heatmap_object_key']
@@ -307,6 +288,7 @@ async def _resolve_image_keys(event_type, event_id, track_id, drone_id, ts, miss
                     a_row = await conn.fetchrow(
                         """SELECT snapshot_key FROM anomaly_events 
                            WHERE drone_id = $1 AND snapshot_key IS NOT NULL AND snapshot_key != '' 
+                           AND abs(extract(epoch from (ts - $2))) <= 10
                            ORDER BY abs(extract(epoch from (ts - $2))) ASC LIMIT 1""",
                         drone_id, ts_dt
                     )

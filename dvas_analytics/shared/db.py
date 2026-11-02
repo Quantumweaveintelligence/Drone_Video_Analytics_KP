@@ -7,7 +7,7 @@ import json
 import logging
 import uuid
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set
 
 import asyncpg
 
@@ -612,16 +612,19 @@ async def get_plates_by_mission(
 # Plate watchlist
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def add_to_watchlist(plate_text: str, reason: Optional[str] = None) -> None:
+async def add_to_watchlist(plate_text: str, reason: Optional[str] = None,
+                           case_ref: Optional[str] = None) -> None:
     pool = await get_pool()
     await pool.execute(
         """
-        INSERT INTO plate_watchlist (plate_text, reason)
-        VALUES ($1, $2)
-        ON CONFLICT (plate_text) DO UPDATE SET is_active=true, reason=EXCLUDED.reason
+        INSERT INTO plate_watchlist (plate_text, reason, case_ref)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (plate_text) DO UPDATE SET is_active=true, reason=EXCLUDED.reason,
+            case_ref=COALESCE(EXCLUDED.case_ref, plate_watchlist.case_ref)
         """,
         plate_text.upper().strip(),
         reason,
+        case_ref or None,
     )
 
 
@@ -639,6 +642,16 @@ async def get_watchlist() -> List[Dict]:
         "SELECT * FROM plate_watchlist WHERE is_active=true ORDER BY added_at DESC"
     )
     return [dict(r) for r in rows]
+
+
+async def get_active_watchlist_plates() -> Set[str]:
+    """Plates the ANPR matcher should flag: active and not past expires_at."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT plate_text FROM plate_watchlist "
+        "WHERE is_active=true AND (expires_at IS NULL OR expires_at > now())"
+    )
+    return {r["plate_text"] for r in rows}
 
 
 async def is_watchlisted(plate_text: str) -> bool:

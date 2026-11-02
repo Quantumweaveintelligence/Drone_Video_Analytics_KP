@@ -26,6 +26,9 @@ ADMIN_CLIENT_SECRET = os.environ.get("ADMIN_CLIENT_SECRET", "")
 KEYCLOAK_ADMIN = os.environ.get("KEYCLOAK_ADMIN", "admin")
 
 # ---------- Analytics microservices ----------
+# Analytics Postgres (asyncpg DSN). Set by dvas-init.sh on RunPod and by
+# docker-compose locally; empty → image resolution / mission discovery skipped.
+ANALYTICS_DATABASE_URL = os.getenv("ANALYTICS_DATABASE_URL", "")
 ANALYTICS_BASE = os.getenv("ANALYTICS_GATEWAY_URL", "http://analytics-gateway:8100")
 CROWD_URL = os.getenv("CROWD_ANALYTICS_URL", "http://crowd-analyzer:8101")
 PERSON_URL = os.getenv("PERSON_ANALYTICS_URL", "http://person-analyzer:8102")

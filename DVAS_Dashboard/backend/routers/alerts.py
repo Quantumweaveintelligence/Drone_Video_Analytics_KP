@@ -4,17 +4,17 @@ import uuid
 import zipfile
 import logging
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, Request
+from typing import Optional
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, update, func, or_, distinct, case
-from jose import jwt
+from sqlalchemy import select, update, func, or_, distinct, case, false
 
 from database import async_session_factory
 from models import Alert, Evidence, Export
-from core.security import get_current_user, get_jwks, scope_filter_for, _apply_scope_to_query, _row_to_dict, require_roles
+from core.security import get_current_user, scope_filter_for, _apply_scope_to_query, _row_to_dict, require_roles
 from audit_service import write_audit_v2
 from schemas.exports import ExportRequestIn, ExportDecisionIn
-from schemas.evidence import LegalHoldIn, LegalHoldReleaseIn, DirectExportIn
+from schemas.evidence import LegalHoldIn, LegalHoldReleaseIn, DirectExportIn, DisposeIn
 from services.pdf_service import _make_65b_pdf
 from core.analytics_client import _get_minio_client
 
@@ -128,6 +128,35 @@ VEHICLE_EVENT_TYPES = ["vehicle_detected", "vehicle_anomaly", "wrong_way", "thef
 CROWD_EVENT_TYPES = ["crowd_threshold", "crowd_surge", "unattended_object"]
 
 
+def _scope_evidence(stmt, user: dict):
+    """Restrict an Evidence select to what the caller may see (B8).
+
+    Applied before any drone/mission filter, so filters can only narrow the scope.
+    Operators see only their mission_scope; an empty scope sees nothing.
+    """
+    role = user.get("role")
+    if role in ("system_administrator", "senior_officer"):
+        return stmt  # State-wide aggregate access
+    if role == "control_room_officer":
+        jur = user.get("jurisdiction")
+        if not jur:
+            return stmt
+        return stmt.where(or_(
+            Evidence.jurisdiction == jur,
+            Evidence.jurisdiction.is_(None),
+            Evidence.jurisdiction == "",
+            Evidence.jurisdiction.in_(["Kerala", "State HQ", "Thiruvananthapuram"])
+        ))
+    if role == "drone_operator":
+        scope = user.get("mission_scope") or []
+        return stmt.where(Evidence.mission_id.in_(scope)) if scope else stmt.where(false())
+    f = scope_filter_for(user)
+    stmt = _apply_scope_to_query(stmt, Evidence, f)
+    if stmt is None:
+        raise HTTPException(403, "Not permitted")
+    return stmt
+
+
 @router.get("/evidence")
 async def list_evidence(
     drone_id: str = "",
@@ -143,31 +172,9 @@ async def list_evidence(
     offset: int = 0,
     user: dict = Depends(get_current_user)
 ):
-    role = user.get("role")
     async with async_session_factory() as session:
-        stmt = select(Evidence)
-        if role in ("system_administrator", "senior_officer"):
-            pass  # State-wide aggregate access
-        elif role == "control_room_officer":
-            jur = user.get("jurisdiction")
-            if jur and not (drone_id or mission_id):
-                stmt = stmt.where(or_(
-                    Evidence.jurisdiction == jur,
-                    Evidence.jurisdiction.is_(None),
-                    Evidence.jurisdiction == "",
-                    Evidence.jurisdiction.in_(["Kerala", "State HQ", "Thiruvananthapuram"])
-                ))
-        elif role == "drone_operator":
-            if user.get("mission_scope"):
-                stmt = stmt.where(Evidence.mission_id.in_(user["mission_scope"]))
-        else:
-            f = scope_filter_for(user)
-            if "__deny__" in f:
-                raise HTTPException(403, "Not permitted")
-            stmt = _apply_scope_to_query(stmt, Evidence, f)
-            if stmt is None:
-                raise HTTPException(403, "Not permitted")
-        
+        stmt = _scope_evidence(select(Evidence), user)
+
         # High-level category filtering
         if category == "person":
             stmt = stmt.where(Evidence.event_type.in_(PERSON_EVENT_TYPES))
@@ -241,32 +248,35 @@ async def list_evidence(
 
 @router.get("/evidence/meta")
 async def get_evidence_meta(user: dict = Depends(get_current_user)):
+    def scoped(*cols):
+        return _scope_evidence(select(*cols), user)
+
     async with async_session_factory() as session:
         drones = (await session.execute(
-            select(distinct(Evidence.drone_id)).where(Evidence.drone_id != "", Evidence.drone_id.is_not(None))
+            scoped(distinct(Evidence.drone_id)).where(Evidence.drone_id != "", Evidence.drone_id.is_not(None))
         )).scalars().all()
         missions = (await session.execute(
-            select(distinct(Evidence.mission_id)).where(Evidence.mission_id != "", Evidence.mission_id.is_not(None))
+            scoped(distinct(Evidence.mission_id)).where(Evidence.mission_id != "", Evidence.mission_id.is_not(None))
         )).scalars().all()
         types = (await session.execute(
-            select(distinct(Evidence.event_type)).where(Evidence.event_type != "", Evidence.event_type.is_not(None))
+            scoped(distinct(Evidence.event_type)).where(Evidence.event_type != "", Evidence.event_type.is_not(None))
         )).scalars().all()
 
         dedup_key = case(
             (func.nullif(Evidence.primary_image_key, '') != None, Evidence.primary_image_key),
             else_=Evidence.id
         )
+        n_all, n_dedup = func.count(Evidence.id), func.count(distinct(dedup_key))
 
         counts = {
-            "all": (await session.scalar(select(func.count(Evidence.id)))) or 0,
-            "all_dedup": (await session.scalar(select(func.count(distinct(dedup_key))))) or 0,
-            "person": (await session.scalar(select(func.count(Evidence.id)).where(Evidence.event_type.in_(PERSON_EVENT_TYPES)))) or 0,
-            "person_dedup": (await session.scalar(select(func.count(distinct(dedup_key))).where(Evidence.event_type.in_(PERSON_EVENT_TYPES)))) or 0,
-            "vehicle": (await session.scalar(select(func.count(Evidence.id)).where(Evidence.event_type.in_(VEHICLE_EVENT_TYPES)))) or 0,
-            "vehicle_dedup": (await session.scalar(select(func.count(distinct(dedup_key))).where(Evidence.event_type.in_(VEHICLE_EVENT_TYPES)))) or 0,
-            "crowd": (await session.scalar(select(func.count(Evidence.id)).where(Evidence.event_type.in_(CROWD_EVENT_TYPES)))) or 0,
-            "crowd_dedup": (await session.scalar(select(func.count(distinct(dedup_key))).where(Evidence.event_type.in_(CROWD_EVENT_TYPES)))) or 0,
+            "all": (await session.scalar(scoped(n_all))) or 0,
+            "all_dedup": (await session.scalar(scoped(n_dedup))) or 0,
         }
+        for name, types_ in (("person", PERSON_EVENT_TYPES), ("vehicle", VEHICLE_EVENT_TYPES),
+                             ("crowd", CROWD_EVENT_TYPES)):
+            in_cat = Evidence.event_type.in_(types_)
+            counts[name] = (await session.scalar(scoped(n_all).where(in_cat))) or 0
+            counts[f"{name}_dedup"] = (await session.scalar(scoped(n_dedup).where(in_cat))) or 0
 
         return {
             "drones": sorted([d for d in drones if d]),
@@ -282,7 +292,9 @@ async def get_evidence(evidence_id: str, user: dict = Depends(get_current_user))
     if user["role"] not in ("control_room_officer", "senior_officer", "system_administrator"):
         raise HTTPException(403, "Not permitted")
     async with async_session_factory() as session:
-        result = await session.execute(select(Evidence).where(Evidence.id == evidence_id))
+        result = await session.execute(
+            _scope_evidence(select(Evidence), user).where(Evidence.id == evidence_id)
+        )
         ev_obj = result.scalar_one_or_none()
         if not ev_obj:
             raise HTTPException(404, "Evidence not found")
@@ -429,12 +441,27 @@ async def direct_export(
     return doc
 
 
+def _retention_expired(retention_until: Optional[str]) -> bool:
+    if not retention_until:
+        return False
+    try:
+        until = datetime.fromisoformat(str(retention_until).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    return until < datetime.now(timezone.utc)
+
+
 @router.delete("/evidence/{evidence_id}")
 async def delete_evidence(
     evidence_id: str,
-    user: dict = Depends(get_current_user),
+    body: Optional[DisposeIn] = Body(default=None),
+    user: dict = Depends(require_roles("senior_officer")),
     request: Request = None,
 ):
+    # B6: senior officers only; before retention ends a disposal reason is mandatory
+    reason = body.reason.strip() if body else ""
     async with async_session_factory() as session:
         result = await session.execute(select(Evidence).where(Evidence.id == evidence_id))
         ev_obj = result.scalar_one_or_none()
@@ -442,6 +469,8 @@ async def delete_evidence(
             raise HTTPException(404, "Evidence not found")
         if ev_obj.legal_hold:
             raise HTTPException(400, "Cannot delete evidence under active legal hold")
+        if not reason and not _retention_expired(ev_obj.retention_until):
+            raise HTTPException(409, "Retention period not over; a disposal reason is required")
         
         ev_dict = _row_to_dict(ev_obj)
         await session.delete(ev_obj)
@@ -453,7 +482,8 @@ async def delete_evidence(
         target=evidence_id,
         target_type="evidence",
         target_id=evidence_id,
-        details=f"Evidence deleted: {ev_dict.get('label', '')}",
+        details=f"Evidence deleted: {ev_dict.get('label', '')}"
+                + (f" — reason: {reason}" if reason else " — retention expired"),
         before_values=ev_dict,
         after_values=None,
         source_endpoint="DELETE /api/evidence/{id}",
@@ -563,28 +593,10 @@ async def decide_export(
 
 
 @router.get("/exports/{export_id}/bundle")
-async def download_65b_bundle(export_id: str, request: Request, token: str = ""):
-    # Support Authorization header, cookie, OR query token for direct <a> downloads
-    if token:
-        try:
-            options = {"verify_aud": False}
-            payload = jwt.decode(token, get_jwks(), algorithms=["RS256"], options=options)
-            # Extract real role from JWT claims instead of hardcoding
-            realm_roles = payload.get("realm_access", {}).get("roles", [])
-            role = "control_room_officer"  # default
-            for r in ("senior_officer", "system_administrator", "control_room_officer", "drone_operator"):
-                if r in realm_roles:
-                    role = r
-                    break
-            user = {
-                "id": payload.get("sub"),
-                "email": payload.get("email", ""),
-                "role": role,
-            }
-        except jwt.JWTError:
-            raise HTTPException(401, "Invalid token")
-    else:
-        user = await get_current_user(request)
+async def download_65b_bundle(export_id: str, request: Request):
+    # get_current_user also reads ?token= (direct <a> downloads) and maps Keycloak
+    # roles the same way as every other endpoint (B9)
+    user = await get_current_user(request)
 
     async with async_session_factory() as session:
         result = await session.execute(

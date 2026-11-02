@@ -8,11 +8,10 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, or_
-from jose import jwt
 
 from database import async_session_factory
 from models import Drone, Mission, AuditLog
-from core.security import get_current_user, get_jwks, require_roles, _row_to_dict
+from core.security import get_current_user, require_roles, _row_to_dict
 from audit_service import write_audit_v2
 from services.pdf_service import _make_shift_pdf
 
@@ -20,21 +19,9 @@ logger = logging.getLogger("dvas")
 router = APIRouter(prefix="/api", tags=["Edge Operator"])
 
 @router.get("/edge/shift-summary")
-async def edge_shift_summary(request: Request, token: str = ""):
-    # Support Authorization header, cookie, OR query token for direct <a> downloads
-    if token:
-        try:
-            options = {"verify_aud": False}
-            payload = jwt.decode(token, get_jwks(), algorithms=["RS256"], options=options)
-            user = {
-                "id": payload.get("sub"),
-                "email": payload.get("email", ""),
-                "role": "control_room_officer", # Assuming higher role for exports
-            }
-        except jwt.JWTError:
-            raise HTTPException(401, "Invalid token")
-    else:
-        user = await get_current_user(request)
+async def edge_shift_summary(request: Request):
+    # get_current_user also reads ?token= (direct <a> downloads) with the real role
+    user = await get_current_user(request)
     if user.get("role") != "drone_operator":
         raise HTTPException(403, "Only drone operators may generate shift summaries")
     # Look up missions in operator's scope

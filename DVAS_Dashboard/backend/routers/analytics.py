@@ -990,6 +990,7 @@ async def watchlist_add(
     result = await _analytics_post(f"{ANPR_URL}/watchlist/add", {
         "plate_text": body.plate,
         "reason":     body.reason,
+        "case_ref":   body.case_ref or None,
     })
     await write_audit_v2(
         actor=user,

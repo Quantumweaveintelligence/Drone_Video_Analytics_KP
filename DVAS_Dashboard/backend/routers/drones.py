@@ -7,9 +7,9 @@ from sqlalchemy import select, func, or_, and_, distinct
 
 from database import async_session_factory
 from models import Mission, Drone, Alert, Evidence, Export
-from core.security import get_current_user, scope_filter_for, _apply_scope_to_query, _row_to_dict
+from core.security import get_current_user, require_roles, scope_filter_for, _apply_scope_to_query, _row_to_dict
 from core.analytics_client import _analytics_get
-from core.config import ANPR_URL, INTRUSION_URL
+from core.config import ANPR_URL, INTRUSION_URL, ANALYTICS_DATABASE_URL
 from audit_service import write_audit_v2
 
 """
@@ -60,36 +60,35 @@ async def list_drones(user: dict = Depends(get_current_user)):
         return docs
 
 
-@router.get("/missions")
-async def list_missions(user: dict = Depends(get_current_user)):
-    # Synchronize missing missions from ANPR, Intrusion, drone_postgres flight telemetry (tracks), and evidence captures
+async def _discover_mission_ids() -> set:
+    """Mission ids seen by ANPR, intrusion, analytics tracks, drones and evidence."""
+    discovered_missions = set()
+
+    # 1. Check ANPR microservice
     try:
-        discovered_missions = set()
+        anpr_res = await _analytics_get(f"{ANPR_URL}/missions", timeout=3.0)
+        if anpr_res and "missions" in anpr_res:
+            discovered_missions.update(anpr_res["missions"])
+    except Exception:
+        pass
 
-        # 1. Check ANPR microservice
-        try:
-            anpr_res = await _analytics_get(f"{ANPR_URL}/missions", timeout=3.0)
-            if anpr_res and "missions" in anpr_res:
-                discovered_missions.update(anpr_res["missions"])
-        except Exception:
-            pass
+    # 2. Check Intrusion microservice
+    try:
+        intrusion_res = await _analytics_get(f"{INTRUSION_URL}/intrusion/missions", timeout=3.0)
+        if intrusion_res and "missions" in intrusion_res:
+            for im in intrusion_res["missions"]:
+                if isinstance(im, dict) and im.get("mission_id"):
+                    discovered_missions.add(im["mission_id"])
+                elif isinstance(im, str):
+                    discovered_missions.add(im)
+    except Exception:
+        pass
 
-        # 2. Check Intrusion microservice
-        try:
-            intrusion_res = await _analytics_get(f"{INTRUSION_URL}/intrusion/missions", timeout=3.0)
-            if intrusion_res and "missions" in intrusion_res:
-                for im in intrusion_res["missions"]:
-                    if isinstance(im, dict) and im.get("mission_id"):
-                        discovered_missions.add(im["mission_id"])
-                    elif isinstance(im, str):
-                        discovered_missions.add(im)
-        except Exception:
-            pass
-
-        # 3. Check drone_postgres tracks for all recorded flight missions
+    # 3. Analytics DB tracks for all recorded flight missions
+    if ANALYTICS_DATABASE_URL:
         try:
             import asyncpg
-            conn = await asyncpg.connect("postgresql://dvas:dvas_secret@drone_postgres:5432/dvas")
+            conn = await asyncpg.connect(ANALYTICS_DATABASE_URL)
             try:
                 rows = await conn.fetch(
                     "SELECT DISTINCT mission_id_str FROM tracks WHERE mission_id_str IS NOT NULL AND mission_id_str != ''"
@@ -100,68 +99,43 @@ async def list_missions(user: dict = Depends(get_current_user)):
             finally:
                 await conn.close()
         except Exception as exc:
-            logger.debug(f"Could not read missions from drone_postgres: {exc}")
+            logger.debug(f"Could not read missions from analytics DB: {exc}")
 
-        async with async_session_factory() as session:
-            # 4. Check drones table for distinct missions
-            drone_missions = await session.execute(
-                select(distinct(Drone.mission_id)).where(Drone.mission_id != "", Drone.mission_id.is_not(None))
-            )
-            for m in drone_missions.scalars().all():
-                if m:
-                    discovered_missions.add(m)
+    async with async_session_factory() as session:
+        # 4. Check drones table for distinct missions
+        drone_missions = await session.execute(
+            select(distinct(Drone.mission_id)).where(Drone.mission_id != "", Drone.mission_id.is_not(None))
+        )
+        discovered_missions.update(m for m in drone_missions.scalars().all() if m)
 
-            # 5. Check evidence table for distinct missions
-            evi_res = await session.execute(
-                select(distinct(Evidence.mission_id)).where(Evidence.mission_id != "", Evidence.mission_id.is_not(None))
-            )
-            for m in evi_res.scalars().all():
-                if m:
-                    discovered_missions.add(m)
+        # 5. Check evidence table for distinct missions
+        evi_res = await session.execute(
+            select(distinct(Evidence.mission_id)).where(Evidence.mission_id != "", Evidence.mission_id.is_not(None))
+        )
+        discovered_missions.update(m for m in evi_res.scalars().all() if m)
+    return discovered_missions
 
-            if discovered_missions:
-                existing = await session.execute(
-                    select(Mission.mission_id).where(Mission.mission_id.in_(discovered_missions))
-                )
-                existing_ids = {row[0] for row in existing.all()}
-                
-                missing_ids = discovered_missions - existing_ids
-                if missing_ids:
-                    logger.info(f"Synchronizing {len(missing_ids)} missing missions into catalog")
-                    for mid in missing_ids:
-                        # Extract timestamp from mission_id like MSN-20260914-1318-14-BETA
-                        started_at = ""
-                        parts = mid.split("-")
-                        if len(parts) >= 4 and parts[1].isdigit() and parts[2].isdigit():
-                            try:
-                                d = parts[1]
-                                t = parts[2]
-                                s = parts[3] if parts[3].isdigit() else "00"
-                                started_at = f"{d[:4]}-{d[4:6]}-{d[6:8]}T{t[:2]}:{t[2:4]}:{s[:2]}+00:00"
-                            except Exception:
-                                pass
-                        
-                        # Lookup associated drone if available
-                        drone_stmt = select(Drone).where(Drone.mission_id == mid).limit(1)
-                        drone_match = (await session.execute(drone_stmt)).scalar_one_or_none()
-                        op_name = drone_match.operator_name if drone_match and drone_match.operator_name else "Safna S"
-                        juris = drone_match.jurisdiction if drone_match and drone_match.jurisdiction else "Thiruvananthapuram"
-                        drone_id = drone_match.id if drone_match else (f"DRN-{mid}" if mid.startswith("MSN-") else "")
 
-                        session.add(Mission(
-                            mission_id=mid,
-                            name=f"Mission {mid}",
-                            status="completed",
-                            drone_id=drone_id,
-                            jurisdiction=juris,
-                            operator_name=op_name,
-                            operator_ids=[],
-                            started_at=started_at
-                        ))
-                    await session.commit()
-    except Exception as e:
-        logger.warning(f"Could not synchronize missions: {e}")
+@router.get("/missions/untracked")
+async def list_untracked_missions(user: dict = Depends(require_roles("system_administrator"))):
+    """Mission ids that have analytics data or evidence but no missions row.
 
+    Read-only (B26): GET /missions used to insert these with a made-up name,
+    operator and jurisdiction. An admin now decides what to do with them.
+    """
+    discovered = await _discover_mission_ids()
+    if not discovered:
+        return {"untracked_mission_ids": []}
+    async with async_session_factory() as session:
+        existing = await session.execute(
+            select(Mission.mission_id).where(Mission.mission_id.in_(discovered))
+        )
+        existing_ids = {row[0] for row in existing.all()}
+    return {"untracked_mission_ids": sorted(discovered - existing_ids)}
+
+
+@router.get("/missions")
+async def list_missions(user: dict = Depends(get_current_user)):
     def _enrich_mission_dict(m_dict: dict) -> dict:
         obj_raw = m_dict.get("objective")
         if obj_raw and isinstance(obj_raw, str) and obj_raw.startswith("{"):

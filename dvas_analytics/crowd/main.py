@@ -91,13 +91,44 @@ def _is_cuda_failure(exc: BaseException) -> bool:
     return is_cuda_failure(exc, oom_type)
 
 
+@app.on_event("startup")
+async def startup():
+    global analyzer, _stream_running, _stream_task
+    await get_pool()
+    for drone_id in cfg.DRONE_IDS:
+        await ensure_drone(drone_id)
+    await minio.ensure_all_buckets()
+    # Load weights separately so a bad model file leaves the service up with
+    # /health = 503 (visible) instead of a supervisord restart loop.
+    analyzer = CrowdAnalyzer(model_path=None, alert_threshold=cfg.CROWD_ALERT_THRESHOLD)
+    try:
+        await asyncio.to_thread(analyzer.switch_model, MODEL_PATH)
+        log.info("Crowd Analyzer ready. Model: %s, Device: %s", MODEL_PATH, analyzer.device)
+    except Exception as exc:
+        log.error("Crowd model failed to load from %s: %s", MODEL_PATH, exc)
+    _stream_running = True
+    _stream_task = asyncio.create_task(_stream_loop())
+    log.info("Crowd stream loop auto-started for drones: %s", cfg.DRONE_IDS)
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global _stream_running, _stream_task
+    _stream_running = False
+    if _stream_task:
+        _stream_task.cancel()
+    await close_pool()
+    await close_client()
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {
-        "status":           "ok",
+    loaded = bool(analyzer and analyzer.ready)
+    body = {
+        "status":           "ok" if loaded else "model_not_loaded",
         "service":          "crowd-analyzer",
-        "model_loaded":     analyzer.ready if analyzer else False,
+        "model_loaded":     loaded,
         "model_type":       _current_model_type,
         "model_path":       analyzer._model_path if analyzer else "",
         "stream_running":   _stream_running,
@@ -106,6 +137,8 @@ async def health():
         "max_fps_per_drone": cfg.CROWD_MAX_FPS,
         "device":           str(analyzer.device) if analyzer else "unknown",
     }
+    # 503 so healthcheck.sh and the gateway see a service that stores nothing (B27)
+    return body if loaded else JSONResponse(body, status_code=503)
 
 
 # ── Single frame analysis ──────────────────────────────────────────────────────

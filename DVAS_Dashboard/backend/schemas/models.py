@@ -13,6 +13,7 @@ class WatchlistAddIn(BaseModel):
     plate: str
     reason: str = ""
     vehicle_type: str = ""
+    case_ref: str = ""           # FIR / case number, stored in plate_watchlist.case_ref
 
 
 class PresetCreateIn(BaseModel):

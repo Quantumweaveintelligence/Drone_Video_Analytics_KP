@@ -6,7 +6,7 @@ import io
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from jose import jwt
-from sqlalchemy import select, update, desc, func
+from sqlalchemy import select, update, desc, func, or_
 
 from database import async_session_factory
 from models import Report, Alert, Evidence, Mission, Drone, User
@@ -25,6 +25,30 @@ router = APIRouter(prefix="/api", tags=["Reports"])
 logger = logging.getLogger("dvas")
 
 _report_cache: dict[str, bytes] = {}
+
+
+async def _load_aar_data(session, mission: dict):
+    """Alerts/evidence tagged to the mission, plus untagged alerts from the same drone
+    inside the mission window (kept separate, never mixed in — B12)."""
+    mission_id = mission["mission_id"]
+    alerts_res = await session.execute(select(Alert).where(Alert.mission_id == mission_id))
+    alerts = [_row_to_dict(a) for a in alerts_res.scalars().all()]
+    ev_res = await session.execute(select(Evidence).where(Evidence.mission_id == mission_id))
+    evidence = [_row_to_dict(e) for e in ev_res.scalars().all()]
+
+    window_alerts = []
+    if mission.get("drone_id") and mission.get("started_at") and mission.get("ended_at"):
+        # ts columns are ISO-8601 UTC strings, so string order is time order
+        win_res = await session.execute(
+            select(Alert).where(
+                Alert.drone_id == mission["drone_id"],
+                or_(Alert.mission_id.is_(None), Alert.mission_id == ""),
+                Alert.ts >= mission["started_at"],
+                Alert.ts <= mission["ended_at"],
+            ).order_by(Alert.ts)
+        )
+        window_alerts = [_row_to_dict(a) for a in win_res.scalars().all()]
+    return alerts, evidence, window_alerts
 
 async def _generate_report_task(report_id: str, report_type: str, params: dict, user: dict):
     try:
@@ -79,20 +103,8 @@ async def _generate_report_task(report_id: str, report_type: str, params: dict, 
                 if not mission_obj:
                     raise ValueError("Mission not found")
                 mission = _row_to_dict(mission_obj)
-                
-                alerts_res = await session.execute(select(Alert).where(Alert.mission_id == mission_id))
-                alerts = [_row_to_dict(a) for a in alerts_res.scalars().all()]
-                if not alerts and mission.get("drone_id"):
-                    al_dr = await session.execute(select(Alert).where(Alert.drone_id == mission.get("drone_id")))
-                    alerts = [_row_to_dict(a) for a in al_dr.scalars().all()]
-                
-                ev_res = await session.execute(select(Evidence).where(Evidence.mission_id == mission_id))
-                evidence = [_row_to_dict(e) for e in ev_res.scalars().all()]
-                if not evidence and mission.get("drone_id"):
-                    ev_dr = await session.execute(select(Evidence).where(Evidence.drone_id == mission.get("drone_id")))
-                    evidence = [_row_to_dict(e) for e in ev_dr.scalars().all()]
-                
-                pdf_bytes = _make_mission_aar_pdf(user, mission, alerts, evidence)
+                alerts, evidence, window_alerts = await _load_aar_data(session, mission)
+                pdf_bytes = _make_mission_aar_pdf(user, mission, alerts, evidence, window_alerts)
             else:
                 raise ValueError("Unknown report type")
 
@@ -351,23 +363,13 @@ async def preview_report_data(
                 if not mission_obj:
                     raise HTTPException(404, "Mission not found")
                 mission = _row_to_dict(mission_obj)
-                
-                alerts_res = await session.execute(select(Alert).where(Alert.mission_id == mission_id))
-                alerts = [_row_to_dict(a) for a in alerts_res.scalars().all()]
-                if not alerts and mission.get("drone_id"):
-                    al_dr = await session.execute(select(Alert).where(Alert.drone_id == mission.get("drone_id")))
-                    alerts = [_row_to_dict(a) for a in al_dr.scalars().all()]
-                
-                ev_res = await session.execute(select(Evidence).where(Evidence.mission_id == mission_id))
-                evidence = [_row_to_dict(e) for e in ev_res.scalars().all()]
-                if not evidence and mission.get("drone_id"):
-                    ev_dr = await session.execute(select(Evidence).where(Evidence.drone_id == mission.get("drone_id")))
-                    evidence = [_row_to_dict(e) for e in ev_dr.scalars().all()]
+                alerts, evidence, window_alerts = await _load_aar_data(session, mission)
                 return {
                     "user": user,
                     "mission": mission,
                     "alerts": alerts,
-                    "evidence_items": evidence
+                    "evidence_items": evidence,
+                    "mission_window_events": window_alerts,
                 }
             else:
                 raise HTTPException(400, "Unknown report type")

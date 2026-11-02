@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 class LegalHoldIn(BaseModel):
     reason: str
@@ -8,3 +8,6 @@ class LegalHoldReleaseIn(BaseModel):
 
 class DirectExportIn(BaseModel):
     justification: str
+
+class DisposeIn(BaseModel):
+    reason: str = Field(..., min_length=20)

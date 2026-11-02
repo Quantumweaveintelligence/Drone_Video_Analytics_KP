@@ -27,7 +27,7 @@ from shared.db import (
     close_pool, ensure_drone, get_pool, upsert_track,
     write_confirmed_event, write_plate_read, write_vehicle_attributes,
     get_recent_plates, get_plates_by_mission, add_to_watchlist, remove_from_watchlist,
-    get_watchlist, is_watchlisted, write_vehicle_plate_link,
+    get_watchlist, is_watchlisted, write_vehicle_plate_link, get_active_watchlist_plates,
 )
 
 from shared.redis_client import (
@@ -63,6 +63,8 @@ LP_MODEL      = os.getenv("LP_MODEL",      "/analytics/anpr/models/license_plate
 analyzer: Optional[ANPRAnalyzer] = None
 _stream_task: Optional[asyncio.Task] = None
 _stream_running = False
+_watchlist_task: Optional[asyncio.Task] = None
+WATCHLIST_REFRESH_S = 60.0   # picks up rows changed in the DB or expired
 _frames_processed = 0
 
 # ── Annotated frame cache ─────────────────────────────────────────────────────
@@ -145,9 +147,28 @@ def _draw_anpr_annotations(frame: np.ndarray, plate_reads: list, drone_id: str) 
     return buf.tobytes() if ok else b""
 
 
+async def _reload_watchlist() -> int:
+    """Replace the in-memory watchlist with the DB's active plates (B30)."""
+    plates = await get_active_watchlist_plates()
+    analyzer.update_watchlist(plates)
+    return len(plates)
+
+
+async def _watchlist_refresh_loop():
+    while True:
+        await asyncio.sleep(WATCHLIST_REFRESH_S)
+        try:
+            await _reload_watchlist()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Watchlist refresh failed (keeping %d cached plates): %s",
+                        len(analyzer.watchlist), exc)
+
+
 @app.on_event("startup")
 async def startup():
-    global analyzer, _stream_running, _stream_task
+    global analyzer, _stream_running, _stream_task, _watchlist_task
     await get_pool()
     for drone_id in cfg.DRONE_IDS:
         await ensure_drone(drone_id)
@@ -161,6 +182,11 @@ async def startup():
         reid_aspect_weight=cfg.ANPR_REID_ASPECT_WEIGHT,
         reid_spatial_weight=cfg.ANPR_REID_SPATIAL_WEIGHT,
     )
+    try:
+        await _reload_watchlist()
+    except Exception as exc:
+        log.error("Watchlist load failed at startup: %s", exc)
+    _watchlist_task = asyncio.create_task(_watchlist_refresh_loop())
     log.info("ANPR Analyzer ready. Watchlist: %d entries", len(analyzer.watchlist))
 
     # Auto-start stream background consumer loop
@@ -176,6 +202,8 @@ async def shutdown():
     _stream_running = False
     if _stream_task:
         _stream_task.cancel()
+    if _watchlist_task:
+        _watchlist_task.cancel()
     await close_pool()
     await close_client()
 
@@ -1080,7 +1108,7 @@ class WatchlistAddRequest(BaseModel):
 
 @app.post("/watchlist/add", dependencies=[Depends(verify_service_key)])
 async def watchlist_add(req: WatchlistAddRequest):
-    await add_to_watchlist(req.plate_text, req.reason)
+    await add_to_watchlist(req.plate_text, req.reason, req.case_ref)
     if analyzer:
         analyzer.watchlist.add(req.plate_text.upper().strip())
     return {"status": "added", "plate": req.plate_text.upper().strip()}

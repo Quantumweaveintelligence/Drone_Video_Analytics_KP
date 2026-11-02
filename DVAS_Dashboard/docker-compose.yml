@@ -39,6 +39,7 @@ services:
       - INGEST_SERVER_URL=${INGEST_SERVER_URL:-http://drone_nginx}
       - EDGE_SERVER_URL=http://edge:8765
       - ANALYTICS_GATEWAY_URL=${ANALYTICS_GATEWAY_URL:-http://analytics-gateway:8100}
+      - ANALYTICS_DATABASE_URL=${ANALYTICS_DATABASE_URL:-postgresql://dvas:dvas_secret@drone_postgres:5432/dvas}
       - CROWD_ANALYTICS_URL=${CROWD_ANALYTICS_URL:-http://crowd-analyzer:8101}
       - PERSON_ANALYTICS_URL=${PERSON_ANALYTICS_URL:-http://person-analyzer:8102}
       - VEHICLE_ANALYTICS_URL=${VEHICLE_ANALYTICS_URL:-http://vehicle-analyzer:8103}

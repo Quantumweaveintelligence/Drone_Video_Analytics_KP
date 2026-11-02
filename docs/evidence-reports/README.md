@@ -12,3 +12,16 @@ Review of evidence storage, export and report generation on branch `runpod-v1` (
 
 **Start with** the summary table in 03, then the P0 phase in 02: it removes the issues that can produce wrong evidence or
 wrong legal documents today. Items marked *(verify on pod)* need a check against live data. The pod was stopped during the review.
+
+## Status
+
+| Phase | State |
+|---|---|
+| P0 | Code done (3 Nov 2026), unit tests only. Needs an image rebuild and a pod check: crowd `/health` 200 with `model_loaded:true`, `healthcheck.sh` all OK, crowd rows in `crowd_density_readings`, ANPR `watchlist_count` after a restart. Then run `DVAS_Dashboard/backend/scripts/review_synthesized_missions.sql` and decide what to do with each row. |
+| E1–U1 | Not started |
+
+P0 differs from the plan in two places:
+
+- **Untracked missions.** `GET /missions` still returns a plain list, so the UI is unchanged. Untracked mission ids are on a separate admin-only endpoint, `GET /api/missions/untracked`, and are no longer looked up on every list call.
+- **Image lookup (B2, partly).** On the pod, evidence images were never resolved, because the hard-coded host does not exist there. Reading `ANALYTICS_DATABASE_URL` switches the lookup on, so the "latest image of any kind" guesses were removed first. Nearest-in-time matches from the same drone or mission must now be within ±10 s. E1 still replaces this with exact keys.
+
