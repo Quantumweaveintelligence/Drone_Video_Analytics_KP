@@ -16,10 +16,10 @@ from typing import AsyncGenerator, Optional
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 
 sys.path.insert(0, "/analytics")
+from shared.auth import install_service_guard
 from shared.config import cfg, get_drone_aliases
 from shared.db import (
     close_pool, ensure_drone, get_pool, write_confirmed_event,
@@ -47,12 +47,8 @@ app = FastAPI(
     description="Real-time crowd counting, density estimation, and heatmap service",
     version="2.0.0",
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Internal service: no browser calls it (no CORS); every route but /health needs the key (M1)
+install_service_guard(app)
 
 MODEL_PATH = os.getenv("MODEL_PATH", "/analytics/crowd/models/PartAmodel_best.pth")
 if not os.path.isfile(MODEL_PATH) or "crowd_counting.pth" in MODEL_PATH:

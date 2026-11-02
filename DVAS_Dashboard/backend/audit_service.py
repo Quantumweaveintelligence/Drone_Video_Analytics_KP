@@ -574,6 +574,10 @@ def _build_filter_clauses(
     if request_id:
         clauses.append(AuditLog.request_id == str(request_id)[:64])
 
+    # M4: only seniors / admins read the whole log; everyone else their own entries
+    if user is not None and user.get("role") not in ("senior_officer", "system_administrator"):
+        clauses.append(AuditLog.actor_email == (user.get("email") or "\x00"))
+
     return clauses
 
 

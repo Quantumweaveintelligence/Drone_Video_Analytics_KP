@@ -16,13 +16,12 @@ from typing import Optional, Dict
 import cv2
 import numpy as np
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 
 sys.path.insert(0, "/analytics")
 from shared.config import cfg, get_drone_aliases
-from shared.auth import verify_service_key
+from shared.auth import verify_service_key, install_service_guard
 from shared.db import (
     close_pool, ensure_drone, get_pool, upsert_track,
     write_confirmed_event, write_plate_read, write_vehicle_attributes,
@@ -51,12 +50,8 @@ app = FastAPI(
     description="License plate recognition, watchlist management, theft alerts",
     version="2.0.0",
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Internal service: no browser calls it (no CORS); every route but /health needs the key (M1)
+install_service_guard(app)
 
 VEHICLE_MODEL = os.getenv("VEHICLE_MODEL", "/analytics/anpr/models/visdrone.pt")
 LP_MODEL      = os.getenv("LP_MODEL",      "/analytics/anpr/models/license_plate_detector.pt")

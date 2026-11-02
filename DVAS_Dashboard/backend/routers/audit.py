@@ -33,7 +33,10 @@ from schemas.models import (
 logger = logging.getLogger("dvas")
 router = APIRouter(prefix="/api", tags=["Audit Log Explorer"])
 
+# M4: seniors / admins read the whole log; control room officers and operators see
+# only their own entries (enforced in audit_service._build_filter_clauses).
 AUDIT_VIEW_ROLES = ("senior_officer", "system_administrator", "control_room_officer", "drone_operator")
+AUDIT_FULL_ROLES = ("senior_officer", "system_administrator")
 
 
 @router.get("/audit-logs")
@@ -151,7 +154,7 @@ async def audit_target_types(
 
 @router.get("/audit-logs/sources")
 async def audit_source_modules(
-    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
+    user: dict = Depends(require_roles(*AUDIT_FULL_ROLES)),
 ):
     """Return distinct source modules for filter dropdown."""
     return await get_distinct_values("source_module")
@@ -159,7 +162,7 @@ async def audit_source_modules(
 
 @router.get("/audit-logs/roles")
 async def audit_roles(
-    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
+    user: dict = Depends(require_roles(*AUDIT_FULL_ROLES)),
 ):
     """Return distinct user roles for filter dropdown."""
     return await get_distinct_values("actor_role")
@@ -175,7 +178,7 @@ async def audit_compliance_tags(
 
 @router.get("/audit-logs/trends")
 async def audit_trends(
-    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
+    user: dict = Depends(require_roles(*AUDIT_FULL_ROLES)),
     range: str = "24h",
 ):
     """Aggregate activity trend histograms and top actor stats."""
@@ -195,7 +198,7 @@ async def audit_access_log_endpoint(
 
 @router.get("/audit-logs/anomalies")
 async def audit_anomalies(
-    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
+    user: dict = Depends(require_roles(*AUDIT_FULL_ROLES)),
     hours: int = 24,
 ):
     """Evaluate and return rule-based security anomaly patterns over the last N hours."""
@@ -322,7 +325,7 @@ async def audit_export_json(
 
 @router.get("/audit-logs/export/pdf")
 async def audit_export_pdf(
-    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
+    user: dict = Depends(require_roles(*AUDIT_FULL_ROLES)),
     q: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -396,7 +399,7 @@ async def audit_export_pdf(
 @router.get("/audit-logs/related/{correlation_id}")
 async def audit_related_events(
     correlation_id: str,
-    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
+    user: dict = Depends(require_roles(*AUDIT_FULL_ROLES)),
 ):
     """Retrieve correlated events for timeline view."""
     return await get_related_events(correlation_id=correlation_id, user=user)
@@ -405,7 +408,7 @@ async def audit_related_events(
 @router.get("/audit-logs/{log_id}")
 async def audit_single_log(
     log_id: str,
-    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
+    user: dict = Depends(require_roles(*AUDIT_FULL_ROLES)),
 ):
     """Retrieve single audit log entry by ID."""
     entry = await get_single_entry(log_id=log_id, user=user)
@@ -490,7 +493,7 @@ async def release_legal_hold_endpoint(
 @router.get("/audit-logs/{log_id}/chain-of-custody")
 async def audit_chain_of_custody_endpoint(
     log_id: str,
-    user: dict = Depends(require_roles(*AUDIT_VIEW_ROLES)),
+    user: dict = Depends(require_roles(*AUDIT_FULL_ROLES)),
 ):
     """Generate complete cryptographic provenance and chain-of-custody envelope."""
     try:
@@ -562,14 +565,20 @@ async def purge_execute_endpoint(
 async def audit_sync_endpoint(
     payload: dict,
     request: Request,
-    user: dict = Depends(require_roles("senior_officer", "system_administrator", "drone_operator")),
+    user: dict = Depends(require_roles("drone_operator")),
 ):
-    """Ingest a batch of audit log entries pushed from an edge ground station."""
-    from services.audit_sync import sync_records_batch
+    """Ingest a batch of audit entries pushed from an edge ground station (H3).
+
+    Only the operator's own entries are accepted; each is re-chained centrally (the
+    edge's id / ts / hash are kept in after_values.edge_record), so a caller can no
+    longer write rows with chosen actors, timestamps or chain hashes."""
+    from services.audit_sync import MAX_SYNC_BATCH, sync_records_batch
     records = payload.get("records", [])
     if not isinstance(records, list):
         raise HTTPException(status_code=400, detail="records must be a list of audit objects")
-    synced = await sync_records_batch(records)
-    return {"synced": synced, "received": len(records)}
+    if len(records) > MAX_SYNC_BATCH:
+        raise HTTPException(status_code=413, detail=f"at most {MAX_SYNC_BATCH} records per batch")
+    synced, rejected = await sync_records_batch(records, caller=user)
+    return {"synced": synced, "rejected": rejected, "received": len(records)}
 
 

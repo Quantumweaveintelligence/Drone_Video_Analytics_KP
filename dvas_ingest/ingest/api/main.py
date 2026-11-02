@@ -23,6 +23,7 @@ Endpoints
 from __future__ import annotations
 
 import asyncio
+import re
 import base64
 import json
 import logging
@@ -1290,7 +1291,16 @@ async def purge_drone_stream(
     """
     Forcefully purges the Valkey stream queue for the given drone,
     terminating any ongoing drain process and taking the stream offline immediately.
+
+    Only the dashboard backend (its Keycloak service account) or a senior officer /
+    administrator token may purge; an operator token on the same client may not (H8).
     """
+    realm_roles = set((claims.get("realm_access") or {}).get("roles") or [])
+    is_service = str(claims.get("preferred_username", "")).startswith("service-account-")
+    if not (is_service or realm_roles & {"sys-admin", "supervisor"}):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not permitted to purge streams")
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", drone_id or ""):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid drone id")
     if not _qm:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Queue unavailable")
     

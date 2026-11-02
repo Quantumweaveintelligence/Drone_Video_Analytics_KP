@@ -208,7 +208,9 @@ async def _jurisdiction_for(session, mission_id: str) -> str:
         jur = res.scalar_one_or_none()
         if jur:
             return jur
-    return "Thiruvananthapuram"
+    # No mission → no jurisdiction (statewide); a fixed district made the item
+    # invisible to every other district's control room (J4)
+    return None
 
 
 def _apply_vault_result(row: Evidence, vault_objects: List[Dict], status: str, integrity: str) -> None:
@@ -312,9 +314,10 @@ async def _broadcast_created(rows: List[Evidence]) -> None:
                 "id": f"evidence:{row.id}", "category": "ai", "type": row.event_type,
                 "title": _event_type_label(row.event_type), "severity": row.severity or "medium",
                 "drone_id": row.drone_id, "mission_id": row.mission_id, "evidence_id": row.id,
-                "confidence": row.confidence, "ts": row.ts}})
+                "jurisdiction": row.jurisdiction, "confidence": row.confidence, "ts": row.ts}})
             await hub.broadcast({"type": "evidence_created", "evidence_id": row.id,
-                                 "event_type": row.event_type, "mission_id": row.mission_id})
+                                 "event_type": row.event_type, "mission_id": row.mission_id,
+                                 "jurisdiction": row.jurisdiction})
         except Exception as exc:
             logger.debug("Broadcast failed: %s", exc)
 

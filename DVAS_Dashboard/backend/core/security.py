@@ -1,5 +1,9 @@
+import asyncio
 import logging
-from typing import Literal
+import time
+from typing import Literal, Optional
+
+import httpx
 from fastapi import Depends, HTTPException, Request
 from jose import jwt
 
@@ -8,115 +12,170 @@ from audit_service import write_audit_v2
 
 logger = logging.getLogger("dvas")
 
-JWKS_CACHE = {}
+# ── Keycloak signing keys (M5) ───────────────────────────────────────────────
+# Cached for JWKS_TTL_S and re-fetched when a token names an unknown key (key
+# rotation), with a short cool-down so a flood of bad tokens cannot hammer Keycloak.
+JWKS_CACHE: dict = {}
+JWKS_TTL_S = 3600
+_jwks_fetched_at = 0.0
+_jwks_lock = asyncio.Lock()
+_JWKS_URL = f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/certs"
+
 
 def fetch_jwks(force: bool = False):
-    global JWKS_CACHE
+    """Synchronous fetch, used once at start-up."""
+    global JWKS_CACHE, _jwks_fetched_at
     if JWKS_CACHE and not force:
         return JWKS_CACHE
-    url = f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/certs"
     try:
         import requests
-        resp = requests.get(url, timeout=5)
+        resp = requests.get(_JWKS_URL, timeout=5)
         if resp.status_code == 200:
-            JWKS_CACHE = resp.json()
-            logger.info("Successfully fetched JWKS from Keycloak")
-            return JWKS_CACHE
+            JWKS_CACHE, _jwks_fetched_at = resp.json(), time.monotonic()
+            logger.info("Fetched JWKS from Keycloak")
         else:
-            logger.error(f"Failed to fetch JWKS: {resp.status_code} {resp.text}")
+            logger.error("Failed to fetch JWKS: HTTP %s", resp.status_code)
     except Exception as e:
-        logger.error(f"Failed to fetch JWKS: {e}")
+        logger.error("Failed to fetch JWKS: %s", e)
     return JWKS_CACHE
 
-def get_jwks():
-    global JWKS_CACHE
-    if not JWKS_CACHE:
-        fetch_jwks()
+
+async def _jwks(kid: Optional[str]) -> dict:
+    global JWKS_CACHE, _jwks_fetched_at
+    known = {k.get("kid") for k in JWKS_CACHE.get("keys", [])}
+    age = time.monotonic() - _jwks_fetched_at
+    if JWKS_CACHE and age < JWKS_TTL_S and (kid is None or kid in known):
+        return JWKS_CACHE
+    if JWKS_CACHE and kid not in known and age < 30:
+        return JWKS_CACHE                       # cool-down: unknown kid fetched < 30 s ago
+    async with _jwks_lock:
+        if time.monotonic() - _jwks_fetched_at < 1 and JWKS_CACHE:
+            return JWKS_CACHE
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(_JWKS_URL)
+            if r.status_code == 200:
+                JWKS_CACHE, _jwks_fetched_at = r.json(), time.monotonic()
+            else:
+                logger.error("JWKS refresh failed: HTTP %s", r.status_code)
+        except Exception as e:
+            logger.error("JWKS refresh failed: %s", e)
     return JWKS_CACHE
+
 
 Role = Literal["drone_operator", "control_room_officer", "senior_officer", "system_administrator"]
 
-ROLE_MAP = {
-    "sys-admin": "system_administrator",
-    "supervisor": "senior_officer",
-    "control-room": "control_room_officer",
-    "drone-operator": "drone_operator",
-}
+# Keycloak realm role → DVAS role, in priority order: a user holding several
+# realm roles always gets the highest one (the old loop let the last match win).
+ROLE_PRIORITY = (
+    ("sys-admin", "system_administrator"),
+    ("supervisor", "senior_officer"),
+    ("control-room", "control_room_officer"),
+    ("drone-operator", "drone_operator"),
+)
+ROLE_MAP = dict(ROLE_PRIORITY)
+DVAS_ROLES = tuple(r for _, r in ROLE_PRIORITY)
+
+
+def derive_role(realm_roles) -> Optional[str]:
+    roles = set(realm_roles or [])
+    for kc_role, dvas_role in ROLE_PRIORITY:
+        if kc_role in roles:
+            return dvas_role
+    return None
+
+
+class AuthError(Exception):
+    pass
+
+
+async def decode_token(token: str) -> dict:
+    """Verify signature, expiry and issuer. Raises AuthError with a generic message."""
+    try:
+        header = jwt.get_unverified_header(token)
+    except Exception:
+        raise AuthError("Invalid token")
+    keys = await _jwks(header.get("kid"))
+    try:
+        payload = jwt.decode(token, keys, algorithms=["RS256"], options={"verify_aud": False})
+    except jwt.ExpiredSignatureError:
+        raise AuthError("Token expired")
+    except Exception:
+        raise AuthError("Invalid token")
+    # Issuer: this realm (the host differs between the pod URL and 127.0.0.1)
+    if not str(payload.get("iss", "")).rstrip("/").endswith(f"/realms/{KEYCLOAK_REALM}"):
+        raise AuthError("Invalid token")
+    return payload
+
+
+async def user_from_payload(payload: dict) -> dict:
+    """DVAS user from a verified token. Keycloak's realm roles are authoritative for the
+    role; the users table only fills in name / jurisdiction / mission scope."""
+    role = derive_role((payload.get("realm_access") or {}).get("roles"))
+    if role is None:
+        raise AuthError("No DVAS role assigned")
+    jur = payload.get("jurisdiction")
+    jurisdiction = str(jur[0]) if isinstance(jur, list) and jur else (jur if isinstance(jur, str) else "")
+    scope = payload.get("mission_scope") or []
+    if isinstance(scope, str):
+        scope = [scope]
+    email = payload.get("email", "")
+    name = payload.get("name") or payload.get("preferred_username", "")
+    if email:
+        try:
+            from database import async_session_factory
+            from models import User
+            from sqlalchemy import select
+            async with async_session_factory() as session:
+                row = (await session.execute(
+                    select(User.name, User.jurisdiction, User.mission_scope, User.role)
+                    .where(User.email == email))).first()
+            if row:
+                name = row[0] or name
+                jurisdiction = jurisdiction or row[1] or ""
+                scope = scope or row[2] or []
+                if row[3] and row[3] != role:
+                    logger.warning("Users-table role %s differs from Keycloak role %s for %s; using Keycloak",
+                                   row[3], role, email)
+        except Exception as e:
+            logger.debug("Could not hydrate user attributes from DB: %s", e)
+    return {"id": payload.get("sub"), "email": email, "name": name, "role": role,
+            "jurisdiction": jurisdiction, "mission_scope": scope, "exp": payload.get("exp")}
+
+
+async def user_from_token(token: str) -> dict:
+    return await user_from_payload(await decode_token(token))
+
 
 async def get_current_user(request: Request) -> dict:
+    """Bearer header (edge app, services) or the httpOnly cookie (browser).
+    Tokens in URLs are not accepted here (H5); WebSockets use authenticate_ws()."""
     token = None
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
     if not token:
-        token = request.query_params.get("token")
-    if not token:
         token = request.cookies.get("dvas_access_token")
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
-        options = {"verify_aud": False}
-        payload = jwt.decode(token, get_jwks(), algorithms=["RS256"], options=options)
-        
-        realm_access = payload.get("realm_access", {})
-        roles = realm_access.get("roles", [])
-        
-        user_role = "drone_operator"
-        for kc_role, mapped_role in ROLE_MAP.items():
-            if kc_role in roles:
-                user_role = mapped_role
-                if user_role == "system_administrator":
-                    break
+        return await user_from_token(token)
+    except AuthError as e:
+        msg = str(e)
+        raise HTTPException(status_code=403 if msg == "No DVAS role assigned" else 401, detail=msg)
 
-        attrs_jurisdiction = payload.get("jurisdiction")
-        jurisdiction_val = ""
-        if isinstance(attrs_jurisdiction, list) and len(attrs_jurisdiction) > 0:
-            jurisdiction_val = str(attrs_jurisdiction[0])
-        elif isinstance(attrs_jurisdiction, str):
-            jurisdiction_val = attrs_jurisdiction
 
-        mission_scope_val = payload.get("mission_scope", [])
-        if isinstance(mission_scope_val, str):
-            mission_scope_val = [mission_scope_val]
+async def authenticate_ws(websocket) -> Optional[dict]:
+    """WebSocket handshake: browsers send the cookie; the edge app (other origin) may
+    send ?token=. Returns the user, or None (caller closes with 4401)."""
+    token = websocket.query_params.get("token") or websocket.cookies.get("dvas_access_token", "")
+    if not token:
+        return None
+    try:
+        return await user_from_token(token)
+    except AuthError:
+        return None
 
-        email_val = payload.get("email", "")
-        name_val = payload.get("name") or payload.get("preferred_username", "")
-        if email_val:
-            try:
-                from database import async_session_factory
-                from models import User
-                from sqlalchemy import select
-                async with async_session_factory() as session:
-                    res = await session.execute(
-                        select(User.name, User.jurisdiction, User.mission_scope, User.role).where(User.email == email_val)
-                    )
-                    row = res.first()
-                    if row:
-                        if row[0]:
-                            name_val = row[0]
-                        if not jurisdiction_val and row[1]:
-                            jurisdiction_val = row[1]
-                        if not mission_scope_val and row[2]:
-                            mission_scope_val = row[2]
-                        if row[3]:
-                            user_role = row[3]
-            except Exception as e:
-                logger.debug(f"Could not hydrate user attributes from DB: {e}")
-
-        return {
-            "id": payload.get("sub"),
-            "email": payload.get("email", email_val),
-            "name": name_val,
-            "role": user_role,
-            "jurisdiction": jurisdiction_val,
-            "mission_scope": mission_scope_val,
-        }
-    except jwt.ExpiredSignatureError:
-        logger.error("get_current_user: Token expired")
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError as e:
-        logger.error(f"get_current_user: Invalid token: {e}")
-        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 def _user_to_dict(u, exclude_password: bool = False) -> dict:
     """Convert a User ORM object to a plain dict."""
@@ -193,3 +252,29 @@ def _apply_scope_to_query(stmt, model, scope: dict):
             # empty mission scope → no results
             stmt = stmt.where(model.mission_id == "__NONE__")
     return stmt
+
+
+# ── One jurisdiction rule for every list, count and live push (J1) ──────────
+# A control room officer sees rows of their own jurisdiction, statewide rows and
+# rows with no jurisdiction yet. Seniors and admins see everything. A CRO with no
+# jurisdiction configured is treated as state-level.
+STATEWIDE_JURISDICTIONS = ("Kerala", "State HQ")
+STATEWIDE_ROLES = ("senior_officer", "system_administrator")
+
+
+def jurisdiction_clause(column, user: dict):
+    """SQLAlchemy filter for `column`, or None when the user is unrestricted."""
+    from sqlalchemy import or_
+    if user.get("role") in STATEWIDE_ROLES:
+        return None
+    jur = user.get("jurisdiction")
+    if not jur:
+        return None
+    return or_(column == jur, column.is_(None), column == "", column.in_(STATEWIDE_JURISDICTIONS))
+
+
+def jurisdiction_visible(value, user: dict) -> bool:
+    """Same rule for a single value (live messages, single-row checks)."""
+    if user.get("role") in STATEWIDE_ROLES or not user.get("jurisdiction"):
+        return True
+    return value in (None, "", user["jurisdiction"]) or value in STATEWIDE_JURISDICTIONS

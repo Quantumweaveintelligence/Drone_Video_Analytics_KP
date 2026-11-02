@@ -25,6 +25,15 @@ ADMIN_CLIENT_ID = os.environ.get("ADMIN_CLIENT_ID", "dvas-admin-service")
 ADMIN_CLIENT_SECRET = os.environ.get("ADMIN_CLIENT_SECRET", "")
 KEYCLOAK_ADMIN = os.environ.get("KEYCLOAK_ADMIN", "admin")
 
+# ---------- Browser tokens (H5) ----------
+# The dashboard in a browser uses only the httpOnly cookie. Clients on these origins
+# (the DVAS Edge app on the laptops, a different origin that cannot use the cookie)
+# also receive the access token in the login/refresh body. New env var.
+EDGE_CLIENT_ORIGINS = frozenset(
+    o.strip().rstrip("/") for o in os.getenv("EDGE_CLIENT_ORIGINS", "http://localhost:8765,http://127.0.0.1:8765").split(",")
+    if o.strip()
+)
+
 # ---------- Evidence (evidence plan E2/E5) ----------
 # New env vars (flagged in docs/evidence-reports/README.md):
 #   EVIDENCE_RETENTION_DAYS — default object-lock / retention period for evidence (Q2; 90 = today's value)
@@ -73,7 +82,9 @@ DVAS_PEER_URL = os.environ.get("DVAS_PEER_URL", "").rstrip("/")
 DVAS_SERVICE_KEY = os.environ.get("DVAS_SERVICE_KEY", "")
 
 # ---------- CORS ----------
-CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")
+# OpenAPI docs (/docs, /redoc, /openapi.json) only when explicitly enabled. New env var.
+API_DOCS_ENABLED = os.environ.get("DVAS_API_DOCS", "0").strip().lower() in ("1", "true", "yes")
 
 
 def validate_required_secrets() -> None:

@@ -17,7 +17,7 @@ from core.config import (
     MINIO_PROXY_ENDPOINT, MINIO_PROXY_ACCESS, MINIO_PROXY_SECRET, MINIO_PROXY_SECURE,
     limiter,
 )
-from core.analytics_client import _get_minio_client
+from core.analytics_client import _get_minio_client, _service_headers
 from core import runtime
 from audit_service import write_audit_v2
 from schemas.models import ModelUpdateIn
@@ -143,7 +143,7 @@ def _build_service_map():
 
 async def _fetch_single_status(client: httpx.AsyncClient, key: str, url: str) -> tuple:
     try:
-        r = await client.get(url, timeout=5.0)
+        r = await client.get(url, timeout=5.0, headers=_service_headers())
         data = r.json() if r.status_code == 200 else {}
         return key, bool(data.get("stream_running", False))
     except Exception:
@@ -179,20 +179,20 @@ async def _get_service_stream_status() -> dict:
 async def _apply_single_change(client: httpx.AsyncClient, svc_key: str, base_url: str, should_run: bool, is_running: bool) -> tuple:
     if should_run and not is_running:
         try:
-            r = await client.get(f"{base_url}/stream/start", timeout=12.0)
+            r = await client.get(f"{base_url}/stream/start", timeout=12.0, headers=_service_headers())
             return svc_key, ("started" if r.status_code == 200 else f"start_failed({r.status_code})")
         except Exception as e:
             return svc_key, f"start_error({e})"
     elif not should_run and is_running:
         try:
-            r = await client.get(f"{base_url}/stream/stop", timeout=12.0)
+            r = await client.get(f"{base_url}/stream/stop", timeout=12.0, headers=_service_headers())
             return svc_key, ("stopped" if r.status_code == 200 else f"stop_failed({r.status_code})")
         except Exception as e:
             return svc_key, f"stop_error({e})"
     elif not should_run and not is_running:
         # Guarantee GPU VRAM is released on deselected service
         try:
-            await client.get(f"{base_url}/stream/stop", timeout=5.0)
+            await client.get(f"{base_url}/stream/stop", timeout=5.0, headers=_service_headers())
         except Exception:
             pass
         return svc_key, "already_stopped"
@@ -307,13 +307,13 @@ async def list_models(user: dict = Depends(get_current_user)):
     }
 
 
-@router.post("/models")
-@router.post("/models/deploy")
-async def update_models(
-    body: ModelUpdateIn,
-    user: dict = Depends(require_roles("control_room_officer", "senior_officer", "system_administrator")),
-    request: Request = None,
-):
+MODEL_ADMIN_ROLES = ("senior_officer", "system_administrator")   # M9: shared cluster config
+
+
+async def apply_model_config(active: list, user: dict, request=None, reason: str = "") -> dict:
+    """Persist the active model set, audit it and start/stop the analytics streams.
+    Used by POST /models and by deploying an AI model suggestion (ING-02)."""
+    body = ModelUpdateIn(active=active)
     valid_keys = {m["key"] for m in AVAILABLE_MODELS}
     invalid = [k for k in body.active if k not in valid_keys]
     if invalid:
@@ -351,7 +351,7 @@ async def update_models(
         target=CLUSTER_SCOPE,
         target_type="configuration",
         target_name=f"Model Config ({CLUSTER_SCOPE})",
-        details=f"active={','.join(body.active)}",
+        details=f"active={','.join(body.active)}" + (f"; {reason}" if reason else ""),
         before_values={"active": old_active},
         after_values={"active": body.active},
         source_endpoint="POST /api/models",
@@ -361,6 +361,16 @@ async def update_models(
     # Concurrently start/stop the analytics stream loops based on what was toggled
     stream_results = await _apply_stream_changes(body.active)
     logger.info("model_deploy", extra={"stream_results": stream_results, "active": body.active, "by": user["email"]})
+    return stream_results
+
+
+@router.post("/models")
+async def update_models(
+    body: ModelUpdateIn,
+    user: dict = Depends(require_roles(*MODEL_ADMIN_ROLES)),
+    request: Request = None,
+):
+    stream_results = await apply_model_config(body.active, user, request)
 
     updated_cfg = await _get_model_config(CLUSTER_SCOPE)
     stream_status = await _get_service_stream_status()

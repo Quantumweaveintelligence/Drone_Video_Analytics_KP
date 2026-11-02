@@ -17,10 +17,10 @@ from typing import Optional, Dict
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
 
 sys.path.insert(0, "/analytics")
+from shared.auth import install_service_guard
 from shared.config import cfg, get_drone_aliases
 from shared.db import (
     close_pool, ensure_drone, get_pool, upsert_track,
@@ -47,12 +47,8 @@ app = FastAPI(
     description="Vehicle detection, tracking, colour classification, speed estimation",
     version="2.0.0",
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Internal service: no browser calls it (no CORS); every route but /health needs the key (M1)
+install_service_guard(app)
 
 VEHICLE_MODEL = os.getenv("VEHICLE_MODEL", "/analytics/vehicle/models/visdrone.pt")
 analyzer: Optional[VehicleAnalyzer] = None

@@ -7,7 +7,7 @@ from sqlalchemy import select, func, or_, and_, distinct
 
 from database import async_session_factory
 from models import Mission, Drone, Alert, Evidence, Export
-from core.security import get_current_user, require_roles, scope_filter_for, _apply_scope_to_query, _row_to_dict
+from core.security import get_current_user, jurisdiction_clause, require_roles, _row_to_dict
 from core.analytics_client import _analytics_get
 from core.config import ANPR_URL, INTRUSION_URL, ANALYTICS_DATABASE_URL
 from audit_service import write_audit_v2
@@ -29,12 +29,10 @@ async def list_drones(user: dict = Depends(get_current_user)):
         elif user["role"] == "system_administrator":
             pass  # infra view — connection status only
         else:
-            f = scope_filter_for(user)
-            if "__deny__" in f:
-                raise HTTPException(403, "Not permitted")
-            stmt = _apply_scope_to_query(stmt, Drone, f)
-            if stmt is None:
-                raise HTTPException(403, "Not permitted")
+            # Same jurisdiction rule as alerts / evidence / missions (J1, J3)
+            jur = jurisdiction_clause(Drone.jurisdiction, user)
+            if jur is not None:
+                stmt = stmt.where(jur)
             # Exclude dead ephemeral test drones (offline with no active mission) and legacy mock drones
             if user["role"] in ["senior_officer", "control_room_officer"]:
                 active_missions_subq = select(Mission.mission_id).where(
@@ -157,35 +155,18 @@ async def list_missions(user: dict = Depends(get_current_user)):
         # can view missions — filtered by jurisdiction if set for control_room_officer
         stmt = select(Mission).where(~Mission.mission_id.like("M-10%"))
         if user.get("role") == "drone_operator":
-            op_name = (user.get("name") or "").strip()
+            # Missions this operator flew (recorded at start) or is assigned to
+            conds = [Mission.operator_ids.contains([user.get("id") or ""])]
+            if user.get("mission_scope"):
+                conds.append(Mission.mission_id.in_(user["mission_scope"]))
             op_email = (user.get("email") or "").strip()
-            op_id = (user.get("id") or "").strip()
-            conds = []
-            if op_name:
-                conds.append(Mission.operator_name.ilike(f"%{op_name}%"))
-            if op_email:
-                conds.append(Mission.operator_name.ilike(f"%{op_email}%"))
-                prefix = op_email.split("@")[0]
-                if prefix:
-                    conds.append(Mission.operator_name.ilike(f"%{prefix}%"))
-            if op_id:
-                conds.append(Mission.operator_ids.contains([op_id]))
-            if conds:
-                stmt = stmt.where(or_(*conds))
-            else:
-                stmt = stmt.where(Mission.operator_name == op_name)
-        elif user.get("role") == "control_room_officer":
-            jur = user.get("jurisdiction")
-            if jur:
-                # Show missions in their jurisdiction, State HQ, statewide, or with no jurisdiction set
-                stmt = stmt.where(
-                    or_(
-                        Mission.jurisdiction == jur,
-                        Mission.jurisdiction.is_(None),
-                        Mission.jurisdiction == "",
-                        Mission.jurisdiction.in_(["Kerala", "State HQ", "Thiruvananthapuram"])
-                    )
-                )
+            if op_email:   # missions started before operator_ids was recorded
+                conds.append(Mission.operator_name.contains(op_email, autoescape=True))
+            stmt = stmt.where(or_(*conds))
+        else:
+            jur = jurisdiction_clause(Mission.jurisdiction, user)
+            if jur is not None:
+                stmt = stmt.where(jur)
         stmt = stmt.order_by(Mission.started_at.desc()).limit(300)
         result = await session.execute(stmt)
         return [_enrich_mission_dict(_row_to_dict(r)) for r in result.scalars().all()]
@@ -195,7 +176,7 @@ async def list_missions(user: dict = Depends(get_current_user)):
 @router.post("/missions")
 async def create_mission(
     payload: dict = Body(...),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_roles("drone_operator", "senior_officer")),
     request: Request = None,
 ):
     """
@@ -208,7 +189,7 @@ async def create_mission(
     operator_name = payload.get("operator_name") or payload.get("operator", "")
     location = payload.get("location", "")
     started_at = payload.get("started_at", "")
-    video_source = payload.get("video_source", "rtmp://10.253.110.250:1935/live/stream")
+    video_source = payload.get("video_source", "")
     login_ts_ist = payload.get("login_ts_ist") or datetime.now(timezone.utc).isoformat()
     frames_sent = payload.get("frames_sent", 0)
     frames_ingested = payload.get("frames_ingested", 0)
@@ -274,17 +255,20 @@ async def create_mission(
 async def end_mission_record(
     mission_id: str,
     payload: dict = Body(default={}),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_roles("drone_operator", "senior_officer")),
     request: Request = None,
 ):
-    """Mark a mission as completed and record the end time."""
+    """Mark a mission as completed: the operator who flies it, or a senior officer (J6)."""
     async with async_session_factory() as session:
         mission = await session.get(Mission, mission_id)
         if not mission:
             raise HTTPException(404, f"Mission {mission_id} not found")
-        # Check jurisdiction / mission scope if scoped
-        if user.get("mission_scope") and mission_id not in user["mission_scope"]:
+        if user["role"] == "drone_operator" and not (
+                user.get("id") in (mission.operator_ids or [])
+                or mission_id in (user.get("mission_scope") or [])):
             raise HTTPException(403, f"Not permitted to end mission {mission_id}")
+        if mission.status == "completed":
+            return {"status": "already_ended", "mission_id": mission_id}
         mission.status = "completed"
         ended_at_str = datetime.now(timezone.utc).isoformat()
         mission.ended_at = ended_at_str
@@ -336,15 +320,22 @@ async def end_mission_record(
 @router.delete("/missions/{mission_id}")
 async def delete_mission_record(
     mission_id: str,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_roles("senior_officer", "system_administrator")),
     request: Request = None,
 ):
-    """Delete a mission record from the database."""
+    """Delete a mission record (seniors / admins, H2). Refused while evidence or alerts
+    refer to it — deleting it would orphan them."""
     mission_name = mission_id
     async with async_session_factory() as session:
         mission = await session.get(Mission, mission_id)
         if not mission:
-            return {"status": "not_found", "mission_id": mission_id}
+            raise HTTPException(404, f"Mission {mission_id} not found")
+        refs = (await session.execute(select(func.count()).select_from(Evidence)
+                                      .where(Evidence.mission_id == mission_id))).scalar() or 0
+        refs += (await session.execute(select(func.count()).select_from(Alert)
+                                       .where(Alert.mission_id == mission_id))).scalar() or 0
+        if refs:
+            raise HTTPException(409, f"Mission {mission_id} has {refs} alert/evidence record(s); it cannot be deleted")
         mission_name = mission.name
         await session.delete(mission)
         await session.commit()
@@ -378,13 +369,9 @@ async def command_kpis(user: dict = Depends(get_current_user)):
     from routers.alerts import _scope_evidence
     if user["role"] not in ("control_room_officer", "senior_officer"):
         raise HTTPException(403, "Not permitted")
-    jur = user.get("jurisdiction") if user["role"] == "control_room_officer" else None
 
     def scoped(column):
-        # CRO: own jurisdiction + statewide / unset rows, as in /api/missions and /api/alerts
-        if not jur:
-            return None
-        return or_(column == jur, column.is_(None), column == "", column.in_(["Kerala", "State HQ"]))
+        return jurisdiction_clause(column, user)
 
     since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     async with async_session_factory() as session:

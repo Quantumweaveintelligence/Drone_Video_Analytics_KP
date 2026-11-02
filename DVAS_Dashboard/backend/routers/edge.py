@@ -1,5 +1,4 @@
 import os
-import random
 import logging
 from typing import Optional
 from datetime import datetime, timezone, timedelta
@@ -77,34 +76,6 @@ async def edge_shift_summary(request: Request):
     )
 
 
-@router.get("/edge/status")
-async def edge_status(user: dict = Depends(require_roles("drone_operator"))):
-    now = datetime.now(timezone.utc)
-    async with async_session_factory() as session:
-        result = await session.execute(
-            select(Drone).where(Drone.operator_id == user["id"])
-        )
-        drone_obj = result.scalar_one_or_none()
-        drone = _row_to_dict(drone_obj) if drone_obj else None
-    return {
-        "drone": drone,
-        "buffer_pct": random.randint(55, 92),
-        "buffer_seconds_oldest": 60,
-        "buffer_seconds_newest": random.randint(0, 3),
-        "flagged_last_minute": random.randint(2, 18),
-        "selected_last_minute": random.randint(0, 5),
-        "clip_status": random.choice(["idle", "uploading", "upload_complete"]),
-        "vpn": "connected",
-        "ingest_reachable": True,
-        "gps_lock": True,
-        "battery_pct": random.randint(48, 96),
-        "signal_pct": random.randint(65, 98),
-        "fps": 28,
-        "resolution": "1920x1080",
-        "server_time": now.isoformat(),
-    }
-
-
 class EdgeActionLogIn(BaseModel):
     action: str
     target: Optional[str] = ""
@@ -117,16 +88,25 @@ class EdgeActionLogIn(BaseModel):
     after_values: Optional[dict] = None
 
 
+# Actions the dashboard itself records; an edge client may not write these (H3)
+_RESERVED_ACTIONS = ("login", "logout", "evidence_", "export_", "direct_export", "bundle_", "report_",
+                     "user_", "audit_", "case_", "legal_hold", "watchlist_", "model_config")
+
+
 @router.post("/edge/action-log")
 async def record_edge_action_log(
     body: EdgeActionLogIn,
     request: Request,
-    user: dict = Depends(get_current_user)
+    user: dict = Depends(require_roles("drone_operator")),
 ):
-    """Record an operator action from the Edge Station into the tamper-evident audit log."""
+    """Record an operator action from the Edge Station into the tamper-evident audit log.
+    The actor is always the caller; dashboard-reserved action names are refused."""
+    action = (body.action or "").strip()[:64]
+    if not action or action.lower().startswith(_RESERVED_ACTIONS):
+        raise HTTPException(400, "Action name not allowed from the edge station")
     entry = await write_audit_v2(
         actor=user,
-        action=body.action,
+        action=action,
         target=body.target,
         target_type=body.target_type,
         target_id=body.target_id,
@@ -134,7 +114,7 @@ async def record_edge_action_log(
         details=body.details,
         before_values=body.before_values,
         after_values=body.after_values,
-        source_module=body.source_module,
+        source_module="edge",
         request=request,
     )
     return {"status": "recorded", "id": entry["id"], "hash": entry.get("hash")}
@@ -145,7 +125,7 @@ async def get_edge_system_logs(
     level: Optional[str] = "ALL",
     source: Optional[str] = "ALL",
     limit: int = 200,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_roles("drone_operator")),
 ):
     """Fetch live operational engine metrics from edge service or fallback to live system metrics."""
     # EDGE_API_HOST set to "" (cloud/RunPod: no edge container) -> return [] at once.

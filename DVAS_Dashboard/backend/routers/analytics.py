@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import engine
 from models import Mission
-from core.security import get_current_user, _row_to_dict
+from core.security import get_current_user, require_roles, _row_to_dict
 from core.analytics_client import _analytics_get, _analytics_post, _analytics_put, _analytics_delete, _service_headers
 from core.config import (
     ANALYTICS_BASE, CROWD_URL, PERSON_URL, VEHICLE_URL, ANPR_URL, INTRUSION_URL,
@@ -19,7 +19,26 @@ from audit_service import write_audit_v2
 from schemas.models import WatchlistAddIn
 
 logger = logging.getLogger("dvas")
-router = APIRouter(prefix="/api", tags=["Analytics"])
+# ── One role policy for every /api/analytics route (M3) ─────────────────────
+# Analytics data, streams and configuration: control room and senior officers.
+# Health / model status: also system administrators (infra view).
+# /api/analytics/suggestions*: per-route rules (operators create, admins deploy …).
+# Per-route checks below may narrow this further, never widen it.
+ANALYTICS_ROLES = ("control_room_officer", "senior_officer")
+
+
+async def _analytics_policy(request: Request, user: dict = Depends(get_current_user)):
+    path = request.url.path
+    if path.startswith("/api/analytics/suggestions"):
+        return
+    allowed = ANALYTICS_ROLES
+    if path.endswith("/health") or path in ("/api/analytics/models/status", "/api/analytics/health/all"):
+        allowed = ANALYTICS_ROLES + ("system_administrator",)
+    if user["role"] not in allowed:
+        raise HTTPException(403, "Not permitted")
+
+
+router = APIRouter(prefix="/api", tags=["Analytics"], dependencies=[Depends(_analytics_policy)])
 
 # ── Analytics Health ──────────────────────────────────────────────────────────
 @router.get("/analytics/health")
@@ -41,13 +60,13 @@ async def analytics_models_status(user: dict = Depends(get_current_user)):
     """Real model status from each analytics service health endpoint."""
     import asyncio as _asyncio
     results = await _asyncio.gather(
-        _analytics_get(f"{CROWD_URL}/health"),
-        _analytics_get(f"{PERSON_URL}/health"),
-        _analytics_get(f"{VEHICLE_URL}/health"),
-        _analytics_get(f"{ANPR_URL}/health"),
-        _analytics_get(f"{INTRUSION_URL}/health"),
-        _analytics_get(f"{VESSEL_URL}/health"),
-        _analytics_get(f"{ANOMALY_URL}/health"),
+        _analytics_get(f"{CROWD_URL}/health", soft=True),
+        _analytics_get(f"{PERSON_URL}/health", soft=True),
+        _analytics_get(f"{VEHICLE_URL}/health", soft=True),
+        _analytics_get(f"{ANPR_URL}/health", soft=True),
+        _analytics_get(f"{INTRUSION_URL}/health", soft=True),
+        _analytics_get(f"{VESSEL_URL}/health", soft=True),
+        _analytics_get(f"{ANOMALY_URL}/health", soft=True),
     )
     return {
         "crowd":     results[0],
@@ -70,7 +89,7 @@ async def analytics_events_stream(request: Request, drone_id: str = ""):
 
     upstream_url = f"{ANALYTICS_BASE}/events/stream"
     if drone_id:
-        upstream_url += f"?drone_id={drone_id}"
+        upstream_url += f"?drone_id={quote(drone_id)}"
 
     async def event_generator():
         try:
@@ -100,13 +119,8 @@ async def crowd_analytics(user: dict = Depends(get_current_user)):
     """Crowd density timeline — proxied from crowd-analyzer with fallback."""
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
-    result = await _analytics_get(f"{CROWD_URL}/density/timeline")
-    if "error" in result:
-        # Fallback: synthesized data when service is offline
-        base = [120,130,90,60,40,30,45,90,180,260,320,400,380,350,300,340,420,500,460,380,300,240,190,150]
-        data = [{"hour": f"{h:02d}:00", "density": base[h], "vehicles": max(0, base[h] // 4)} for h in range(24)]
-        return {"series": data, "source": "fallback"}
-    return result
+    # No synthesized fallback: if the analyzer is down the caller gets an error, not invented data
+    return await _analytics_get(f"{CROWD_URL}/density/timeline")
 
 
 @router.get("/analytics/crowd/readings")
@@ -115,7 +129,7 @@ async def crowd_readings(user: dict = Depends(get_current_user), drone_id: str =
         raise HTTPException(403, "Not permitted")
     url = f"{CROWD_URL}/readings/history?limit={limit}"
     if drone_id:
-        url += f"&drone_id={drone_id}"
+        url += f"&drone_id={quote(drone_id)}"
     return await _analytics_get(url)
 
 
@@ -125,7 +139,7 @@ async def crowd_timeline(user: dict = Depends(get_current_user), drone_id: str =
         raise HTTPException(403, "Not permitted")
     url = f"{CROWD_URL}/density/timeline?hours={hours}"
     if drone_id:
-        url += f"&drone_id={drone_id}"
+        url += f"&drone_id={quote(drone_id)}"
     return await _analytics_get(url)
 
 
@@ -135,13 +149,13 @@ async def crowd_heatmap(user: dict = Depends(get_current_user), drone_id: str = 
         raise HTTPException(403, "Not permitted")
     url = f"{CROWD_URL}/density/heatmap/latest"
     if drone_id:
-        url += f"?drone_id={drone_id}"
+        url += f"?drone_id={quote(drone_id)}"
     return await _analytics_get(url)
 
 
 @router.get("/analytics/crowd/health")
 async def crowd_health(user: dict = Depends(get_current_user)):
-    return await _analytics_get(f"{CROWD_URL}/health")
+    return await _analytics_get(f"{CROWD_URL}/health", soft=True)
 
 
 @router.get("/analytics/crowd/annotated")
@@ -153,7 +167,7 @@ async def crowd_annotated_frame(user: dict = Depends(get_current_user), drone_id
     try:
         params = {"drone_id": drone_id} if drone_id else {}
         async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(f"{CROWD_URL}/annotated/latest", params=params)
+            r = await client.get(f"{CROWD_URL}/annotated/latest", params=params, headers=_service_headers())
         if r.status_code == 200:
             headers = {
                 "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -179,10 +193,10 @@ async def crowd_switch_model(request: Request, user: dict = Depends(get_current_
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
     body = await request.json()
-    result = await _analytics_put(f"{CROWD_URL}/model/switch", body)
+    result = await _analytics_put(f"{CROWD_URL}/model/switch", body, soft=True)
     if "error" in result:
         # Fallback to post if put had an issue
-        result = await _analytics_post(f"{CROWD_URL}/model/switch", body)
+        result = await _analytics_post(f"{CROWD_URL}/model/switch", body, soft=True)
     if "error" in result:
         raise HTTPException(502, detail=result.get("detail", "Failed to switch crowd model upstream"))
 
@@ -220,7 +234,7 @@ async def crowd_export_csv(user: dict = Depends(get_current_user)):
         raise HTTPException(403, "Not permitted")
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.get(f"{CROWD_URL}/export/csv")
+            r = await client.get(f"{CROWD_URL}/export/csv", headers=_service_headers())
         if r.status_code == 200:
             return Response(
                 content=r.content,
@@ -245,7 +259,7 @@ async def crowd_export_pdf(
     try:
         params = {k: v for k, v in {"operator": operator, "location": location, "mission_id": mission_id}.items() if v}
         async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.get(f"{CROWD_URL}/export/pdf", params=params)
+            r = await client.get(f"{CROWD_URL}/export/pdf", params=params, headers=_service_headers())
         if r.status_code == 200:
             return Response(
                 content=r.content,
@@ -264,9 +278,9 @@ async def person_identities(user: dict = Depends(get_current_user), drone_id: st
         raise HTTPException(403, "Not permitted")
     url = f"{PERSON_URL}/persons/identities?limit={limit}"
     if drone_id:
-        url += f"&drone_id={drone_id}"
+        url += f"&drone_id={quote(drone_id)}"
     if mission_id:
-        url += f"&mission_id={mission_id}"
+        url += f"&mission_id={quote(mission_id)}"
     return await _analytics_get(url)
 
 
@@ -276,9 +290,9 @@ async def person_gallery(user: dict = Depends(get_current_user), drone_id: str =
         raise HTTPException(403, "Not permitted")
     url = f"{PERSON_URL}/faces/gallery?limit={limit}"
     if drone_id:
-        url += f"&drone_id={drone_id}"
+        url += f"&drone_id={quote(drone_id)}"
     if mission_id:
-        url += f"&mission_id={mission_id}"
+        url += f"&mission_id={quote(mission_id)}"
     return await _analytics_get(url)
 
 
@@ -288,7 +302,7 @@ async def person_count(user: dict = Depends(get_current_user), drone_id: str = "
         raise HTTPException(403, "Not permitted")
     url = f"{PERSON_URL}/persons/count"
     if drone_id:
-        url += f"?drone_id={drone_id}"
+        url += f"?drone_id={quote(drone_id)}"
     return await _analytics_get(url)
 
 
@@ -298,7 +312,7 @@ async def person_tracks(user: dict = Depends(get_current_user), drone_id: str = 
         raise HTTPException(403, "Not permitted")
     url = f"{PERSON_URL}/tracks/active?limit={limit}"
     if drone_id:
-        url += f"&drone_id={drone_id}"
+        url += f"&drone_id={quote(drone_id)}"
     return await _analytics_get(url)
 
 
@@ -315,7 +329,7 @@ async def person_detections(user: dict = Depends(get_current_user), drone_id: st
         raise HTTPException(403, "Not permitted")
     url = f"{PERSON_URL}/detections/recent?limit={limit}"
     if drone_id:
-        url += f"&drone_id={drone_id}"
+        url += f"&drone_id={quote(drone_id)}"
     return await _analytics_get(url)
 
 
@@ -341,7 +355,7 @@ async def person_dedup_progress(user: dict = Depends(get_current_user), mission_
         raise HTTPException(403, "Not permitted")
     url = f"{PERSON_URL}/persons/deduplicate/progress"
     if mission_id:
-        url += f"?mission_id={mission_id}"
+        url += f"?mission_id={quote(mission_id)}"
     return await _analytics_get(url)
 
 
@@ -365,17 +379,17 @@ async def person_missions_dedup_runs(user: dict = Depends(get_current_user)):
 @router.get("/analytics/vehicle/health")
 async def vehicle_health(user: dict = Depends(get_current_user)):
     """Proxy vehicle-analyzer health including stream_running status."""
-    return await _analytics_get(f"{VEHICLE_URL}/health")
+    return await _analytics_get(f"{VEHICLE_URL}/health", soft=True)
 
 
 @router.get("/analytics/anpr/health")
 async def anpr_health(user: dict = Depends(get_current_user)):
     """Proxy anpr-analyzer health including stream_running status."""
-    return await _analytics_get(f"{ANPR_URL}/health")
+    return await _analytics_get(f"{ANPR_URL}/health", soft=True)
 
 
 # ── Analytics Stream Start/Stop Proxies ──────────────────────────────────────
-@router.get("/analytics/vehicle/stream/start")
+@router.post("/analytics/vehicle/stream/start")
 async def vehicle_stream_start(user: dict = Depends(get_current_user)):
     """Start the vehicle detection stream loop."""
     if user["role"] == "drone_operator":
@@ -383,7 +397,7 @@ async def vehicle_stream_start(user: dict = Depends(get_current_user)):
     return await _analytics_get(f"{VEHICLE_URL}/stream/start")
 
 
-@router.get("/analytics/vehicle/stream/stop")
+@router.post("/analytics/vehicle/stream/stop")
 async def vehicle_stream_stop(user: dict = Depends(get_current_user)):
     """Stop the vehicle detection stream loop."""
     if user["role"] == "drone_operator":
@@ -391,7 +405,7 @@ async def vehicle_stream_stop(user: dict = Depends(get_current_user)):
     return await _analytics_get(f"{VEHICLE_URL}/stream/stop")
 
 
-@router.get("/analytics/anpr/stream/start")
+@router.post("/analytics/anpr/stream/start")
 async def anpr_stream_start(user: dict = Depends(get_current_user)):
     """Start the ANPR detection stream loop."""
     if user["role"] == "drone_operator":
@@ -399,7 +413,7 @@ async def anpr_stream_start(user: dict = Depends(get_current_user)):
     return await _analytics_get(f"{ANPR_URL}/stream/start")
 
 
-@router.get("/analytics/anpr/stream/stop")
+@router.post("/analytics/anpr/stream/stop")
 async def anpr_stream_stop(user: dict = Depends(get_current_user)):
     """Stop the ANPR detection stream loop."""
     if user["role"] == "drone_operator":
@@ -407,7 +421,7 @@ async def anpr_stream_stop(user: dict = Depends(get_current_user)):
     return await _analytics_get(f"{ANPR_URL}/stream/stop")
 
 
-@router.get("/analytics/crowd/stream/start")
+@router.post("/analytics/crowd/stream/start")
 async def crowd_stream_start(user: dict = Depends(get_current_user)):
     """Start the crowd analysis stream loop."""
     if user["role"] == "drone_operator":
@@ -415,7 +429,7 @@ async def crowd_stream_start(user: dict = Depends(get_current_user)):
     return await _analytics_get(f"{CROWD_URL}/stream/start")
 
 
-@router.get("/analytics/crowd/stream/stop")
+@router.post("/analytics/crowd/stream/stop")
 async def crowd_stream_stop(user: dict = Depends(get_current_user)):
     """Stop the crowd analysis stream loop."""
     if user["role"] == "drone_operator":
@@ -423,7 +437,7 @@ async def crowd_stream_stop(user: dict = Depends(get_current_user)):
     return await _analytics_get(f"{CROWD_URL}/stream/stop")
 
 
-@router.get("/analytics/person/stream/start")
+@router.post("/analytics/person/stream/start")
 async def person_stream_start(user: dict = Depends(get_current_user)):
     """Start the person detection stream loop."""
     if user["role"] == "drone_operator":
@@ -434,10 +448,10 @@ async def person_stream_start(user: dict = Depends(get_current_user)):
 @router.get("/analytics/person/health")
 async def person_health_proxy(user: dict = Depends(get_current_user)):
     """Proxy person-analyzer health including stream_running status."""
-    return await _analytics_get(f"{PERSON_URL}/health")
+    return await _analytics_get(f"{PERSON_URL}/health", soft=True)
 
 
-@router.get("/analytics/person/stream/stop")
+@router.post("/analytics/person/stream/stop")
 async def person_stream_stop(user: dict = Depends(get_current_user)):
     """Stop the person detection stream loop."""
     if user["role"] == "drone_operator":
@@ -455,7 +469,7 @@ async def person_annotated_frame(user: dict = Depends(get_current_user), drone_i
     try:
         params = {"drone_id": drone_id} if drone_id else {}
         async with httpx.AsyncClient(timeout=8.0) as client:
-            r = await client.get(f"{PERSON_URL}/annotated/latest", params=params)
+            r = await client.get(f"{PERSON_URL}/annotated/latest", params=params, headers=_service_headers())
         if r.status_code == 200:
             headers = {
                 "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -480,7 +494,7 @@ async def person_live_buffer(user: dict = Depends(get_current_user), drone_id: s
         raise HTTPException(403, "Not permitted")
     url = f"{PERSON_URL}/persons/live"
     if drone_id:
-        url += f"?drone_id={drone_id}"
+        url += f"?drone_id={quote(drone_id)}"
     return await _analytics_get(url)
 
 
@@ -529,7 +543,7 @@ async def person_watchlist_enroll(
     Proxy multipart form upload for watchlist enrollment.
     Forwards the raw multipart body to person-analyzer.
     """
-    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer", "admin", "super_admin"):
+    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer"):
         raise HTTPException(403, "Not permitted")
 
     body = await request.body()
@@ -580,7 +594,7 @@ async def person_watchlist_detail(
     user: dict = Depends(get_current_user),
 ):
     """Proxy: get details of a specific watchlist entry."""
-    return await _analytics_get(f"{PERSON_URL}/watchlist/{watchlist_id}")
+    return await _analytics_get(f"{PERSON_URL}/watchlist/{quote(watchlist_id, safe='')}")
 
 
 @router.put("/analytics/person/watchlist/{watchlist_id}")
@@ -591,9 +605,9 @@ async def person_watchlist_update(
     body: dict = {},
 ):
     """Proxy: update mutable fields of a watchlist entry."""
-    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer", "admin", "super_admin"):
+    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer"):
         raise HTTPException(403, "Not permitted")
-    result = await _analytics_put(f"{PERSON_URL}/watchlist/{watchlist_id}", body)
+    result = await _analytics_put(f"{PERSON_URL}/watchlist/{quote(watchlist_id, safe='')}", body, soft=True)
     _audit_status = "error" if isinstance(result, dict) and result.get("error") else "success"
     try:
         await write_audit_v2(
@@ -618,9 +632,9 @@ async def person_watchlist_remove(
     user: dict = Depends(get_current_user),
 ):
     """Proxy: soft-delete a person from the watchlist."""
-    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer", "admin", "super_admin"):
+    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer"):
         raise HTTPException(403, "Not permitted")
-    result = await _analytics_delete(f"{PERSON_URL}/watchlist/{watchlist_id}")
+    result = await _analytics_delete(f"{PERSON_URL}/watchlist/{quote(watchlist_id, safe='')}", soft=True)
     _audit_status = "error" if isinstance(result, dict) and result.get("error") else "success"
     try:
         await write_audit_v2(
@@ -646,12 +660,13 @@ async def person_watchlist_alert_confirm(
     body: dict = {},
 ):
     """Proxy: confirm a watchlist alert."""
-    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer", "admin", "super_admin", "analyst"):
+    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer"):
         raise HTTPException(403, "Not permitted")
     notes = body.get("notes") or ""
     result = await _analytics_post(
-        f"{PERSON_URL}/watchlist/alerts/{alert_id}/confirm?notes={quote(notes)}",
+        f"{PERSON_URL}/watchlist/alerts/{quote(alert_id)}/confirm?notes={quote(notes)}",
         {},
+        soft=True,
     )
     _audit_status = "error" if isinstance(result, dict) and result.get("error") else "success"
     try:
@@ -678,12 +693,13 @@ async def person_watchlist_alert_dismiss(
     body: dict = {},
 ):
     """Proxy: dismiss a watchlist alert."""
-    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer", "admin", "super_admin", "analyst"):
+    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer"):
         raise HTTPException(403, "Not permitted")
     notes = body.get("notes") or ""
     result = await _analytics_post(
-        f"{PERSON_URL}/watchlist/alerts/{alert_id}/dismiss?notes={quote(notes)}",
+        f"{PERSON_URL}/watchlist/alerts/{quote(alert_id)}/dismiss?notes={quote(notes)}",
         {},
+        soft=True,
     )
     _audit_status = "error" if isinstance(result, dict) and result.get("error") else "success"
     try:
@@ -707,7 +723,7 @@ async def person_watchlist_gallery_reload(
     user: dict = Depends(get_current_user),
 ):
     """Proxy: force reload in-memory gallery matrix."""
-    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer", "admin", "super_admin"):
+    if user["role"] not in ("system_administrator", "senior_officer", "control_room_officer"):
         raise HTTPException(403, "Admin or supervisor only")
     return await _analytics_post(f"{PERSON_URL}/watchlist/gallery/reload", {})
 
@@ -729,9 +745,9 @@ async def person_annotation_config_set(
     body: dict = {},
 ):
     """Proxy: update HUD annotation toggles."""
-    if user["role"] not in ("drone_operator", "control_room_officer", "senior_officer", "system_administrator", "admin", "super_admin", "analyst"):
+    if user["role"] not in ("drone_operator", "control_room_officer", "senior_officer", "system_administrator"):
         raise HTTPException(403, "Not permitted")
-    result = await _analytics_put(f"{PERSON_URL}/annotation/config", body)
+    result = await _analytics_put(f"{PERSON_URL}/annotation/config", body, soft=True)
     _audit_status = "error" if isinstance(result, dict) and result.get("error") else "success"
     try:
         await write_audit_v2(
@@ -808,7 +824,7 @@ async def vehicle_tracks(user: dict = Depends(get_current_user), drone_id: str =
         raise HTTPException(403, "Not permitted")
     url = f"{VEHICLE_URL}/tracks/active?limit={limit}"
     if drone_id:
-        url += f"&drone_id={drone_id}"
+        url += f"&drone_id={quote(drone_id)}"
     return await _analytics_get(url)
 
 
@@ -818,7 +834,7 @@ async def vehicle_recent(user: dict = Depends(get_current_user), drone_id: str =
         raise HTTPException(403, "Not permitted")
     url = f"{VEHICLE_URL}/vehicles/recent?limit={limit}"
     if drone_id:
-        url += f"&drone_id={drone_id}"
+        url += f"&drone_id={quote(drone_id)}"
     return await _analytics_get(url)
 
 
@@ -850,7 +866,7 @@ async def vehicle_plate(tracker_id: str, user: dict = Depends(get_current_user),
         raise HTTPException(403, "Not permitted")
     url = f"{VEHICLE_URL}/vehicles/{tracker_id}/plate"
     if drone_id:
-        url += f"?drone_id={drone_id}"
+        url += f"?drone_id={quote(drone_id)}"
     return await _analytics_get(url)
 
 
@@ -860,7 +876,7 @@ async def vehicle_image_url(tracker_id: str, user: dict = Depends(get_current_us
         raise HTTPException(403, "Not permitted")
     url = f"{VEHICLE_URL}/vehicles/{tracker_id}/image"
     if drone_id:
-        url += f"?drone_id={drone_id}"
+        url += f"?drone_id={quote(drone_id)}"
     return await _analytics_get(url)
 
 
@@ -874,7 +890,7 @@ async def vehicle_annotated_frame(user: dict = Depends(get_current_user), drone_
     try:
         params = {"drone_id": drone_id} if drone_id else {}
         async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(f"{VEHICLE_URL}/annotated/latest", params=params)
+            r = await client.get(f"{VEHICLE_URL}/annotated/latest", params=params, headers=_service_headers())
         if r.status_code == 200:
             headers = {
                 "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -903,7 +919,7 @@ async def anpr_annotated_frame(user: dict = Depends(get_current_user), drone_id:
     try:
         params = {"drone_id": drone_id} if drone_id else {}
         async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(f"{ANPR_URL}/annotated/latest", params=params)
+            r = await client.get(f"{ANPR_URL}/annotated/latest", params=params, headers=_service_headers())
         if r.status_code == 200:
             headers = {
                 "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -934,9 +950,9 @@ async def plates_recent(
         raise HTTPException(403, "Not permitted")
     url = f"{ANPR_URL}/plates/recent?limit={limit}"
     if mission_id:
-        url += f"&mission_id={mission_id}"
+        url += f"&mission_id={quote(mission_id)}"
     elif drone_id:
-        url += f"&drone_id={drone_id}"
+        url += f"&drone_id={quote(drone_id)}"
     return await _analytics_get(url)
 
 
@@ -952,9 +968,9 @@ async def plates_live(
         raise HTTPException(403, "Not permitted")
     url = f"{ANPR_URL}/plates/live?limit={limit}"
     if mission_id:
-        url += f"&mission_id={mission_id}"
+        url += f"&mission_id={quote(mission_id)}"
     elif drone_id:
-        url += f"&drone_id={drone_id}"
+        url += f"&drone_id={quote(drone_id)}"
     return await _analytics_get(url)
 
 
@@ -962,14 +978,14 @@ async def plates_live(
 async def plate_lookup(plate_text: str, user: dict = Depends(get_current_user)):
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
-    return await _analytics_get(f"{ANPR_URL}/plates/{plate_text}")
+    return await _analytics_get(f"{ANPR_URL}/plates/{quote(plate_text, safe='')}")
 
 
 @router.get("/analytics/plates/{plate_text}/image")
 async def plate_image_url(plate_text: str, user: dict = Depends(get_current_user)):
     if user["role"] == "drone_operator":
         raise HTTPException(403, "Not permitted")
-    return await _analytics_get(f"{ANPR_URL}/plates/{plate_text}/image")
+    return await _analytics_get(f"{ANPR_URL}/plates/{quote(plate_text, safe='')}/image")
 
 
 @router.get("/analytics/watchlist")
@@ -1014,7 +1030,7 @@ async def watchlist_remove(
 ):
     if user["role"] not in ("control_room_officer", "senior_officer"):
         raise HTTPException(403, "Not permitted")
-    result = await _analytics_delete(f"{ANPR_URL}/watchlist/{plate}")
+    result = await _analytics_delete(f"{ANPR_URL}/watchlist/{quote(plate, safe='')}")
     await write_audit_v2(
         actor=user,
         action="watchlist_remove",
@@ -1152,7 +1168,7 @@ async def mission_stats(
 @router.get("/analytics/intrusion/health")
 async def intrusion_health(user: dict = Depends(get_current_user)):
     """Intrusion analyzer service health."""
-    return await _analytics_get(f"{INTRUSION_URL}/health")
+    return await _analytics_get(f"{INTRUSION_URL}/health", soft=True)
 
 
 @router.get("/analytics/intrusion/live")
@@ -1162,7 +1178,7 @@ async def intrusion_live(
 ):
     """Live intrusion tracks and states for a drone."""
     return await _analytics_get(
-        f"{INTRUSION_URL}/intrusion/live?drone_id={drone_id}"
+        f"{INTRUSION_URL}/intrusion/live?drone_id={quote(drone_id)}"
     )
 
 
@@ -1204,7 +1220,7 @@ async def intrusion_zone_status(
 ):
     """Active geofence zone status."""
     return await _analytics_get(
-        f"{INTRUSION_URL}/intrusion/zone/status?drone_id={drone_id}"
+        f"{INTRUSION_URL}/intrusion/zone/status?drone_id={quote(drone_id)}"
     )
 
 
@@ -1218,7 +1234,7 @@ async def intrusion_events(
     """Historical intrusion events for post-mission review."""
     return await _analytics_get(
         f"{INTRUSION_URL}/intrusion/events?"
-        f"drone_id={drone_id}&mission_id={mission_id}&limit={limit}"
+        f"drone_id={quote(drone_id)}&mission_id={quote(mission_id)}&limit={limit}"
     )
 
 
@@ -1229,7 +1245,7 @@ async def intrusion_analytics(
 ):
     """Full analytics JSON for a completed mission."""
     return await _analytics_get(
-        f"{INTRUSION_URL}/intrusion/analytics?mission_id={mission_id}"
+        f"{INTRUSION_URL}/intrusion/analytics?mission_id={quote(mission_id)}"
     )
 
 
@@ -1252,7 +1268,7 @@ async def intrusion_config_update(
         raise HTTPException(403, "Config changes require elevated role")
     body = await request.json()
     result = await _analytics_post(
-        f"{INTRUSION_URL}/intrusion/config?drone_id={drone_id}", body
+        f"{INTRUSION_URL}/intrusion/config?drone_id={quote(drone_id)}", body
     )
     await write_audit_v2(
         actor=user,
@@ -1270,7 +1286,7 @@ async def intrusion_config_update(
     return result
 
 
-@router.get("/analytics/intrusion/stream/start")
+@router.post("/analytics/intrusion/stream/start")
 async def intrusion_stream_start(user: dict = Depends(get_current_user)):
     """Start intrusion detection stream."""
     if user["role"] == "drone_operator":
@@ -1278,7 +1294,7 @@ async def intrusion_stream_start(user: dict = Depends(get_current_user)):
     return await _analytics_get(f"{INTRUSION_URL}/stream/start")
 
 
-@router.get("/analytics/intrusion/stream/stop")
+@router.post("/analytics/intrusion/stream/stop")
 async def intrusion_stream_stop(user: dict = Depends(get_current_user)):
     """Stop intrusion detection stream."""
     if user["role"] == "drone_operator":
@@ -1325,17 +1341,30 @@ async def _forward_suggestion_to_peer(suggestion_dict: dict) -> None:
         logger.warning(f"Could not forward suggestion to peer DVAS ({DVAS_PEER_URL}): {exc}")
 
 
+# ── AI model suggestions: who may do what (H2) ──────────────────────────────
+SUGGESTION_ADMIN_ROLES = ("senior_officer", "system_administrator")
+
+
+def _own_suggestion(user: dict):
+    from models import AIModelSuggestion
+    return AIModelSuggestion.suggested_by.contains(f"({user.get('email')})", autoescape=True)
+
+
 @router.get("/analytics/suggestions")
 async def list_model_suggestions(
     limit: int = 50,
     user: dict = Depends(get_current_user)
 ):
-    """List operator AI model suggestions ordered by newest first."""
+    """List AI model suggestions, newest first. Operators see their own."""
     from database import async_session_factory
     from models import AIModelSuggestion
     from sqlalchemy import select, desc
+    limit = max(1, min(limit, 200))
     async with async_session_factory() as session:
-        stmt = select(AIModelSuggestion).order_by(desc(AIModelSuggestion.timestamp)).limit(limit)
+        stmt = select(AIModelSuggestion)
+        if user["role"] == "drone_operator":
+            stmt = stmt.where(_own_suggestion(user))
+        stmt = stmt.order_by(desc(AIModelSuggestion.timestamp)).limit(limit)
         res = await session.execute(stmt)
         return [_row_to_dict(r) for r in res.scalars().all()]
 
@@ -1343,7 +1372,7 @@ async def list_model_suggestions(
 @router.post("/analytics/suggestions")
 async def create_model_suggestion(
     payload: dict,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_roles("drone_operator", "control_room_officer", "senior_officer")),
     request: Request = None,
 ):
     """
@@ -1487,18 +1516,36 @@ async def create_model_suggestion(
 async def update_suggestion_status(
     suggestion_id: str,
     payload: dict,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_roles("control_room_officer", "senior_officer", "system_administrator")),
     request: Request = None,
 ):
-    """Update suggestion status to ACKNOWLEDGED or DEPLOYED_TO_GPU."""
+    """ACKNOWLEDGED (command roles) or DEPLOYED_TO_GPU (seniors / admins). Deploying
+    really adds the suggested models to the active model set and starts their
+    analytics streams (ING-02) — it used to change only the status text."""
     from database import async_session_factory
     from models import AIModelSuggestion
     from sqlalchemy import update
     from services.websocket_hub import hub
 
-    new_status = payload.get("status", "ACKNOWLEDGED").upper()
+    new_status = str(payload.get("status", "ACKNOWLEDGED")).upper()
     if new_status not in ("PENDING", "ACKNOWLEDGED", "DEPLOYED_TO_GPU"):
-        new_status = "ACKNOWLEDGED"
+        raise HTTPException(400, "status must be PENDING, ACKNOWLEDGED or DEPLOYED_TO_GPU")
+
+    deploy_result = None
+    if new_status == "DEPLOYED_TO_GPU":
+        if user["role"] not in SUGGESTION_ADMIN_ROLES:
+            raise HTTPException(403, "Only senior officers or administrators deploy models")
+        from routers.infra import _get_model_config, CLUSTER_SCOPE, apply_model_config
+        async with async_session_factory() as session:
+            sugg = await session.get(AIModelSuggestion, suggestion_id)
+        if sugg is None:
+            raise HTTPException(404, "Model suggestion not found")
+        alias = {"anpr": "plate", "lpr": "plate"}
+        wanted = [alias.get(m, m) for m in (sugg.models or [])]
+        current = (await _get_model_config(CLUSTER_SCOPE)).get("active") or []
+        active = list(dict.fromkeys(list(current) + wanted))
+        deploy_result = await apply_model_config(
+            active, user, request, reason=f"deployed from AI model suggestion {suggestion_id}")
 
     async with async_session_factory() as session:
         res = await session.execute(
@@ -1527,7 +1574,8 @@ async def update_suggestion_status(
         "status": new_status,
     })
 
-    return {"status": "ok", "suggestion_id": suggestion_id, "new_status": new_status}
+    return {"status": "ok", "suggestion_id": suggestion_id, "new_status": new_status,
+            "stream_actions": deploy_result}
 
 
 @router.delete("/analytics/suggestions/{suggestion_id}")
@@ -1546,6 +1594,8 @@ async def delete_model_suggestion(
         sugg = await session.get(AIModelSuggestion, suggestion_id)
         if not sugg:
             raise HTTPException(404, "Model suggestion not found")
+        if user["role"] not in SUGGESTION_ADMIN_ROLES and f"({user.get('email')})" not in (sugg.suggested_by or ""):
+            raise HTTPException(403, "Only the officer who made it, or a senior officer, may delete it")
         sugg_dict = _row_to_dict(sugg)
         await session.delete(sugg)
         await session.execute(delete(Alert).where(Alert.id == suggestion_id))
@@ -1580,16 +1630,21 @@ async def clear_all_model_suggestions(
     user: dict = Depends(get_current_user),
     request: Request = None,
 ):
-    """Clear all AI model suggestions and associated alert records."""
+    """Clear suggestions: seniors / admins all, anyone else only their own (H2)."""
     from database import async_session_factory
     from models import AIModelSuggestion, Alert
-    from sqlalchemy import delete
+    from sqlalchemy import delete, select
     from services.websocket_hub import hub
 
+    everything = user["role"] in SUGGESTION_ADMIN_ROLES
     async with async_session_factory() as session:
-        res = await session.execute(delete(AIModelSuggestion))
-        count = res.rowcount
-        await session.execute(delete(Alert).where(Alert.id.like("SUGG-%")))
+        q = select(AIModelSuggestion.id) if everything else select(AIModelSuggestion.id).where(_own_suggestion(user))
+        id_list = list((await session.execute(q)).scalars().all())
+        count = 0
+        if id_list:
+            res = await session.execute(delete(AIModelSuggestion).where(AIModelSuggestion.id.in_(id_list)))
+            count = res.rowcount
+            await session.execute(delete(Alert).where(Alert.id.in_(id_list)))
         await session.commit()
 
     try:
@@ -1611,6 +1666,7 @@ async def clear_all_model_suggestions(
     await hub.broadcast({
         "type": "model_suggestions_cleared",
         "count": count,
+        "suggestion_ids": None if everything else id_list,     # None = everything was cleared
     })
     return {"status": "ok", "deleted_count": count}
 
@@ -1622,10 +1678,10 @@ async def clear_all_model_suggestions(
 @router.get("/analytics/vessel/health")
 async def vessel_health(user: dict = Depends(get_current_user)):
     """Proxy health status from vessel-analyzer."""
-    return await _analytics_get(f"{VESSEL_URL}/health")
+    return await _analytics_get(f"{VESSEL_URL}/health", soft=True)
 
 
-@router.get("/analytics/vessel/stream/start")
+@router.post("/analytics/vessel/stream/start")
 async def vessel_stream_start(user: dict = Depends(get_current_user)):
     """Start maritime vessel detection stream loop."""
     if user["role"] == "drone_operator":
@@ -1633,7 +1689,7 @@ async def vessel_stream_start(user: dict = Depends(get_current_user)):
     return await _analytics_get(f"{VESSEL_URL}/stream/start")
 
 
-@router.get("/analytics/vessel/stream/stop")
+@router.post("/analytics/vessel/stream/stop")
 async def vessel_stream_stop(user: dict = Depends(get_current_user)):
     """Stop maritime vessel detection stream loop."""
     if user["role"] == "drone_operator":
@@ -1650,7 +1706,7 @@ async def vessel_annotated_frame(user: dict = Depends(get_current_user), drone_i
     try:
         params = {"drone_id": drone_id} if drone_id else {}
         async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(f"{VESSEL_URL}/annotated/latest", params=params)
+            r = await client.get(f"{VESSEL_URL}/annotated/latest", params=params, headers=_service_headers())
         if r.status_code == 200:
             headers = {
                 "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -1681,9 +1737,9 @@ async def vessel_tracks(
     """Retrieve active vessel tracks from vessel-analyzer."""
     url = f"{VESSEL_URL}/tracks/active?limit={limit}&window={window}"
     if drone_id:
-        url += f"&drone_id={drone_id}"
+        url += f"&drone_id={quote(drone_id)}"
     if mission_id:
-        url += f"&mission_id={mission_id}"
+        url += f"&mission_id={quote(mission_id)}"
     return await _analytics_get(url)
 
 
@@ -1697,9 +1753,9 @@ async def vessel_stats(
     url = f"{VESSEL_URL}/stats/summary"
     params = []
     if drone_id:
-        params.append(f"drone_id={drone_id}")
+        params.append(f"drone_id={quote(drone_id)}")
     if mission_id:
-        params.append(f"mission_id={mission_id}")
+        params.append(f"mission_id={quote(mission_id)}")
     if params:
         url += "?" + "&".join(params)
     return await _analytics_get(url)
@@ -1715,9 +1771,9 @@ async def vessel_by_class(
     url = f"{VESSEL_URL}/stats/by-class"
     params = []
     if drone_id:
-        params.append(f"drone_id={drone_id}")
+        params.append(f"drone_id={quote(drone_id)}")
     if mission_id:
-        params.append(f"mission_id={mission_id}")
+        params.append(f"mission_id={quote(mission_id)}")
     if params:
         url += "?" + "&".join(params)
     return await _analytics_get(url)
@@ -1734,9 +1790,9 @@ async def vessel_events(
     """Retrieve maritime alert events from vessel-analyzer."""
     url = f"{VESSEL_URL}/events/recent?limit={limit}"
     if drone_id:
-        url += f"&drone_id={drone_id}"
+        url += f"&drone_id={quote(drone_id)}"
     if mission_id:
-        url += f"&mission_id={mission_id}"
+        url += f"&mission_id={quote(mission_id)}"
     if event_type:
         url += f"&event_type={event_type}"
     return await _analytics_get(url)
@@ -1750,7 +1806,7 @@ async def vessel_heatmap(
     """Retrieve spatial heatmap density coordinates from vessel-analyzer."""
     url = f"{VESSEL_URL}/heatmap/data"
     if drone_id:
-        url += f"?drone_id={drone_id}"
+        url += f"?drone_id={quote(drone_id)}"
     return await _analytics_get(url)
 
 
@@ -1759,16 +1815,16 @@ async def vessel_heatmap(
 @router.get("/analytics/anomaly/health")
 async def anomaly_health(user: dict = Depends(get_current_user)):
     """Health check from anomaly-analyzer."""
-    return await _analytics_get(f"{ANOMALY_URL}/health")
+    return await _analytics_get(f"{ANOMALY_URL}/health", soft=True)
 
 
-@router.get("/analytics/anomaly/stream/start")
+@router.post("/analytics/anomaly/stream/start")
 async def anomaly_stream_start(user: dict = Depends(get_current_user)):
     """Start anomaly analyzer stream consumer loop."""
     return await _analytics_get(f"{ANOMALY_URL}/stream/start")
 
 
-@router.get("/analytics/anomaly/stream/stop")
+@router.post("/analytics/anomaly/stream/stop")
 async def anomaly_stream_stop(user: dict = Depends(get_current_user)):
     """Stop anomaly analyzer stream consumer loop."""
     return await _analytics_get(f"{ANOMALY_URL}/stream/stop")
@@ -1787,7 +1843,7 @@ async def anomaly_annotated_latest(
 
     async with httpx.AsyncClient(timeout=5.0) as client:
         try:
-            r = await client.get(f"{ANOMALY_URL}/annotated/latest", params=params)
+            r = await client.get(f"{ANOMALY_URL}/annotated/latest", params=params, headers=_service_headers())
             if r.status_code == 200:
                 return Response(
                     content=r.content,
@@ -1809,7 +1865,7 @@ async def anomaly_tracks(
     """Retrieve active anomaly tracks."""
     url = f"{ANOMALY_URL}/tracks/active?limit={limit}"
     if drone_id:
-        url += f"&drone_id={drone_id}"
+        url += f"&drone_id={quote(drone_id)}"
     return await _analytics_get(url)
 
 
@@ -1826,9 +1882,9 @@ async def anomaly_alerts(
     """Retrieve recent anomaly alerts."""
     url = f"{ANOMALY_URL}/alerts/recent?limit={limit}"
     if drone_id:
-        url += f"&drone_id={drone_id}"
+        url += f"&drone_id={quote(drone_id)}"
     if mission_id:
-        url += f"&mission_id={mission_id}"
+        url += f"&mission_id={quote(mission_id)}"
     if event_type:
         url += f"&event_type={event_type}"
     if severity:
@@ -1842,7 +1898,7 @@ async def anomaly_alert_detail(
     user: dict = Depends(get_current_user),
 ):
     """Retrieve full detail for a single anomaly alert."""
-    return await _analytics_get(f"{ANOMALY_URL}/alerts/{alert_id}")
+    return await _analytics_get(f"{ANOMALY_URL}/alerts/{quote(alert_id, safe='')}")
 
 
 @router.get("/analytics/anomaly/stats")
@@ -1856,9 +1912,9 @@ async def anomaly_stats_summary(
     url = f"{ANOMALY_URL}/stats/summary"
     params = []
     if drone_id:
-        params.append(f"drone_id={drone_id}")
+        params.append(f"drone_id={quote(drone_id)}")
     if mission_id:
-        params.append(f"mission_id={mission_id}")
+        params.append(f"mission_id={quote(mission_id)}")
     if params:
         url += "?" + "&".join(params)
     return await _analytics_get(url)
@@ -1874,9 +1930,9 @@ async def anomaly_stats_by_type(
     url = f"{ANOMALY_URL}/stats/by-type"
     params = []
     if drone_id:
-        params.append(f"drone_id={drone_id}")
+        params.append(f"drone_id={quote(drone_id)}")
     if mission_id:
-        params.append(f"mission_id={mission_id}")
+        params.append(f"mission_id={quote(mission_id)}")
     if params:
         url += "?" + "&".join(params)
     return await _analytics_get(url)

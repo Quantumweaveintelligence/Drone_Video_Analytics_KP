@@ -112,6 +112,41 @@ async def _any_user(request: Request):
     return await get_current_user(request)
 
 
+# ── Per-drone access (H8) ────────────────────────────────────────────────────
+import re as _re
+_DRONE_ID_RE = _re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+
+
+async def _check_drone_access(drone_id: str, user: dict) -> None:
+    """drone_id is validated before it goes into an upstream URL. Operators reach only
+    their own drones; control room officers drones of their jurisdiction (or with none)."""
+    if not _DRONE_ID_RE.match(drone_id or ""):
+        raise HTTPException(400, "Invalid drone id")
+    role = user.get("role")
+    if role in ("senior_officer", "system_administrator"):
+        return
+    from database import async_session_factory
+    from models import Drone
+    from core.security import jurisdiction_visible
+    async with async_session_factory() as session:
+        drone = await session.get(Drone, drone_id)
+    if role == "drone_operator":
+        if drone is None or (drone.operator_id != user.get("id")
+                             and drone.mission_id not in (user.get("mission_scope") or [])):
+            raise HTTPException(404, "Drone not found")
+        return
+    if drone is not None and not jurisdiction_visible(drone.jurisdiction, user):
+        raise HTTPException(404, "Drone not found")
+
+
+async def _drone_visible(drone_id, user: dict) -> bool:
+    try:
+        await _check_drone_access(str(drone_id or ""), user)
+        return True
+    except HTTPException:
+        return False
+
+
 # ── Cached health state for the top-bar indicator ────────────────────────────
 _last_health: dict = {"status": "unknown", "ts": 0}
 _health_lock = asyncio.Lock()
@@ -173,22 +208,14 @@ async def ingest_health():
     global _last_health
     try:
         data = await _proxy_get("/health", timeout=3.0)
-        result = {
-            "reachable": True,
-            "status": "ok",
-            **data,
-        }
         async with _health_lock:
             _last_health = {"status": "ok", "ts": time.time(), "data": data}
-        return result
+        # Public route (top-bar chip): status only — no upstream fields or internal hosts (M6)
+        return {"reachable": True, "status": "ok"}
     except HTTPException:
         async with _health_lock:
             _last_health = {"status": "unreachable", "ts": time.time()}
-        return {
-            "reachable": False,
-            "status": "unreachable",
-            "detail": f"Ingest server at {INGEST_SERVER_URL} is not reachable",
-        }
+        return {"reachable": False, "status": "unreachable"}
 
 
 @ingest_api.get("/ready", summary="Proxy: ingest server readiness")
@@ -264,9 +291,11 @@ async def ingest_telemetry(user: dict = Depends(_any_user)):
           Prefer /streams/active which reads directly from Valkey.
     """
     try:
-        return await _proxy_get("/ingest/telemetry", timeout=3.0)
+        data = await _proxy_get("/ingest/telemetry", timeout=3.0)
     except HTTPException:
         return {"drones": [], "count": 0}
+    drones = [d for d in (data.get("drones") or []) if await _drone_visible(d.get("drone_id"), user)]
+    return dict(data, drones=drones, count=len(drones))
 
 
 @ingest_api.get("/streams/active", summary="Proxy: active drone streams from Valkey (restart-safe)")
@@ -363,6 +392,7 @@ async def ingest_latest_frame(drone_id: str, request: Request, user: dict = Depe
       2. User's Authorization header forwarded from the frontend request.
       3. User's HttpOnly cookie dvas_access_token.
     """
+    await _check_drone_access(drone_id, user)
     url = f"{INGEST_SERVER_URL}/ingest/frame/{drone_id}/latest"
 
     # Prefer a fresh service token so this endpoint never breaks due to
@@ -420,9 +450,11 @@ async def proxy_purge_stream(
     """
     from core.security import get_current_user
     user = await get_current_user(request)
-    allowed_roles = ["senior_officer", "system_administrator", "control_room_officer"]
-    if user.get("role") not in allowed_roles and not any(r in user.get("realm_roles", []) for r in allowed_roles):
-        raise HTTPException(status_code=403, detail="Insufficient permissions to purge streams")
+    # Purging drops queued frames for good: seniors and administrators only (MON-23)
+    if user.get("role") not in ("senior_officer", "system_administrator"):
+        raise HTTPException(status_code=403, detail="Only senior officers or administrators may purge streams")
+    if not _DRONE_ID_RE.match(drone_id or ""):
+        raise HTTPException(400, "Invalid drone id")
 
     url = f"{INGEST_SERVER_URL}/ingest/streams/{drone_id}/purge"
     token = await _get_service_token()
@@ -751,15 +783,14 @@ async def ingest_ws_relay(ws: WebSocket):
     real ingest server's WebSocket and relays messages in both directions.
     On disconnect from either end, both sides are closed.
     """
-    await ws.accept()
-
-    # Auth check — extract token from query param or cookie
-    from services.websocket_hub import _authz_ws
-    token = ws.query_params.get("token", "") or ws.cookies.get("dvas_access_token", "")
-    payload = _authz_ws(token)
-    if not payload or payload.get("role") != "system_administrator":
-        await ws.close(code=4403)
+    # Auth: session cookie (browser) or ?token=; admins only
+    from core.security import authenticate_ws
+    user = await authenticate_ws(ws)
+    if user is None or user.get("role") != "system_administrator":
+        await ws.close(code=4401 if user is None else 4403)
         return
+    await ws.accept()
+    token = ws.query_params.get("token", "") or ws.cookies.get("dvas_access_token", "")
 
     ingest_ws_url = INGEST_SERVER_URL.replace("http://", "ws://").replace("https://", "wss://")
     # ingest /ws/status requires ?token= — pass on the (already checked) admin token

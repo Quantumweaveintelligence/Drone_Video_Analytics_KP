@@ -19,10 +19,10 @@ import cv2
 import numpy as np
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 sys.path.insert(0, "/analytics")
+from shared.auth import install_service_guard
 from shared.config import cfg, get_drone_aliases
 from shared.db import (
     close_pool, ensure_drone, get_pool, upsert_track,
@@ -69,12 +69,8 @@ app = FastAPI(
     description="Person tracking (ByteTrack), face detection, Re-ID, deduplication",
     version="2.0.0",
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Internal service: no browser calls it (no CORS); every route but /health needs the key (M1)
+install_service_guard(app)
 
 PERSON_MODEL = os.getenv("PERSON_MODEL", "/analytics/person/models/yolov8m.pt")
 FACE_MODEL   = os.getenv("FACE_MODEL",   "/analytics/person/models/yolov8n-face.pt")

@@ -23,11 +23,11 @@ import numpy as np
 import torch
 import yaml
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from ultralytics import YOLO
 
 sys.path.insert(0, "/analytics")
+from shared.auth import install_service_guard
 from shared.config import cfg, get_drone_aliases
 from shared.db import close_pool, ensure_drone, get_pool, write_confirmed_event
 from shared.redis_client import (
@@ -58,12 +58,8 @@ app = FastAPI(
     description="Geofence intrusion detection via YOLOv8s + temporal state machine",
     version="1.0.0",
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Internal service: no browser calls it (no CORS); every route but /health needs the key (M1)
+install_service_guard(app)
 
 INTRUSION_MODEL = os.getenv(
     "INTRUSION_MODEL",

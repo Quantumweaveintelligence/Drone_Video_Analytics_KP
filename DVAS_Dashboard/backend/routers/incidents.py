@@ -10,12 +10,12 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Request, Body
-from sqlalchemy import select, update, desc, delete
+from sqlalchemy import select, update, desc, delete, or_
 import httpx
 
 from database import async_session_factory
-from models import Incident, Alert
-from core.security import get_current_user, _row_to_dict
+from models import Incident, Alert, Mission
+from core.security import get_current_user, jurisdiction_clause, require_roles, _row_to_dict
 from audit_service import write_audit_v2
 from services.websocket_hub import hub
 from ingest_proxy import _get_service_token, INGEST_SERVER_URL
@@ -65,22 +65,57 @@ async def _forward_incident_to_peer(incident_dict: dict) -> None:
         logger.warning(f"Could not forward incident to peer DVAS ({DVAS_PEER_URL}): {exc}")
 
 
+# ── Who may see / change an incident (H2, J1) ───────────────────────────────
+STATEWIDE_ROLES = ("senior_officer", "system_administrator")
+
+
+def _own(user: dict):
+    """Incidents this user created (created_by carries "(email)")."""
+    return Incident.created_by.contains(f"({user.get('email')})", autoescape=True)
+
+
+def _visible_clause(user: dict):
+    if user["role"] == "drone_operator":
+        scope = user.get("mission_scope") or []
+        return or_(_own(user), Incident.mission_id.in_(scope)) if scope else _own(user)
+    jur = jurisdiction_clause(Mission.jurisdiction, user)
+    if jur is None:
+        return None
+    # CRO: incidents of missions in their jurisdiction, or not tied to a mission
+    return or_(Incident.mission_id.is_(None), Incident.mission_id == "",
+               Incident.mission_id.in_(select(Mission.mission_id).where(jur)))
+
+
+async def _load_owned(session, incident_id: str, user: dict) -> Incident:
+    """The incident, if this user may change it: its creator, or a senior / admin."""
+    inc = await session.get(Incident, incident_id)
+    if not inc:
+        raise HTTPException(404, "Incident not found")
+    if user["role"] not in STATEWIDE_ROLES and f"({user.get('email')})" not in (inc.created_by or ""):
+        raise HTTPException(403, "Only the officer who reported it, or a senior officer, may do this")
+    return inc
+
+
 @router.get("")
 async def list_incidents(
     limit: int = 100,
     user: dict = Depends(get_current_user)
 ):
-    """List operational incidents ordered by latest timestamp."""
+    """List operational incidents (scoped to the caller) ordered by latest timestamp."""
+    limit = max(1, min(limit, 500))
     async with async_session_factory() as session:
-        stmt = select(Incident).order_by(desc(Incident.timestamp)).limit(limit)
-        result = await session.execute(stmt)
+        stmt = select(Incident)
+        clause = _visible_clause(user)
+        if clause is not None:
+            stmt = stmt.where(clause)
+        result = await session.execute(stmt.order_by(desc(Incident.timestamp)).limit(limit))
         return [_row_to_dict(r) for r in result.scalars().all()]
 
 
 @router.post("")
 async def create_incident(
     payload: dict = Body(...),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_roles("drone_operator", "control_room_officer", "senior_officer")),
     request: Request = None,
 ):
     """
@@ -225,17 +260,19 @@ async def acknowledge_incident(
     user: dict = Depends(get_current_user),
     request: Request = None,
 ):
-    """Mark an incident as acknowledged."""
+    """Mark an incident as acknowledged (command roles; an operator for their own)."""
     async with async_session_factory() as session:
-        result = await session.execute(
-            update(Incident)
-            .where(Incident.id == incident_id)
-            .values(status="ACKNOWLEDGED")
-        )
-        if result.rowcount == 0:
-            raise HTTPException(404, "Incident not found")
+        if user["role"] == "drone_operator":
+            await _load_owned(session, incident_id, user)
+        else:
+            inc = await session.get(Incident, incident_id)
+            clause = _visible_clause(user)
+            if inc is None or (clause is not None and not (await session.execute(
+                    select(Incident.id).where(Incident.id == incident_id, clause))).first()):
+                raise HTTPException(404, "Incident not found")
+        await session.execute(update(Incident).where(Incident.id == incident_id).values(status="ACKNOWLEDGED"))
 
-        # Also update corresponding Alert record
+        # Pre-R1 alert copies carry the incident id
         await session.execute(
             update(Alert)
             .where(Alert.id == incident_id)
@@ -276,11 +313,9 @@ async def resend_incident(
     incident_id: str,
     user: dict = Depends(get_current_user),
 ):
-    """Retry sending an unsent incident to the Ingest Server."""
+    """Retry sending an unsent incident to the Ingest Server (its reporter or a senior)."""
     async with async_session_factory() as session:
-        inc = await session.get(Incident, incident_id)
-        if not inc:
-            raise HTTPException(404, "Incident not found")
+        inc = await _load_owned(session, incident_id, user)
 
         inc_dict = _row_to_dict(inc)
         sent = await _forward_incident_to_ingest(inc_dict)
@@ -295,11 +330,9 @@ async def delete_incident(
     user: dict = Depends(get_current_user),
     request: Request = None,
 ):
-    """Delete an operational incident and its associated alert record."""
+    """Delete an incident: its reporter, or a senior officer / admin (H2)."""
     async with async_session_factory() as session:
-        inc = await session.get(Incident, incident_id)
-        if not inc:
-            raise HTTPException(404, "Incident not found")
+        inc = await _load_owned(session, incident_id, user)
         inc_dict = _row_to_dict(inc)
         await session.delete(inc)
         await session.execute(delete(Alert).where(Alert.id == incident_id))
@@ -315,7 +348,7 @@ async def delete_incident(
             target=incident_id,
             target_type="incident",
             target_id=incident_id,
-            details=f"Incident {incident_id} ({inc_dict.get('title')}) deleted by operator",
+            details=f"Incident {incident_id} ({inc_dict.get('title')}) deleted by {user.get('email')}",
             source_module="edge",
             request=request,
         )
@@ -334,11 +367,19 @@ async def clear_all_incidents(
     user: dict = Depends(get_current_user),
     request: Request = None,
 ):
-    """Clear all operational incidents and associated alert records."""
+    """Clear incidents. Seniors / admins clear all; anyone else only the incidents they
+    reported (H2: one operator could wipe every unit's log)."""
+    if user["role"] not in ("drone_operator", "control_room_officer", "senior_officer", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    everything = user["role"] in STATEWIDE_ROLES
     async with async_session_factory() as session:
-        res = await session.execute(delete(Incident))
-        count = res.rowcount
-        await session.execute(delete(Alert).where(Alert.id.like("INC-%")))
+        ids = select(Incident.id) if everything else select(Incident.id).where(_own(user))
+        id_list = [r for r in (await session.execute(ids)).scalars().all()]
+        count = 0
+        if id_list:
+            res = await session.execute(delete(Incident).where(Incident.id.in_(id_list)))
+            count = res.rowcount
+            await session.execute(delete(Alert).where(Alert.id.in_(id_list)))
         await session.commit()
 
     try:
@@ -350,7 +391,7 @@ async def clear_all_incidents(
             severity="warning",
             target="all_incidents",
             target_type="incident",
-            details=f"Cleared {count} incidents from operational log",
+            details=f"Cleared {count} incidents ({'all' if everything else 'own'}) from operational log",
             source_module="edge",
             request=request,
         )
@@ -360,5 +401,6 @@ async def clear_all_incidents(
     await hub.broadcast({
         "type": "incidents_cleared",
         "count": count,
+        "incident_ids": id_list if not everything else None,     # None = everything was cleared
     })
     return {"status": "ok", "deleted_count": count}

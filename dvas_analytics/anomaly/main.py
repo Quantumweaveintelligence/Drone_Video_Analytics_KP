@@ -20,13 +20,13 @@ from typing import Dict, List, Optional, Tuple, Any
 import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request, Response, Body
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 sys.path.insert(0, "/analytics")
 sys.path.insert(0, "/analytics/anomaly")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from shared.auth import install_service_guard
 from shared.config import cfg, get_drone_aliases
 from shared.db import (
     close_pool, get_pool,
@@ -56,13 +56,8 @@ app = FastAPI(
     version="1.0.0",
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Internal service: no browser calls it (no CORS); every route but /health needs the key (M1)
+install_service_guard(app)
 
 # ── Service State ─────────────────────────────────────────────────────────────
 _analyzers: Dict[str, AnomalyAnalyzer] = {}

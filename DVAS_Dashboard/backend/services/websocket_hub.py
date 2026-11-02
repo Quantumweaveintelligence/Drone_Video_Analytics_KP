@@ -1,58 +1,91 @@
 """
-WebSocket Hub for live telemetry and alerts push.
-"""
-from typing import Optional
-from fastapi import WebSocket
-from jose import jwt
-import logging
+WebSocket hub for live pushes (telemetry, alerts, incidents, reports …).
 
-from core.security import get_jwks, ROLE_MAP
+Every connection is authenticated (routers/ws.py) and remembers its user. Each
+message is filtered per user before sending (C1/F4): jurisdiction for control
+room officers, mission scope for operators, audit events for seniors/admins
+only, report messages for their requester. A connection whose token has expired
+is closed with 4401 so the client refreshes and reconnects.
+"""
+import logging
+import time
+from typing import Dict, Optional
+
+from fastapi import WebSocket
+
+from core.security import STATEWIDE_ROLES, jurisdiction_visible
 
 logger = logging.getLogger(__name__)
 
-# ---------- WebSocket: live telemetry & alerts push ----------
+COMMAND_ROLES = ("control_room_officer", "senior_officer", "system_administrator")
+# Message types an operator (edge) client may receive; everything else is command-side
+OPERATOR_TYPES = {"welcome", "pong", "telemetry", "alert", "incident", "incident_ack", "incident_deleted",
+                  "incidents_cleared", "model_suggestion", "model_suggestion_status",
+                  "model_suggestion_deleted", "model_suggestions_cleared"}
+
+
+def _mission_ok(mission_id, user: dict) -> bool:
+    return bool(mission_id) and mission_id in (user.get("mission_scope") or [])
+
+
+def filter_for(msg: dict, user: dict) -> Optional[dict]:
+    """The message as this user may see it, or None."""
+    role = user.get("role")
+    mtype = msg.get("type") or msg.get("event") or ""
+    if role == "drone_operator" and mtype not in OPERATOR_TYPES:
+        return None
+    if mtype.startswith("audit"):
+        return msg if role in STATEWIDE_ROLES else None
+    if mtype in ("report_ready", "report_failed"):
+        return msg if role in STATEWIDE_ROLES or msg.get("requested_by") == user.get("email") else None
+    if mtype == "alert":
+        a = msg.get("alert") or {}
+        if role == "drone_operator":
+            return msg if _mission_ok(a.get("mission_id"), user) else None
+        return msg if jurisdiction_visible(a.get("jurisdiction"), user) else None
+    if mtype == "evidence_created":
+        return msg if jurisdiction_visible(msg.get("jurisdiction"), user) else None
+    if mtype == "telemetry" and isinstance(msg.get("drones"), list):
+        if role == "drone_operator":
+            drones = [d for d in msg["drones"] if _mission_ok(d.get("mission_id"), user)
+                      or d.get("operator_id") == user.get("id")]
+        else:
+            drones = [d for d in msg["drones"] if jurisdiction_visible(d.get("jurisdiction"), user)]
+        return dict(msg, drones=drones) if drones else None
+    return msg
+
+
 class WSHub:
     def __init__(self):
-        self.clients: list[WebSocket] = []
+        self.clients: Dict[WebSocket, dict] = {}
 
-    async def connect(self, ws: WebSocket):
+    async def connect(self, ws: WebSocket, user: dict):
         await ws.accept()
-        self.clients.append(ws)
+        self.clients[ws] = user
 
     def disconnect(self, ws: WebSocket):
-        if ws in self.clients:
-            self.clients.remove(ws)
+        self.clients.pop(ws, None)
 
     async def broadcast(self, msg: dict):
+        now = time.time()
         dead = []
-        for c in self.clients:
+        for ws, user in list(self.clients.items()):
+            if user.get("exp") and user["exp"] < now:
+                dead.append(ws)
+                try:
+                    await ws.close(code=4401)          # token expired: client refreshes and reconnects
+                except Exception:
+                    pass
+                continue
+            out = filter_for(msg, user)
+            if out is None:
+                continue
             try:
-                await c.send_json(msg)
+                await ws.send_json(out)
             except Exception:
-                dead.append(c)
+                dead.append(ws)
         for d in dead:
             self.disconnect(d)
 
 
 hub = WSHub()
-
-
-def _authz_ws(token: str) -> Optional[dict]:
-    if not token:
-        return {"role": "control_room_officer"}
-    try:
-        options = {"verify_aud": False}
-        payload = jwt.decode(token, get_jwks(), algorithms=["RS256"], options=options)
-        
-        realm_access = payload.get("realm_access", {})
-        roles = realm_access.get("roles", [])
-        user_role = "drone_operator"
-        for kc_role, mapped_role in ROLE_MAP.items():
-            if kc_role in roles:
-                user_role = mapped_role
-                if user_role == "system_administrator":
-                    break
-        return {"role": user_role}
-    except Exception as e:
-        logger.warning(f"_authz_ws: Token check note: {e}. Connecting client.")
-        return {"role": "control_room_officer"}

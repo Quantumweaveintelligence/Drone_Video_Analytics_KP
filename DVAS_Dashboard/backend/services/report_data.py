@@ -47,9 +47,8 @@ class Scope:
         return cls(s.get("role") or "", s.get("jurisdiction"))
 
     def jur_clause(self, column):
-        if self.unrestricted:
-            return None
-        return or_(column == self.jurisdiction, column.is_(None), column == "", column.in_(STATEWIDE))
+        from core.security import jurisdiction_clause
+        return jurisdiction_clause(column, {"role": self.role, "jurisdiction": self.jurisdiction})
 
 
 def _where(stmt, *clauses):

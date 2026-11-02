@@ -16,7 +16,7 @@ import os
 import asyncio
 import json
 import logging
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
 import asyncpg
 from sqlalchemy import select
 from database import async_session_factory
@@ -42,87 +42,70 @@ def _clean_json_field(val):
     return val
 
 
-async def sync_records_batch(records: List[Dict[str, Any]]) -> int:
-    """Insert a batch of audit records into the local database if not already present."""
-    if not records:
-        return 0
+MAX_SYNC_BATCH = 500
+_SEVERITIES = {"info", "warning", "warn", "critical", "error"}
 
-    inserted_count = 0
-    async with async_session_factory() as session:
-        for r in records:
-            log_id = r.get("id")
-            if not log_id:
+
+async def sync_records_batch(records: List[Dict[str, Any]], caller: Optional[dict] = None) -> Tuple[int, int]:
+    """Append edge audit records to the central chain. Returns (synced, rejected).
+
+    H3: records are never inserted verbatim. Each is appended through write_audit_v2,
+    so the central chain computes its own prev_hash / hash; the edge's id, ts, hash
+    and prev_hash are kept in after_values.edge_record for cross-verification.
+    caller = the operator pushing over HTTP: only their own records are accepted.
+    caller = None: the trusted LAN poller reading an edge database directly.
+    """
+    from audit_service import write_audit_v2
+
+    synced = rejected = 0
+    for r in records[:MAX_SYNC_BATCH]:
+        if not isinstance(r, dict) or not r.get("id") or not r.get("action"):
+            rejected += 1
+            continue
+        edge_id = str(r["id"])[:64]
+        async with async_session_factory() as session:
+            dup = (await session.execute(
+                select(AuditLog.id).where(AuditLog.request_id == f"edge:{edge_id}"))).first()
+        if dup:
+            continue
+        if caller is not None:
+            if (r.get("actor_email") or "").lower() != (caller.get("email") or "").lower():
+                rejected += 1
                 continue
-
-            # Check if record exists
-            existing = await session.execute(
-                select(AuditLog.id).where(AuditLog.id == log_id)
-            )
-            if existing.scalar_one_or_none():
-                continue
-
-            entry = AuditLog(
-                id=log_id,
-                ts=r.get("ts"),
-                actor_id=r.get("actor_id"),
-                actor_email=r.get("actor_email"),
-                actor_role=r.get("actor_role"),
-                actor_name=r.get("actor_name"),
-                actor_session_id=r.get("actor_session_id"),
-                actor_device_id=r.get("actor_device_id"),
-                action=r.get("action"),
-                action_type=r.get("action_type"),
-                category=r.get("category"),
-                severity=r.get("severity") or "info",
-                target=r.get("target") or "",
-                target_type=r.get("target_type"),
-                target_id=r.get("target_id"),
-                target_name=r.get("target_name"),
-                details=r.get("details") or "",
-                before_values=_clean_json_field(r.get("before_values")),
-                after_values=_clean_json_field(r.get("after_values")),
-                status=r.get("status") or "success",
-                error_code=r.get("error_code"),
-                source_module=r.get("source_module"),
-                source_endpoint=r.get("source_endpoint"),
-                request_id=r.get("request_id"),
-                correlation_id=r.get("correlation_id"),
-                compliance_tags=_clean_json_field(r.get("compliance_tags")) or [],
-                ip=r.get("ip") or "-",
-                prev_hash=r.get("prev_hash"),
-                hash=r.get("hash"),
-            )
-            session.add(entry)
-            inserted_count += 1
-
-            # Broadcast new audit event via WebSocket for live tail
-            try:
-                data_dict = {
-                    "id": entry.id,
-                    "ts": entry.ts,
-                    "actor_id": entry.actor_id,
-                    "actor_email": entry.actor_email,
-                    "actor_role": entry.actor_role,
-                    "actor_name": entry.actor_name,
-                    "action": entry.action,
-                    "action_type": entry.action_type,
-                    "category": entry.category,
-                    "severity": entry.severity,
-                    "target": entry.target,
-                    "target_type": entry.target_type,
-                    "status": entry.status,
-                    "ip": entry.ip,
-                    "hash": entry.hash,
-                }
-                await hub.broadcast({"type": "audit_event", "data": data_dict})
-            except Exception as b_err:
-                logger.debug("WebSocket broadcast error during audit sync: %s", b_err)
-
-        if inserted_count > 0:
-            await session.commit()
-            logger.info("Successfully synced %d new audit log records to central DB.", inserted_count)
-
-    return inserted_count
+            actor = {"id": caller.get("id"), "email": caller.get("email"),
+                     "role": caller.get("role"), "name": caller.get("name") or ""}
+        else:
+            actor = {"id": r.get("actor_id"), "email": r.get("actor_email"),
+                     "role": r.get("actor_role"), "name": r.get("actor_name") or ""}
+        severity = str(r.get("severity") or "info").lower()
+        after = _clean_json_field(r.get("after_values"))
+        after = dict(after) if isinstance(after, dict) else ({"value": after} if after is not None else {})
+        after["edge_record"] = {"id": edge_id, "ts": r.get("ts"), "hash": r.get("hash"),
+                                "prev_hash": r.get("prev_hash"), "device": r.get("actor_device_id")}
+        await write_audit_v2(
+            actor=actor,
+            action=str(r["action"])[:64],
+            action_type=r.get("action_type"),
+            category=r.get("category"),
+            severity=severity if severity in _SEVERITIES else "info",
+            target=str(r.get("target") or "")[:256],
+            target_type=r.get("target_type"),
+            target_id=r.get("target_id"),
+            target_name=r.get("target_name"),
+            details=str(r.get("details") or "")[:2000],
+            before_values=_clean_json_field(r.get("before_values")) if isinstance(
+                _clean_json_field(r.get("before_values")), dict) else None,
+            after_values=after,
+            status=r.get("status") or "success",
+            source_module="edge_sync",
+            request_id=f"edge:{edge_id}",
+            correlation_id=r.get("correlation_id"),
+            ip=r.get("ip") or "-",
+        )
+        synced += 1
+    if synced:
+        logger.info("Synced %d edge audit record(s) into the central chain (%d rejected)", synced, rejected)
+    return synced, rejected
 
 
 async def _poll_edge_host(host: str):
@@ -156,7 +139,7 @@ async def _poll_edge_host(host: str):
         )
         records = [dict(row) for row in rows]
         if records:
-            await sync_records_batch(records)
+            await sync_records_batch(records, caller=None)
     except Exception as e:
         logger.debug("Edge audit sync unreachable for host %s: %s", host, e)
     finally:

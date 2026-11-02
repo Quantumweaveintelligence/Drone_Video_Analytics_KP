@@ -516,10 +516,12 @@ def test_proxy_image_authenticates_with_cookie_only(env, monkeypatch):
     """Analytics pages no longer put the JWT in image URLs; the httpOnly cookie is enough."""
     from core import security
     env.s3.put("dvas-plates", "plates/a.jpg", b"plate")
-    monkeypatch.setattr(security, "get_jwks", lambda: {})
-    monkeypatch.setattr(security.jwt, "decode", lambda token, *a, **k: {
-        "sub": "c1", "email": "cro@test", "realm_access": {"roles": ["control-room"]}} if token == "cookie-jwt"
-        else (_ for _ in ()).throw(security.jwt.JWTError("bad")))
+
+    async def fake_decode(token):
+        if token != "cookie-jwt":
+            raise security.AuthError("Invalid token")
+        return {"sub": "c1", "email": "cro@test", "realm_access": {"roles": ["control-room"]}}
+    monkeypatch.setattr(security, "decode_token", fake_decode)
     c = client_for()
     url = "/api/minio/image?bucket=dvas-plates&key=plates/a.jpg"
     assert c.get(url).status_code == 401                         # nothing sent

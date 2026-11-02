@@ -182,11 +182,15 @@ def test_delete_evidence_legal_hold_still_blocked(db, audit):
 # ── B9: bundle download with ?token= ──────────────────────────────────────────
 @pytest.fixture
 def token_roles(monkeypatch):
-    """Make the real get_current_user decode ?token= into the given Keycloak roles."""
+    """Make the real get_current_user verify a token into the given Keycloak roles."""
     holder = {}
-    monkeypatch.setattr(security, "get_jwks", lambda: {})
-    monkeypatch.setattr(security.jwt, "decode", lambda *a, **k: {
-        "sub": "u1", "email": holder["email"], "realm_access": {"roles": holder["roles"]}})
+
+    async def fake_decode(token):
+        if token != "t":
+            raise security.AuthError("Invalid token")
+        return {"sub": "u1", "email": holder["email"], "realm_access": {"roles": holder["roles"]},
+                "iss": "http://kc/realms/kerala-police-drone"}
+    monkeypatch.setattr(security, "decode_token", fake_decode)
 
     def _set(roles, email):
         holder.update(roles=roles, email=email)
@@ -210,7 +214,7 @@ def bundle_deps(monkeypatch, audit):
 def test_bundle_senior_via_query_token(db, bundle_deps, token_roles):
     token_roles(["supervisor"], "sr@test")
     db.results = [[], [_approved_export()]]   # [] = user hydration lookup, then the export
-    r = make_client().get("/api/exports/X1/bundle?token=t")
+    r = make_client().get("/api/exports/X1/bundle", headers={"Authorization": "Bearer t"})
     assert r.status_code == 200
     assert r.headers["content-type"] == "application/zip"
 
@@ -218,14 +222,14 @@ def test_bundle_senior_via_query_token(db, bundle_deps, token_roles):
 def test_bundle_operator_via_query_token_forbidden(db, bundle_deps, token_roles):
     token_roles(["drone-operator"], "op@test")
     db.results = [[], [_approved_export()]]
-    r = make_client().get("/api/exports/X1/bundle?token=t")
+    r = make_client().get("/api/exports/X1/bundle", headers={"Authorization": "Bearer t"})
     assert r.status_code == 403
 
 
 def test_bundle_other_cro_forbidden(db, bundle_deps, token_roles):
     token_roles(["control-room"], "someone-else@test")
     db.results = [[], [_approved_export()]]
-    r = make_client().get("/api/exports/X1/bundle?token=t")
+    r = make_client().get("/api/exports/X1/bundle", headers={"Authorization": "Bearer t"})
     assert r.status_code == 403
 
 
@@ -297,3 +301,21 @@ def test_image_resolution_skipped_without_analytics_db_url(monkeypatch, caplog):
     for _ in range(2):
         assert asyncio.run(evidence_sync._legacy_objects("person_detected", "e1", "")) == []
     assert sum("ANALYTICS_DATABASE_URL" in r.message for r in caplog.records) == 1
+
+
+
+# ── H5: no tokens in URLs; one role rule (J7) ────────────────────────────────
+def test_query_token_is_not_accepted(db, bundle_deps, token_roles):
+    token_roles(["supervisor"], "sr@test")
+    assert make_client().get("/api/exports/X1/bundle?token=t").status_code == 401
+
+
+def test_role_priority_and_no_role():
+    assert security.derive_role(["drone-operator", "supervisor"]) == "senior_officer"
+    assert security.derive_role(["control-room", "sys-admin"]) == "system_administrator"
+    assert security.derive_role(["offline_access"]) is None
+
+
+def test_user_without_dvas_role_is_refused(db, token_roles):
+    token_roles(["offline_access"], "x@test")
+    assert make_client().get("/api/alerts", cookies={"dvas_access_token": "t"}).status_code == 403

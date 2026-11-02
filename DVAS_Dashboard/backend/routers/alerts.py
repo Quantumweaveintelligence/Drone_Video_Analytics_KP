@@ -9,7 +9,8 @@ from sqlalchemy import select, update, func, or_, distinct, case, false
 
 from database import async_session_factory
 from models import Alert, Case, CaseEvidence, Evidence, Export
-from core.security import get_current_user, scope_filter_for, _apply_scope_to_query, _row_to_dict, require_roles
+from core.security import (get_current_user, jurisdiction_clause, jurisdiction_visible, _row_to_dict,
+                           require_roles)
 from audit_service import write_audit_v2
 from schemas.exports import ExportRequestIn, ExportDecisionIn
 from schemas.evidence import AckIn, LegalHoldIn, LegalHoldReleaseIn, DirectExportIn, DisposeIn
@@ -36,20 +37,9 @@ async def list_alerts(category: str = "ai,manual", user: dict = Depends(get_curr
         else Alert.category.in_(cats)
     async with async_session_factory() as session:
         base = select(Alert).where(cat_filter)
-        if role in ("system_administrator", "senior_officer"):
-            stmt = base.order_by(Alert.ts.desc()).limit(200)
-        elif role == "control_room_officer":
-            f = scope_filter_for(user)
-            jur = f.get("jurisdiction") if "__deny__" not in f else None
-            if jur:
-                stmt = base.where(or_(
-                    Alert.jurisdiction == jur,
-                    Alert.jurisdiction == "Kerala",
-                    Alert.jurisdiction == "State HQ",
-                    Alert.jurisdiction.is_(None)
-                )).order_by(Alert.ts.desc()).limit(200)
-            else:
-                stmt = base.order_by(Alert.ts.desc()).limit(200)
+        if role in ("system_administrator", "senior_officer", "control_room_officer"):
+            clause = jurisdiction_clause(Alert.jurisdiction, user)          # shared rule (J1)
+            stmt = (base if clause is None else base.where(clause)).order_by(Alert.ts.desc()).limit(200)
         elif role == "drone_operator":
             scope = user.get("mission_scope") or []
             stmt = base.where(Alert.mission_id.in_(scope) if scope else false()) \
@@ -69,6 +59,10 @@ async def ack_alert(
     if user["role"] not in ("control_room_officer", "senior_officer", "system_administrator"):
         raise HTTPException(403, "Not permitted")
     async with async_session_factory() as session:
+        # J5: only alerts the caller can see
+        target = await session.get(Alert, alert_id)
+        if target is None or not jurisdiction_visible(target.jurisdiction, user):
+            raise HTTPException(404, "Alert not found")
         result = await session.execute(
             update(Alert)
             .where(Alert.id == alert_id)
@@ -143,42 +137,26 @@ CROWD_EVENT_TYPES = ["crowd_threshold", "crowd_surge", "unattended_object"]
 
 
 def _case_visible(case, user: dict) -> bool:
-    """Case access by jurisdiction (E4): seniors/admins all; CROs their jurisdiction or statewide."""
-    if user.get("role") in ("senior_officer", "system_administrator"):
-        return True
-    if user.get("role") == "control_room_officer":
-        jur = user.get("jurisdiction")
-        return not jur or case.jurisdiction in (jur, None, "", "Kerala", "State HQ")
-    return False
+    """Case access by jurisdiction (E4) — the shared rule (J1)."""
+    if user.get("role") not in ("senior_officer", "system_administrator", "control_room_officer"):
+        return False
+    return jurisdiction_visible(case.jurisdiction, user)
 
 
 def _scope_evidence(stmt, user: dict):
-    """Restrict an Evidence select to what the caller may see (B8).
+    """Restrict an Evidence select to what the caller may see (B8, J1).
 
     Applied before any drone/mission filter, so filters can only narrow the scope.
     Operators see only their mission_scope; an empty scope sees nothing.
     """
     role = user.get("role")
-    if role in ("system_administrator", "senior_officer"):
-        return stmt  # State-wide aggregate access
-    if role == "control_room_officer":
-        jur = user.get("jurisdiction")
-        if not jur:
-            return stmt
-        return stmt.where(or_(
-            Evidence.jurisdiction == jur,
-            Evidence.jurisdiction.is_(None),
-            Evidence.jurisdiction == "",
-            Evidence.jurisdiction.in_(["Kerala", "State HQ", "Thiruvananthapuram"])
-        ))
     if role == "drone_operator":
         scope = user.get("mission_scope") or []
         return stmt.where(Evidence.mission_id.in_(scope)) if scope else stmt.where(false())
-    f = scope_filter_for(user)
-    stmt = _apply_scope_to_query(stmt, Evidence, f)
-    if stmt is None:
+    if role not in ("control_room_officer", "senior_officer", "system_administrator"):
         raise HTTPException(403, "Not permitted")
-    return stmt
+    clause = jurisdiction_clause(Evidence.jurisdiction, user)
+    return stmt if clause is None else stmt.where(clause)
 
 
 @router.get("/evidence")

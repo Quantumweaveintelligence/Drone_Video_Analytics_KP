@@ -1,14 +1,13 @@
 import os
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from jose import jwt
 import httpx
 
 from core.config import (
-    KEYCLOAK_URL, KEYCLOAK_REALM, KEYCLOAK_CLIENT_ID, KEYCLOAK_CLIENT_SECRET, limiter
+    EDGE_CLIENT_ORIGINS, KEYCLOAK_URL, KEYCLOAK_REALM, KEYCLOAK_CLIENT_ID, KEYCLOAK_CLIENT_SECRET, limiter
 )
 from core.security import (
-    get_current_user, get_jwks, require_roles, ROLE_MAP, _row_to_dict
+    AuthError, get_current_user, require_roles, user_from_token, _row_to_dict
 )
 from audit_service import write_audit_v2
 from keycloak_service import (
@@ -18,6 +17,11 @@ from schemas.auth import LoginIn, UserCreateIn, UserPatchIn
 
 logger = logging.getLogger("dvas")
 router = APIRouter(prefix="/api", tags=["Authentication & Users"])
+
+
+def _token_in_body(request: Request) -> bool:
+    """Only the edge app (another origin, no cookie) gets the JWT in JSON (H5)."""
+    return request.headers.get("origin", "").rstrip("/") in EDGE_CLIENT_ORIGINS
 
 @router.post("/auth/login")
 @limiter.limit("5/minute")
@@ -52,57 +56,12 @@ async def login(body: LoginIn, response: Response, request: Request):
             token_data = r.json()
             access_token = token_data["access_token"]
             
-            options = {"verify_aud": False}
-            payload = jwt.decode(access_token, get_jwks(), algorithms=["RS256"], options=options)
-            
-            realm_access = payload.get("realm_access", {})
-            roles = realm_access.get("roles", [])
-            user_role = "drone_operator"
-            for kc_role, mapped_role in ROLE_MAP.items():
-                if kc_role in roles:
-                    user_role = mapped_role
-                    if user_role == "system_administrator":
-                        break
-                        
-            attrs_jurisdiction = payload.get("jurisdiction")
-            jurisdiction_val = ""
-            if isinstance(attrs_jurisdiction, list) and len(attrs_jurisdiction) > 0:
-                jurisdiction_val = str(attrs_jurisdiction[0])
-            elif isinstance(attrs_jurisdiction, str):
-                jurisdiction_val = attrs_jurisdiction
+            try:
+                user_dict = await user_from_token(access_token)
+            except AuthError as exc:
+                raise HTTPException(status_code=403 if "role" in str(exc) else 401, detail=str(exc))
+            user_dict.pop("exp", None)
 
-            mission_scope_val = payload.get("mission_scope", [])
-            if isinstance(mission_scope_val, str):
-                mission_scope_val = [mission_scope_val]
-
-            if (not jurisdiction_val or not mission_scope_val) and email:
-                try:
-                    from database import async_session_factory
-                    from models import User
-                    from sqlalchemy import select
-                    name_val = payload.get("name") or payload.get("preferred_username", "")
-                    async with async_session_factory() as session:
-                        res = await session.execute(select(User.name, User.jurisdiction, User.mission_scope).where(User.email == email))
-                        row = res.first()
-                        if row:
-                            if row[0]:
-                                name_val = row[0]
-                            if not jurisdiction_val and row[1]:
-                                jurisdiction_val = row[1]
-                            if not mission_scope_val and row[2]:
-                                mission_scope_val = row[2]
-                except Exception as e:
-                    logger.debug(f"Could not hydrate user attributes from DB: {e}")
-
-            user_dict = {
-                "id": payload.get("sub"),
-                "email": payload.get("email", email),
-                "name": name_val if 'name_val' in locals() else (payload.get("name") or payload.get("preferred_username", "")),
-                "role": user_role,
-                "jurisdiction": jurisdiction_val,
-                "mission_scope": mission_scope_val,
-            }
-            
             is_secure = (request.url.scheme == "https" or os.environ.get("ENV") == "production" or os.environ.get("SECURE_COOKIES", "false").lower() == "true")
             response.set_cookie(
                 "dvas_access_token",
@@ -133,13 +92,15 @@ async def login(body: LoginIn, response: Response, request: Request):
                 request=request,
             )
             
-            user_dict["access_token"] = access_token
+            if _token_in_body(request):
+                user_dict["access_token"] = access_token
             return user_dict
             
         except httpx.RequestError:
             raise HTTPException(status_code=503, detail="Authentication server unreachable")
 
 @router.post("/auth/refresh")
+@limiter.limit("30/minute")
 async def refresh_token(request: Request, response: Response):
     """Silent token refresh using HttpOnly refresh_token cookie."""
     refresh_tok = request.cookies.get("dvas_refresh_token")
@@ -161,37 +122,11 @@ async def refresh_token(request: Request, response: Response):
             token_data = r.json()
             new_access_token = token_data["access_token"]
             
-            options = {"verify_aud": False}
-            payload = jwt.decode(new_access_token, get_jwks(), algorithms=["RS256"], options=options)
-            
-            realm_access = payload.get("realm_access", {})
-            roles = realm_access.get("roles", [])
-            user_role = "drone_operator"
-            for kc_role, mapped_role in ROLE_MAP.items():
-                if kc_role in roles:
-                    user_role = mapped_role
-                    if user_role == "system_administrator":
-                        break
-
-            attrs_jurisdiction = payload.get("jurisdiction")
-            jurisdiction_val = ""
-            if isinstance(attrs_jurisdiction, list) and len(attrs_jurisdiction) > 0:
-                jurisdiction_val = str(attrs_jurisdiction[0])
-            elif isinstance(attrs_jurisdiction, str):
-                jurisdiction_val = attrs_jurisdiction
-
-            mission_scope_val = payload.get("mission_scope", [])
-            if isinstance(mission_scope_val, str):
-                mission_scope_val = [mission_scope_val]
-
-            user_dict = {
-                "id": payload.get("sub"),
-                "email": payload.get("email", ""),
-                "name": payload.get("name") or payload.get("preferred_username", ""),
-                "role": user_role,
-                "jurisdiction": jurisdiction_val,
-                "mission_scope": mission_scope_val,
-            }
+            try:
+                user_dict = await user_from_token(new_access_token)
+            except AuthError as exc:
+                raise HTTPException(status_code=401, detail=str(exc))
+            user_dict.pop("exp", None)
 
             is_secure = (request.url.scheme == "https" or os.environ.get("ENV") == "production" or os.environ.get("SECURE_COOKIES", "false").lower() == "true")
             response.set_cookie(
@@ -213,7 +148,8 @@ async def refresh_token(request: Request, response: Response):
                     max_age=token_data.get("refresh_expires_in", 86400),
                     path="/"
                 )
-            user_dict["access_token"] = new_access_token
+            if _token_in_body(request):
+                user_dict["access_token"] = new_access_token
             return user_dict
         except httpx.RequestError:
             raise HTTPException(status_code=503, detail="Authentication server unreachable")

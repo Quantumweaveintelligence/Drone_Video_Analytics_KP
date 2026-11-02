@@ -20,12 +20,12 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 sys.path.insert(0, "/analytics")
 sys.path.insert(0, "/analytics/vessel")
 
+from shared.auth import install_service_guard
 from shared.config import cfg, get_drone_aliases
 from shared.db import (
     close_pool, get_pool, ensure_drone,
@@ -62,12 +62,8 @@ app = FastAPI(
     description="Maritime vessel detection, classification, tracking, and telemetry-free trajectory analytics",
     version="1.0.0",
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Internal service: no browser calls it (no CORS); every route but /health needs the key (M1)
+install_service_guard(app)
 
 # ── Configuration Constants ───────────────────────────────────────────────────
 VESSEL_MODEL_TYPE = os.getenv("VESSEL_MODEL_TYPE", "yolov8").lower()

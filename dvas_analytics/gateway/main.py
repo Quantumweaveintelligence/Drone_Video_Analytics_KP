@@ -18,7 +18,6 @@ from typing import AsyncGenerator, Dict, Any, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, PlainTextResponse
 
 sys.path.insert(0, "/analytics")
@@ -28,7 +27,7 @@ from shared.db import (
     get_recent_confirmed_events, get_recent_plates,
 )
 from shared.redis_client import close_client, get_client
-from shared.auth import verify_service_key
+from shared.auth import verify_service_key, install_service_guard
 
 logging.basicConfig(
     level=cfg.LOG_LEVEL,
@@ -44,12 +43,8 @@ app = FastAPI(
     description="Unified SSE, health aggregation, and stats for the dashboard",
     version="2.0.0",
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Internal service: no browser calls it (no CORS); every route but /health needs the key (M1)
+install_service_guard(app)
 
 # Service definitions
 _SERVICES = {
@@ -104,8 +99,8 @@ async def health_all():
             try:
                 resp = await client.get(f"{base_url}/health")
                 results[name] = resp.json() if resp.status_code == 200 else {"status": "error", "code": resp.status_code}
-            except Exception as exc:
-                results[name] = {"status": "unreachable", "error": str(exc)}
+            except Exception:
+                results[name] = {"status": "unreachable"}        # no exception text (M1)
 
     all_ok = all(v.get("status") == "ok" for v in results.values())
     return {

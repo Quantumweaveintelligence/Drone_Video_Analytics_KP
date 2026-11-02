@@ -18,7 +18,9 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Request
 
 from database import async_session_factory
-from core.config import DVAS_SERVICE_KEY
+import hmac
+
+from core.config import DVAS_SERVICE_KEY, limiter
 from services.websocket_hub import hub
 
 logger = logging.getLogger("dvas.push")
@@ -27,11 +29,13 @@ router = APIRouter(prefix="/api/push", tags=["Peer Push"])
 
 def _check_service_key(request: Request):
     key = request.headers.get("X-DVAS-Service-Key", "")
-    if not key or key != DVAS_SERVICE_KEY:
+    # constant-time comparison (M7)
+    if not key or not DVAS_SERVICE_KEY or not hmac.compare_digest(key.encode(), DVAS_SERVICE_KEY.encode()):
         raise HTTPException(status_code=403, detail="Invalid or missing service key")
 
 
 @router.post("/receive")
+@limiter.limit("120/minute")
 async def receive_notification(payload: dict, request: Request):
     """
     Receive an incident or AI model suggestion from the peer DVAS backend.

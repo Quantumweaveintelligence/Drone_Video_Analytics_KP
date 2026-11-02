@@ -17,7 +17,8 @@ from starlette.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
-from core.config import CORS_ORIGINS, IS_CLOUD, PUBLIC_BASE_URL, limiter, validate_required_secrets
+from core.config import (API_DOCS_ENABLED, CORS_ORIGINS, EDGE_CLIENT_ORIGINS, IS_CLOUD, PUBLIC_BASE_URL, limiter,
+                         validate_required_secrets)
 from core.security import fetch_jwks
 from database import engine
 from models import Base
@@ -38,7 +39,12 @@ logger = logging.getLogger("dvas")
 # Fail fast in cloud mode if a required secret is missing (RunPod plan 2.4).
 validate_required_secrets()
 
-app = FastAPI(title="DVAS API")
+app = FastAPI(
+    title="DVAS API",
+    docs_url="/docs" if API_DOCS_ENABLED else None,
+    redoc_url="/redoc" if API_DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if API_DOCS_ENABLED else None,
+)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -122,7 +128,7 @@ if IS_CLOUD:
     cloud_origins = set(cors_origins)
     if PUBLIC_BASE_URL:
         cloud_origins.add(PUBLIC_BASE_URL)
-    cloud_origins.add("http://localhost:8765")
+    cloud_origins |= set(EDGE_CLIENT_ORIGINS)
     app.add_middleware(
         CORSMiddleware,
         allow_credentials=True,
@@ -134,8 +140,9 @@ else:
     app.add_middleware(
         CORSMiddleware,
         allow_credentials=True,
-        allow_origins=cors_origins or ["http://localhost:3000"],
-        allow_origin_regex=r"^https?://.*(:[0-9]+)?$",
+        # Explicit list only (H7): a reflected any-origin + credentials let any site
+        # call the API with the user's cookie
+        allow_origins=sorted(set(cors_origins or ["http://localhost:3000"]) | set(EDGE_CLIENT_ORIGINS)),
         allow_methods=["*"],
         allow_headers=["*"],
     )

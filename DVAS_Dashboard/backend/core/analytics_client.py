@@ -1,6 +1,7 @@
 import logging
 import os
 import httpx
+from fastapi import HTTPException
 from core.config import MINIO_PROXY_ENDPOINT, MINIO_PROXY_ACCESS, MINIO_PROXY_SECRET, MINIO_PROXY_SECURE
 
 logger = logging.getLogger("dvas")
@@ -35,56 +36,65 @@ def _get_minio_client():
             return None
     return _minio_proxy_client
 
-async def _analytics_get(url: str, timeout: float = 8.0) -> dict:
-    """Forward GET to analytics service; return response JSON or error envelope."""
+class _Upstream(Exception):
+    def __init__(self, status: int, error: str, detail: str):
+        super().__init__(detail)
+        self.status, self.error, self.detail = status, error, detail
+
+
+def _fail(exc: "_Upstream", soft: bool) -> dict:
+    """soft=True: the old error envelope (for aggregations / callers that audit failures).
+    Otherwise a real HTTP error, so the UI never renders an upstream failure as empty data."""
+    if soft:
+        return {"error": exc.error, "detail": exc.detail}
+    raise HTTPException(exc.status, exc.detail)
+
+
+async def _call(method: str, url: str, timeout: float, ok: tuple, **kw) -> dict:
     try:
         async with httpx.AsyncClient() as client:
-            r = await client.get(url, timeout=timeout, headers=_service_headers())
-            if r.status_code == 200:
-                return r.json()
-            return {"error": f"upstream {r.status_code}", "detail": r.text[:200]}
+            r = await client.request(method, url, timeout=timeout, headers=_service_headers(), **kw)
     except httpx.ConnectError:
-        return {"error": "service_unavailable", "detail": f"Cannot reach {url}"}
+        raise _Upstream(503, "service_unavailable", "Analytics service unavailable")
     except httpx.TimeoutException:
-        return {"error": "timeout", "detail": f"Timeout reaching {url}"}
+        raise _Upstream(504, "timeout", "Analytics service timed out")
     except Exception as exc:
-        return {"error": "proxy_error", "detail": str(exc)}
+        logger.warning("Analytics proxy error for %s: %s", url, exc)
+        raise _Upstream(502, "proxy_error", "Analytics proxy error")
+    if r.status_code in ok:
+        return r.json() if r.content else {"ok": True}
+    # upstream 4xx are passed through (bad input); 5xx become 502
+    status = r.status_code if 400 <= r.status_code < 500 else 502
+    raise _Upstream(status, f"upstream {r.status_code}", r.text[:200])
 
-async def _analytics_post(url: str, payload: dict, timeout: float = 8.0) -> dict:
-    """Forward POST to analytics service."""
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.post(url, json=payload, timeout=timeout, headers=_service_headers())
-            if r.status_code in (200, 201):
-                return r.json()
-            return {"error": f"upstream {r.status_code}", "detail": r.text[:200]}
-    except httpx.ConnectError:
-        return {"error": "service_unavailable", "detail": f"Cannot reach {url}"}
-    except Exception as exc:
-        return {"error": "proxy_error", "detail": str(exc)}
 
-async def _analytics_put(url: str, payload: dict, timeout: float = 8.0) -> dict:
-    """Forward PUT to analytics service."""
+async def _analytics_get(url: str, timeout: float = 8.0, soft: bool = False) -> dict:
+    """Forward GET to an analytics service."""
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.put(url, json=payload, timeout=timeout, headers=_service_headers())
-            if r.status_code in (200, 201):
-                return r.json()
-            return {"error": f"upstream {r.status_code}", "detail": r.text[:200]}
-    except httpx.ConnectError:
-        return {"error": "service_unavailable", "detail": f"Cannot reach {url}"}
-    except Exception as exc:
-        return {"error": "proxy_error", "detail": str(exc)}
+        return await _call("GET", url, timeout, (200,))
+    except _Upstream as exc:
+        return _fail(exc, soft)
 
-async def _analytics_delete(url: str, timeout: float = 8.0) -> dict:
-    """Forward DELETE to analytics service."""
+
+async def _analytics_post(url: str, payload: dict, timeout: float = 8.0, soft: bool = False) -> dict:
+    """Forward POST to an analytics service."""
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.delete(url, timeout=timeout, headers=_service_headers())
-            if r.status_code in (200, 204):
-                return r.json() if r.content else {"ok": True}
-            return {"error": f"upstream {r.status_code}", "detail": r.text[:200]}
-    except httpx.ConnectError:
-        return {"error": "service_unavailable", "detail": f"Cannot reach {url}"}
-    except Exception as exc:
-        return {"error": "proxy_error", "detail": str(exc)}
+        return await _call("POST", url, timeout, (200, 201), json=payload)
+    except _Upstream as exc:
+        return _fail(exc, soft)
+
+
+async def _analytics_put(url: str, payload: dict, timeout: float = 8.0, soft: bool = False) -> dict:
+    """Forward PUT to an analytics service."""
+    try:
+        return await _call("PUT", url, timeout, (200, 201), json=payload)
+    except _Upstream as exc:
+        return _fail(exc, soft)
+
+
+async def _analytics_delete(url: str, timeout: float = 8.0, soft: bool = False) -> dict:
+    """Forward DELETE to an analytics service."""
+    try:
+        return await _call("DELETE", url, timeout, (200, 204))
+    except _Upstream as exc:
+        return _fail(exc, soft)
