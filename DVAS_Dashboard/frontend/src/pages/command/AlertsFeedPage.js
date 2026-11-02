@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useState } from "react";
 import { useCommand } from "@/context/CommandContext";
 import { useI18n } from "@/context/I18nContext";
 import {
@@ -61,23 +61,33 @@ export default function AlertsFeedPage() {
     };
   });
 
+  // R1: AI alerts carry a real severity; colour by it (critical / high / medium / low)
+  const SEVERITY_BADGE = {
+    critical: "bg-red-500/10 text-red-400 border-red-500/30",
+    high: "bg-orange-500/10 text-orange-400 border-orange-500/30",
+    medium: "bg-amber-500/10 text-amber-300 border-amber-500/30",
+    low: "bg-sky-500/10 text-sky-300 border-sky-500/30",
+  };
   const normalizedAlerts = alerts.map((a) => {
     const missionPrefix = a.mission_id ? `${a.mission_id}: ` : "";
-    const alertName = a.type ? a.type.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase()) : (a.title || "Detection Alert");
+    const alertName = a.title || (a.type ? a.type.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase()) : "Detection Alert");
+    const sev = (a.severity || "medium").toLowerCase();
     return {
       id: a.id,
       category: "vision",
       title: `${missionPrefix}${alertName}`,
-      subtitle: `${a.drone_id || "DRN"} · ${a.zone || "Zone"} · conf ${a.confidence || "—"}`,
+      subtitle: `${a.drone_id || "DRN"} · ${a.zone || "Zone"} · conf ${a.confidence ?? "—"}${a.evidence_id ? ` · ${a.evidence_id}` : ""}`,
       ts: a.ts,
-      severity: a.severity === "critical" ? "critical" : "warning",
-      badge: "DETECTION",
-      badgeClass: a.severity === "critical" ? "bg-red-500/10 text-red-400 border-red-500/30" : "bg-purple-500/10 text-purple-400 border-purple-500/30",
+      severity: sev === "critical" ? "critical" : sev === "high" ? "warning" : "info",
+      badge: `${a.category === "ai" ? "AI" : "ALERT"} · ${sev.toUpperCase()}`,
+      badgeClass: SEVERITY_BADGE[sev] || SEVERITY_BADGE.medium,
       status: a.acknowledged_by ? "ACKNOWLEDGED" : "OPEN",
       acknowledged_by: a.acknowledged_by,
+      disposition: a.disposition,
       raw: a,
     };
   });
+  const [disposition, setDisposition] = useState({});
 
   const allItems = [...normalizedSuggestions, ...normalizedIncidents, ...normalizedAlerts]
     .sort((a, b) => new Date(b.ts || 0).getTime() - new Date(a.ts || 0).getTime());
@@ -200,21 +210,36 @@ export default function AlertsFeedPage() {
             <div className="shrink-0 flex items-center gap-2">
               {item.status === "ACKNOWLEDGED" ? (
                 <span className="mono text-[10px] text-emerald-400 flex items-center gap-1 font-semibold px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/20">
-                  <CheckCircle size={12} /> ACKNOWLEDGED
+                  <CheckCircle size={12} /> ACKNOWLEDGED{item.disposition ? ` · ${item.disposition.replace(/_/g, " ")}` : ""}
                 </span>
-              ) : (
+              ) : (<>
+                {item.category === "vision" && (
+                  <select
+                    aria-label="Disposition"
+                    value={disposition[item.id] || ""}
+                    onChange={(e) => setDisposition({ ...disposition, [item.id]: e.target.value })}
+                    className="bg-slate-900 border border-slate-700 text-[11px] px-1.5 py-1 rounded text-slate-300"
+                    title="What was it? Used for the Detection Quality report"
+                  >
+                    <option value="">Disposition…</option>
+                    <option value="true_positive">True positive</option>
+                    <option value="false_positive">False positive</option>
+                    <option value="duplicate">Duplicate</option>
+                    <option value="handled">Handled</option>
+                  </select>
+                )}
                 <button
                   data-testid={`ack-${item.id}`}
                   onClick={() => {
                     if (item.category === "suggestion") ackSuggestion(item.id);
                     else if (item.category === "incident") ackIncident(item.id);
-                    else ackAlert(item.id);
+                    else ackAlert(item.id, disposition[item.id] || undefined);
                   }}
                   className="px-2.5 py-1 text-xs font-semibold rounded-md border border-slate-700 hover:border-slate-500 text-slate-300 hover:text-white transition-colors"
                 >
                   Acknowledge
                 </button>
-              )}
+              </>)}
             </div>
           </div>
         ))}

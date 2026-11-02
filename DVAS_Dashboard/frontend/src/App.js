@@ -24,6 +24,7 @@ import EvidencePage from "@/pages/command/EvidencePage";
 import MissionsPage from "@/pages/command/MissionsPage";
 import ModelsPage from "@/pages/command/ModelsPage";
 import ExportsPage from "@/pages/command/ExportsPage";
+import CasesPage from "@/pages/command/CasesPage";
 import ReportsPage from "@/pages/command/ReportsPage";
 import AggregatedPage from "@/pages/command/AggregatedPage";
 
@@ -81,6 +82,7 @@ export default function App() {
                 <Route path="missions" element={<MissionsPage />} />
                 <Route path="models" element={<ModelsPage />} />
                 <Route path="exports" element={<ExportsPage />} />
+                <Route path="cases" element={<CasesPage />} />
                 <Route path="reports" element={<ReportsPage />} />
                 <Route path="aggregated" element={<AggregatedPage />} />
                 <Route path="*" element={<Navigate to="tactical-map" replace />} />

@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { useCommand } from "@/context/CommandContext";
+import { useAuth } from "@/context/AuthContext";
 import {
   ClipboardList,
   Search,
@@ -13,6 +14,8 @@ import {
 
 export default function MissionsPage() {
   const { missions, generateMissionReport, generatingReport } = useCommand();
+  const { user } = useAuth();
+  const isSenior = user?.role === "senior_officer";
   const [filter, setFilter] = useState("");
 
   const filtered = (missions || []).filter(m => {
@@ -126,9 +129,9 @@ export default function MissionsPage() {
                       className="px-2.5 py-1 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 flex items-center gap-1 text-[10px] rounded transition-colors disabled:opacity-40"
                     >
                       {generatingReport === m.mission_id ? (
-                        <><RefreshCw size={10} className="animate-spin" /> Generating...</>
+                        <><RefreshCw size={10} className="animate-spin" /> Sending...</>
                       ) : (
-                        <><Download size={10} /> AAR Report</>
+                        <><Download size={10} /> {isSenior ? "AAR Report" : "Request AAR"}</>
                       )}
                     </button>
                   </td>

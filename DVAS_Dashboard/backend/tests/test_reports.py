@@ -281,3 +281,26 @@ def test_preview_matches_report_data(jobs):
     assert [a["id"] for a in prev["data"]["alerts"]] == ["P1"]
     assert prev["params"]["start_utc"] == "2026-11-01T18:30:00+00:00"
     assert client_for(SENIOR).get("/api/reports/nope/preview-data").status_code == 400
+
+
+# ── U1: KPI tiles use the same scope / definitions as the lists ─────────────
+def test_kpis_match_list_scope(env, monkeypatch):
+    from routers import drones as drones_router
+    monkeypatch.setattr(drones_router, "async_session_factory", env.factory)
+    now = datetime.now(timezone.utc)
+    seed(env,
+         Alert(id="K1", category="ai", type="x", jurisdiction="Kochi", ts=now.isoformat()),
+         Alert(id="K2", category="ai", type="x", jurisdiction="Kerala", ts=now.isoformat()),          # statewide
+         Alert(id="K3", category="incident", type="x", jurisdiction="Kochi", ts=now.isoformat()),     # copy
+         Alert(id="K4", category="ai", type="x", jurisdiction="Kochi", ts=(now - timedelta(days=2)).isoformat()),
+         Alert(id="K5", category="ai", type="x", jurisdiction="Kannur", ts=now.isoformat()))
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from core.security import get_current_user
+    app = FastAPI()
+    app.include_router(drones_router.router)
+    app.dependency_overrides[get_current_user] = lambda: CRO
+    k = TestClient(app).get("/api/command/kpis").json()
+    assert k["alerts_24h"] == 2                       # K1 + statewide K2; not the copy, not 2 days old, not Kannur
+    app.dependency_overrides[get_current_user] = lambda: OPERATOR
+    assert TestClient(app).get("/api/command/kpis").status_code == 403

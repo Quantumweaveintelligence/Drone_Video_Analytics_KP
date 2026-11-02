@@ -1,4 +1,4 @@
-import {
+import { Briefcase,
   MapPin,
   Radio,
   Bell,
@@ -55,6 +55,7 @@ export const NAV_MANIFEST = {
         { key: "evidence", path: "/command/evidence", labelKey: "cmd.page.evidence", fallback: "Evidence Review", Icon: Film },
         { key: "missions", path: "/command/missions", labelKey: "cmd.page.missions", fallback: "Case & Missions", Icon: ClipboardList },
         { key: "models", path: "/command/models", labelKey: "cmd.page.models", fallback: "Detection Models", Icon: Cpu },
+        { key: "cases", path: "/command/cases", labelKey: "cmd.page.cases", fallback: "Cases", Icon: Briefcase },
         { key: "exports", path: "/command/exports", labelKey: "cmd.page.exports", fallback: "Export Requests", Icon: ExternalLink },
         { key: "reports", path: "/command/reports", labelKey: "cmd.page.reports", fallback: "Reports & Briefs", Icon: FileText },
       ]
@@ -88,6 +89,7 @@ export const NAV_MANIFEST = {
         { key: "evidence", path: "/command/evidence", labelKey: "cmd.page.evidence", fallback: "Evidence Review", Icon: Film },
         { key: "missions", path: "/command/missions", labelKey: "cmd.page.missions", fallback: "Case & Missions", Icon: ClipboardList },
         { key: "models", path: "/command/models", labelKey: "cmd.page.models", fallback: "Detection Models", Icon: Cpu },
+        { key: "cases", path: "/command/cases", labelKey: "cmd.page.cases", fallback: "Cases", Icon: Briefcase },
         { key: "exports", path: "/command/exports", labelKey: "cmd.page.exports", fallback: "Export Requests", Icon: ExternalLink },
         { key: "reports", path: "/command/reports", labelKey: "cmd.page.reports", fallback: "Reports & Briefs", Icon: FileText },
       ]

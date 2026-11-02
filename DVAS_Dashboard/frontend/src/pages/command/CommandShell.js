@@ -6,13 +6,18 @@ import { useAuth } from "@/context/AuthContext";
 import { useI18n } from "@/context/I18nContext";
 import {
   X,
-  Play,
+  Eye,
   FolderLock,
+  ShieldCheck,
+  Briefcase,
+  Trash2,
   Image as ImageIcon
 } from "lucide-react";
 
-import { downloadSigned } from "@/lib/api";
+import { api, downloadSigned } from "@/lib/api";
+import { fmtIST } from "@/lib/ist";
 import EvidenceImage from "@/components/EvidenceImage";
+import ActionModal from "@/components/evidence/ActionModal";
 
 function KPI({ label, value, tone = "text-sky-500" }) {
   return (
@@ -39,13 +44,21 @@ function CommandInner() {
     setPlaying,
     evidenceDetail,
     setEvidenceDetail,
-    requestOn,
-    setRequestOn,
-    justification,
-    setJustification,
-    requestExport,
-    directExport
+    action,
+    setAction,
+    openAction,
+    load,
+    loadFilteredEvidence
   } = useCommand();
+  const [verify, setVerify] = React.useState(null);
+
+  const runVerify = async (id) => {
+    setVerify({ busy: true });
+    try { setVerify((await api.get(`/evidence/${id}/verify`)).data); }
+    catch (e) { setVerify({ error: e.response?.data?.detail || "Verification failed" }); }
+  };
+  const ev = evidenceDetail?.evidence;
+  const act = (kind) => { openAction(kind, ev); setEvidenceDetail(null); setVerify(null); };
 
   return (
     <div className="flex flex-col gap-5">
@@ -161,7 +174,7 @@ function CommandInner() {
               </div>
 
             ) : (
-              <div className="p-8 text-center text-slate-500 mono text-xs">No media available for this detection</div>
+              <div className="p-8 text-center text-slate-500 mono text-xs">No image was captured for this event</div>
             )}
           </div>
         </div>
@@ -175,7 +188,7 @@ function CommandInner() {
               <div className="text-sm font-semibold" style={{ color: "var(--dvas-text)" }}>
                 Evidence Detail — {evidenceDetail.evidence?.id}
               </div>
-              <button onClick={() => setEvidenceDetail(null)} className="text-slate-400 hover:text-white p-1">
+              <button onClick={() => { setEvidenceDetail(null); setVerify(null); }} className="text-slate-400 hover:text-white p-1">
                 <X size={16} />
               </button>
             </div>
@@ -223,9 +236,11 @@ function CommandInner() {
                   ["Drone", evidenceDetail.evidence?.drone_id],
                   ["Mission", evidenceDetail.evidence?.mission_id],
                   ["Confidence", evidenceDetail.evidence?.confidence],
-                  ["Duration", `${evidenceDetail.evidence?.duration_s}s`],
                   ["Jurisdiction", evidenceDetail.evidence?.jurisdiction],
-                  ["Captured", evidenceDetail.evidence?.ts ? new Date(evidenceDetail.evidence.ts).toLocaleString() : "-"],
+                  ["Captured", fmtIST(evidenceDetail.evidence?.capture_ts || evidenceDetail.evidence?.ts)],
+                  ["Image", { exact: "Exact capture from the analyzer", heuristic: "Matched afterwards (pre-E1) — verify before use", none: "No image captured" }[evidenceDetail.evidence?.image_match] || "—"],
+                  ["Integrity", evidenceDetail.evidence?.integrity],
+                  ["Record SHA-256", evidenceDetail.evidence?.record_sha256 ? `${evidenceDetail.evidence.record_sha256.slice(0, 24)}…` : "—"],
                   ["Legal Hold", evidenceDetail.evidence?.legal_hold ? `Yes — ${evidenceDetail.evidence.legal_hold_reason || ""}` : "No"],
                   ["Retention Until", evidenceDetail.evidence?.retention_until ? new Date(evidenceDetail.evidence.retention_until).toLocaleDateString() : "-"]
                 ].map(([k, v]) => (
@@ -279,27 +294,51 @@ function CommandInner() {
                 </div>
               )}
 
+              {verify && (
+                <div className="border border-slate-800 rounded p-2 text-xs">
+                  {verify.busy && <span className="text-slate-400">Re-hashing stored files…</span>}
+                  {verify.error && <span className="text-red-400">{verify.error}</span>}
+                  {verify.integrity && (
+                    <div className={verify.integrity === "ok" ? "text-emerald-400" : "text-red-400"}>
+                      Integrity: {verify.integrity} · record {verify.record_ok ? "matches" : "DOES NOT match"} its hash
+                      {(verify.objects || []).map((o) => (
+                        <div key={o.key} className="mono text-[10px] text-slate-400">{o.role}: {o.ok ? "match" : "MISMATCH"} {(o.actual || "").slice(0, 16)}…</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
               <div className="flex flex-wrap gap-2 pt-2 border-t border-slate-800">
                 <button
                   onClick={() => { setPlaying(evidenceDetail.evidence); setEvidenceDetail(null); }}
                   className="px-3 py-1.5 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 text-xs flex items-center gap-1 rounded"
                 >
-                  <Play size={12} /> View Evidence
+                  <Eye size={12} /> View image
                 </button>
+                {["control_room_officer", "senior_officer"].includes(user?.role) && (
+                  <button onClick={() => act("add_to_case")} className="px-3 py-1.5 border border-slate-700 text-slate-300 hover:border-sky-500 text-xs rounded flex items-center gap-1">
+                    <Briefcase size={12} /> Add to case
+                  </button>
+                )}
                 {user?.role === "control_room_officer" && (
-                  <button
-                    onClick={() => { setRequestOn(evidenceDetail.evidence); setEvidenceDetail(null); }}
-                    className="px-3 py-1.5 border border-slate-700 text-slate-300 hover:border-sky-500 text-xs rounded"
-                  >
+                  <button onClick={() => act("request_export")} className="px-3 py-1.5 border border-slate-700 text-slate-300 hover:border-sky-500 text-xs rounded">
                     Request Export
                   </button>
                 )}
                 {user?.role === "senior_officer" && (
-                  <button
-                    onClick={() => { directExport(evidenceDetail.evidence); setEvidenceDetail(null); }}
-                    className="px-3 py-1.5 border border-emerald-600/60 text-emerald-300 hover:bg-emerald-500/10 text-xs rounded"
-                  >
+                  <button onClick={() => act("direct_export")} className="px-3 py-1.5 border border-emerald-600/60 text-emerald-300 hover:bg-emerald-500/10 text-xs rounded">
                     Direct Export
+                  </button>
+                )}
+                {["senior_officer", "system_administrator"].includes(user?.role) && (
+                  <button onClick={() => runVerify(ev.id)} className="px-3 py-1.5 border border-slate-700 text-slate-300 hover:border-emerald-500 text-xs rounded flex items-center gap-1">
+                    <ShieldCheck size={12} /> Verify integrity
+                  </button>
+                )}
+                {user?.role === "senior_officer" && !ev?.legal_hold && (
+                  <button onClick={() => act("dispose")} className="px-3 py-1.5 border border-red-700/60 text-red-300 hover:bg-red-500/10 text-xs rounded flex items-center gap-1">
+                    <Trash2 size={12} /> Dispose
                   </button>
                 )}
               </div>
@@ -308,32 +347,9 @@ function CommandInner() {
         </div>
       )}
 
-      {/* ── Export Request Modal ── */}
-      {requestOn && (
-        <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-6" onClick={() => setRequestOn(null)}>
-          <div className="border border-slate-700 bg-slate-950 max-w-md w-full p-4 rounded-xl" onClick={e => e.stopPropagation()}>
-            <div className="dvas-label">Request Export</div>
-            <div className="text-sm mt-1 mb-3 text-slate-200">{requestOn.label}</div>
-            <label className="dvas-label block mb-1">Justification</label>
-            <textarea
-              data-testid="input-justification"
-              value={justification}
-              onChange={e => setJustification(e.target.value)}
-              rows={4}
-              className="w-full bg-slate-900 border border-slate-700 focus:border-sky-500 outline-none p-2 text-sm mono rounded"
-              placeholder="Cr. No / Case ref / purpose…"
-            />
-            <div className="mt-3 flex justify-end gap-2 text-xs">
-              <button onClick={() => setRequestOn(null)} className="px-3 py-1.5 border border-slate-700 text-slate-300 rounded">
-                Cancel
-              </button>
-              <button data-testid="submit-export-request" onClick={requestExport} className="px-3 py-1.5 bg-sky-600 hover:bg-sky-500 text-white rounded font-semibold">
-                Submit
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* ── Evidence action modal (legal hold, export, disposal, add to case) ── */}
+      <ActionModal action={action} onClose={() => setAction(null)}
+        onDone={() => { load(); loadFilteredEvidence(); }} />
     </div>
   );
 }

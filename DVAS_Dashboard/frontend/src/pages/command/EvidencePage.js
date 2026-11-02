@@ -2,13 +2,13 @@ import React, { useRef, useState, useMemo } from "react";
 import { useCommand } from "@/context/CommandContext";
 import { useAuth } from "@/context/AuthContext";
 import EvidenceImage from "@/components/EvidenceImage";
-import {
+import { fmtIST } from "@/lib/ist";
+import { Eye, Briefcase,
   Film,
   UserSearch,
   Car,
   Users,
   FolderLock,
-  Play,
   Download,
   RefreshCw,
   Image as ImageIcon,
@@ -46,6 +46,7 @@ export default function EvidencePage() {
     setRequestOn,
     directExport,
     toggleLegalHold,
+    openAction,
     generateMissionReport,
     generatingReport,
     openEvidenceDetail
@@ -116,7 +117,11 @@ export default function EvidencePage() {
               e.target.onerror = null;
               e.target.style.display = "none";
               const fb = e.target.parentElement.querySelector(".thumbnail-fallback");
-              if (fb) fb.style.display = "flex";
+              if (fb) {
+                fb.style.display = "flex";
+                const note = fb.querySelector(".thumbnail-note");
+                if (note) note.textContent = "Image unavailable";       // captured, but cannot be loaded now
+              }
             }}
           />
         ) : null}
@@ -126,6 +131,7 @@ export default function EvidencePage() {
         >
           <ImageIcon size={28} className="text-slate-600" />
           <span className="mono text-[10px] text-slate-500 uppercase tracking-wider">{ev.event_type?.replace(/_/g, " ")}</span>
+          <span className="thumbnail-note mono text-[10px] text-slate-500">No image captured</span>
         </div>
         <button
           data-testid={`play-${ev.id}`}
@@ -133,9 +139,17 @@ export default function EvidencePage() {
           className="absolute inset-0 flex items-center justify-center bg-black/20 hover:bg-black/40 transition-colors text-white"
         >
           <div className="border border-white/70 px-3 py-1 text-xs bg-black/60 rounded flex items-center gap-1.5">
-            <Play size={11} fill="currentColor" /> View Evidence
+            <Eye size={11} /> View image
           </div>
         </button>
+        {ev.image_match && ev.image_match !== "none" && (
+          <span
+            className={`absolute top-8 left-2 mono text-[9px] px-1.5 py-0.5 rounded border ${ev.image_match === "exact" ? "border-emerald-500/60 bg-emerald-950/80 text-emerald-300" : "border-amber-500/60 bg-amber-950/80 text-amber-300"}`}
+            title={ev.image_match === "exact" ? "Image recorded by the analyzer with the event" : "Image matched afterwards (before E1) — verify before relying on it"}
+          >
+            {ev.image_match}
+          </span>
+        )}
         {ev.legal_hold && (
           <span className="absolute top-2 left-2 mono text-[10px] px-1.5 py-0.5 border border-red-500/50 bg-white/90 text-red-500 uppercase flex items-center gap-1 shadow-sm rounded-sm">
             <FolderLock size={10} /> hold
@@ -170,9 +184,10 @@ export default function EvidencePage() {
         <div>
           <div className="text-xs font-semibold truncate" style={{ color: "var(--dvas-text)" }}>{ev.label}</div>
           <div className="mono text-[10px] text-slate-500 mt-1 flex flex-wrap gap-2">
-            <span>{ev.event_type}</span><span>·</span><span>conf {ev.confidence}</span><span>·</span><span>{ev.duration_s}s</span>
+            <span>{ev.event_type}</span><span>·</span><span>conf {ev.confidence}</span>
+            {ev.record_sha256 && <><span>·</span><span title={ev.record_sha256}>#{ev.record_sha256.slice(0, 8)}</span></>}
           </div>
-          <div className="mono text-[10px] text-slate-500">{new Date(ev.ts).toLocaleString()}</div>
+          <div className="mono text-[10px] text-slate-500">{fmtIST(ev.capture_ts || ev.ts)}</div>
           <div className="mono text-[10px] text-slate-500">{ev.drone_id} · {ev.mission_id || "Unassigned"}</div>
         </div>
 
@@ -202,13 +217,22 @@ export default function EvidencePage() {
               <FolderLock size={10} className="inline mr-1" />{ev.legal_hold ? "Release Hold" : "Legal Hold"}
             </button>
           )}
-          {ev.mission_id && (
+          {["control_room_officer", "senior_officer"].includes(user?.role) && (
+            <button
+              onClick={() => openAction("add_to_case", ev)}
+              className="text-[10px] px-2 py-1 border border-slate-700 hover:border-sky-500 text-slate-300 rounded flex items-center gap-1"
+            >
+              <Briefcase size={10} /> Add to case
+            </button>
+          )}
+          {ev.mission_id && ["control_room_officer", "senior_officer"].includes(user?.role) && (
             <button
               onClick={() => generateMissionReport(ev.mission_id)}
               disabled={generatingReport === ev.mission_id}
+              title={user?.role === "senior_officer" ? "Generate the mission after-action report" : "Ask a Senior Officer for the mission after-action report"}
               className="text-[10px] px-2 py-1 border border-sky-600/60 text-sky-300 hover:bg-sky-500/10 disabled:opacity-40 flex items-center gap-1 rounded"
             >
-              {generatingReport === ev.mission_id ? <><RefreshCw size={10} className="animate-spin" /> Generating...</> : <><Download size={10} /> AAR Report</>}
+              {generatingReport === ev.mission_id ? <><RefreshCw size={10} className="animate-spin" /> Sending...</> : <><Download size={10} /> {user?.role === "senior_officer" ? "AAR Report" : "Request AAR"}</>}
             </button>
           )}
         </div>
@@ -497,7 +521,7 @@ export default function EvidencePage() {
                   </div>
 
                   <div className="flex items-center gap-2">
-                    {group.missionId !== "UNASSIGNED" && (
+                    {group.missionId !== "UNASSIGNED" && ["control_room_officer", "senior_officer"].includes(user?.role) && (
                       <button
                         type="button"
                         onClick={(e) => {
@@ -506,17 +530,17 @@ export default function EvidencePage() {
                         }}
                         disabled={generatingReport === group.missionId}
                         className="text-xs px-2.5 py-1 rounded bg-sky-600/20 hover:bg-sky-600/30 text-sky-300 border border-sky-500/40 flex items-center gap-1.5 transition-all disabled:opacity-40"
-                        title="Generate After-Action Review (AAR) PDF for this mission"
+                        title={user?.role === "senior_officer" ? "Generate the After-Action Report (PDF) for this mission" : "Ask a Senior Officer for this mission's After-Action Report"}
                       >
                         {generatingReport === group.missionId ? (
                           <>
                             <RefreshCw size={12} className="animate-spin" />
-                            <span>Generating AAR...</span>
+                            <span>Sending...</span>
                           </>
                         ) : (
                           <>
                             <Download size={12} />
-                            <span>Mission AAR</span>
+                            <span>{user?.role === "senior_officer" ? "Mission AAR" : "Request AAR"}</span>
                           </>
                         )}
                       </button>

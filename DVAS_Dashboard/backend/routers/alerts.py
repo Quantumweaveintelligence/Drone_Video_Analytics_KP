@@ -498,6 +498,7 @@ async def direct_export(
         source_endpoint="POST /api/evidence/{id}/direct-export",
         request=request
     )
+    await _broadcast_export(exp_id, "approved")
     return await _finalize_or_error(exp_id, user, request)
 
 
@@ -710,10 +711,20 @@ async def decide_export(
         source_endpoint="POST /api/exports/{id}/decision",
         request=request,
     )
+    await _broadcast_export(export_id, body.decision)
     if body.decision == "approved":
         doc = await _finalize_or_error(export_id, user, request)
         return {"ok": True, "export": doc}
     return {"ok": True}
+
+
+async def _broadcast_export(export_id: str, status: str) -> None:
+    """U1: screens refresh exports on this instead of polling."""
+    try:
+        from services.websocket_hub import hub
+        await hub.broadcast({"type": "export_decided", "export_id": export_id, "status": status})
+    except Exception as exc:
+        logger.debug("export broadcast failed: %s", exc)
 
 
 @router.get("/exports/{export_id}/bundle")

@@ -373,36 +373,40 @@ async def delete_mission_record(
 # ---------- Command dashboard: aggregate KPIs ----------
 @router.get("/command/kpis")
 async def command_kpis(user: dict = Depends(get_current_user)):
-    if user["role"] == "drone_operator":
+    """KPI tiles with the same scope and definitions as the lists they summarise (U1)."""
+    from datetime import timedelta
+    from routers.alerts import _scope_evidence
+    if user["role"] not in ("control_room_officer", "senior_officer"):
         raise HTTPException(403, "Not permitted")
-    f = scope_filter_for(user)
-    if "__deny__" in f:
-        raise HTTPException(403, "Not permitted")
+    jur = user.get("jurisdiction") if user["role"] == "control_room_officer" else None
 
+    def scoped(column):
+        # CRO: own jurisdiction + statewide / unset rows, as in /api/missions and /api/alerts
+        if not jur:
+            return None
+        return or_(column == jur, column.is_(None), column == "", column.in_(["Kerala", "State HQ"]))
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     async with async_session_factory() as session:
-        # Active missions count
-        missions_stmt = select(func.count()).select_from(Mission).where(Mission.status == "active")
-        if user["role"] != "senior_officer":
-            missions_stmt = missions_stmt.where(Mission.jurisdiction == user.get("jurisdiction"))
-        active_missions = (await session.execute(missions_stmt)).scalar() or 0
+        q = select(func.count()).select_from(Mission).where(Mission.status == "active")
+        if scoped(Mission.jurisdiction) is not None:
+            q = q.where(scoped(Mission.jurisdiction))
+        active_missions = (await session.execute(q)).scalar() or 0
 
-        # Alerts count
-        alerts_stmt = select(func.count()).select_from(Alert)
-        alerts_stmt = _apply_scope_to_query(alerts_stmt, Alert, f) if "__deny__" not in f else alerts_stmt
-        alerts_24h = (await session.execute(alerts_stmt)).scalar() or 0
+        q = select(func.count()).select_from(Alert).where(
+            Alert.ts >= since, or_(Alert.category.in_(["ai", "manual"]), Alert.category.is_(None)))
+        if scoped(Alert.jurisdiction) is not None:
+            q = q.where(scoped(Alert.jurisdiction))
+        alerts_24h = (await session.execute(q)).scalar() or 0
 
-        # Evidence total
-        evidence_stmt = select(func.count()).select_from(Evidence)
-        evidence_stmt = _apply_scope_to_query(evidence_stmt, Evidence, f) if "__deny__" not in f else evidence_stmt
-        evidence_total = (await session.execute(evidence_stmt)).scalar() or 0
+        q = _scope_evidence(select(func.count()).select_from(Evidence), user).where(Evidence.status != "disposed")
+        evidence_total = (await session.execute(q)).scalar() or 0
 
-        # Exports pending
-        exports_stmt = select(func.count()).select_from(Export).where(Export.status == "pending")
-        if user["role"] != "senior_officer":
-            exports_stmt = exports_stmt.where(Export.jurisdiction == user.get("jurisdiction"))
-        exports_pending = (await session.execute(exports_stmt)).scalar() or 0
+        q = select(func.count()).select_from(Export).where(Export.status == "pending")
+        if user["role"] == "control_room_officer":
+            q = q.where(Export.requested_by == user["email"])      # what /api/exports shows a CRO
+        exports_pending = (await session.execute(q)).scalar() or 0
 
-        # Drones online
         drones_online = (await session.execute(
             select(func.count()).select_from(Drone).where(Drone.status == "live")
         )).scalar() or 0

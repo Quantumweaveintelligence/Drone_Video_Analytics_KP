@@ -19,7 +19,7 @@ wrong legal documents today. Items marked *(verify on pod)* need a check against
 |---|---|
 | P0 | Code done (3 Nov 2026), unit tests only. Needs an image rebuild and a pod check: crowd `/health` 200 with `model_loaded:true`, `healthcheck.sh` all OK, crowd rows in `crowd_density_readings`, ANPR `watchlist_count` after a restart. Then run `DVAS_Dashboard/backend/scripts/review_synthesized_missions.sql` and decide what to do with each row. |
 | E1–E5 | Code done (3 Nov 2026), unit tests only (in-memory DB and MinIO fakes). Needs an image rebuild and the pod checks below. |
-| E6, R1–R5, U1 | Not started |
+| E6, R1–R5, U1 | Code done (2 Nov 2026). Unit tests + a production frontend build; E6/analytics migrations and every report query checked on a real Postgres 16. Needs an image rebuild and the pod checks below. |
 
 P0 differs from the plan in two places:
 
@@ -67,3 +67,38 @@ New env vars: `EVIDENCE_RETENTION_DAYS`, `PII_VIEW_ROLES` (both optional, defaul
 4. Legal hold → `mc legalhold info` on the vault copy shows ON.
 5. Approve an export and download it twice: identical bytes, `sha256sum -c SHA256SUMS.txt` passes inside the zip.
 6. `GET /api/evidence/{id}/verify` → `ok`.
+
+### E6–U1: what was built
+
+- **E6 — time columns.** 20 dashboard time columns are `timestamptz` (column type `UTCDateTime`: still ISO-8601 strings in the API). Migration `dashboard_timestamps.sql` runs at backend start in the same transaction as table creation, logs unparseable values to `migration_issues` and converts each column once. `audit_logs.ts` stays text (hash chain).
+- **R1 — alerts.** Every confirmed AI event becomes one evidence item and one alert (`category=ai`, severity, rule, evidence link, GPS). Incidents and suggestions no longer create alert copies (B16). Acknowledge takes a disposition. Also fixed: changing a suggestion's status crashed (missing import).
+- **R2 — report data.** `services/report_data.py`: IST calendar periods, the requester's scope on every query, hours clipped to the period, analytics via the read-only role.
+- **R3 — PDF engine.** `services/pdf/`: Noto Sans + Malayalam with text shaping, classification banner, IST, page x of y, watermark, "Showing N of M" + annexes, evidence galleries, charts, offline maps.
+- **R4 — report jobs.** Queue with requested → queued → running → ready/failed/rejected, 80 s limit, interrupted jobs failed on restart, PDFs in `dvas-reports` with SHA-256, live `report_ready`.
+- **R5 — report types.** Daily SITREP, Mission AAR, Evidence Register (case), ANPR, Crowd, Intrusion, Detection Quality, Weekly Response, Drone Utilisation. Seniors generate; CROs request and a senior approves.
+- **U1 — UI.** One validated modal for legal hold / release / export / disposal / add-to-case; Cases page; new Reports page (catalog, IST dates, drone filter, preview, approvals, hashes); evidence cards with still-image wording, exact/heuristic badge, hash, Verify; alerts feed with severities and dispositions; refresh on WebSocket events with a 60 s fallback poll (was 5 s); KPI tiles use the lists' scope.
+
+### Decisions (Q6, Q7)
+
+| Q | Chosen |
+|---|---|
+| Q6 read-only role | Yes: `dvas_report_ro`, SELECT only, read-only sessions, 30 s statement limit; re-applied by `dvas-bootstrap.sh` every boot |
+| Q7 maps | Offline only: maps drawn from coordinates (graticule, scale, north arrow); optional `.mbtiles` base map; no tile fetch at generation |
+
+New env vars: `ANALYTICS_REPORT_DATABASE_URL` (set by `dvas-init.sh`), `DVAS_REPORT_DB_PASSWORD` (appended to `dvas.env` on existing pods by `gen-secrets.sh`), `REPORT_BASEMAP_MBTILES` (optional). New dependency: `uharfbuzz` (Malayalam shaping). Fonts vendored under `backend/assets/fonts` (OFL).
+
+### Pod checks for E6–U1
+
+1. Backend log: `dashboard_timestamps.sql` and `reports_v2.sql` applied; `SELECT * FROM migration_issues` reviewed.
+2. `psql -U dvas_report_ro -d dvas -c 'INSERT …'` is refused; reports show analytics sections (not "unavailable").
+3. A confirmed event shows once in the alerts feed (AI · severity) and once in evidence; an incident shows once.
+4. Generate a Daily SITREP and a Mission AAR: status goes queued → ready without refreshing; the PDF's hash matches the list; Malayalam names render.
+5. As CRO, request a report; as senior, approve it; the CRO downloads it.
+6. Restart the backend during a generation: the report ends as failed ("interrupted"), not stuck.
+
+### Not covered
+
+- React Testing Library tests for the modals and report form were not written (the CRA project has no test setup); the frontend was checked with a production build only.
+- The cases screen has no evidence search of its own; evidence is added from Evidence Review.
+- Reports blur nothing: faces / plates appear in ANPR and evidence galleries for the roles allowed to generate them (DPDPA note printed on the ANPR report).
+

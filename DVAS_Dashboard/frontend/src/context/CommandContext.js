@@ -20,8 +20,9 @@ export function CommandProvider({ children }) {
   const [exports, setExports] = useState([]);
   const [crowd, setCrowd] = useState([]);
   const [playing, setPlaying] = useState(null);
-  const [requestOn, setRequestOn] = useState(null);
-  const [justification, setJustification] = useState("");
+  // U1: one modal for every evidence action ({ kind, evidence }), see components/evidence/ActionModal.js
+  const [action, setAction] = useState(null);
+  const openAction = (kind, evidence) => setAction({ kind, evidence });
   const [selectedDrone, setSelectedDrone] = useState(null);
 
   const [evidenceCategory, setEvidenceCategory] = useState("all");
@@ -43,12 +44,6 @@ export function CommandProvider({ children }) {
   const [evidenceDetail, setEvidenceDetail] = useState(null);
   const [reports, setReports] = useState([]);
   const [generatingReport, setGeneratingReport] = useState(null);
-  const [reportParams, setReportParams] = useState({
-    daily_incident: { date: new Date().toISOString().split("T")[0] },
-    weekly_response: { week_start: new Date(Date.now() - 6 * 86400000).toISOString().split("T")[0] },
-    drone_utilisation: { period_days: 30 },
-    mission_after_action: { mission_id: "" },
-  });
 
   const evidenceFiltersRef = useRef(evidenceFilters);
   evidenceFiltersRef.current = evidenceFilters;
@@ -114,7 +109,7 @@ export function CommandProvider({ children }) {
   useEffect(() => {
     load();
     loadFilteredEvidence(evidenceFiltersRef.current, evidenceCategoryRef.current, evidenceDedupRef.current);
-    const t = setInterval(load, 5000);
+    const t = setInterval(load, 60000);          // fallback; WebSocket events refresh sooner
     return () => clearInterval(t);
   }, []);
 
@@ -148,11 +143,24 @@ export function CommandProvider({ children }) {
       setIncidents((prev) => prev.map(x => x.id === msg.incident_id ? { ...x, status: "ACKNOWLEDGED" } : x));
     } else if (msg.type === "model_suggestion_status") {
       setSuggestions((prev) => prev.map(x => x.id === msg.suggestion_id ? { ...x, status: msg.status } : x));
+    } else if (["evidence_created", "export_decided", "report_ready", "report_failed"].includes(msg.type)) {
+      scheduleRefresh(msg.type === "evidence_created");
     }
   });
 
-  const ackAlert = async (id) => {
-    try { await api.post(`/alerts/${id}/ack`); load(); } catch (e) {}
+  // WebSocket events refresh the lists (debounced); the poll below is only a fallback (U1)
+  const refreshTimer = useRef(null);
+  const scheduleRefresh = (withEvidence) => {
+    if (refreshTimer.current) return;
+    refreshTimer.current = setTimeout(() => {
+      refreshTimer.current = null;
+      load();
+      if (withEvidence) loadFilteredEvidence();
+    }, 1500);
+  };
+
+  const ackAlert = async (id, disposition) => {
+    try { await api.post(`/alerts/${id}/ack`, disposition ? { disposition } : undefined); load(); } catch (e) {}
   };
 
   const ackIncident = async (id) => {
@@ -169,17 +177,7 @@ export function CommandProvider({ children }) {
     } catch (e) {}
   };
 
-  const requestExport = async () => {
-    if (!requestOn || !justification.trim()) return;
-    try {
-      await api.post("/exports", { evidence_id: requestOn.id, justification });
-      setRequestOn(null);
-      setJustification("");
-      load();
-    } catch (e) {
-      alert(e.response?.data?.detail || "failed");
-    }
-  };
+  const requestExport = (ev) => openAction("request_export", ev);
 
   const decide = async (id, decision) => {
     try {
@@ -231,34 +229,9 @@ export function CommandProvider({ children }) {
     loadFilteredEvidence(newFilters, evidenceCategoryRef.current, checked);
   };
 
-  const toggleLegalHold = async (ev) => {
-    try {
-      if (ev.legal_hold) {
-        await api.delete(`/evidence/${ev.id}/legal-hold`, { data: { reason: "Released by Senior Officer" } });
-      } else {
-        const reason = prompt("Enter legal hold reason:");
-        if (!reason) return;
-        await api.post(`/evidence/${ev.id}/legal-hold`, { reason });
-      }
-      load();
-    } catch (e) {
-      alert(e.response?.data?.detail || "Failed");
-    }
-  };
+  const toggleLegalHold = (ev) => openAction(ev.legal_hold ? "release_hold" : "legal_hold", ev);
 
-  const directExport = async (ev) => {
-    const caseNumber = prompt("Case / crime number for this export (required):");
-    if (!caseNumber || !caseNumber.trim()) return;
-    const just = prompt("Enter justification for direct export:");
-    if (!just) return;
-    try {
-      const res = await api.post(`/evidence/${ev.id}/direct-export`, { justification: just, case_number: caseNumber.trim() });
-      if (res.data?.bundle_error) alert(`Export approved, but the bundle could not be built: ${res.data.bundle_error}`);
-      load();
-    } catch (e) {
-      alert(e.response?.data?.detail || "Failed");
-    }
-  };
+  const directExport = (ev) => openAction("direct_export", ev);
 
   const generateMissionReport = async (missionId) => {
     try {
@@ -278,19 +251,6 @@ export function CommandProvider({ children }) {
       setEvidenceDetail(res.data);
     } catch (e) {
       alert(e.response?.data?.detail || "Failed");
-    }
-  };
-
-  const generateReport = async (reportType) => {
-    try {
-      setGeneratingReport(reportType);
-      const params = reportParams[reportType] || {};
-      await api.post("/reports/generate", { report_type: reportType, params });
-      load();
-      setTimeout(() => setGeneratingReport(null), 3000);
-    } catch (e) {
-      alert(e.response?.data?.detail || "Failed");
-      setGeneratingReport(null);
     }
   };
 
@@ -324,13 +284,11 @@ export function CommandProvider({ children }) {
     setPlaying,
     evidenceDetail,
     setEvidenceDetail,
-    requestOn,
-    setRequestOn,
-    justification,
-    setJustification,
+    action,
+    setAction,
+    openAction,
+    setRequestOn: (ev) => ev && openAction("request_export", ev),
     generatingReport,
-    reportParams,
-    setReportParams,
     connected,
     mergedDrones,
     liveMissionsCount,
@@ -348,7 +306,6 @@ export function CommandProvider({ children }) {
     directExport,
     generateMissionReport,
     openEvidenceDetail,
-    generateReport,
     downloadReport
   };
 
