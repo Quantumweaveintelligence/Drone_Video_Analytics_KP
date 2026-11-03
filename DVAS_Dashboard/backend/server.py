@@ -99,6 +99,11 @@ async def _sync_models_on_startup():
             logging.getLogger("dvas").warning("Model startup sync deferred: %s", e)
     asyncio.create_task(_do_sync())
 
+@app.on_event("startup")
+async def _push_fps_policy_on_startup():
+    from services import fps_policy
+    asyncio.create_task(fps_policy.push_on_startup())
+
 # ---------- Root ----------
 @app.get("/api/")
 async def root():

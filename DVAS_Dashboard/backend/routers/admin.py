@@ -18,7 +18,7 @@ from core.security import STATEWIDE_JURISDICTIONS, require_roles
 from database import async_session_factory
 from keycloak_service import list_active_sessions, logout_user_everywhere, realm_token_settings, revoke_session
 from models import AuditLegalHold, AuditLog, Evidence, Export
-from services import settings_service
+from services import fps_policy, settings_service
 
 router = APIRouter(prefix="/api/admin", tags=["Admin"])
 
@@ -78,6 +78,8 @@ async def put_settings(request: Request, changes: Dict[str, Any] = Body(...),
             before_values={k: v["before"] for k, v in diff.items()},
             after_values={k: v["after"] for k, v in diff.items()},
             source_endpoint="PUT /api/admin/settings", request=request)
+        if any(k in settings_service.FPS_KEYS for k in diff):
+            await fps_policy.push()          # the analytics governor applies it within 2 s
     return {"changed": diff, "settings": await settings_service.get_all()}
 
 

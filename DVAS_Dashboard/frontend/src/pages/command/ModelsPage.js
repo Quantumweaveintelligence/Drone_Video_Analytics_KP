@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { api, apiError } from "@/lib/api";
+import GpuPerformancePanel from "@/components/command/GpuPerformancePanel";
 import {
   Cpu,
   RefreshCw,
@@ -138,7 +139,7 @@ export default function ModelsPage() {
 
         <div className="flex items-center gap-6">
           <div className="text-right">
-            <div className="dvas-label text-[10px]" title="Sum of the per-model planning estimates, not a measurement">Estimated GPU share</div>
+            <div className="dvas-label text-[10px]" title="Sum of the per-model planning estimates (measured on a 4 GB GPU), not a measurement">Estimated GPU share</div>
             <div className={`mono text-lg font-extrabold ${gpuUsed > 80 ? "text-amber-400" : "text-emerald-400"}`}>
               {gpuUsed}%
             </div>
@@ -159,6 +160,9 @@ export default function ModelsPage() {
           </div>
         </div>
       </div>
+
+      {/* Detected GPU, FPS governor and measured fps (RunPod plan Phase 10) */}
+      <GpuPerformancePanel />
 
       {/* Model Cards Grid */}
       <div
@@ -239,10 +243,16 @@ export default function ModelsPage() {
                       </span>
                     )}
                   </div>
-                  <div className="mono text-[10px] text-slate-500 mt-1 flex items-center gap-2">
-                    <span title="Planning estimate">est. GPU <span className="text-slate-300 font-semibold">~{m.gpu_pct}%</span></span>
-                    <span>·</span>
-                    <span title="Planning estimate">est. <span className="text-slate-300 font-semibold">~{m.throughput_fps} fps</span></span>
+                  <div className="mono text-[10px] text-slate-500 mt-1 flex items-center gap-2 flex-wrap">
+                    {m.live?.fps != null ? (
+                      <span title="Measured: frames analysed per second per drone (average)" data-testid={`model-live-${m.key}`}>
+                        <span className="text-emerald-300 font-semibold">{m.live.fps} fps</span>
+                        {" "}on {m.live.drones} drone{m.live.drones === 1 ? "" : "s"}
+                        {m.live.input_fps != null && <> · input {m.live.input_fps}</>}
+                      </span>
+                    ) : (
+                      <span title="Planning estimate">est. GPU <span className="text-slate-300 font-semibold">~{m.gpu_pct}%</span></span>
+                    )}
                     {lastAction && (
                       <>
                         <span>·</span>
@@ -269,8 +279,9 @@ export default function ModelsPage() {
         {!cfg.read_only && (
           <div className="p-3.5 border-t flex items-center gap-3" style={{ borderColor: "var(--dvas-border)" }}>
             {gpuUsed > 100 && (
-              <div className="mono text-xs text-red-400 flex items-center gap-1.5">
-                <Warning size={14} /> GPU over-committed ({gpuUsed}%) — reduce models before deploying
+              <div className="mono text-xs text-amber-400 flex items-center gap-1.5"
+                   title="Estimates are for the small edge GPU; the governor shares the real GPU">
+                <Warning size={14} /> Estimate {gpuUsed}% — if the GPU fills up, all analyzers slow down equally
               </div>
             )}
             {msg.text && (
@@ -290,7 +301,7 @@ export default function ModelsPage() {
               </button>
               <button
                 data-testid="models-save"
-                disabled={!dirty || saving || gpuUsed > 100}
+                disabled={!dirty || saving}
                 onClick={deploy}
                 className="px-4 py-1.5 bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold rounded-md disabled:opacity-50 transition-colors flex items-center gap-1.5 shadow-sm"
               >

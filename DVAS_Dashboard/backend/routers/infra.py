@@ -19,7 +19,8 @@ from core.config import (
 from core.analytics_client import _get_minio_client, _service_headers
 from core import runtime
 from audit_service import write_audit_v2
-from schemas.models import ModelUpdateIn
+from schemas.models import FpsPolicyIn, ModelUpdateIn
+from services import fps_policy, settings_service
 from services.system_telemetry import (
     collect_system_hardware,
     collect_stream_overview,
@@ -311,13 +312,16 @@ async def _get_model_config(scope: str = CLUSTER_SCOPE):
 
 async def _models_payload(cfg: dict, user: dict) -> dict:
     """Model config plus measured state, shared by GET and POST /models (CMD-06)."""
-    stream_status = await _get_service_stream_status()
+    stream_status, gov = await asyncio.gather(_get_service_stream_status(), fps_policy.status())
+    services = (gov or {}).get("services") or {}
     available_with_status = [
         {
             **m,
             "stream_running": stream_status.get(m["key"]),     # None = service unreachable
             # gpu_pct / throughput_fps are planning estimates per model, not measurements
             "estimate": True,
+            # measured fps per drone from the analyzer (None until it has streamed)
+            "live": _live_summary(services.get(_MODEL_SERVICE.get(m["key"], m["key"]))),
         }
         for m in AVAILABLE_MODELS
     ]
@@ -351,14 +355,129 @@ async def _models_payload(cfg: dict, user: dict) -> dict:
     }
 
 
+MODEL_ADMIN_ROLES = ("senior_officer", "system_administrator")   # M9: shared cluster config
+
+# Detection Models page key → analytics service that runs it
+_MODEL_SERVICE = {"face": "person", "plate": "anpr"}
+
+
+def _live_summary(doc: dict | None) -> dict | None:
+    """Per-service measured fps from the governor document (averaged over drones)."""
+    drones = (doc or {}).get("drones") or {}
+    if not drones:
+        return None
+    rows = list(drones.values())
+
+    def avg(field):
+        vals = [r[field] for r in rows if isinstance(r.get(field), (int, float))]
+        return round(sum(vals) / len(vals), 1) if vals else None
+    return {
+        "drones": len(rows),
+        "fps": avg("fps"),
+        "input_fps": avg("input_fps"),
+        "infer_ms": avg("infer_ms"),
+        "skipped": sum(int(r.get("skipped") or 0) for r in rows),
+        "cap_fps": doc.get("cap_fps"),
+        "governed": doc.get("governed", True),
+    }
+
+
+_BG_TASKS: set = set()      # keep fire-and-forget tasks referenced until done
+
+
+def _performance_view(gov: dict, policy: dict, user: dict, local_gpu=None) -> dict:
+    """Governor document reshaped for the Detection Models page."""
+    ok = isinstance(gov, dict) and "error" not in gov
+    services = gov.get("services") or {} if ok else {}
+    labels = {m["key"]: m["label"] for m in AVAILABLE_MODELS}
+    labels.update({"person": "Person & Face", "anpr": labels.get("plate", "ANPR")})
+    rows = []
+    for svc in ("person", "vehicle", "anpr", "intrusion", "vessel", "anomaly", "crowd"):
+        doc = services.get(svc)
+        if not doc:
+            continue
+        drones = []
+        for d, st in sorted((doc.get("drones") or {}).items()):
+            fps, inp = st.get("fps") or 0, st.get("input_fps") or 0
+            if svc == "crowd":
+                state = "capped"                      # 1–2 fps by design
+            elif inp and inp < policy["target_min"] and fps >= 0.85 * inp:
+                state = "input_limited"
+            elif fps >= policy["target_min"] * 0.95:
+                state = "on_target"
+            else:
+                state = "below_target"
+            drones.append({"drone_id": d, **{k: st.get(k) for k in
+                           ("fps", "input_fps", "skipped", "infer_ms", "total_ms", "lag_ms")},
+                           "state": state})
+        rows.append({"service": svc, "label": labels.get(svc, svc), "governed": doc.get("governed", True),
+                     "cap_fps": doc.get("cap_fps"), "avg_batch": doc.get("avg_batch"), "drones": drones})
+    profile = (gov.get("gpu") if ok else None) or {}
+    if not profile:
+        name, metrics = local_gpu or (None, None)
+        profile = {"name": name, "vram_gb": metrics[2] if metrics else None, "tier": None,
+                   "fp16": None, "max_batch": None, "available": bool(name)}
+    return {
+        "available": ok,
+        "detail": None if ok else (gov or {}).get("detail", "Analytics gateway unavailable"),
+        "policy": policy,
+        "editable": user["role"] in MODEL_ADMIN_ROLES,
+        "governor": {k: gov.get(k) for k in ("enabled", "state", "reason", "cap_fps", "lagging",
+                                             "gpu_util_pct", "updated_at")} if ok else None,
+        "gpu": profile,
+        "services": rows,
+    }
+
+
+@router.get("/models/performance")
+async def models_performance(user: dict = Depends(get_current_user)):
+    """Detected GPU, FPS policy and measured fps per analyzer and drone (RunPod plan 10.4)."""
+    if user["role"] not in ("control_room_officer", "senior_officer", "system_administrator"):
+        raise HTTPException(403, "Not permitted")
+    policy, gov = await asyncio.gather(fps_policy.current(), fps_policy.status())
+    if isinstance(gov, dict) and "error" not in gov and not fps_policy.in_sync(policy, gov):
+        # gateway restarted (policy lost) or still on env defaults: re-send the stored policy
+        task = asyncio.create_task(fps_policy.push(policy))
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
+    local_gpu = None
+    if not (isinstance(gov, dict) and gov.get("gpu")):
+        # NVML calls block: run them off the event loop
+        local_gpu = await asyncio.to_thread(lambda: (runtime.gpu_name_nvml(), runtime.gpu_metrics_nvml()))
+    return _performance_view(gov, policy, user, local_gpu)
+
+
+@router.put("/models/performance/policy")
+@limiter.limit("20/minute")
+async def update_fps_policy(body: FpsPolicyIn, request: Request,
+                            user: dict = Depends(require_roles(*MODEL_ADMIN_ROLES))):
+    changes = {"analytics_fps_min": body.target_min, "analytics_fps_max": body.target_max,
+               "analytics_fps_floor": body.floor}
+    try:
+        diff = await settings_service.update(changes, user)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if diff:
+        await write_audit_v2(
+            actor=user, action="fps_policy_update", category="configuration", severity="warning",
+            target="analytics_fps_policy", target_type="configuration",
+            details="; ".join(f"{k}: {v['before']} → {v['after']}" for k, v in diff.items()),
+            before_values={k: v["before"] for k, v in diff.items()},
+            after_values={k: v["after"] for k, v in diff.items()},
+            source_endpoint="PUT /api/models/performance/policy", request=request)
+    policy = await fps_policy.current()
+    applied = await fps_policy.push(policy)
+    return {"policy": policy, "applied": applied, "changed": bool(diff),
+            "detail": None if applied else "Saved; the analytics gateway is unreachable and will "
+                                           "receive the policy when it is back"}
+
+
 @router.get("/models")
 async def list_models(user: dict = Depends(get_current_user)):
     if user["role"] not in ("control_room_officer", "senior_officer", "system_administrator"):
         raise HTTPException(403, "Not permitted")
     return await _models_payload(await _get_model_config(CLUSTER_SCOPE), user)
 
-
-MODEL_ADMIN_ROLES = ("senior_officer", "system_administrator")   # M9: shared cluster config
 
 
 async def apply_model_config(active: list, user: dict, request=None, reason: str = "") -> dict:

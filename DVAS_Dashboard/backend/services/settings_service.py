@@ -40,7 +40,22 @@ DEFINITIONS: Dict[str, dict] = {
         "label": "Retention job runs at (IST, HH:MM)", "type": "time", "default": "02:30",
         "enforced_by": "Daily evidence / report retention job",
     },
+    # Analytics FPS policy (RunPod plan Phase 10); also editable on the Detection Models page
+    "analytics_fps_min": {
+        "label": "Analytics target fps — minimum", "type": "int", "min": 1, "max": 60, "default": 20,
+        "enforced_by": "FPS governor (analytics gateway): target range for every analyzer but crowd",
+    },
+    "analytics_fps_max": {
+        "label": "Analytics target fps — maximum", "type": "int", "min": 1, "max": 60, "default": 30,
+        "enforced_by": "FPS governor: per-drone cap when the GPU has headroom",
+    },
+    "analytics_fps_floor": {
+        "label": "Analytics fps floor under GPU overload", "type": "int", "min": 1, "max": 60, "default": 5,
+        "enforced_by": "FPS governor: analyzers slow down equally, never below this",
+    },
 }
+
+FPS_KEYS = ("analytics_fps_min", "analytics_fps_max", "analytics_fps_floor")
 
 _cache: Dict[str, Any] = {}
 _cache_at = 0.0
@@ -96,6 +111,9 @@ async def update(changes: Dict[str, Any], user: dict) -> Dict[str, Dict[str, Any
     global _cache_at
     clean = {k: validate(k, v) for k, v in changes.items()}
     current = await get_all()
+    merged = {**current, **clean}
+    if not merged["analytics_fps_floor"] <= merged["analytics_fps_min"] <= merged["analytics_fps_max"]:
+        raise ValueError("Analytics fps: floor ≤ minimum ≤ maximum is required")
     diff = {k: {"before": current[k], "after": v} for k, v in clean.items() if current[k] != v}
     if not diff:
         return {}

@@ -3,11 +3,25 @@ Schemas for ML models, watchlists, and presets.
 """
 from typing import List, Optional
 
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 
 class ModelUpdateIn(BaseModel):
     active: List[str]
+
+
+class FpsPolicyIn(BaseModel):
+    """Analytics FPS governor policy (Detection Models page, SO/SA)."""
+    model_config = ConfigDict(extra="forbid")
+    target_min: int = Field(ge=1, le=60)
+    target_max: int = Field(ge=1, le=60)
+    floor: int = Field(ge=1, le=60)
+
+    @model_validator(mode="after")
+    def _ordered(self):
+        if not self.floor <= self.target_min <= self.target_max:
+            raise ValueError("floor ≤ target_min ≤ target_max is required")
+        return self
 
 
 class WatchlistAddIn(BaseModel):
