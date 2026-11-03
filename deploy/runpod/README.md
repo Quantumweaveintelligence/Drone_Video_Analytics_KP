@@ -60,6 +60,24 @@ deploy/runpod/tools/smoke_public.py --url https://<POD_ID>-80.proxy.runpod.net [
 
 Tests: `python -m pytest deploy/runpod/tests -q`
 
+## GPU-aware analytics throughput (2026-11)
+
+The analyzers detect the GPU and aim for **20–30 fps per drone** (every analyzer except crowd,
+which stays at `CROWD_MAX_FPS`). Full notes: `context_gpu_fps.md` at the repo root.
+
+- **GPU profile:** FP16 + cuDNN autotune on Volta+ (not GTX 16xx); drones per detector batch from VRAM
+  (L40S 4, RTX PRO 6000 8). Override with `DVAS_FP16`, `DVAS_MAX_BATCH`. Inference sizes never change.
+- **Newest frame only:** when an analyzer can't keep up it analyses the newest frame and acks the rest
+  (shown as *skipped*), so lag stays at one frame.
+- **Governor** (analytics gateway): if the GPU is ≥ 90 % busy and analyzers fall short, all of them
+  are capped equally, never below the floor (default 5 fps). `GOVERNOR_ENABLED=false` disables it.
+- **Detection Models page:** detected GPU, governor state, analysed vs input fps per analyzer and drone.
+  SO/SA edit the target range (`PUT /api/models/performance/policy`, audited).
+- **Valkey queue:** 2000 frames per drone, raw JPEG only (`QUEUE_WRITE_JPEG_B64=false`); ingest trims
+  streams to a quarter when Valkey passes `QUEUE_MEM_GUARD_PCT` (85 %) of `maxmemory`.
+- **Edge input:** the edge app sends 10 fps by default; raise its send rate to reach 20–30 fps.
+- One tracker per drone now (they were shared across drones before), and anomaly loads its models once.
+
 ## Role & API audit changes (2026-11)
 
 Fixes for `DVAS_ROLE_AND_API_AUDIT_COMBINED.md` and `DEAD_UI_FINDINGS.md` (edge pages excluded).
