@@ -341,7 +341,15 @@ Instead of managing separate machine credentials on each laptop, the Edge Operat
    - Drones can be freely selected during Mission Start in the UI (`req.drone_id`), eliminating drone-to-laptop lock-in.
 
 ### Key Code Modifications:
+0. **`DVAS_Dashboard/frontend/src/pages/edge/MissionControl.js`:**
+   - Added dedicated Drone ID input with fixed `DRN-` prefix and `000` default value (making `DRN-000`).
+   - Eliminates dropdowns; constables type only the drone number (e.g. `001` or `010`).
+   - Transmits selected `drone_id` dynamically to `/api/edge/mission/start`.
+
 1. **`dvas_edge/ingest/edge_sender.py`:**
+   - Automatically detects physical laptop Windows computer name (`COMPUTERNAME`) via `get_laptop_name()`.
+   - Attaches `laptop_id`, `laptop_name`, and `uploader_username` to every frame's `metadata_json` for HQ forensics/audit.
+   - `INGEST__USERNAME` defaults automatically to the physical laptop name.
    - `IngestClient.__init__`: Added `session_token: Optional[str] = None` and `token_expiry: float = 0.0`.
    - Added `set_session_token(token, expiry)` to dynamically receive refreshed session tokens.
    - `get_token()`: Returns forwarded session token if valid (>15s remaining); attempts Keycloak direct grant only if credentials exist; gracefully retains session token if direct grant fails instead of crashing.

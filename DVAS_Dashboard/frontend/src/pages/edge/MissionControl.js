@@ -14,7 +14,7 @@ export default function MissionControl() {
 
   const [form, setForm] = useState(() => {
     const initSquadron = localStorage.getItem('dvas_default_squadron') || 'ALPHA';
-    return { name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: initSquadron };
+    return { name: '', id: '', droneNumber: '000', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: initSquadron };
   });
   const [videoFile, setVideoFile] = useState(null);
   const [srtFile, setSrtFile] = useState(null);
@@ -260,12 +260,16 @@ export default function MissionControl() {
         setUploadProgress('');
       }
 
+      const rawNum = (form.droneNumber || '').trim();
+      const droneId = `DRN-${rawNum || '000'}`.toUpperCase();
+
       const resp = await authFetch('/edge-api/api/edge/mission/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           mission_id: form.id || generateMissionId(form.squadron),
           mission_name: form.name,
+          drone_id: droneId,
           video_source: finalVideoSource,
           video_source_type: form.video_source_type,
           operator: form.operator,
@@ -296,7 +300,7 @@ export default function MissionControl() {
           end: '--:--:--',
           status: 'active',
         }, ...prev]);
-        setForm({ name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: defaultSquadron });
+        setForm({ name: '', id: '', droneNumber: '000', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: defaultSquadron });
         setVideoFile(null);
         setSrtFile(null);
 
@@ -595,14 +599,36 @@ export default function MissionControl() {
           <div className="bg-slate-900 border border-slate-800 p-6 rounded-lg flex flex-col">
             <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-6">New Mission</h2>
             <div className="space-y-4 flex-1">
-              <div>
-                <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Mission Name *</label>
-                <input 
-                  type="text" 
-                  value={form.name} onChange={handleNameChange}
-                  className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm text-slate-200"
-                  placeholder="e.g. VIP Route Sweep"
-                />
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Mission Name *</label>
+                  <input 
+                    type="text" 
+                    value={form.name} onChange={handleNameChange}
+                    className="w-full bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-sm text-slate-200"
+                    placeholder="e.g. VIP Route Sweep"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1.5">Drone ID *</label>
+                  <div className="flex bg-slate-950 border border-slate-700 focus-within:border-sky-500 overflow-hidden">
+                    <span className="bg-slate-800/90 text-sky-400 font-mono font-bold px-3 py-2 text-sm select-none border-r border-slate-700 flex items-center">
+                      DRN-
+                    </span>
+                    <input 
+                      type="text" 
+                      value={form.droneNumber} 
+                      onChange={e => {
+                        const clean = e.target.value.replace(/[^0-9A-Za-z]/g, '');
+                        setForm(prev => ({ ...prev, droneNumber: clean }));
+                      }}
+                      className="w-full bg-transparent outline-none px-3 py-2 text-sm font-mono text-slate-200 placeholder-slate-600"
+                      placeholder="000"
+                      maxLength={10}
+                    />
+                  </div>
+                  <p className="text-[9px] text-slate-500 mt-1 font-mono">Assigned Asset: DRN-{form.droneNumber || '000'}</p>
+                </div>
               </div>
               <div className="grid grid-cols-2 gap-4">
                   <div>
@@ -706,7 +732,7 @@ export default function MissionControl() {
                   <Play size={16} fill="currentColor" /> {loading ? 'Starting...' : 'Start Mission'}
                 </button>
                 <button 
-                  onClick={() => setForm({ name: '', id: '', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: defaultSquadron })}
+                  onClick={() => setForm({ name: '', id: '', droneNumber: '000', video_source_type: 'rtmp', video_source: '', operator: '', location: '', squadron: defaultSquadron })}
                   className="px-6 border border-slate-700 hover:bg-slate-800 text-slate-300 py-2.5 text-sm font-semibold tracking-wide rounded transition-colors"
                 >
                   Clear

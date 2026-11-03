@@ -38,15 +38,35 @@ import httpx
 #   set TOKEN_URL=http://10.51.27.250:8080/realms/kerala-police-drone/protocol/openid-connect/token
 
 import os
+import platform
+import socket
+
+def get_laptop_name() -> str:
+    """
+    Automatically detect the Windows computer name (e.g. LAPTOP-PATROL-03).
+    Falls back to socket hostname or platform node.
+    """
+    name = os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME")
+    if not name:
+        try:
+            name = socket.gethostname()
+        except Exception:
+            name = platform.node()
+    return name.strip() if name else "LAPTOP-EDGE"
+
+LAPTOP_ID = get_laptop_name()
 
 INGEST_URL  = os.getenv("INGEST__URL", os.getenv("INGEST_URL",  "http://10.123.225.251/ingest/frame"))
 TOKEN_URL   = os.getenv("INGEST__TOKEN_URL", os.getenv("TOKEN_URL",   "http://10.123.225.251:8080/realms/kerala-police-drone/protocol/openid-connect/token"))
 CLIENT_ID   = os.getenv("KC_CLIENT_ID",  "drone-ingest-client")
 CLIENT_SEC  = os.getenv("INGEST__CLIENT_SECRET", os.getenv("KC_CLIENT_SEC", "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn"))
 
-USERNAME    = os.getenv("INGEST__USERNAME", os.getenv("EDGE_USERNAME", "edge_laptop_01"))
+# INGEST__USERNAME: if not explicitly configured, automatically defaults to Windows Computer Name
+_env_user   = os.getenv("INGEST__USERNAME", os.getenv("EDGE_USERNAME", "")).strip()
+USERNAME    = _env_user if (_env_user and _env_user not in ("edge_laptop_01", "<per-laptop account>")) else LAPTOP_ID
+
 PASSWORD    = os.getenv("INGEST__PASSWORD", os.getenv("EDGE_PASSWORD", ""))
-DRONE_ID    = os.getenv("INGEST__DRONE_ID", os.getenv("DRONE_ID", "DRN-001"))
+DRONE_ID    = os.getenv("INGEST__DRONE_ID", os.getenv("DRONE_ID", "DRN-000"))
 MISSION_ID  = os.getenv("MISSION_ID",    "MISSION_DEFAULT")
 
 # TLS verification:
@@ -93,12 +113,13 @@ class IngestClient:
 
     def __init__(
         self,
-        drone_id:      str,
-        mission_id:    str,
+        drone_id:      str = "DRN-000",
+        mission_id:    str = "MISSION_DEFAULT",
         username:      str = "",
         password:      str = "",
         session_token: Optional[str] = None,
         token_expiry:  float = 0.0,
+        laptop_id:     Optional[str] = None,
     ) -> None:
         if drone_id:
             import re
@@ -107,10 +128,11 @@ class IngestClient:
                 cleaned_drone = cleaned_drone[:30].rstrip("-_")
             self.drone_id = cleaned_drone
         else:
-            self.drone_id = "DRONE_KL_001"
+            self.drone_id = "DRN-000"
 
         self.mission_id    = mission_id
-        self.username      = username
+        self.laptop_id     = (laptop_id or LAPTOP_ID).strip()
+        self.username      = username or USERNAME or self.laptop_id
         self.password      = password
         self.token:        Optional[str] = session_token
         self.token_expiry: float         = token_expiry if (session_token and token_expiry > 0) else (time.time() + 300 if session_token else 0.0)
@@ -234,16 +256,19 @@ class IngestClient:
         self.frame_seq += 1
 
         meta = {
-            "drone_id":       self.drone_id,
-            "mission_id":     self.mission_id,
-            "timestamp":      time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-            "frame_sequence": self.frame_seq,
-            "change_score":   change_score,
-            "latitude":       lat,
-            "longitude":      lon,
-            "altitude_m":     alt,
-            "frame_seq":      self.frame_seq,
-            "capture_ts":     time.time(),
+            "drone_id":          self.drone_id,
+            "mission_id":        self.mission_id,
+            "timestamp":         time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            "frame_sequence":    self.frame_seq,
+            "change_score":      change_score,
+            "latitude":          lat,
+            "longitude":         lon,
+            "altitude_m":        alt,
+            "frame_seq":         self.frame_seq,
+            "capture_ts":        time.time(),
+            "laptop_id":         self.laptop_id,
+            "laptop_name":       self.laptop_id,
+            "uploader_username": self.username,
         }
 
         frame_bytes = Path(frame_path).read_bytes()
@@ -340,25 +365,28 @@ class IngestClient:
         self.frame_seq += 1
 
         meta = {
-            "drone_id":       self.drone_id,
-            "mission_id":     self.mission_id,
-            "timestamp":      time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-            "frame_sequence": self.frame_seq,
-            "change_score":   change_score,
-            "latitude":       lat,
-            "longitude":      lon,
-            "altitude_m":     alt,
-            "speed_mps":      speed_mps,
-            "battery_pct":    battery_pct,
-            "frames_total":   frames_total,
-            "abs_alt":        abs_alt,
-            "gb_yaw":         gb_yaw,
-            "gb_pitch":       gb_pitch,
-            "gb_roll":        gb_roll,
-            "focal_len":      focal_len,
-            "dzoom_ratio":    dzoom_ratio,
-            "frame_seq":     self.frame_seq,
-            "capture_ts":    time.time(),
+            "drone_id":          self.drone_id,
+            "mission_id":        self.mission_id,
+            "timestamp":         time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            "frame_sequence":    self.frame_seq,
+            "change_score":      change_score,
+            "latitude":          lat,
+            "longitude":         lon,
+            "altitude_m":        alt,
+            "speed_mps":         speed_mps,
+            "battery_pct":       battery_pct,
+            "frames_total":      frames_total,
+            "abs_alt":           abs_alt,
+            "gb_yaw":            gb_yaw,
+            "gb_pitch":          gb_pitch,
+            "gb_roll":           gb_roll,
+            "focal_len":         focal_len,
+            "dzoom_ratio":       dzoom_ratio,
+            "frame_seq":         self.frame_seq,
+            "capture_ts":        time.time(),
+            "laptop_id":         self.laptop_id,
+            "laptop_name":       self.laptop_id,
+            "uploader_username": self.username,
         }
 
         last_exc: Optional[Exception] = None
@@ -423,9 +451,12 @@ class IngestClient:
         )
         token = await self.get_token()
         payload = {
-            "drone_id":     self.drone_id,
-            "mission_id":   self.mission_id,
-            "operator":     operator or self.username,
+            "drone_id":          self.drone_id,
+            "mission_id":        self.mission_id,
+            "operator":          operator or self.username,
+            "laptop_id":         self.laptop_id,
+            "laptop_name":       self.laptop_id,
+            "uploader_username": self.username,
         }
         if mission_name:
             payload["mission_name"] = mission_name

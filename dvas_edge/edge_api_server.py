@@ -537,7 +537,7 @@ class PipelineManager:
             elif req.mission_id.startswith("MSN-"):
                 drone_id = f"DRN-{req.mission_id[4:]}"
             else:
-                drone_id = f"DRN-{req.mission_id}"
+                drone_id = "DRN-000"
 
             # Clean and strictly enforce Ingest API constraint: ^[A-Z0-9_\-]{3,30}$
             drone_id = re.sub(r"[^A-Z0-9_\-]", "-", drone_id.upper())
@@ -748,13 +748,20 @@ class PipelineManager:
             # ── Edge Sender Thread ─────────────────────────────────────────
             effective_token = session_token or _ACTIVE_OPERATOR_TOKEN
             effective_expiry = token_expiry if (token_expiry and token_expiry > 0) else _ACTIVE_OPERATOR_TOKEN_EXPIRY
+            
+            # Detect Windows computer name (Solution 3: Machine Identity)
+            import socket, platform
+            laptop_id = os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or socket.gethostname()
+            effective_user = cfg.ingest.username if (cfg.ingest.username and cfg.ingest.username not in ("edge_laptop_01", "<per-laptop account>")) else laptop_id
+
             client = IngestClient(
-                username=cfg.ingest.username,
+                username=effective_user,
                 password=cfg.ingest.password,
                 drone_id=drone_id,
                 mission_id=req.mission_id,
                 session_token=effective_token,
                 token_expiry=effective_expiry,
+                laptop_id=laptop_id,
             )
             self.sender_thread = EdgeSenderThread(
                 client=client,
@@ -787,6 +794,7 @@ class PipelineManager:
                 "video_source_type": req.video_source_type,
                 "start_time": start_time_str,
                 "geofence": self.geofence,
+                "laptop_id": laptop_id,
             }
 
             # Add / update record in mission_history

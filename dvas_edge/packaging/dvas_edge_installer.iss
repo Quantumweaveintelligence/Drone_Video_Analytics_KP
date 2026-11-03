@@ -132,9 +132,9 @@ begin
       Lines.Add('INGEST__TOKEN_URL=' + CloudBase + '/realms/kerala-police-drone/protocol/openid-connect/token');
       Lines.Add('INGEST__CLIENT_ID=drone-ingest-client');
       Lines.Add('INGEST__CLIENT_SECRET={#ClientSecret}');
-      Lines.Add('INGEST__USERNAME=edge_laptop_01');
+      Lines.Add('# INGEST__USERNAME auto-detected from Windows computer name');
       Lines.Add('INGEST__PASSWORD={#IngestPassword}');
-      Lines.Add('INGEST__DRONE_ID=DRN-001');
+      Lines.Add('INGEST__DRONE_ID=DRN-000');
       if Pos('https://', LowerUrl) = 1 then
         Lines.Add('INGEST__TLS_VERIFY=true')
       else

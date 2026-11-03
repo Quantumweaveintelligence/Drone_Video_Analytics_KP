@@ -93,7 +93,25 @@ sequenceDiagram
 
 ## 4. Code Changes Made in the Edge Codebase
 
-### 4.1. `dvas_edge/ingest/edge_sender.py`
+### 4.0. `DVAS_Dashboard/frontend/src/pages/edge/MissionControl.js` (Dynamic Drone ID Input)
+
+1. **No Dropdowns — Clean Numeric Input:**
+   - The New Mission form now features a dedicated **Drone ID** asset field.
+   - Built with a fixed, uneditable prefix block displaying **`DRN-`** and a clean numeric input field beside it.
+   - Initial/default value is **`000`** (making the full Asset ID **`DRN-000`**).
+   - Constables enter only the drone number (e.g., typing `001` or `010`). Non-alphanumeric characters are automatically sanitized.
+   - Live badge below the input previews the exact ID: `Assigned Asset: DRN-001`.
+   - On clicking **Start Mission**, `DRN-<number>` is sent to `/edge-api/api/edge/mission/start` in `drone_id`.
+
+---
+
+### 4.1. `dvas_edge/ingest/edge_sender.py` (Automatic Physical Machine Detection)
+
+0. **Windows Computer Name Auto-Detection:**
+   - Added `get_laptop_name()`: Reads `os.environ.get("COMPUTERNAME")` (falls back to `socket.gethostname()`).
+   - Automatically sets `LAPTOP_ID = get_laptop_name()`.
+   - If `INGEST__USERNAME` is not configured, it defaults dynamically to the physical laptop's Windows computer name (e.g. `LAPTOP-PATROL-03`).
+   - Attaches `laptop_id`, `laptop_name`, and `uploader_username` to every frame's `metadata_json` sent to `/ingest/frame` and the mission start payload. HQ now automatically knows the exact physical laptop that uploaded the video for forensic and audit purposes.
 
 1. **`IngestClient.__init__`**:
    - Added `session_token: Optional[str] = None` and `token_expiry: float = 0.0`.
