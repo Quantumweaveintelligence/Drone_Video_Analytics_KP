@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import AsyncGenerator, Dict, Any, Optional
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse, PlainTextResponse
 
 sys.path.insert(0, "/analytics")
@@ -28,6 +28,8 @@ from shared.db import (
 )
 from shared.redis_client import close_client, get_client
 from shared.auth import verify_service_key, install_service_guard
+from shared.redis_client import _get_raw_client
+from gateway.governor import Governor, Policy, POLICY_KEY, STATUS_KEY
 
 logging.basicConfig(
     level=cfg.LOG_LEVEL,
@@ -71,16 +73,46 @@ _ANALYTICS_STREAMS = [
 ]
 
 
+_governor = Governor(_get_raw_client)
+_governor_task: Optional[asyncio.Task] = None
+
+
 @app.on_event("startup")
 async def startup():
+    global _governor_task
     await get_pool()
+    _governor_task = asyncio.create_task(_governor.run())
     log.info("Analytics Gateway started on port 8100")
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    if _governor_task:
+        _governor_task.cancel()
     await close_pool()
     await close_client()
+
+
+# ── FPS governor (RunPod plan Phase 10) ─────────────────────────────────────
+
+@app.get("/governor/status", dependencies=[Depends(verify_service_key)])
+async def governor_status():
+    """Live governor document: policy, common cap, per-service/drone fps and the GPU profile."""
+    raw = await _get_raw_client().get(STATUS_KEY)
+    if not raw:
+        return {"state": "starting", "reason": "No governor cycle yet", "policy": None, "services": {}}
+    return json.loads(raw)
+
+
+@app.put("/governor/policy", dependencies=[Depends(verify_service_key)])
+async def governor_policy(body: dict = Body(...)):
+    """Set target_min / target_max / floor (validated by the backend, clamped again here)."""
+    policy = Policy.parse(body)
+    if policy is None:
+        raise HTTPException(422, "target_min, target_max and floor are required numbers")
+    # No TTL: the policy must survive (volatile-lru only evicts keys with a TTL)
+    await _get_raw_client().set(POLICY_KEY, json.dumps(policy.__dict__))
+    return {"policy": policy.__dict__}
 
 
 # ── Health ──────────────────────────────────────────────────────────────────

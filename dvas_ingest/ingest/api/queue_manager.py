@@ -12,8 +12,8 @@ from the consumer's perspective.
 
 Field layout in every stream entry
 -----------------------------------
-  jpeg_b64   : base64-encoded JPEG string  — read by analytics services
-  frame      : raw JPEG bytes              — read by ingest /latest endpoint
+  frame      : raw JPEG bytes              — read by analytics and ingest /latest
+  jpeg_b64   : base64 copy, only when QUEUE_WRITE_JPEG_B64=true (legacy readers)
   metadata   : JSON string of full FrameMetadata
   drone_id   : plain string copy           — analytics fast-path
   change_score: plain float string         — analytics fast-path
@@ -36,8 +36,19 @@ log = logging.getLogger(__name__)
 
 # ── Config (from env) ─────────────────────────────────────────────────────────
 REDIS_URL        = os.getenv("REDIS_URL", "redis://redis:6379/0")
-QUEUE_MAX_LEN    = int(os.getenv("QUEUE_MAX_LENGTH",  "1000"))
+QUEUE_MAX_LEN    = int(os.getenv("QUEUE_MAX_LENGTH",  "2000"))
 QUEUE_MSG_TTL_MS = int(os.getenv("QUEUE_MSG_TTL_MS",  "30000"))
+# Analytics read the raw `frame` field (RunPod plan 9.1); the base64 copy doubled
+# Valkey memory per frame. Re-enable only for an analytics build older than 9.1.
+QUEUE_WRITE_JPEG_B64 = os.getenv("QUEUE_WRITE_JPEG_B64", "false").lower() == "true"
+# Streams carry no TTL, so Valkey can't evict them: if a large queue × large frames
+# approaches maxmemory, every XADD would fail. Above this share of maxmemory the
+# publishing drone's stream is trimmed to a quarter of QUEUE_MAX_LEN.
+try:
+    QUEUE_MEM_GUARD_PCT = min(100.0, max(10.0, float(os.getenv("QUEUE_MEM_GUARD_PCT", "85"))))
+except ValueError:          # a bad template value must not stop ingest
+    QUEUE_MEM_GUARD_PCT = 85.0
+_MEM_CHECK_S = 2.0
 
 
 # ── Per-drone stats ────────────────────────────────────────────────────────────
@@ -197,6 +208,27 @@ class QueueManager:
 
     # ── Frame publishing ──────────────────────────────────────────────────────
 
+    async def _memory_tight(self) -> bool:
+        """True while Valkey memory is above QUEUE_MEM_GUARD_PCT of maxmemory (checked every 2 s)."""
+        now = time.monotonic()
+        if now - getattr(self, "_mem_checked_at", 0.0) < _MEM_CHECK_S:
+            return getattr(self, "_mem_tight", False)
+        self._mem_checked_at = now
+        tight = False
+        try:
+            info = await self._client.info("memory")
+            used, limit = int(info.get("used_memory", 0)), int(info.get("maxmemory", 0))
+            tight = limit > 0 and used * 100 >= limit * QUEUE_MEM_GUARD_PCT
+        except Exception as exc:
+            log.debug("valkey memory check failed: %s", exc)
+        if tight and not getattr(self, "_mem_tight", False):
+            log.warning("valkey_memory_high: frame streams trimmed to %d entries per drone",
+                        max(10, QUEUE_MAX_LEN // 4))
+        elif not tight and getattr(self, "_mem_tight", False):
+            log.info("valkey_memory_ok: frame streams back to %d entries per drone", QUEUE_MAX_LEN)
+        self._mem_tight = tight
+        return tight
+
     async def publish_frame(
         self,
         drone_id:   str,
@@ -209,8 +241,8 @@ class QueueManager:
 
         Field layout
         ------------
-        jpeg_b64     — base64-encoded JPEG (analytics services read this)
-        frame        — raw JPEG bytes     (ingest /latest endpoint reads this)
+        frame        — raw JPEG bytes     (analytics + ingest /latest read this)
+        jpeg_b64     — base64 copy, only with QUEUE_WRITE_JPEG_B64=true
         metadata     — full JSON metadata string
         drone_id     — plain string, analytics fast-path
         change_score — plain float string, analytics fast-path
@@ -221,14 +253,8 @@ class QueueManager:
         if not self._connected:
             await self.connect()
 
-        # Base64-encode the JPEG so analytics services can decode it with
-        # base64.b64decode(f["jpeg_b64"]).  Raw bytes are kept as "frame"
-        # for the ingest server's own /ingest/frame/{id}/latest endpoint.
-        jpeg_b64 = base64.b64encode(frame_bytes).decode("ascii")
-
         key = self._stream_key(drone_id)
         fields: Dict[str, Any] = {
-            "jpeg_b64":       jpeg_b64,
             "frame":          frame_bytes,
             "metadata":       json.dumps(metadata),
             # Individual fields for analytics fast-path (no JSON parsing needed)
@@ -242,10 +268,14 @@ class QueueManager:
             "capture_ts":     str(metadata.get("capture_ts") or ""),
         }
 
+        if QUEUE_WRITE_JPEG_B64:
+            fields["jpeg_b64"] = base64.b64encode(frame_bytes).decode("ascii")
+
+        maxlen = QUEUE_MAX_LEN if not await self._memory_tight() else max(10, QUEUE_MAX_LEN // 4)
         entry_id: str = await self._client.xadd(
             key,
             fields,
-            maxlen=QUEUE_MAX_LEN,
+            maxlen=maxlen,
             approximate=True,
         )
 

@@ -34,6 +34,7 @@ from shared import minio_client as minio
 from shared.evidence import ThresholdGate, evidence_block, frame_context, model_info, upload_context
 from crowd.analyzer import CrowdAnalyzer
 from crowd.stream_policy import FrameRateCap, is_cuda_failure, parse_mission_id
+from shared.frame_sampler import FrameSampler, decode_frame, frame_bytes
 from crowd.schema import CrowdAnalysisResult, StreamStatus, CrowdTimelineItem, ModelSwitchRequest, ModelInfo, SessionSummary
 
 logging.basicConfig(
@@ -70,7 +71,9 @@ _frames_processed = 0
 # sooner are ACKed without being decoded. The Phase-10 governor will replace
 # the env value with dvas:fps_target:crowd:<drone>.
 _rate_cap = FrameRateCap(cfg.CROWD_MAX_FPS)
-_frames_skipped = 0                    # frames ACKed without inference (rate cap)
+# Newest-frame reader + live fps stats; crowd keeps its own cap (not FPS-governed)
+_sampler = FrameSampler("crowd", "crowd-group", "crowd-analyzer", governed=False,
+                        cap_fps=cfg.CROWD_MAX_FPS if cfg.CROWD_MAX_FPS > 0 else None)
 HEATMAP_EVERY_N_FRAMES = 10            # heatmap PNG/base64 is only uploaded every Nth frame
 # One crowd_threshold event per surge (B29): re-armed after the count falls below
 # 0.8 x threshold and 60 s have passed — not one event per analysed frame.
@@ -133,7 +136,7 @@ async def health():
         "model_path":       analyzer._model_path if analyzer else "",
         "stream_running":   _stream_running,
         "frames_processed": _frames_processed,
-        "frames_skipped":   _frames_skipped,
+        "frames_skipped":   sum(st.skipped for st in _sampler.stats.values()),
         "max_fps_per_drone": cfg.CROWD_MAX_FPS,
         "device":           str(analyzer.device) if analyzer else "unknown",
     }
@@ -226,11 +229,8 @@ async def analyze_frame(
 async def _process_crowd_frame(drone_id: str, f: dict) -> None:
     """Decode, analyse and persist one frame (the newest one read for a drone)."""
     global _frames_processed
-    raw = f.get("jpeg_b64", "")
-    if not raw:
-        return
-    img_bytes = base64.b64decode(raw)
-    frame = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+    t_start = time.perf_counter()
+    frame = await asyncio.to_thread(decode_frame, f)
     if frame is None:
         log.debug("Undecodable frame for %s skipped", drone_id)
         return
@@ -247,6 +247,8 @@ async def _process_crowd_frame(drone_id: str, f: dict) -> None:
         # Model not ready (e.g. mid model-switch) — frame is ACKed by the caller
         return
     _rate_cap.mark(drone_id)
+    _sampler.record(drone_id, infer_ms=result.get("inference_ms"),
+                    total_ms=(time.perf_counter() - t_start) * 1000)
     ts = datetime.now(timezone.utc)
 
     heatmap_key = None
@@ -275,7 +277,7 @@ async def _process_crowd_frame(drone_id: str, f: dict) -> None:
         objects = [await minio.upload_object(
             cfg.BUCKET_EVIDENCE,
             minio.make_key("crowd", drone_id, f"surge_{stamp}.jpg", mission_id=mission_id),
-            img_bytes, "image/jpeg", kind="source_frame")]
+            frame_bytes(f), "image/jpeg", kind="source_frame")]
         objects.append(heatmap_obj)        # None (no heatmap this frame) is dropped
         attrs = {
             "estimated_count": result["estimated_count"],
@@ -314,7 +316,7 @@ async def _process_crowd_frame(drone_id: str, f: dict) -> None:
 
 
 async def _stream_loop():
-    global _stream_running, _frames_skipped
+    global _stream_running
     active_drones = list(cfg.DRONE_IDS)
     log.info("Crowd stream loop started for initial drones: %s (max %.2f fps/drone)",
              active_drones, cfg.CROWD_MAX_FPS)
@@ -335,43 +337,29 @@ async def _stream_loop():
             except Exception as exc:
                 log.warning("Crowd stream scanner warning: %s", exc)
 
-        any_frames_received = False
-        for drone_id in list(active_drones):
+        try:
+            await _sampler.maybe_publish()
+            # Newest frame per drone; the sampler's cap is CROWD_MAX_FPS (crowd is not governed)
+            round_frames = await _sampler.next_round([d for d in active_drones if _rate_cap.due(d)])
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            log.warning("Crowd stream read error: %s", exc)
+            await asyncio.sleep(1)
+            continue
+        for drone_id, f in round_frames.items():
             try:
-                frames = await xreadgroup_frames(
-                    "crowd-group", "crowd-analyzer", drone_id, ">", count=5, block_ms=50
-                )
-                if not frames:
-                    continue
-                any_frames_received = True
-                entry_ids = [entry_id for entry_id, _ in frames]
-                try:
-                    if not _rate_cap.due(drone_id):
-                        # Rate cap: drop without decoding (latest-frame-wins)
-                        _frames_skipped += len(entry_ids)
-                        continue
-                    # Older frames in the batch are skipped; only the newest is analysed
-                    _frames_skipped += len(entry_ids) - 1
-                    await _process_crowd_frame(drone_id, frames[-1][1])
-                except Exception as exc:
-                    if _is_cuda_failure(exc) and analyzer is not None:
-                        log.warning("CUDA failure in crowd stream for %s — falling back to CPU: %s",
-                                    drone_id, exc)
-                        await asyncio.to_thread(analyzer.to_device, "cpu")
-                    else:
-                        raise
-                finally:
-                    # Always ACK, so failed frames never pile up in the pending list
-                    await ack_frames(drone_id, "crowd-group", *entry_ids)
-
+                await _process_crowd_frame(drone_id, f)
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                log.warning("Stream loop error for %s: %s", drone_id, exc)
-                await asyncio.sleep(1)
-
-        if not any_frames_received:
-            await asyncio.sleep(0.05)
+                if _is_cuda_failure(exc) and analyzer is not None:
+                    log.warning("CUDA failure in crowd stream for %s — falling back to CPU: %s",
+                                drone_id, exc)
+                    await asyncio.to_thread(analyzer.to_device, "cpu")
+                else:
+                    log.warning("Stream loop error for %s: %s", drone_id, exc)
+                    await asyncio.sleep(1)
 
 
 @app.get("/stream/start")

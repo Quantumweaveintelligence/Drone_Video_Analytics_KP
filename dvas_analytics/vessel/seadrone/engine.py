@@ -5,6 +5,7 @@ Coordinates Context-Aware Global Inference, Spectral Water-Domain Masking (WDM),
 Class-Agnostic NMS, and Hierarchical IoS Suppression.
 """
 
+import threading
 import time
 import json
 from pathlib import Path
@@ -13,10 +14,17 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 import logging
+from typing import Dict, List, Optional, Tuple
 
 from .water_domain import get_water_domain_mask, generate_water_slices
 from .classifier import classify_maritime_object
 from .tracker import MaritimeVesselTracker
+
+try:    # service runtime (/analytics on sys.path); absent for the standalone run_pipeline
+    from shared import gpu_profile as _gpu_profile
+except ImportError:
+    _gpu_profile = None
+
 
 class MaritimePerceptionEngine:
     def __init__(
@@ -50,15 +58,48 @@ class MaritimePerceptionEngine:
                 weights_file = alt
 
         self.model = YOLO(str(weights_file))
+        # Default tracker (standalone run_pipeline / callers without a drone id).
+        # The service passes drone_id: one tracker per drone, model weights shared.
         self.tracker = MaritimeVesselTracker()
+        self.trackers: Dict[str, MaritimeVesselTracker] = {}
+        # The stream thread and the /annotated/latest recovery share one predictor and the
+        # per-drone trackers; Ultralytics predictors are not thread-safe
+        self._lock = threading.RLock()
+        # FP16 on GPUs that support it (gpu_profile); inference resolution unchanged
+        self._fp16 = bool(_gpu_profile.predict_kwargs()["half"]) if _gpu_profile else False
+        self.max_batch = max(1, _gpu_profile.detect().max_batch) if _gpu_profile else 1
+
+    def tracker_for(self, drone_id: Optional[str]) -> MaritimeVesselTracker:
+        if drone_id is None:
+            return self.tracker
+        trk = self.trackers.get(drone_id)
+        if trk is None:
+            trk = self.trackers[drone_id] = MaritimeVesselTracker()
+        return trk
+
+    def forget_drone(self, drone_id: str) -> None:
+        self.trackers.pop(drone_id, None)
+
+    def _predict(self, source, imgsz: int, conf: float):
+        """model.predict with FP16 on CUDA; CUDA failure → CPU fallback and one retry (FP32)."""
+        try:
+            return self.model.predict(source=source, imgsz=imgsz, conf=conf, device=self.device,
+                                      half=self._fp16 and str(self.device) != "cpu", verbose=False)
+        except RuntimeError as e:
+            if "CUDA" in str(e):
+                self._fallback_to_cpu()
+                return self.model.predict(source=source, imgsz=imgsz, conf=conf, device=self.device,
+                                          half=False, verbose=False)
+            raise
 
     def to_device(self, target_device: str):
-        self.device = target_device
-        if self.model is not None:
-            try:
-                self.model.to(target_device)
-            except Exception:
-                pass
+        with self._lock:            # never move weights under a running predict
+            self.device = target_device
+            if self.model is not None:
+                try:
+                    self.model.to(target_device)
+                except Exception:
+                    pass
 
     def _fallback_to_cpu(self):
         """Fall back to CPU when CUDA is unavailable or errored."""
@@ -71,7 +112,39 @@ class MaritimePerceptionEngine:
             except Exception:
                 pass
 
-    def process_frame(self, frame: np.ndarray):
+    def process_frame(self, frame: np.ndarray, drone_id: Optional[str] = None):
+        """One frame → (annotated_frame, tracked_objects). Tracker state is per drone_id."""
+        infer_conf = min(self.conf_thresh, self.person_conf)
+        with self._lock:
+            res_global = self._predict(frame, self.global_imgsz, infer_conf)[0]
+            return self._postprocess(frame, res_global, self.tracker_for(drone_id))
+
+    def process_batch(self, frames: Dict[str, np.ndarray]) -> Tuple[Dict[str, tuple], float]:
+        """Newest frame of several drones → ({drone_id: (annotated, tracked)}, model ms per frame).
+
+        The global pass runs batched (chunks of gpu_profile max_batch). Only frames of
+        identical shape share a batch, so each frame gets exactly the letterbox it gets
+        alone (Ultralytics pads mixed-shape batches to a full square). The optional
+        slice pass, NMS, IoS suppression, classification and tracking stay per drone.
+        """
+        infer_conf = min(self.conf_thresh, self.person_conf)
+        by_shape: Dict[tuple, List[str]] = {}
+        for d, fr in frames.items():
+            by_shape.setdefault(fr.shape, []).append(d)
+        globals_: Dict[str, object] = {}
+        with self._lock:
+            t0 = time.perf_counter()
+            for ids in by_shape.values():
+                for i in range(0, len(ids), self.max_batch):
+                    chunk = ids[i:i + self.max_batch]
+                    src = [frames[d] for d in chunk]
+                    res = self._predict(src if len(src) > 1 else src[0], self.global_imgsz, infer_conf)
+                    globals_.update(zip(chunk, res))
+            model_ms = (time.perf_counter() - t0) * 1000 / max(1, len(frames))
+            out = {d: self._postprocess(fr, globals_[d], self.tracker_for(d)) for d, fr in frames.items()}
+        return out, model_ms
+
+    def _postprocess(self, frame: np.ndarray, res_global, tracker: MaritimeVesselTracker):
         img_h, img_w = frame.shape[:2]
         water_mask, dilated_mask = get_water_domain_mask(frame)
 
@@ -79,17 +152,8 @@ class MaritimePerceptionEngine:
         cand_scores = []
         cand_classes = []
 
-        # 1. Global Context Inference (imgsz=1280)
-        # 1. Global Context Inference (detect candidates down to min threshold)
+        # 1. Global Context Inference (imgsz=1280, detect candidates down to min threshold)
         infer_conf = min(self.conf_thresh, self.person_conf)
-        try:
-            res_global = self.model.predict(source=frame, imgsz=self.global_imgsz, conf=infer_conf, device=self.device, verbose=False)[0]
-        except RuntimeError as e:
-            if "CUDA" in str(e):
-                self._fallback_to_cpu()
-                res_global = self.model.predict(source=frame, imgsz=self.global_imgsz, conf=infer_conf, device=self.device, verbose=False)[0]
-            else:
-                raise
         if res_global.boxes is not None and len(res_global.boxes) > 0:
             for b, conf, cls_id in zip(res_global.boxes.xyxy.cpu().numpy(), res_global.boxes.conf.cpu().numpy(), res_global.boxes.cls.cpu().numpy()):
                 name = self.model.names[int(cls_id)].lower()
@@ -117,14 +181,7 @@ class MaritimePerceptionEngine:
             slices = generate_water_slices(img_h, img_w, water_mask, slice_size=self.slice_size, overlap_ratio=self.overlap_ratio)
             if slices:
                 slice_crops = [frame[ymin:ymax, xmin:xmax] for (xmin, ymin, xmax, ymax) in slices]
-                try:
-                    slice_res = self.model.predict(source=slice_crops, imgsz=self.slice_size, conf=infer_conf, device=self.device, verbose=False)
-                except RuntimeError as e:
-                    if "CUDA" in str(e):
-                        self._fallback_to_cpu()
-                        slice_res = self.model.predict(source=slice_crops, imgsz=self.slice_size, conf=infer_conf, device=self.device, verbose=False)
-                    else:
-                        raise
+                slice_res = self._predict(slice_crops, self.slice_size, infer_conf)
                 for idx, sres in enumerate(slice_res):
                     if sres.boxes is None or len(sres.boxes) == 0:
                         continue
@@ -155,7 +212,7 @@ class MaritimePerceptionEngine:
                                 cand_classes.append(name)
 
         if not cand_boxes:
-            return self.tracker.update([], frame)
+            return tracker.update([], frame)
 
         # 3. Class-Agnostic NMS (via native cv2.dnn.NMSBoxes, eliminating torchvision dependency)
         boxes_xywh = [[int(b[0]), int(b[1]), int(b[2] - b[0]), int(b[3] - b[1])] for b in cand_boxes]
@@ -208,7 +265,7 @@ class MaritimePerceptionEngine:
             fine_id, fine_name = classify_maritime_object(box, orig_cls, img_h, img_w, crop=crop)
             detections.append((box, score, fine_id, fine_name))
 
-        annotated_frame, tracked_objects = self.tracker.update(detections, frame)
+        annotated_frame, tracked_objects = tracker.update(detections, frame)
         return annotated_frame, tracked_objects
 
 def run_pipeline(

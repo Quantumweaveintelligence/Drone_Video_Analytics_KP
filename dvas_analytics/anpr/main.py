@@ -10,6 +10,7 @@ import io
 import logging
 import os
 import sys
+import time as _time
 from datetime import datetime, timezone
 from typing import Optional, Dict
 
@@ -35,6 +36,8 @@ from shared.redis_client import (
     scan_active_stream_drones, get_latest_stream_frame,
 )
 from shared import minio_client as minio
+from shared import gpu_profile
+from shared.frame_sampler import FrameSampler, decode_frame
 from shared.evidence import EventGate, bbox_xyxy, evidence_block, frame_context, model_info, upload_context
 from anpr.analyzer import ANPRAnalyzer
 from anpr.schema import ANPRFrameResult, WatchlistEntry, TheftAlert
@@ -64,6 +67,8 @@ _watchlist_task: Optional[asyncio.Task] = None
 _theft_gate = EventGate(cooldown_s=300.0)
 WATCHLIST_REFRESH_S = 60.0   # picks up rows changed in the DB or expired
 _frames_processed = 0
+# Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
+_sampler = FrameSampler("anpr", "anpr-group", "anpr-analyzer")
 
 # ── Annotated frame cache ─────────────────────────────────────────────────────
 # Stores latest JPEG with plate bboxes + OCR text drawn, per drone_id
@@ -171,6 +176,7 @@ async def startup():
     for drone_id in cfg.DRONE_IDS:
         await ensure_drone(drone_id)
     await minio.ensure_all_buckets()
+    gpu_profile.apply_torch_settings()      # FP16 / cuDNN autotune for the detected GPU
     analyzer = ANPRAnalyzer(
         vehicle_model_path=VEHICLE_MODEL,
         lp_model_path=LP_MODEL,
@@ -218,7 +224,7 @@ async def health():
         "frames_processed":   _frames_processed,
         "watchlist_count":    len(analyzer.watchlist) if analyzer else 0,
         "cached_drone_feeds": list(_last_annotated.keys()),
-        "reid_stats":         analyzer.reid_tracker.get_stats() if analyzer else {},
+        "reid_stats":         analyzer.reid_stats() if analyzer else {},
     }
 
 
@@ -228,7 +234,7 @@ async def tracking_stats():
     """Return vehicle Re-ID tracker statistics for debugging deduplication."""
     if not analyzer:
         raise HTTPException(503, "Analyzer not loaded")
-    stats = analyzer.reid_tracker.get_stats()
+    stats = analyzer.reid_stats()
     stats["frames_processed"] = _frames_processed
     return stats
 
@@ -375,73 +381,297 @@ async def analyze_frame(
 
 
 # ── Continuous stream loop ─────────────────────────────────────────────────────
+async def _persist_anpr_frame(drone_id: str, f: dict, frame: np.ndarray, result: dict,
+                              frame_mission_id: Optional[str]) -> None:
+    """Annotate, cache, store and publish one analysed frame (runs while the next batch infers)."""
+    global _frames_processed
+    import json as _json
+
+    if _frames_processed % 50 == 1 or result.get("plates_read", 0) > 0:
+        log.info("ANPR [%s]: frame #%d done — vehicles=%d plates_read=%d inference_ms=%.0f",
+                 drone_id, _frames_processed, result.get("total_vehicles", 0),
+                 result.get("plates_read", 0), result.get("inference_ms", 0))
+    ts     = datetime.now(timezone.utc)
+
+    # ── Annotate frame and cache for dashboard ─────────────────
+    import time as _time
+    annotated_bytes = await asyncio.to_thread(
+        _draw_anpr_annotations, frame, result.get("plate_reads", []), drone_id
+    )
+    if annotated_bytes:
+        _last_annotated[drone_id]    = annotated_bytes
+        _last_annotated_ts[drone_id] = _time.monotonic()
+
+    # ── Update live in-memory plate cache (for /plates/live) ────
+    import time as _time2
+    for plate in result.get("plate_reads", []):
+        m_key = frame_mission_id or "default"
+        cache_key = f"{drone_id}:{m_key}:{plate['tracker_id']}"
+        existing  = _recent_plate_cache.get(cache_key, {})
+        plate_text = plate.get("plate_text") or existing.get("plate_text", "")
+
+        # Synchronized fresh crops from current detection take precedence
+        veh_img = plate.get("vehicle_image_b64") or existing.get("vehicle_image_b64")
+        plate_img = plate.get("plate_crop_b64") or existing.get("plate_crop_b64")
+
+        _recent_plate_cache[cache_key] = {
+            "plate_text":        plate_text,
+            "ocr_confidence":    plate.get("ocr_confidence") or existing.get("ocr_confidence", 0.0),
+            "is_reliable":       plate.get("is_reliable", False),
+            "drone_id":          drone_id,
+            "mission_id":        frame_mission_id or existing.get("mission_id"),
+            "tracker_id":        plate.get("tracker_id"),
+            "vehicle_type":      plate.get("vehicle_type", "vehicle"),
+            "vehicle_image_b64": veh_img,
+            "plate_crop_b64":    plate_img,
+            "vehicle_bbox":      plate.get("vehicle_bbox") or existing.get("vehicle_bbox"),
+            "plate_bbox":        plate.get("plate_bbox") or existing.get("plate_bbox"),
+            "is_watchlisted":    plate.get("is_watchlisted", False),
+            "created_at":        existing.get("created_at") or ts.isoformat(),
+            "_cache_ts":         _time2.monotonic(),
+        }
+
+    # ── Persist plates ─────────────────────────────────────────
+    for plate in result.get("plate_reads", []):
+        has_plate_crop = bool(plate.get("plate_crop_b64"))
+        has_valid_plate = bool(plate.get("plate_text") and plate.get("is_reliable"))
+        if not (has_valid_plate or has_plate_crop):
+            continue
+        tracker_id = plate.get("tracker_id")
+        track_id   = await upsert_track(
+            drone_id, None, "vehicle", ts, ts,
+            tracker_id=tracker_id, mission_id=frame_mission_id
+        )
+        plate_image_key = None
+        plate_obj = None
+        plate_crop_b64  = plate.get("plate_crop_b64")
+        if plate_crop_b64:
+            plate_bytes_data = base64.b64decode(plate_crop_b64)
+            plate_name_part = plate.get("plate_text") or f"veh_{tracker_id}"
+            key = minio.make_key(
+                "plates", drone_id,
+                f"plate_{plate_name_part}_{int(ts.timestamp()*1000)}.jpg",
+                mission_id=frame_mission_id or "",
+            )
+            plate_obj = await minio.upload_object(
+                cfg.BUCKET_PLATES, key, plate_bytes_data, "image/jpeg", kind="plate_crop"
+            )
+            plate_image_key = plate_obj["key"] if plate_obj else None
+
+        # Upload vehicle image if available
+        vehicle_image_key = None
+        vehicle_obj = None
+        veh_img_b64 = plate.get("vehicle_image_b64")
+        if veh_img_b64:
+            veh_bytes_data = base64.b64decode(veh_img_b64)
+            key = minio.make_key(
+                "vehicles", drone_id,
+                f"anpr_veh_{tracker_id}_{int(ts.timestamp()*1000)}.jpg",
+                mission_id=frame_mission_id or "",
+            )
+            vehicle_obj = await minio.upload_object(
+                cfg.BUCKET_VEHICLES, key, veh_bytes_data, "image/jpeg", kind="vehicle_crop"
+            )
+            vehicle_image_key = vehicle_obj["key"] if vehicle_obj else None
+
+        if plate_image_key or has_valid_plate:
+            await write_plate_read(
+                track_id=track_id, event_id=None,
+                plate_text=plate.get("plate_text") or "",
+                ocr_confidence=plate.get("ocr_confidence") or 0.0,
+                is_reliable=plate.get("is_reliable", False),
+                plate_image_key=plate_image_key,
+                vehicle_image_key=vehicle_image_key,
+                mission_id=frame_mission_id,
+            )
+
+        await write_vehicle_attributes(
+            track_id=track_id,
+            event_id=None,
+            vehicle_type=plate.get("vehicle_type", "car"),
+            colour_top3=[],
+            make_model_top3=[],
+            speed_kph=None,
+            speed_reliability=None,
+            mission_id=frame_mission_id,
+        )
+
+        if (vehicle_image_key or plate_image_key) and track_id:
+            pool = await get_pool()
+            meta_updates = {}
+            if vehicle_image_key: meta_updates["vehicle_image_key"] = vehicle_image_key
+            if plate_image_key: meta_updates["plate_image_key"] = plate_image_key
+            await pool.execute(
+                """
+                UPDATE tracks
+                SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb
+                WHERE track_id = $2::uuid
+                """,
+                _json.dumps(meta_updates), track_id,
+            )
+
+
+        if tracker_id is not None:
+            await hset_vehicle_track(
+                tracker_id=tracker_id, drone_id=drone_id,
+                data={
+                    "plate_text":      plate["plate_text"],
+                    "plate_conf":      plate["ocr_confidence"],
+                    "plate_image_key": plate_image_key or "",
+                    "mission_id":      frame_mission_id or "",
+                },
+                ttl=cfg.VEHICLE_TRACK_TTL,
+            )
+            veh_data = await hget_vehicle_track(tracker_id, drone_id)
+            colour   = veh_data.get("colour", "")
+            await write_vehicle_plate_link(
+                tracker_id=tracker_id, drone_id=drone_id,
+                plate_text=plate["plate_text"],
+                plate_conf=plate["ocr_confidence"],
+                vehicle_type=plate.get("vehicle_type"),
+                colour=colour,
+                plate_image_key=plate_image_key,
+                vehicle_image_key=vehicle_image_key,
+                mission_id=frame_mission_id,
+            )
+
+        if plate.get("is_watchlisted") and _theft_gate.allow(
+                (plate["plate_text"], frame_mission_id or drone_id)):
+            pool = await get_pool()
+            await pool.execute(
+                """
+                INSERT INTO theft_alerts
+                    (plate_text, track_id, drone_id, detected_at, frame_ts,
+                     confidence, vehicle_type)
+                VALUES ($1, $2::uuid, $3, $4, $4, $5, $6)
+                ON CONFLICT DO NOTHING
+                """,
+                plate["plate_text"], track_id, drone_id, ts,
+                plate["ocr_confidence"], plate.get("vehicle_type", "unknown"),
+            )
+            # Confirmed event (B28) with the exact crops; objects were uploaded above
+            ctx = frame_context(f)
+            geo = ctx["geo"] or {}
+            wl_row = await pool.fetchrow(
+                "SELECT reason, case_ref FROM plate_watchlist WHERE plate_text=$1",
+                plate["plate_text"],
+            )
+            event_id = await write_confirmed_event(
+                drone_id=drone_id,
+                event_type="theft_alert",
+                confidence=plate.get("ocr_confidence") or 0.0,
+                ts=ts,
+                track_id=track_id,
+                attributes={
+                    "plate_text":   plate["plate_text"],
+                    "ocr_confidence": plate.get("ocr_confidence"),
+                    "vehicle_type": plate.get("vehicle_type"),
+                    "tracker_id":   tracker_id,
+                    "watchlist_reason": wl_row["reason"] if wl_row else None,
+                    "case_ref":     wl_row["case_ref"] if wl_row else None,
+                    "mission_id":   frame_mission_id,
+                    "evidence": evidence_block(
+                        [vehicle_obj, plate_obj], ctx,
+                        detection={"track_id": tracker_id, "class": "vehicle",
+                                   "bbox_xyxy": bbox_xyxy(plate.get("vehicle_bbox")),
+                                   "confidence": plate.get("ocr_confidence")},
+                        model=model_info("anpr", LP_MODEL),
+                    ),
+                },
+                mission_id=frame_mission_id,
+                latitude=geo.get("lat"),
+                longitude=geo.get("lon"),
+            )
+            await publish_confirmed_event({
+                "event_id":    event_id,
+                "event_type":  "theft_alert",
+                "drone_id":    drone_id,
+                "mission_id":  frame_mission_id,
+                "ts":          ts.isoformat(),
+                "plate_text":  plate["plate_text"],
+            })
+
+    await publish_analytics_result("anpr", {
+        **result,
+        "drone_id":    drone_id,
+        "ts":          ts.isoformat(),
+        "frame_count": _frames_processed,
+    })
+    _frames_processed += 1
+
+
+async def _persist_round(items: list) -> None:
+    for drone_id, f, frame, result, frame_mission_id, t_start in items:
+        try:
+            await _persist_anpr_frame(drone_id, f, frame, result, frame_mission_id)
+        except Exception as exc:
+            log.warning("ANPR persist error for %s: %s", drone_id, exc)
+        _sampler.record(drone_id, infer_ms=result.get("model_ms"),
+                        total_ms=(_time.perf_counter() - t_start) * 1000)
+
+
+def _frame_mission(f: dict) -> Optional[str]:
+    """mission_id from the stream entry's metadata JSON, if any."""
+    import json as _json
+    raw_meta = f.get("metadata", "")
+    if raw_meta:
+        if isinstance(raw_meta, bytes):
+            raw_meta = raw_meta.decode()
+        try:
+            return _json.loads(raw_meta).get("mission_id")
+        except Exception:
+            pass
+    return None
+
+
 async def _stream_loop():
     global _stream_running, _frames_processed
     try:
-        last_ids = {d: "0" for d in cfg.DRONE_IDS}
         active_drones = list(cfg.DRONE_IDS)
         active_drone_missions: dict = {}
-        log.info("ANPR stream loop started for drones: %s", cfg.DRONE_IDS)
+        log.info("ANPR stream loop started for drones: %s (GPU %s)",
+                 cfg.DRONE_IDS, gpu_profile.detect().as_dict())
     except Exception as exc:
         log.error("ANPR stream loop FAILED to initialize: %s", exc, exc_info=True)
         _stream_running = False
         return
 
     loop_count = 0
-    while _stream_running:
-        loop_count += 1
-        if loop_count % 10 == 1:
+    pending: Optional[asyncio.Task] = None
+    try:
+        while _stream_running:
+            loop_count += 1
+            if loop_count % 50 == 1:
+                try:
+                    for d in await scan_active_stream_drones():
+                        if d not in active_drones:
+                            active_drones.append(d)
+                except Exception:
+                    pass
             try:
-                discovered = await scan_active_stream_drones()
-                for d in discovered:
-                    if d not in active_drones:
-                        active_drones.append(d)
-                        last_ids[d] = "0"
-            except Exception:
-                pass
-
-        for drone_id in active_drones:
-            if drone_id not in last_ids:
-                last_ids[drone_id] = "0"
-            try:
-                frames = await xreadgroup_frames(
-                    "anpr-group", "anpr-analyzer", drone_id, ">", count=2, block_ms=100
-                )
-
-                if not frames:
+                await _sampler.maybe_publish()
+                # Newest frame per drone; older ones are acked unread and counted as skipped
+                round_frames = await _sampler.next_round(active_drones)
+                if not round_frames:
+                    continue
+                t_start = _time.perf_counter()
+                decoded = {}
+                for drone_id, f in round_frames.items():
+                    frame = await asyncio.to_thread(decode_frame, f)
+                    if frame is not None:
+                        decoded[drone_id] = (f, frame, _frame_mission(f))
+                if not decoded:
                     continue
 
-                all_entry_ids = [eid for eid, _ in frames]
-                # If multiple frames arrived, process the newest frame to keep real-time latency minimal
-                frames_to_process = frames[-1:] if len(frames) > 1 else frames
-
-                for entry_id, f in frames_to_process:
-                    raw = f.get("jpeg_b64", "")
-                    if not raw:
-                        continue
-                    img_bytes = base64.b64decode(raw)
-                    nparr  = np.frombuffer(img_bytes, np.uint8)
-                    frame  = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    if frame is None:
-                        continue
-
-                    # Extract mission_id from stream frame metadata first
-                    import json as _json
-                    frame_mission_id = None
-                    raw_meta = f.get("metadata", "")
-                    if raw_meta:
-                        if isinstance(raw_meta, bytes):
-                            raw_meta = raw_meta.decode()
-                        try:
-                            meta_dict = _json.loads(raw_meta)
-                            frame_mission_id = meta_dict.get("mission_id")
-                        except Exception:
-                            pass
-
+                for drone_id, (f, frame, frame_mission_id) in decoded.items():
                     # Detect mission transition per drone to evict stale cache & tracks
                     if frame_mission_id:
                         old_m = active_drone_missions.get(drone_id)
                         if old_m and old_m != frame_mission_id:
+                            # The previous round may still be caching plates of the old mission
+                            if pending:
+                                await asyncio.shield(pending)   # a stream stop must not cut a round half-written
+                                pending = None
                             log.info("ANPR stream loop: mission change on %s (%s -> %s), flushing old cache",
                                      drone_id, old_m, frame_mission_id)
                             stale_keys = [k for k, v in _recent_plate_cache.items()
@@ -451,228 +681,26 @@ async def _stream_loop():
                             if analyzer:
                                 analyzer.reset_drone(drone_id, frame_mission_id)
                         active_drone_missions[drone_id] = frame_mission_id
-
-                    _frames_processed += 1
-                    result = await asyncio.to_thread(
-                        analyzer.analyze_frame, frame, drone_id=drone_id, mission_id=frame_mission_id
-                    )
-                    if _frames_processed % 50 == 1 or result.get("plates_read", 0) > 0:
-                        log.info("ANPR [%s]: frame #%d done — vehicles=%d plates_read=%d inference_ms=%.0f",
-                                 drone_id, _frames_processed, result.get("total_vehicles", 0),
-                                 result.get("plates_read", 0), result.get("inference_ms", 0))
-                    ts     = datetime.now(timezone.utc)
-
-                    # ── Annotate frame and cache for dashboard ─────────────────
-                    import time as _time
-                    annotated_bytes = await asyncio.to_thread(
-                        _draw_anpr_annotations, frame, result.get("plate_reads", []), drone_id
-                    )
-                    if annotated_bytes:
-                        _last_annotated[drone_id]    = annotated_bytes
-                        _last_annotated_ts[drone_id] = _time.monotonic()
-
-                    # ── Update live in-memory plate cache (for /plates/live) ────
-                    import time as _time2
-                    for plate in result.get("plate_reads", []):
-                        m_key = frame_mission_id or "default"
-                        cache_key = f"{drone_id}:{m_key}:{plate['tracker_id']}"
-                        existing  = _recent_plate_cache.get(cache_key, {})
-                        plate_text = plate.get("plate_text") or existing.get("plate_text", "")
-
-                        # Synchronized fresh crops from current detection take precedence
-                        veh_img = plate.get("vehicle_image_b64") or existing.get("vehicle_image_b64")
-                        plate_img = plate.get("plate_crop_b64") or existing.get("plate_crop_b64")
-
-                        _recent_plate_cache[cache_key] = {
-                            "plate_text":        plate_text,
-                            "ocr_confidence":    plate.get("ocr_confidence") or existing.get("ocr_confidence", 0.0),
-                            "is_reliable":       plate.get("is_reliable", False),
-                            "drone_id":          drone_id,
-                            "mission_id":        frame_mission_id or existing.get("mission_id"),
-                            "tracker_id":        plate.get("tracker_id"),
-                            "vehicle_type":      plate.get("vehicle_type", "vehicle"),
-                            "vehicle_image_b64": veh_img,
-                            "plate_crop_b64":    plate_img,
-                            "vehicle_bbox":      plate.get("vehicle_bbox") or existing.get("vehicle_bbox"),
-                            "plate_bbox":        plate.get("plate_bbox") or existing.get("plate_bbox"),
-                            "is_watchlisted":    plate.get("is_watchlisted", False),
-                            "created_at":        existing.get("created_at") or ts.isoformat(),
-                            "_cache_ts":         _time2.monotonic(),
-                        }
-
-                    # ── Persist plates ─────────────────────────────────────────
-                    for plate in result.get("plate_reads", []):
-                        has_plate_crop = bool(plate.get("plate_crop_b64"))
-                        has_valid_plate = bool(plate.get("plate_text") and plate.get("is_reliable"))
-                        if not (has_valid_plate or has_plate_crop):
-                            continue
-                        tracker_id = plate.get("tracker_id")
-                        track_id   = await upsert_track(
-                            drone_id, None, "vehicle", ts, ts,
-                            tracker_id=tracker_id, mission_id=frame_mission_id
-                        )
-                        plate_image_key = None
-                        plate_obj = None
-                        plate_crop_b64  = plate.get("plate_crop_b64")
-                        if plate_crop_b64:
-                            plate_bytes_data = base64.b64decode(plate_crop_b64)
-                            plate_name_part = plate.get("plate_text") or f"veh_{tracker_id}"
-                            key = minio.make_key(
-                                "plates", drone_id,
-                                f"plate_{plate_name_part}_{int(ts.timestamp()*1000)}.jpg",
-                                mission_id=frame_mission_id or "",
-                            )
-                            plate_obj = await minio.upload_object(
-                                cfg.BUCKET_PLATES, key, plate_bytes_data, "image/jpeg", kind="plate_crop"
-                            )
-                            plate_image_key = plate_obj["key"] if plate_obj else None
-
-                        # Upload vehicle image if available
-                        vehicle_image_key = None
-                        vehicle_obj = None
-                        veh_img_b64 = plate.get("vehicle_image_b64")
-                        if veh_img_b64:
-                            veh_bytes_data = base64.b64decode(veh_img_b64)
-                            key = minio.make_key(
-                                "vehicles", drone_id,
-                                f"anpr_veh_{tracker_id}_{int(ts.timestamp()*1000)}.jpg",
-                                mission_id=frame_mission_id or "",
-                            )
-                            vehicle_obj = await minio.upload_object(
-                                cfg.BUCKET_VEHICLES, key, veh_bytes_data, "image/jpeg", kind="vehicle_crop"
-                            )
-                            vehicle_image_key = vehicle_obj["key"] if vehicle_obj else None
-
-                        if plate_image_key or has_valid_plate:
-                            await write_plate_read(
-                                track_id=track_id, event_id=None,
-                                plate_text=plate.get("plate_text") or "",
-                                ocr_confidence=plate.get("ocr_confidence") or 0.0,
-                                is_reliable=plate.get("is_reliable", False),
-                                plate_image_key=plate_image_key,
-                                vehicle_image_key=vehicle_image_key,
-                                mission_id=frame_mission_id,
-                            )
-
-                        await write_vehicle_attributes(
-                            track_id=track_id,
-                            event_id=None,
-                            vehicle_type=plate.get("vehicle_type", "car"),
-                            colour_top3=[],
-                            make_model_top3=[],
-                            speed_kph=None,
-                            speed_reliability=None,
-                            mission_id=frame_mission_id,
-                        )
-
-                        if (vehicle_image_key or plate_image_key) and track_id:
-                            pool = await get_pool()
-                            meta_updates = {}
-                            if vehicle_image_key: meta_updates["vehicle_image_key"] = vehicle_image_key
-                            if plate_image_key: meta_updates["plate_image_key"] = plate_image_key
-                            await pool.execute(
-                                """
-                                UPDATE tracks
-                                SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb
-                                WHERE track_id = $2::uuid
-                                """,
-                                _json.dumps(meta_updates), track_id,
-                            )
-
-
-                        if tracker_id is not None:
-                            await hset_vehicle_track(
-                                tracker_id=tracker_id, drone_id=drone_id,
-                                data={
-                                    "plate_text":      plate["plate_text"],
-                                    "plate_conf":      plate["ocr_confidence"],
-                                    "plate_image_key": plate_image_key or "",
-                                    "mission_id":      frame_mission_id or "",
-                                },
-                                ttl=cfg.VEHICLE_TRACK_TTL,
-                            )
-                            veh_data = await hget_vehicle_track(tracker_id, drone_id)
-                            colour   = veh_data.get("colour", "")
-                            await write_vehicle_plate_link(
-                                tracker_id=tracker_id, drone_id=drone_id,
-                                plate_text=plate["plate_text"],
-                                plate_conf=plate["ocr_confidence"],
-                                vehicle_type=plate.get("vehicle_type"),
-                                colour=colour,
-                                plate_image_key=plate_image_key,
-                                vehicle_image_key=vehicle_image_key,
-                                mission_id=frame_mission_id,
-                            )
-
-                        if plate.get("is_watchlisted") and _theft_gate.allow(
-                                (plate["plate_text"], frame_mission_id or drone_id)):
-                            pool = await get_pool()
-                            await pool.execute(
-                                """
-                                INSERT INTO theft_alerts
-                                    (plate_text, track_id, drone_id, detected_at, frame_ts,
-                                     confidence, vehicle_type)
-                                VALUES ($1, $2::uuid, $3, $4, $4, $5, $6)
-                                ON CONFLICT DO NOTHING
-                                """,
-                                plate["plate_text"], track_id, drone_id, ts,
-                                plate["ocr_confidence"], plate.get("vehicle_type", "unknown"),
-                            )
-                            # Confirmed event (B28) with the exact crops; objects were uploaded above
-                            ctx = frame_context(f)
-                            geo = ctx["geo"] or {}
-                            wl_row = await pool.fetchrow(
-                                "SELECT reason, case_ref FROM plate_watchlist WHERE plate_text=$1",
-                                plate["plate_text"],
-                            )
-                            event_id = await write_confirmed_event(
-                                drone_id=drone_id,
-                                event_type="theft_alert",
-                                confidence=plate.get("ocr_confidence") or 0.0,
-                                ts=ts,
-                                track_id=track_id,
-                                attributes={
-                                    "plate_text":   plate["plate_text"],
-                                    "ocr_confidence": plate.get("ocr_confidence"),
-                                    "vehicle_type": plate.get("vehicle_type"),
-                                    "tracker_id":   tracker_id,
-                                    "watchlist_reason": wl_row["reason"] if wl_row else None,
-                                    "case_ref":     wl_row["case_ref"] if wl_row else None,
-                                    "mission_id":   frame_mission_id,
-                                    "evidence": evidence_block(
-                                        [vehicle_obj, plate_obj], ctx,
-                                        detection={"track_id": tracker_id, "class": "vehicle",
-                                                   "bbox_xyxy": bbox_xyxy(plate.get("vehicle_bbox")),
-                                                   "confidence": plate.get("ocr_confidence")},
-                                        model=model_info("anpr", LP_MODEL),
-                                    ),
-                                },
-                                mission_id=frame_mission_id,
-                                latitude=geo.get("lat"),
-                                longitude=geo.get("lon"),
-                            )
-                            await publish_confirmed_event({
-                                "event_id":    event_id,
-                                "event_type":  "theft_alert",
-                                "drone_id":    drone_id,
-                                "mission_id":  frame_mission_id,
-                                "ts":          ts.isoformat(),
-                                "plate_text":  plate["plate_text"],
-                            })
-
-                    await publish_analytics_result("anpr", {
-                        **result,
-                        "drone_id":    drone_id,
-                        "ts":          ts.isoformat(),
-                        "frame_count": _frames_processed,
-                    })
                     _frames_processed += 1
 
-                if all_entry_ids:
-                    await ack_frames(drone_id, "anpr-group", *all_entry_ids)
+                # One batched vehicle-detection call for all drones; tracking, plate
+                # detection and OCR stay per drone
+                results = await asyncio.to_thread(
+                    analyzer.analyze_batch,
+                    {d: fr for d, (_, fr, _) in decoded.items()},
+                    {d: m for d, (_, _, m) in decoded.items()},
+                )
+                _sampler.record_batch(len(decoded))
+                # Persist the previous round before queuing this one (keeps per-drone order);
+                # it ran concurrently with the inference above.
+                if pending:
+                    await asyncio.shield(pending)   # a stream stop must not cut a round half-written
+                pending = asyncio.create_task(_persist_round(
+                    [(d, f, fr, results[d], m, t_start) for d, (f, fr, m) in decoded.items()]
+                ))
 
             except asyncio.CancelledError:
-                return
+                raise
             except Exception as exc:
                 err_str = str(exc)
                 if "CUDA" in err_str and analyzer and hasattr(analyzer, 'to_device'):
@@ -682,8 +710,14 @@ async def _stream_loop():
                     except Exception:
                         pass
                 else:
-                    log.warning("ANPR stream error for %s: %s", drone_id, exc)
+                    log.warning("ANPR stream error: %s", exc)
                 await asyncio.sleep(1)
+    finally:
+        if pending and not pending.done():
+            try:
+                await asyncio.shield(pending)   # a stream stop must not cut a round half-written
+            except Exception:
+                pass
 
 
 # ── Stream control ─────────────────────────────────────────────────────────────

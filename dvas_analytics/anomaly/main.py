@@ -7,7 +7,6 @@ persistence, and Redis stream publishing.
 """
 
 import asyncio
-import base64
 import json as _json
 import logging
 import os
@@ -36,13 +35,15 @@ from shared.db import (
 )
 from shared.redis_client import (
     close_client, get_client, publish_analytics_result,
-    publish_confirmed_event, xreadgroup_frames, ack_frames,
+    publish_confirmed_event,
     scan_active_stream_drones, get_latest_stream_frame
 )
 from shared import minio_client as minio
 from shared.db import write_confirmed_event
 from shared.evidence import bbox_xyxy, evidence_block, frame_context, model_info
-from analyzer import AnomalyAnalyzer
+from shared import gpu_profile
+from shared.frame_sampler import FrameSampler, decode_frame, frame_bytes
+from analyzer import AnomalyAnalyzer, analyze_round, release_shared_detectors
 
 logging.basicConfig(
     level=cfg.LOG_LEVEL,
@@ -64,6 +65,8 @@ _analyzers: Dict[str, AnomalyAnalyzer] = {}
 _stream_task: Optional[asyncio.Task] = None
 _stream_running = False
 _frames_processed = 0
+# Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
+_sampler = FrameSampler("anomaly", "anomaly-group", "anomaly-analyzer")
 
 # In-memory per-drone telemetry & frame buffers
 _last_annotated: Dict[str, bytes] = {}
@@ -116,328 +119,356 @@ def _get_or_create_analyzer(drone_id: str) -> AnomalyAnalyzer:
 
 # ── Background Stream Processing Loop ─────────────────────────────────────────
 
+def _frame_metadata(drone_id: str, f: dict) -> Tuple[Dict[str, Any], str]:
+    """Stream-entry metadata dict and mission id (DRN-MSN-* drones carry it in the id)."""
+    raw_meta = f.get("metadata", "")
+    metadata_dict = {}
+    if raw_meta:
+        if isinstance(raw_meta, bytes):
+            raw_meta = raw_meta.decode()
+        try:
+            metadata_dict = _json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+        except Exception:
+            metadata_dict = {}
+
+    mission_id = metadata_dict.get("mission_id") or ""
+    if not mission_id and drone_id.startswith("DRN-MSN-"):
+        mission_id = drone_id[4:]
+    return metadata_dict, mission_id
+
+
+async def _persist_anomaly_frame(
+    drone_id: str, f: dict, analyzer: AnomalyAnalyzer, frame_ts: datetime, mission_id: str,
+    annotated_bgr: np.ndarray, triggered_alerts: List[Dict[str, Any]],
+    tracks_summary: List[Dict[str, Any]],
+) -> None:
+    """Annotated-frame cache, alert evidence + events, track upserts for one analysed frame.
+
+    Runs while the next round is on the GPU (RunPod plan 9.2).
+    """
+    global _frames_processed
+    pool = await get_pool()
+    img_bytes = frame_bytes(f) or b""     # source JPEG for alert evidence
+
+    # Encode annotated frame as JPEG for the live /annotated/latest endpoint
+    success, jpeg_buf = await asyncio.to_thread(
+        cv2.imencode, ".jpg", annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85]
+    )
+    if success:
+        _last_annotated[drone_id] = jpeg_buf.tobytes()
+        _last_annotated_ts[drone_id] = time.time()
+
+    # Handle Triggered Alerts (Evidence Capture & Escalation)
+    for alert in triggered_alerts:
+        event_type = (alert.get("event") or alert.get("event_type") or "suspicious_activity").lower()
+        # Normalise to standard DVAS event types
+        type_map = {
+            "suspicious_object_detected": "abandoned_object",
+            "abandoned_object": "abandoned_object",
+            "unknown_owner_object": "abandoned_object",
+            "unknown_owner_weapon": "weapon_abandoned",
+            "weapon_like_object": "weapon_detected",
+            "weapon_held": "weapon_held",
+            "weapon_aiming_candidate": "weapon_aiming",
+            "weapon_aiming": "weapon_aiming",
+            "suspicious_package": "abandoned_object",
+            "unusual_object_placement": "unusual_placement",
+            "object_transfer": "object_transfer",
+            "loitering": "suspicious_loitering",
+            "loitering_event": "suspicious_loitering",
+            "fall_event": "person_fall",
+            "fall_collapse": "person_fall",
+            "persistent_following": "suspicious_following",
+            "following": "suspicious_following",
+            "opposing_crowd_flow": "opposing_crowd_flow",
+            "group_convergence": "group_convergence",
+            "rapid_crowd_dispersal": "rapid_crowd_dispersal",
+            "crowd_dispersal": "rapid_crowd_dispersal",
+            "erratic_movement": "erratic_movement",
+            "coordinated_arrival": "coordinated_arrival",
+            "boundary_crossing": "boundary_crossing",
+            "running_event": "running_flight",
+            "wrong_direction_vehicle": "vehicle_wrong_way",
+            "wrong_direction_event": "vehicle_wrong_way",
+            "wrong_way": "vehicle_wrong_way",
+            "high_risk_traffic_event": "vehicle_wrong_way",
+            "abnormal_vehicle_speed": "abnormal_vehicle_speed",
+            "abrupt_vehicle_stop": "vehicle_abrupt_stop",
+            "abrupt_stop": "vehicle_abrupt_stop",
+            "vehicle_person_interaction": "vehicle_person_interaction",
+            "vehicle_object_interaction": "suspicious_dropoff",
+            "vehicle_object_abandonment": "suspicious_dropoff",
+            "suspicious_dropoff": "suspicious_dropoff",
+            "vehicle_circling": "vehicle_circling",
+            "vehicle_approach_flee": "vehicle_approach_flee",
+            "vehicle_pedestrian_near_miss": "vehicle_pedestrian_near_miss",
+        }
+        canonical_type = type_map.get(event_type, event_type)
+        severity = alert.get("level", "HIGH")
+        summary_msg = alert.get("summary_explanation", "")
+
+        # Snapshot upload to MinIO: source frame + the alert snapshot, hashed,
+        # under make_key (mission / time / uuid — B30), before the event is written
+        snapshot_key = ""
+        evidence_objects = [await minio.upload_object(
+            BUCKET_ANOMALY,
+            minio.make_key("anomaly", drone_id, "source.jpg", mission_id=mission_id),
+            img_bytes, "image/jpeg", kind="source_frame",
+        )]
+        evidence_img = alert.get("evidence_image")
+        if evidence_img:
+            # Read snapshot if written by alert_manager, or encode current frame
+            snapshot_path = os.path.join(analyzer.alert_manager.output_dir, evidence_img)
+            if os.path.exists(snapshot_path):
+                with open(snapshot_path, "rb") as sf:
+                    snap_bytes = sf.read()
+            else:
+                snap_bytes = jpeg_buf.tobytes() if success else b""
+            if snap_bytes:
+                snap_obj = await minio.upload_object(
+                    BUCKET_ANOMALY,
+                    minio.make_key("anomaly", drone_id, os.path.basename(evidence_img),
+                                   mission_id=mission_id),
+                    snap_bytes, "image/jpeg", kind="annotated_frame",
+                )
+                snapshot_key = snap_obj["key"] if snap_obj else ""
+                evidence_objects.append(snap_obj)
+
+        # Write to drone_postgres.anomaly_events
+        confidences = alert.get("confidences", {})
+        obj_info = alert.get("object", {})
+        owner_info = alert.get("owner", {})
+
+        event_id = await write_anomaly_event(
+            pool=pool,
+            drone_id=drone_id,
+            track_id=obj_info.get("track_id", 0),
+            event_type=canonical_type,
+            severity=severity,
+            class_name=obj_info.get("class", ""),
+            confidence_detector=confidences.get("detector_confidence", 0.0),
+            confidence_rule=confidences.get("rule_confidence", 0.0),
+            confidence_event=confidences.get("event_confidence", 0.0),
+            confidence_alert=confidences.get("alert_confidence", 0.0),
+            evidence_groups=alert.get("evidence_groups", []),
+            reasons=alert.get("reasons", []),
+            summary=summary_msg,
+            snapshot_key=snapshot_key,
+            bbox=obj_info.get("bbox", []),
+            owner_track_id=owner_info.get("track_id"),
+            owner_status=owner_info.get("status"),
+            temporal=alert.get("temporal", {}),
+            gps_lat=alert.get("gps_lat"),
+            gps_lon=alert.get("gps_lon"),
+            details=alert,
+            mission_id=mission_id,
+        )
+
+        # Confirmed event (B28): every gated anomaly alert, same id as anomaly_events
+        ctx = frame_context(f)
+        geo = ctx["geo"] or {}
+        if alert.get("gps_lat") is not None and alert.get("gps_lon") is not None:
+            geo = {"lat": alert.get("gps_lat"), "lon": alert.get("gps_lon"),
+                   "alt_m": None, "heading_deg": None}
+        if event_id:
+            try:
+                await write_confirmed_event(
+                    drone_id=drone_id,
+                    event_type=canonical_type,
+                    confidence=confidences.get("alert_confidence", 0.75),
+                    ts=frame_ts,
+                    attributes={
+                        "severity": severity,
+                        "title": f"Anomaly: {alert.get('event', 'Suspicious Activity')}",
+                        "summary": summary_msg,
+                        "reasons": alert.get("reasons", []),
+                        "evidence_groups": alert.get("evidence_groups", []),
+                        "confidences": confidences,
+                        "class_name": obj_info.get("class", ""),
+                        "tracker_id": obj_info.get("track_id"),
+                        "mission_id": mission_id or None,
+                        "source_table": "anomaly_events",
+                        "evidence": evidence_block(
+                            evidence_objects, ctx,
+                            detection={"track_id": obj_info.get("track_id"),
+                                       "class": obj_info.get("class", ""),
+                                       "bbox_xyxy": bbox_xyxy(obj_info.get("bbox")),
+                                       "confidence": confidences.get("detector_confidence")},
+                            model=model_info("anomaly", os.getenv(
+                                "ANOMALY_MODEL_PRIMARY",
+                                "/analytics/anomaly/models/weights/visdrone-yolov11x.pt")),
+                            geo=geo or None,
+                        ),
+                    },
+                    mission_id=mission_id or None,
+                    latitude=geo.get("lat"),
+                    longitude=geo.get("lon"),
+                    event_id=event_id,
+                )
+            except Exception as ce_err:
+                log.warning("Confirmed anomaly event write failed: %s", ce_err)
+
+        # Publish to drone:events:confirmed (for evidence_sync & live alerts feed)
+        await publish_confirmed_event({
+            "event_id": event_id,
+            "event_type": canonical_type,
+            "drone_id": drone_id,
+            "mission_id": mission_id,
+            "track_id": obj_info.get("track_id"),
+            "confidence": confidences.get("alert_confidence", 0.75),
+            "severity": severity,
+            "snapshot_key": snapshot_key,
+            "title": f"Anomaly: {alert.get('event', 'Suspicious Activity')}",
+            "description": summary_msg,
+            "attributes": {
+                "evidence_groups": alert.get("evidence_groups", []),
+                "reasons": alert.get("reasons", []),
+                "summary": summary_msg,
+                "confidences": confidences,
+                "temporal": alert.get("temporal", {}),
+                "class_name": obj_info.get("class", ""),
+            },
+            "ts": frame_ts.isoformat(),
+        })
+
+        # Publish to analytics:anomaly:results for SSE stream
+        await publish_analytics_result("anomaly", {
+            "type": "anomaly_alert",
+            "drone_id": drone_id,
+            "event_id": event_id,
+            "event_type": canonical_type,
+            "severity": severity,
+            "summary": summary_msg,
+            "snapshot_key": snapshot_key,
+            "ts": frame_ts.isoformat(),
+        })
+
+    # Update active tracks in drone_postgres (batch upsert)
+    for trk_data in tracks_summary:
+        try:
+            await upsert_anomaly_track(
+                pool=pool,
+                drone_id=drone_id,
+                track_id=trk_data["track_id"],
+                class_name=trk_data["class_name"],
+                class_category=trk_data["class_category"],
+                suspicion_level=trk_data["suspicion_level"],
+                suspicion_score=trk_data["suspicion_score"],
+                pipeline_stage=trk_data["pipeline_stage"],
+                duration_s=trk_data["duration_s"],
+                trajectory=trk_data["trajectory"],
+                ground_trajectory=trk_data["ground_trajectory"],
+                attributes=trk_data["attributes"],
+                bbox_xyxy=trk_data["bbox_xyxy"],
+                is_stationary=trk_data["is_stationary"],
+                stationary_seconds=trk_data["stationary_seconds"],
+                owner_track_id=trk_data.get("owner_track_id"),
+                owner_distance_px=trk_data.get("owner_distance_px"),
+                snapshot_key="",
+                mission_id=mission_id,
+            )
+        except Exception as trk_err:
+            log.debug("Track upsert error: %s", trk_err)
+
+    _frames_processed += 1
+
+
+async def _persist_round(items: list) -> None:
+    """Persist one round in drone order; the per-drone order across rounds is kept by the loop."""
+    for drone_id, f, analyzer, frame_ts, mission_id, result, t_start in items:
+        annotated_bgr, triggered_alerts, tracks_summary, detect_ms = result
+        try:
+            await _persist_anomaly_frame(drone_id, f, analyzer, frame_ts, mission_id,
+                                         annotated_bgr, triggered_alerts, tracks_summary)
+        except Exception as exc:
+            log.error("[%s] Anomaly persist error: %s", drone_id, exc)
+        t_elapsed = time.monotonic() - t_start
+        if t_elapsed > 0:
+            _fps_tracker[drone_id].append(1.0 / t_elapsed)
+        _sampler.record(drone_id, infer_ms=detect_ms, total_ms=t_elapsed * 1000)
+
+
+def _decode_round(round_frames: Dict[str, dict]) -> Dict[str, Tuple[dict, np.ndarray]]:
+    out = {}
+    for drone_id, f in round_frames.items():
+        try:
+            frame = decode_frame(f)
+        except Exception as e:
+            log.debug("Frame decode error: %s", e)
+            frame = None
+        if frame is not None:
+            out[drone_id] = (f, frame)
+    return out
+
+
 async def _stream_loop():
-    global _stream_running, _frames_processed
     active_drones: List[str] = []
-    log.info("Anomaly stream loop started (dynamic stream discovery mode)")
+    log.info("Anomaly stream loop started (dynamic stream discovery mode, GPU %s)",
+             gpu_profile.detect().as_dict())
 
     loop_count = 0
-    while _stream_running:
-        loop_count += 1
-        if loop_count % 5 == 1 or not active_drones:
-            try:
-                discovered = await scan_active_stream_drones()
-                for d in discovered:
-                    if d not in active_drones:
-                        active_drones.append(d)
-                        log.info("Discovered active ingest stream for anomaly analysis: %s", d)
-            except Exception as e:
-                log.debug("Stream scan error: %s", e)
+    pending: Optional[asyncio.Task] = None
+    try:
+        while _stream_running:
+            loop_count += 1
+            if loop_count % 50 == 1 or not active_drones:
+                try:
+                    discovered = await scan_active_stream_drones()
+                    for d in discovered:
+                        if d not in active_drones:
+                            active_drones.append(d)
+                            log.info("Discovered active ingest stream for anomaly analysis: %s", d)
+                except Exception as e:
+                    log.debug("Stream scan error: %s", e)
 
-        if not active_drones:
-            await asyncio.sleep(0.5)
-            continue
-
-        for drone_id in list(active_drones):
-            try:
-                frames = await xreadgroup_frames(
-                    "anomaly-group", "anomaly-analyzer", drone_id, ">", count=1, block_ms=100
-                )
-                if not frames:
-                    # Check for un-ACKed pending messages in the PEL
-                    pending = await xreadgroup_frames(
-                        "anomaly-group", "anomaly-analyzer", drone_id, "0", count=1, block_ms=10
-                    )
-                    if pending:
-                        frames = pending
-                    else:
-                        continue
-
-                pool = await get_pool()
-
-                for entry_id, f in frames:
-                    raw = f.get("jpeg_b64", "")
-                    if not raw:
-                        await ack_frames(drone_id, "anomaly-group", entry_id)
-                        continue
-
-                    # Decode base64 frame
-                    try:
-                        img_bytes = base64.b64decode(raw)
-                        nparr = np.frombuffer(img_bytes, np.uint8)
-                        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    except Exception as e:
-                        log.debug("Frame decode error: %s", e)
-                        continue
-
-                    if frame is None:
-                        continue
-
-                    t_start = time.monotonic()
-                    frame_ts = datetime.now(timezone.utc)
-
-                    # Extract metadata if present
-                    raw_meta = f.get("metadata", "")
-                    metadata_dict = {}
-                    if raw_meta:
-                        if isinstance(raw_meta, bytes):
-                            raw_meta = raw_meta.decode()
-                        try:
-                            metadata_dict = _json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
-                        except Exception:
-                            metadata_dict = {}
-
-                    mission_id = metadata_dict.get("mission_id") or ""
-                    if not mission_id and drone_id.startswith("DRN-MSN-"):
-                        mission_id = drone_id[4:]
-
-                    # Process frame through AnomalyAnalyzer pipeline in worker thread
-                    analyzer = _get_or_create_analyzer(drone_id)
-                    annotated_bgr, triggered_alerts, tracks_summary = await asyncio.to_thread(
-                        analyzer.process_frame,
-                        frame,
-                        metadata_dict,
-                        time.time() - analyzer.start_time,
-                    )
-
-                    # Encode annotated frame as JPEG for the live /annotated/latest endpoint
-                    success, jpeg_buf = cv2.imencode(".jpg", annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                    if success:
-                        _last_annotated[drone_id] = jpeg_buf.tobytes()
-                        _last_annotated_ts[drone_id] = time.time()
-
-                    # Handle Triggered Alerts (Evidence Capture & Escalation)
-                    for alert in triggered_alerts:
-                        event_type = (alert.get("event") or alert.get("event_type") or "suspicious_activity").lower()
-                        # Normalise to standard DVAS event types
-                        type_map = {
-                            "suspicious_object_detected": "abandoned_object",
-                            "abandoned_object": "abandoned_object",
-                            "unknown_owner_object": "abandoned_object",
-                            "unknown_owner_weapon": "weapon_abandoned",
-                            "weapon_like_object": "weapon_detected",
-                            "weapon_held": "weapon_held",
-                            "weapon_aiming_candidate": "weapon_aiming",
-                            "weapon_aiming": "weapon_aiming",
-                            "suspicious_package": "abandoned_object",
-                            "unusual_object_placement": "unusual_placement",
-                            "object_transfer": "object_transfer",
-                            "loitering": "suspicious_loitering",
-                            "loitering_event": "suspicious_loitering",
-                            "fall_event": "person_fall",
-                            "fall_collapse": "person_fall",
-                            "persistent_following": "suspicious_following",
-                            "following": "suspicious_following",
-                            "opposing_crowd_flow": "opposing_crowd_flow",
-                            "group_convergence": "group_convergence",
-                            "rapid_crowd_dispersal": "rapid_crowd_dispersal",
-                            "crowd_dispersal": "rapid_crowd_dispersal",
-                            "erratic_movement": "erratic_movement",
-                            "coordinated_arrival": "coordinated_arrival",
-                            "boundary_crossing": "boundary_crossing",
-                            "running_event": "running_flight",
-                            "wrong_direction_vehicle": "vehicle_wrong_way",
-                            "wrong_direction_event": "vehicle_wrong_way",
-                            "wrong_way": "vehicle_wrong_way",
-                            "high_risk_traffic_event": "vehicle_wrong_way",
-                            "abnormal_vehicle_speed": "abnormal_vehicle_speed",
-                            "abrupt_vehicle_stop": "vehicle_abrupt_stop",
-                            "abrupt_stop": "vehicle_abrupt_stop",
-                            "vehicle_person_interaction": "vehicle_person_interaction",
-                            "vehicle_object_interaction": "suspicious_dropoff",
-                            "vehicle_object_abandonment": "suspicious_dropoff",
-                            "suspicious_dropoff": "suspicious_dropoff",
-                            "vehicle_circling": "vehicle_circling",
-                            "vehicle_approach_flee": "vehicle_approach_flee",
-                            "vehicle_pedestrian_near_miss": "vehicle_pedestrian_near_miss",
-                        }
-                        canonical_type = type_map.get(event_type, event_type)
-                        severity = alert.get("level", "HIGH")
-                        summary_msg = alert.get("summary_explanation", "")
-
-                        # Snapshot upload to MinIO: source frame + the alert snapshot, hashed,
-                        # under make_key (mission / time / uuid — B30), before the event is written
-                        snapshot_key = ""
-                        evidence_objects = [await minio.upload_object(
-                            BUCKET_ANOMALY,
-                            minio.make_key("anomaly", drone_id, "source.jpg", mission_id=mission_id),
-                            img_bytes, "image/jpeg", kind="source_frame",
-                        )]
-                        evidence_img = alert.get("evidence_image")
-                        if evidence_img:
-                            # Read snapshot if written by alert_manager, or encode current frame
-                            snapshot_path = os.path.join(analyzer.alert_manager.output_dir, evidence_img)
-                            if os.path.exists(snapshot_path):
-                                with open(snapshot_path, "rb") as sf:
-                                    snap_bytes = sf.read()
-                            else:
-                                snap_bytes = jpeg_buf.tobytes() if success else b""
-                            if snap_bytes:
-                                snap_obj = await minio.upload_object(
-                                    BUCKET_ANOMALY,
-                                    minio.make_key("anomaly", drone_id, os.path.basename(evidence_img),
-                                                   mission_id=mission_id),
-                                    snap_bytes, "image/jpeg", kind="annotated_frame",
-                                )
-                                snapshot_key = snap_obj["key"] if snap_obj else ""
-                                evidence_objects.append(snap_obj)
-
-                        # Write to drone_postgres.anomaly_events
-                        confidences = alert.get("confidences", {})
-                        obj_info = alert.get("object", {})
-                        owner_info = alert.get("owner", {})
-
-                        event_id = await write_anomaly_event(
-                            pool=pool,
-                            drone_id=drone_id,
-                            track_id=obj_info.get("track_id", 0),
-                            event_type=canonical_type,
-                            severity=severity,
-                            class_name=obj_info.get("class", ""),
-                            confidence_detector=confidences.get("detector_confidence", 0.0),
-                            confidence_rule=confidences.get("rule_confidence", 0.0),
-                            confidence_event=confidences.get("event_confidence", 0.0),
-                            confidence_alert=confidences.get("alert_confidence", 0.0),
-                            evidence_groups=alert.get("evidence_groups", []),
-                            reasons=alert.get("reasons", []),
-                            summary=summary_msg,
-                            snapshot_key=snapshot_key,
-                            bbox=obj_info.get("bbox", []),
-                            owner_track_id=owner_info.get("track_id"),
-                            owner_status=owner_info.get("status"),
-                            temporal=alert.get("temporal", {}),
-                            gps_lat=alert.get("gps_lat"),
-                            gps_lon=alert.get("gps_lon"),
-                            details=alert,
-                            mission_id=mission_id,
-                        )
-
-                        # Confirmed event (B28): every gated anomaly alert, same id as anomaly_events
-                        ctx = frame_context(f)
-                        geo = ctx["geo"] or {}
-                        if alert.get("gps_lat") is not None and alert.get("gps_lon") is not None:
-                            geo = {"lat": alert.get("gps_lat"), "lon": alert.get("gps_lon"),
-                                   "alt_m": None, "heading_deg": None}
-                        if event_id:
-                            try:
-                                await write_confirmed_event(
-                                    drone_id=drone_id,
-                                    event_type=canonical_type,
-                                    confidence=confidences.get("alert_confidence", 0.75),
-                                    ts=frame_ts,
-                                    attributes={
-                                        "severity": severity,
-                                        "title": f"Anomaly: {alert.get('event', 'Suspicious Activity')}",
-                                        "summary": summary_msg,
-                                        "reasons": alert.get("reasons", []),
-                                        "evidence_groups": alert.get("evidence_groups", []),
-                                        "confidences": confidences,
-                                        "class_name": obj_info.get("class", ""),
-                                        "tracker_id": obj_info.get("track_id"),
-                                        "mission_id": mission_id or None,
-                                        "source_table": "anomaly_events",
-                                        "evidence": evidence_block(
-                                            evidence_objects, ctx,
-                                            detection={"track_id": obj_info.get("track_id"),
-                                                       "class": obj_info.get("class", ""),
-                                                       "bbox_xyxy": bbox_xyxy(obj_info.get("bbox")),
-                                                       "confidence": confidences.get("detector_confidence")},
-                                            model=model_info("anomaly", os.getenv(
-                                                "ANOMALY_MODEL_PRIMARY",
-                                                "/analytics/anomaly/models/weights/visdrone-yolov11x.pt")),
-                                            geo=geo or None,
-                                        ),
-                                    },
-                                    mission_id=mission_id or None,
-                                    latitude=geo.get("lat"),
-                                    longitude=geo.get("lon"),
-                                    event_id=event_id,
-                                )
-                            except Exception as ce_err:
-                                log.warning("Confirmed anomaly event write failed: %s", ce_err)
-
-                        # Publish to drone:events:confirmed (for evidence_sync & live alerts feed)
-                        await publish_confirmed_event({
-                            "event_id": event_id,
-                            "event_type": canonical_type,
-                            "drone_id": drone_id,
-                            "mission_id": mission_id,
-                            "track_id": obj_info.get("track_id"),
-                            "confidence": confidences.get("alert_confidence", 0.75),
-                            "severity": severity,
-                            "snapshot_key": snapshot_key,
-                            "title": f"Anomaly: {alert.get('event', 'Suspicious Activity')}",
-                            "description": summary_msg,
-                            "attributes": {
-                                "evidence_groups": alert.get("evidence_groups", []),
-                                "reasons": alert.get("reasons", []),
-                                "summary": summary_msg,
-                                "confidences": confidences,
-                                "temporal": alert.get("temporal", {}),
-                                "class_name": obj_info.get("class", ""),
-                            },
-                            "ts": frame_ts.isoformat(),
-                        })
-
-                        # Publish to analytics:anomaly:results for SSE stream
-                        await publish_analytics_result("anomaly", {
-                            "type": "anomaly_alert",
-                            "drone_id": drone_id,
-                            "event_id": event_id,
-                            "event_type": canonical_type,
-                            "severity": severity,
-                            "summary": summary_msg,
-                            "snapshot_key": snapshot_key,
-                            "ts": frame_ts.isoformat(),
-                        })
-
-                    # Update active tracks in drone_postgres (batch upsert)
-                    for trk_data in tracks_summary:
-                        try:
-                            await upsert_anomaly_track(
-                                pool=pool,
-                                drone_id=drone_id,
-                                track_id=trk_data["track_id"],
-                                class_name=trk_data["class_name"],
-                                class_category=trk_data["class_category"],
-                                suspicion_level=trk_data["suspicion_level"],
-                                suspicion_score=trk_data["suspicion_score"],
-                                pipeline_stage=trk_data["pipeline_stage"],
-                                duration_s=trk_data["duration_s"],
-                                trajectory=trk_data["trajectory"],
-                                ground_trajectory=trk_data["ground_trajectory"],
-                                attributes=trk_data["attributes"],
-                                bbox_xyxy=trk_data["bbox_xyxy"],
-                                is_stationary=trk_data["is_stationary"],
-                                stationary_seconds=trk_data["stationary_seconds"],
-                                owner_track_id=trk_data.get("owner_track_id"),
-                                owner_distance_px=trk_data.get("owner_distance_px"),
-                                snapshot_key="",
-                                mission_id=mission_id,
-                            )
-                        except Exception as trk_err:
-                            log.debug("Track upsert error: %s", trk_err)
-
-                    _frames_processed += 1
-                    t_elapsed = time.monotonic() - t_start
-                    if t_elapsed > 0:
-                        _fps_tracker[drone_id].append(1.0 / t_elapsed)
-                    try:
-                        await ack_frames(drone_id, "anomaly-group", entry_id)
-                    except Exception as ack_err:
-                        log.debug("Failed to ACK frame %s: %s", entry_id, ack_err)
-
-            except Exception as e:
-                log.error("[%s] Stream processing iteration error: %s", drone_id, e)
-                if 'frames' in locals() and frames:
-                    for eid, _ in frames:
-                        try:
-                            await ack_frames(drone_id, "anomaly-group", eid)
-                        except Exception:
-                            pass
+            if not active_drones:
                 await asyncio.sleep(0.5)
+                continue
 
-        await asyncio.sleep(0.01)
+            try:
+                await _sampler.maybe_publish()
+                # Newest due frame per drone (older ones acked unread, counted as skipped)
+                round_frames = await _sampler.next_round(active_drones)
+                if not round_frames:
+                    continue
+                t_start = time.monotonic()
+                decoded = await asyncio.to_thread(_decode_round, round_frames)
+                if not decoded:
+                    continue
+
+                items = []
+                meta = []
+                for drone_id in sorted(decoded):        # stable batch order
+                    f, frame = decoded[drone_id]
+                    metadata_dict, mission_id = _frame_metadata(drone_id, f)
+                    analyzer = _get_or_create_analyzer(drone_id)
+                    items.append((analyzer, frame, metadata_dict, time.time() - analyzer.start_time))
+                    meta.append((drone_id, f, analyzer, datetime.now(timezone.utc), mission_id))
+
+                # Camera motion per drone, one batched detector pass, then per-drone pipeline
+                results = await asyncio.to_thread(
+                    analyze_round, items, gpu_profile.detect().max_batch
+                )
+                _sampler.record_batch(len(items))
+
+                # Persist the previous round before queuing this one (keeps per-drone order);
+                # it ran concurrently with the inference above.
+                if pending:
+                    await asyncio.shield(pending)   # a stream stop must not cut a round half-written
+                pending = asyncio.create_task(_persist_round(
+                    [(*m, r, t_start) for m, r in zip(meta, results)]
+                ))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.error("Anomaly stream processing iteration error: %s", e)
+                await asyncio.sleep(0.5)
+    finally:
+        if pending and not pending.done():
+            try:
+                await asyncio.shield(pending)   # a stream stop must not cut a round half-written
+            except Exception:
+                pass
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -448,6 +479,7 @@ async def startup_event():
     log.info("Starting DVAS Anomaly Analytics Service...")
     await get_pool()
     await minio.ensure_bucket(BUCKET_ANOMALY)
+    gpu_profile.apply_torch_settings()      # FP16 / cuDNN autotune before any model loads
     # Start stream consumer loop automatically
     _stream_running = True
     _stream_task = asyncio.create_task(_stream_loop())
@@ -516,18 +548,13 @@ async def stream_stop():
                 pass
             _stream_task = None
     if not cfg.VRAM_OFFLOAD_ON_STOP:
-        # RunPod pod: keep the per-drone analyzers (and their models) resident on the GPU
+        # RunPod pod: keep the per-drone analyzers (and the shared models) resident on the GPU
         log.info("Anomaly stream loop stopped (models kept on GPU, VRAM_OFFLOAD_ON_STOP=false)")
         return {"status": "stopped", "stream_running": False}
-    # Release dual models from GPU VRAM
+    # Release the shared dual models from GPU VRAM (one copy for all drones)
     try:
-        for d_id, analyzer in list(_analyzers.items()):
-            if hasattr(analyzer, 'detector') and hasattr(analyzer.detector, 'model'):
-                try:
-                    analyzer.detector.model.to("cpu")
-                except Exception:
-                    pass
         _analyzers.clear()
+        release_shared_detectors()
     except Exception as e:
         log.warning("Error releasing anomaly models: %s", e)
     import gc

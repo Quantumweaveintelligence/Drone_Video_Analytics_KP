@@ -128,3 +128,29 @@ def test_http_frame_one_event_per_surge_with_exact_upload(crowd_main, monkeypatc
     block = events[0]["attributes"]["evidence"]
     assert block["objects"][0]["kind"] == "source_frame" and uploads[0][1] == b"jpeg-bytes"
     assert block["frame"]["source"] == "http_upload" and block["geo"] is None
+
+
+def test_stream_frame_surge_uploads_the_raw_stream_jpeg(crowd_main, monkeypatch):
+    """Stream path: the frame comes from the raw `frame` field (no jpeg_b64 since plan 9.1)."""
+    events, uploads = [], []
+
+    async def write_confirmed_event(**kw):
+        events.append(kw)
+        return "ev1"
+
+    async def upload_object(bucket, key, data, content_type="", kind=""):
+        uploads.append((bucket, data, kind))
+        return {"bucket": bucket, "key": key, "content_type": content_type, "sha256": "h", "bytes": len(data),
+                "kind": kind}
+
+    _run_startup(crowd_main)
+    crowd_main.analyzer.alert_threshold = 100
+    crowd_main.analyzer.analyze_frame = lambda frame, **kw: {
+        "estimated_count": 150, "density_label": "high", "alert_triggered": True, "inference_ms": 12.0}
+    monkeypatch.setattr(crowd_main, "write_confirmed_event", write_confirmed_event)
+    monkeypatch.setattr(crowd_main.minio, "upload_object", upload_object, raising=False)
+    monkeypatch.setattr(crowd_main, "decode_frame", lambda f: "frame")
+
+    asyncio.run(crowd_main._process_crowd_frame("D1", {"frame": b"raw-jpeg", "entry_id": "1-0", "drone_id": "D1"}))
+    assert len(events) == 1 and uploads[0][1] == b"raw-jpeg" and uploads[0][2] == "source_frame"
+    assert crowd_main._sampler.stats["D1"].infer_ms == 12.0

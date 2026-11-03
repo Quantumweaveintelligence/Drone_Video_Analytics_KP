@@ -7,19 +7,24 @@ Includes VehicleReIDTracker for appearance-based re-identification
 to prevent duplicate tracker IDs when ByteTrack loses/re-acquires vehicles.
 """
 import base64
+import itertools
 import logging
 import os
 import re
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
+
+from shared import gpu_profile
+from shared.batch_tracker import BatchTracker
 
 log = logging.getLogger(__name__)
 
@@ -137,6 +142,7 @@ class VehicleReIDTracker:
         spatial_weight: float = 0.3,
         frame_width: int = TRACK_RESIZE_WIDTH,
         frame_height: int = TRACK_RESIZE_HEIGHT,
+        id_source: Optional[Callable[[], int]] = None,
     ):
         self.match_threshold = match_threshold
         self.max_lost_frames = max_lost_frames
@@ -154,8 +160,10 @@ class VehicleReIDTracker:
         # Stable ID → features at time of disappearance
         self._lost: Dict[int, _ReIDFeatures] = {}
 
-        # Monotonic stable-ID counter
+        # Monotonic stable-ID counter (count of IDs this tracker assigned + 1)
         self._next_stable_id: int = 1
+        # Optional shared ID source so stable IDs stay unique across per-drone trackers
+        self._id_source = id_source
 
         # ByteTrack IDs seen in the *current* frame (reset each frame)
         self._frame_bt_ids: set = set()
@@ -300,7 +308,7 @@ class VehicleReIDTracker:
             return stable_id
 
         # No match — assign new stable ID
-        stable_id = self._next_stable_id
+        stable_id = self._id_source() if self._id_source is not None else self._next_stable_id
         self._next_stable_id += 1
         self._bt_to_stable[bt_id] = stable_id
         if features is not None:
@@ -466,11 +474,15 @@ class ANPRAnalyzer:
         self.device     = 0 if self.use_gpu else "cpu"
 
         self.vehicle_model: Optional[YOLO] = None
+        self.tracker: Optional[BatchTracker] = None
         self._vehicle_class_ids: Optional[List[int]] = None
         self._vehicle_class_map: Dict[int, str] = {}
 
         try:
             self.vehicle_model = YOLO(vehicle_model_path)
+            # One tracker per drone (model.track() default botsort.yaml); frames of all
+            # drones go through the vehicle model as one batch
+            self.tracker = BatchTracker(self.vehicle_model)
             log.info("ANPR vehicle model loaded: %s", vehicle_model_path)
 
             if hasattr(self.vehicle_model, "names") and self.vehicle_model.names:
@@ -490,6 +502,7 @@ class ANPRAnalyzer:
         except Exception as exc:
             log.error("Failed to load vehicle model: %s", exc)
             self.vehicle_model = None
+            self.tracker = None
 
         self.lp_model = None
         if lp_model_path:
@@ -510,19 +523,28 @@ class ANPRAnalyzer:
         self.watchlist: Set[str] = watchlist or set()
         self._drone_tracks: Dict[str, Dict[int, TrackRecord]] = defaultdict(dict)
         self._drone_missions: Dict[str, str] = {}
-        self._frame_idx = 0
+        # Frame counter per drone: OCR cadence, Re-ID expiry and first/last-seen frames are
+        # per-track timings, so they must not speed up when more drones stream
+        self._frame_idx: Dict[str, int] = defaultdict(int)
 
         # Enable/disable appearance Re-ID (defaults to False for clean ByteTrack stability)
         self.enable_reid: bool = os.getenv("ANPR_ENABLE_REID", "false").lower() == "true"
 
-        # Vehicle Re-ID tracker for deduplication
-        self.reid_tracker = VehicleReIDTracker(
+        # Vehicle Re-ID trackers for deduplication, one per drone: a vehicle lost on
+        # drone A must never be re-identified as a new track on drone B. Stable IDs
+        # come from one shared counter so they stay unique across drones.
+        self._reid_params = dict(
             match_threshold=reid_match_threshold,
             max_lost_frames=reid_max_lost_frames,
             hist_weight=reid_hist_weight,
             aspect_weight=reid_aspect_weight,
             spatial_weight=reid_spatial_weight,
         )
+        self._stable_ids = itertools.count(1)
+        self._reid: Dict[str, VehicleReIDTracker] = {}
+        # Track / Re-ID state is mutated per frame; the stream loop (worker thread)
+        # and the upload / recovery endpoints may analyse at the same time
+        self._lock = threading.RLock()
         log.info(
             "Vehicle Re-ID tracker initialised (enabled=%s, threshold=%.2f, max_lost=%d)",
             self.enable_reid, reid_match_threshold, reid_max_lost_frames,
@@ -556,43 +578,65 @@ class ANPRAnalyzer:
             merged.update(d_tracks)
         return merged
 
+    def _reid_for(self, drone_id: str) -> VehicleReIDTracker:
+        t = self._reid.get(drone_id)
+        if t is None:
+            t = self._reid[drone_id] = VehicleReIDTracker(
+                **self._reid_params, id_source=lambda: next(self._stable_ids),
+            )
+        return t
+
+    def reid_stats(self, drone_id: Optional[str] = None) -> dict:
+        """Re-ID statistics for one drone, or summed over all drones (with `per_drone`)."""
+        if drone_id is not None:
+            t = self._reid.get(drone_id)
+            return t.get_stats() if t else VehicleReIDTracker(**self._reid_params).get_stats()
+        per = {d: t.get_stats() for d, t in list(self._reid.items())}
+        agg = {k: sum(s[k] for s in per.values()) for k in (
+            "total_stable_ids_assigned", "total_remaps", "total_new_ids",
+            "active_tracks", "lost_tracks", "bt_id_mappings")}
+        agg["match_threshold"] = self._reid_params["match_threshold"]
+        agg["max_lost_frames"] = self._reid_params["max_lost_frames"]
+        agg["per_drone"] = per
+        return agg
+
     def reset_drone(self, drone_id: str, new_mission_id: Optional[str] = None):
         """Cleanly flush tracking and Re-ID state for a drone on mission transition or stream reset."""
         log.info("ANPRAnalyzer: resetting tracks for drone %s (new_mission=%s)", drone_id, new_mission_id)
-        if drone_id in self._drone_tracks:
-            self._drone_tracks[drone_id].clear()
-        if new_mission_id is not None:
-            self._drone_missions[drone_id] = new_mission_id
-        self.reid_tracker.reset()
-        if self.vehicle_model and hasattr(self.vehicle_model, "predictor") and self.vehicle_model.predictor:
-            for t in getattr(self.vehicle_model.predictor, "trackers", []):
-                if hasattr(t, "reset"):
-                    try:
-                        t.reset()
-                    except Exception:
-                        pass
+        with self._lock:
+            if drone_id in self._drone_tracks:
+                self._drone_tracks[drone_id].clear()
+            if new_mission_id is not None:
+                self._drone_missions[drone_id] = new_mission_id
+            # Only this drone's Re-ID and ByteTrack/BoT-SORT state; other drones keep theirs
+            reid = self._reid.get(drone_id)
+            if reid is not None:
+                reid.reset()
+            if self.tracker is not None:
+                self.tracker.reset(drone_id)
 
 
     def update_watchlist(self, watchlist: Set[str]):
         self.watchlist = watchlist
 
-    def analyze_frame(
-        self,
-        frame_orig: np.ndarray,
-        drone_id: str = "DRONE_KL_001",
-        mission_id: Optional[str] = None,
-    ) -> dict:
-        """
-        Process a single full-resolution frame.
-        Two-resolution pipeline: track on 720p, OCR on original-res crop.
-        """
-        if not self.ready:
-            return {
-                "drone_id": drone_id, "ts": datetime.now(timezone.utc).isoformat(),
-                "plate_reads": [], "total_vehicles": 0, "plates_read": 0,
-                "theft_alerts": 0, "inference_ms": 0.0,
-            }
+    def _empty(self, drone_id: str) -> dict:
+        return {
+            "drone_id": drone_id, "ts": datetime.now(timezone.utc).isoformat(),
+            "plate_reads": [], "total_vehicles": 0, "plates_read": 0,
+            "theft_alerts": 0, "inference_ms": 0.0, "model_ms": 0.0,
+        }
 
+    def _half(self) -> bool:
+        # FP16 where the GPU profile allows it; never on the CPU fallback
+        return bool(gpu_profile.predict_kwargs()["half"]) and self.use_gpu
+
+    def _track_kwargs(self) -> dict:
+        return dict(
+            imgsz=IMG_SIZE, conf=CONF_VEHICLE, classes=self._vehicle_class_ids,
+            device=self.device, verbose=False, half=self._half(),
+        )
+
+    def _check_mission(self, drone_id: str, mission_id: Optional[str]) -> None:
         # Check mission transition per drone
         if mission_id and self._drone_missions.get(drone_id) and self._drone_missions.get(drone_id) != mission_id:
             log.info("ANPRAnalyzer: mission transition for %s (%s -> %s), resetting tracks",
@@ -601,38 +645,87 @@ class ANPRAnalyzer:
         elif mission_id:
             self._drone_missions[drone_id] = mission_id
 
-        drone_tracks = self._drone_tracks[drone_id]
-
-        t0 = time.perf_counter()
-        self._frame_idx += 1
-        frame_idx = self._frame_idx
-
+    @staticmethod
+    def _to_track_res(frame_orig: np.ndarray) -> Tuple[np.ndarray, float, float]:
         orig_h, orig_w = frame_orig.shape[:2]
         if orig_w == TRACK_RESIZE_WIDTH and orig_h == TRACK_RESIZE_HEIGHT:
-            frame_track = frame_orig
-            scale_x = 1.0
-            scale_y = 1.0
-        else:
-            scale_x = orig_w / TRACK_RESIZE_WIDTH
-            scale_y = orig_h / TRACK_RESIZE_HEIGHT
-            frame_track = cv2.resize(frame_orig, (TRACK_RESIZE_WIDTH, TRACK_RESIZE_HEIGHT), interpolation=cv2.INTER_LINEAR)
+            return frame_orig, 1.0, 1.0
+        frame_track = cv2.resize(frame_orig, (TRACK_RESIZE_WIDTH, TRACK_RESIZE_HEIGHT), interpolation=cv2.INTER_LINEAR)
+        return frame_track, orig_w / TRACK_RESIZE_WIDTH, orig_h / TRACK_RESIZE_HEIGHT
 
-        # ── 1. Vehicle detection + tracking (720p) ──────────────────────────
+    def analyze_frame(
+        self,
+        frame_orig: np.ndarray,
+        drone_id: str = "DRONE_KL_001",
+        mission_id: Optional[str] = None,
+    ) -> dict:
+        """
+        Process a single full-resolution frame (upload / recovery paths).
+        Two-resolution pipeline: track on 720p, OCR on original-res crop.
+        """
         try:
-            track_kwargs = dict(
-                persist=True, imgsz=IMG_SIZE, conf=CONF_VEHICLE,
-                classes=self._vehicle_class_ids, device=self.device, verbose=False,
-            )
-            if self.use_gpu:
-                track_kwargs["half"] = True
-            results = self.vehicle_model.track(frame_track, **track_kwargs)
-        except Exception as exc:
+            return self.analyze_batch({drone_id: frame_orig}, {drone_id: mission_id})[drone_id]
+        except Exception as exc:     # CUDA failure: these paths never raised before
             log.warning("Vehicle tracking failed: %s", exc)
+            return self._empty(drone_id)
+
+    def analyze_batch(
+        self,
+        frames: Dict[str, np.ndarray],
+        mission_ids: Optional[Dict[str, Optional[str]]] = None,
+    ) -> Dict[str, dict]:
+        """
+        Newest frame of several drones → {drone_id: result}.
+        Vehicle detection runs as one GPU batch with a separate tracker per drone;
+        plate detection / OCR then runs per drone exactly as for a single frame.
+        CUDA errors propagate (main.py moves the models to CPU and retries).
+        """
+        if not self.ready:
+            return {d: self._empty(d) for d in frames}
+        mission_ids = mission_ids or {}
+        with self._lock:
+            prepared = {}
+            for d, frame_orig in frames.items():
+                self._check_mission(d, mission_ids.get(d))
+                prepared[d] = self._to_track_res(frame_orig)
+
+            # ── 1. Vehicle detection + tracking (720p), all drones in one batch ──
+            t0 = time.perf_counter()
+            try:
+                tracked = self.tracker.track_batch(
+                    {d: p[0] for d, p in prepared.items()}, **self._track_kwargs()
+                )
+            except Exception as exc:
+                if "CUDA" in str(exc):
+                    raise
+                log.warning("Vehicle tracking failed: %s", exc)
+                return {d: self._empty(d) for d in frames}
+            infer_ms = (time.perf_counter() - t0) * 1000 / max(1, len(frames))
+
             return {
-                "drone_id": drone_id, "ts": datetime.now(timezone.utc).isoformat(),
-                "plate_reads": [], "total_vehicles": 0, "plates_read": 0,
-                "theft_alerts": 0, "inference_ms": 0.0,
+                d: self._postprocess(d, frames[d], *prepared[d], tracked.get(d), infer_ms)
+                for d in frames
             }
+
+    def _postprocess(
+        self,
+        drone_id: str,
+        frame_orig: np.ndarray,
+        frame_track: np.ndarray,
+        scale_x: float,
+        scale_y: float,
+        result,
+        infer_ms: float,
+    ) -> dict:
+        """Re-ID, plate detection, OCR and track bookkeeping for one drone's tracked frame."""
+        drone_tracks = self._drone_tracks[drone_id]
+        reid_tracker = self._reid_for(drone_id)
+
+        t0 = time.perf_counter()
+        self._frame_idx[drone_id] += 1
+        frame_idx = self._frame_idx[drone_id]
+        orig_h, orig_w = frame_orig.shape[:2]
+        results = [result] if result is not None else []
 
         plate_reads  = []
         theft_alerts = 0
@@ -660,7 +753,7 @@ class ANPRAnalyzer:
 
                 # Resolve ByteTrack ID → stable Re-ID (if enabled)
                 if self.enable_reid:
-                    track_id = self.reid_tracker.resolve_id(
+                    track_id = reid_tracker.resolve_id(
                         bt_id, reid_crop, cx, cy, bw, bh, frame_idx
                     )
                 else:
@@ -698,9 +791,8 @@ class ANPRAnalyzer:
                     rec.ocr_attempts += 1
                     rec.last_ocr_frame = frame_idx
                     try:
-                        lp_kwargs = dict(imgsz=IMG_SIZE, conf=CONF_LP, device=self.device, verbose=False)
-                        if self.use_gpu:
-                            lp_kwargs["half"] = True
+                        lp_kwargs = dict(imgsz=IMG_SIZE, conf=CONF_LP, device=self.device,
+                                         verbose=False, half=self._half())
                         lp_res = self.lp_model.predict(vehicle_crop, **lp_kwargs)
                         lp_found = False
                         if lp_res and lp_res[0].boxes and len(lp_res[0].boxes) > 0:
@@ -856,9 +948,9 @@ class ANPRAnalyzer:
 
         # ── End-of-frame Re-ID housekeeping ──────────────────────────────
         if self.enable_reid:
-            self.reid_tracker.end_frame(frame_idx)
+            reid_tracker.end_frame(frame_idx)
 
-        elapsed_ms = (time.perf_counter() - t0) * 1000
+        elapsed_ms = infer_ms + (time.perf_counter() - t0) * 1000
         return {
             "drone_id":       drone_id,
             "ts":             datetime.now(timezone.utc).isoformat(),
@@ -867,7 +959,8 @@ class ANPRAnalyzer:
             "plates_read":    sum(1 for p in plate_reads if p["plate_text"]),
             "theft_alerts":   theft_alerts,
             "inference_ms":   round(elapsed_ms, 1),
-            "reid_stats":     self.reid_tracker.get_stats(),
+            "model_ms":       round(infer_ms, 1),
+            "reid_stats":     reid_tracker.get_stats(),
         }
 
     def get_all_tracks(self, drone_id: Optional[str] = None) -> List[dict]:

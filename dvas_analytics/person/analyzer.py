@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Person & Face Analyzer — production-ready with ByteTrack cross-frame tracking.
-Uses YOLOv8m for person tracking (.track persist=True) and YOLOv8n-face
+Uses YOLOv8m for person tracking (batched predict + one tracker per drone via
+shared.batch_tracker.BatchTracker) and YOLOv8n-face
 for tile-based face detection, linking faces to person tracks by IoU.
 """
 import base64
@@ -14,6 +15,9 @@ import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
+
+from shared import gpu_profile
+from shared.batch_tracker import BatchTracker
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +90,8 @@ def detect_faces_on_tiles(
     device=0,
 ) -> List[Tuple[int, int, int, int, float]]:
     """Tile-based face detection. Returns list of (x1, y1, x2, y2, conf)."""
+    # FP16 on GPUs that support it (no effect on CPU)
+    half = device != "cpu" and gpu_profile.predict_kwargs()["half"]
     h_img, w_img = frame.shape[:2]
     step_h, step_w = h_img // rows, w_img // cols
     overlap = 150
@@ -100,7 +106,7 @@ def detect_faces_on_tiles(
             tile = frame[y1:y2, x1:x2]
             results = model(
                 tile, device=device, imgsz=TILE_IMG_SIZE,
-                conf=CONF_FACE, verbose=False, agnostic_nms=True,
+                conf=CONF_FACE, verbose=False, agnostic_nms=True, half=half,
             )
             for res in results:
                 for box in res.boxes:
@@ -131,9 +137,13 @@ class PersonFaceAnalyzer:
     def __init__(self, person_model_path: str, face_model_path: str):
         self.device = 0 if torch.cuda.is_available() else "cpu"
         log.info("PersonFaceAnalyzer device: %s", self.device)
+        self.tracker: Optional[BatchTracker] = None
 
         try:
             self.person_model = YOLO(person_model_path)
+            # One tracker per drone; newest frames of all drones go through the model
+            # as one batch. Holds the same model object, so .to() moves still apply.
+            self.tracker = BatchTracker(self.person_model)
             log.info("Person model loaded: %s", person_model_path)
         except Exception as exc:
             log.error("Failed to load person model: %s", exc)
@@ -152,6 +162,11 @@ class PersonFaceAnalyzer:
     def ready(self) -> bool:
         return self.person_model is not None and self.face_model is not None
 
+    def _track_kwargs(self) -> dict:
+        # Same arguments as the former person_model.track(...) call (persist/verbose
+        # are handled by BatchTracker; FP16 comes from gpu_profile.predict_kwargs())
+        return dict(imgsz=640, conf=CONF_PERSON, classes=[0], device=self.device)
+
     def analyze_frame(
         self,
         frame_bgr: np.ndarray,
@@ -159,52 +174,35 @@ class PersonFaceAnalyzer:
         save_crops: bool = True,
     ) -> dict:
         """
-        Detect and track persons (ByteTrack) + detect faces (tile-based).
-        Persons get stable tracker_id across frames.
-        Each face is linked to the nearest person by centre-point containment.
+        Detect and track persons + detect faces (tile-based) on one frame.
+        Thin wrapper over analyze_batch (upload / offline paths).
         """
+        try:
+            return self.analyze_batch({drone_id: frame_bgr}, save_crops)[drone_id]
+        except RuntimeError as exc:     # unexpected CUDA failure on the upload path
+            log.warning("Person frame inference error: %s", exc)
+            return self._result(drone_id, [], [], 0.0, 0.0)
+
+    def analyze_batch(
+        self,
+        frames: Dict[str, np.ndarray],
+        save_crops: bool = True,
+    ) -> Dict[str, dict]:
+        """
+        Newest frame of several drones -> {drone_id: result}.
+        Person detection runs as ONE batched GPU call with a separate tracker per
+        drone; face tiling + linking run per drone afterwards.
+        Persons get stable tracker_id across frames of the same drone.
+        """
+        if not frames:
+            return {}
         t0 = time.perf_counter()
-        self._frame_count += 1
-        persons: List[dict] = []
-        faces:   List[dict] = []
-        _untracked_counter = 0
+        tracked: Dict[str, object] = {}
 
-        # ── Person detection + ByteTrack ─────────────────────────────────────
-        if self.person_model:
+        # ── Person detection + tracking (batched across drones) ─────────────
+        if self.person_model and self.tracker:
             try:
-                results = self.person_model.track(
-                    frame_bgr,
-                    persist=True,
-                    imgsz=640,
-                    conf=CONF_PERSON,
-                    classes=[0],      # person class
-                    device=self.device,
-                    verbose=False,
-                )
-                if results and results[0].boxes:
-                    for box in results[0].boxes:
-                        if box.id is not None:
-                            tracker_id = int(box.id[0])
-                        else:
-                            _untracked_counter += 1
-                            tracker_id = -_untracked_counter
-                        conf = float(box.conf[0])
-                        x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
-
-                        crop_b64  = None
-                        crop_bytes = None
-                        if save_crops and self._frame_count % SAVE_EVERY_N == 0:
-                            crop_bytes = _crop_to_bytes(frame_bgr, x1, y1, x2, y2)
-                            if crop_bytes:
-                                crop_b64 = base64.b64encode(crop_bytes).decode()
-
-                        persons.append({
-                            "tracker_id": tracker_id,
-                            "bbox":       _bbox_dict(x1, y1, x2, y2),
-                            "confidence": round(conf, 4),
-                            "crop_b64":   crop_b64,
-                            "crop_bytes": crop_bytes,   # kept for MinIO upload
-                        })
+                tracked = self.tracker.track_batch(frames, **self._track_kwargs())
             except Exception as exc:
                 if "CUDA" in str(exc) and self.device != "cpu":
                     log.warning("CUDA error in person tracking — falling back to CPU: %s", exc)
@@ -215,43 +213,76 @@ class PersonFaceAnalyzer:
                         pass
                     # Retry on CPU
                     try:
-                        results = self.person_model.track(
-                            frame_bgr, persist=True, imgsz=640, conf=CONF_PERSON,
-                            classes=[0], device=self.device, verbose=False,
-                        )
-                        if results and results[0].boxes:
-                            for box in results[0].boxes:
-                                if box.id is not None:
-                                    tracker_id = int(box.id[0])
-                                else:
-                                    _untracked_counter += 1
-                                    tracker_id = -_untracked_counter
-                                conf = float(box.conf[0])
-                                x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
-                                crop_b64 = None
-                                crop_bytes = None
-                                if save_crops and self._frame_count % SAVE_EVERY_N == 0:
-                                    crop_bytes = _crop_to_bytes(frame_bgr, x1, y1, x2, y2)
-                                    if crop_bytes:
-                                        crop_b64 = base64.b64encode(crop_bytes).decode()
-                                persons.append({
-                                    "tracker_id": tracker_id,
-                                    "bbox": _bbox_dict(x1, y1, x2, y2),
-                                    "confidence": round(conf, 4),
-                                    "crop_b64": crop_b64,
-                                    "crop_bytes": crop_bytes,
-                                })
+                        tracked = self.tracker.track_batch(frames, **self._track_kwargs())
                     except Exception as retry_exc:
                         log.warning("Person tracking CPU retry also failed: %s", retry_exc)
                 else:
                     log.warning("Person tracking error: %s", exc)
+        person_ms = (time.perf_counter() - t0) * 1000 / max(1, len(frames))
+
+        return {
+            d: self._postprocess(d, frame, tracked.get(d), save_crops, person_ms)
+            for d, frame in frames.items()
+        }
+
+    def _result(self, drone_id, persons, faces, elapsed_ms, model_ms) -> dict:
+        return {
+            "drone_id":     drone_id,
+            "ts":           datetime.now(timezone.utc).isoformat(),
+            "persons":      persons,
+            "faces":        faces,
+            "person_count": len(persons),
+            "face_count":   len(faces),
+            "inference_ms": round(elapsed_ms, 1),
+            "model_ms":     round(model_ms, 1),
+        }
+
+    def _postprocess(self, drone_id, frame_bgr, result, save_crops, person_ms) -> dict:
+        """Per-drone part: person boxes from the batched result, face tiles, linking."""
+        t0 = time.perf_counter()
+        self._frame_count += 1
+        persons: List[dict] = []
+        faces:   List[dict] = []
+        _untracked_counter = 0
+        face_ms = 0.0
+
+        # ── Person boxes (tracked) ───────────────────────────────────────────
+        try:
+            if result is not None and result.boxes:
+                for box in result.boxes:
+                    if box.id is not None:
+                        tracker_id = int(box.id[0])
+                    else:
+                        _untracked_counter += 1
+                        tracker_id = -_untracked_counter
+                    conf = float(box.conf[0])
+                    x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
+
+                    crop_b64  = None
+                    crop_bytes = None
+                    if save_crops and self._frame_count % SAVE_EVERY_N == 0:
+                        crop_bytes = _crop_to_bytes(frame_bgr, x1, y1, x2, y2)
+                        if crop_bytes:
+                            crop_b64 = base64.b64encode(crop_bytes).decode()
+
+                    persons.append({
+                        "tracker_id": tracker_id,
+                        "bbox":       _bbox_dict(x1, y1, x2, y2),
+                        "confidence": round(conf, 4),
+                        "crop_b64":   crop_b64,
+                        "crop_bytes": crop_bytes,   # kept for MinIO upload
+                    })
+        except Exception as exc:
+            log.warning("Person tracking error: %s", exc)
 
         # ── Face detection (tile-based) ───────────────────────────────────────
         if self.face_model:
             try:
+                tf = time.perf_counter()
                 face_boxes = detect_faces_on_tiles(
                     self.face_model, frame_bgr, device=self.device
                 )
+                face_ms = (time.perf_counter() - tf) * 1000
                 for (x1, y1, x2, y2, conf) in face_boxes:
                     face_bbox = _bbox_dict(x1, y1, x2, y2)
 
@@ -317,13 +348,6 @@ class PersonFaceAnalyzer:
                 else:
                     log.warning("Face detection error: %s", exc)
 
-        elapsed_ms = (time.perf_counter() - t0) * 1000
-        return {
-            "drone_id":     drone_id,
-            "ts":           datetime.now(timezone.utc).isoformat(),
-            "persons":      persons,
-            "faces":        faces,
-            "person_count": len(persons),
-            "face_count":   len(faces),
-            "inference_ms": round(elapsed_ms, 1),
-        }
+        elapsed_ms = person_ms + (time.perf_counter() - t0) * 1000
+        # model_ms: this frame's share of the batched person call + its face tiles
+        return self._result(drone_id, persons, faces, elapsed_ms, person_ms + face_ms)

@@ -73,7 +73,26 @@ class RFDETRMaritimeEngine:
             num_classes=len(SEADRONESSEE_CLASSES),
         )
 
+        # Default tracker for callers without a drone id; one tracker per drone otherwise
         self.tracker = MaritimeVesselTracker(iou_thresh=self.iou_thresh)
+        self.trackers: Dict[str, MaritimeVesselTracker] = {}
+
+    def tracker_for(self, drone_id: Optional[str]) -> MaritimeVesselTracker:
+        if drone_id is None:
+            return self.tracker
+        trk = self.trackers.get(drone_id)
+        if trk is None:
+            trk = self.trackers[drone_id] = MaritimeVesselTracker(iou_thresh=self.iou_thresh)
+        return trk
+
+    def forget_drone(self, drone_id: str) -> None:
+        self.trackers.pop(drone_id, None)
+
+    def process_batch(self, frames: Dict[str, np.ndarray]) -> Tuple[Dict[str, tuple], float]:
+        """Same contract as MaritimePerceptionEngine.process_batch (per-frame RF-DETR calls)."""
+        t0 = time.perf_counter()
+        out = {d: self.process_frame(fr, drone_id=d) for d, fr in frames.items()}
+        return out, (time.perf_counter() - t0) * 1000 / max(1, len(frames))
 
     def _resolve_weights(self, weights_str: str) -> str:
         """Resolve local checkpoint or download from Hugging Face if not found."""
@@ -115,7 +134,7 @@ class RFDETRMaritimeEngine:
         except Exception as e:
             log.warning("Could not move model to %s: %s", device, e)
 
-    def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, List[Dict]]:
+    def process_frame(self, frame: np.ndarray, drone_id: Optional[str] = None) -> Tuple[np.ndarray, List[Dict]]:
 
         """
         Process a single BGR frame:
@@ -130,6 +149,7 @@ class RFDETRMaritimeEngine:
             tracked_objects: list of tracked object dicts
         """
         img_h, img_w = frame.shape[:2]
+        tracker = self.tracker_for(drone_id)
 
         # 1. Spectral Water Domain Masking
         if self.water_filtering:
@@ -181,7 +201,7 @@ class RFDETRMaritimeEngine:
                 cand_classes.append(name)
 
         if not cand_boxes:
-            return self.tracker.update([], frame)
+            return tracker.update([], frame)
 
         # 3. Class-Agnostic NMS (cv2.dnn.NMSBoxes)
         boxes_xywh = [[int(b[0]), int(b[1]), int(b[2] - b[0]), int(b[3] - b[1])] for b in cand_boxes]
@@ -203,5 +223,5 @@ class RFDETRMaritimeEngine:
             detections.append((box, score, fine_id, fine_name))
 
         # 5. Zero-Flicker Tracking
-        annotated_frame, tracked_objects = self.tracker.update(detections, frame)
+        annotated_frame, tracked_objects = tracker.update(detections, frame)
         return annotated_frame, tracked_objects

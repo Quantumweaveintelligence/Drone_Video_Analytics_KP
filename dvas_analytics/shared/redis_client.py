@@ -56,11 +56,11 @@ async def xread_frames(
     """
     Read up to `count` frames from drone:frames:{drone_id}.
     Returns (new_last_id, list_of_frame_dicts).
-    Each frame dict has: frame_id, jpeg_b64, timestamp, drone_id
+    Each frame dict has: entry_id, frame (raw JPEG bytes), timestamp, drone_id
 
     Uses a raw (non-decoding) Redis client because the ingest server
     stores raw JPEG bytes in the 'frame' field.  Text fields are
-    manually decoded; binary fields are skipped.
+    decoded; 'frame' stays bytes.
     """
     raw_client = _get_raw_client()
     stream_key = f"drone:frames:{drone_id}"
@@ -85,7 +85,9 @@ async def xread_frames(
             for k, v in fields.items():
                 key = k.decode() if isinstance(k, bytes) else k
                 if key == "frame":
-                    # Skip raw binary JPEG — analytics uses jpeg_b64 instead
+                    # Raw JPEG bytes (the only payload since RunPod plan 9.1);
+                    # decode with shared.frame_sampler.decode_frame
+                    decoded["frame"] = v if isinstance(v, bytes) else str(v).encode("latin-1")
                     continue
                 if isinstance(v, bytes):
                     try:
@@ -165,6 +167,7 @@ async def xreadgroup_frames(group: str, consumer: str, drone_id: str,
             for k, v in fields.items():
                 key = k.decode() if isinstance(k, bytes) else k
                 if key == "frame":
+                    decoded["frame"] = v if isinstance(v, bytes) else str(v).encode("latin-1")
                     continue
                 if isinstance(v, bytes):
                     try:

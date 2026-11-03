@@ -51,7 +51,7 @@ ALLOWED_ROLES: set[str] = {"drone-operator", "sys-admin", "control-room", "super
 REDIS_URL: str = os.getenv("REDIS_URL", "redis://valkey:6379/0")
 
 # Per-drone stream settings
-QUEUE_MAX_LENGTH: int = int(os.getenv("QUEUE_MAX_LENGTH", "1000"))
+QUEUE_MAX_LENGTH: int = int(os.getenv("QUEUE_MAX_LENGTH", "2000"))
 QUEUE_MSG_TTL_MS: int = int(os.getenv("QUEUE_MSG_TTL_MS", "30000"))
 
 # ── Frame Validation ──────────────────────────────────────────────────────────

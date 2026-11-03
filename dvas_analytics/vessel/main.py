@@ -6,7 +6,6 @@ MinIO thumbnail persistence, and Redis stream publishing.
 """
 
 import asyncio
-import base64
 import json as _json
 import logging
 import math
@@ -35,10 +34,11 @@ from shared.db import (
 )
 from shared.redis_client import (
     close_client, get_client, publish_analytics_result,
-    xreadgroup_frames, ack_frames, scan_active_stream_drones,
-    get_latest_stream_frame
+    scan_active_stream_drones, get_latest_stream_frame
 )
 from shared import minio_client as minio
+from shared import gpu_profile
+from shared.frame_sampler import FrameSampler, decode_frame, frame_bytes as _frame_jpeg
 from shared.db import write_confirmed_event
 from shared.evidence import evidence_block, frame_context, model_info
 from shared.redis_client import publish_confirmed_event
@@ -87,6 +87,8 @@ engine: Optional[object] = None
 _stream_task: Optional[asyncio.Task] = None
 _stream_running = False
 _frames_processed = 0
+# Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
+_sampler = FrameSampler("vessel", "vessel-group", "vessel-analyzer")
 
 # In-memory per-drone telemetry state
 _last_annotated: Dict[str, bytes] = {}
@@ -194,268 +196,290 @@ def _draw_hud_overlay(annotated: np.ndarray, drone_id: str, count: int, fps: flo
 
 # ── Background Stream Processing Loop ─────────────────────────────────────────
 
+async def _persist_vessel_frame(drone_id: str, f: dict, frame: np.ndarray,
+                                annotated_frame: np.ndarray, tracked_objects: list,
+                                engine_ms: float) -> None:
+    """Telemetry, DB/MinIO persistence, alerts, HUD and publish for one analysed frame.
+
+    Runs as a task while the GPU processes the next round (per-drone order kept).
+    """
+    global _frames_processed
+    if drone_id not in _ensured_drones:
+        try:
+            await ensure_drone(drone_id)
+            _ensured_drones.add(drone_id)
+        except Exception as ex:
+            log.warning("Failed to ensure drone %s: %s", drone_id, ex)
+
+    pool = await get_pool()
+    frame_ts = datetime.now(timezone.utc)
+
+    # Extract mission_id from metadata if present
+    raw_meta = f.get("metadata", "")
+    frame_mission_id = None
+    if raw_meta:
+        if isinstance(raw_meta, bytes):
+            raw_meta = raw_meta.decode()
+        try:
+            frame_mission_id = _json.loads(raw_meta).get("mission_id")
+        except Exception:
+            pass
+
+    # Calculate FPS (engine time of this frame; a batched round is amortised over its frames)
+    proc_time = max(engine_ms / 1000.0, 0.001)
+    fps = 1.0 / proc_time
+    _fps_tracker[drone_id].append(fps)
+    avg_fps = sum(_fps_tracker[drone_id]) / len(_fps_tracker[drone_id])
+
+    # 2. Enrich & Update Per-Track Telemetry
+    enriched_objects = []
+    for obj in tracked_objects:
+        tid = obj["track_id"]
+        bx, by, bw, bh = obj["bbox_xywh"]
+        cx, cy = bx + bw / 2.0, by + bh / 2.0
+
+        # Record trajectory history
+        traj = _track_trajectories[drone_id][tid]
+        traj.append((cx, cy, time.time()))
+        direction, is_stationary = _analyze_trajectory(traj)
+        size_bucket = _classify_size(bw, bh)
+
+        # Accumulate heatmap points
+        _heatmap_points[drone_id].append((round(cx, 1), round(cy, 1)))
+
+        # Auto-capture thumbnail for new track
+        thumb_key = None
+        if tid not in _known_track_thumbnails[drone_id]:
+            _known_track_thumbnails[drone_id].add(tid)
+            try:
+                crop_x1, crop_y1 = max(0, bx), max(0, by)
+                crop_x2, crop_y2 = min(frame.shape[1], bx + bw), min(frame.shape[0], by + bh)
+                if crop_x2 > crop_x1 and crop_y2 > crop_y1:
+                    crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+                    ok, crop_buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    if ok:
+                        ts_ms = int(frame_ts.timestamp() * 1000)
+                        t_key = f"vessels/{drone_id}/v_{tid}_{ts_ms}.jpg"
+                        thumb_key = await minio.upload_bytes(
+                            BUCKET_VESSELS, t_key, crop_buf.tobytes(), "image/jpeg"
+                        )
+            except Exception as ex:
+                log.debug("Thumbnail capture error: %s", ex)
+
+            # Record new track event
+            try:
+                await write_vessel_event(
+                    pool=pool,
+                    drone_id=drone_id,
+                    mission_id=frame_mission_id,
+                    tracker_id=tid,
+                    event_type="vessel_detected",
+                    class_name=obj["class_name"],
+                    confidence=obj["confidence"],
+                    snapshot_key=thumb_key,
+                    details={"size": size_bucket, "direction": direction}
+                )
+            except Exception as ex:
+                log.warning("Error writing vessel event: %s", ex)
+
+        # Persist updated track state to Postgres
+        try:
+            traj_coords = [[round(p[0], 1), round(p[1], 1)] for p in list(traj)[-20:]]
+            await upsert_vessel_track(
+                pool=pool,
+                drone_id=drone_id,
+                mission_id=frame_mission_id,
+                tracker_id=tid,
+                class_id=obj["class_id"],
+                class_name=obj["class_name"],
+                confidence=obj["confidence"],
+                bbox_xyxy=obj["bbox_xyxy"],
+                size_bucket=size_bucket,
+                direction=direction,
+                is_stationary=is_stationary,
+                trajectory=traj_coords,
+                thumbnail_key=thumb_key,
+            )
+        except Exception as ex:
+            log.warning("Error upserting vessel track: %s", ex)
+
+        enriched_objects.append({
+            **obj,
+            "direction": direction,
+            "is_stationary": is_stationary,
+            "size_bucket": size_bucket,
+        })
+
+    # 3. Proximity Clustering Alert Detection
+    # (cooldown 30 s per pair inside _check_proximity_clusters)
+    proximity_pairs = _check_proximity_clusters(drone_id, tracked_objects)
+    for (o1, o2, dist) in proximity_pairs:
+        try:
+            # Evidence: the source frame, hashed, uploaded before the event
+            snap_obj = await minio.upload_object(
+                BUCKET_VESSELS,
+                minio.make_key("vessels", drone_id,
+                               f"proximity_{o1['track_id']}_{o2['track_id']}.jpg",
+                               mission_id=frame_mission_id or ""),
+                _frame_jpeg(f), "image/jpeg", kind="source_frame",
+            )
+            details = {
+                "target_1": o1["track_id"],
+                "target_2": o2["track_id"],
+                "distance_px": round(dist, 1),
+                "message": f"Convergence detected ({round(dist, 0)}px separation)"
+            }
+            vessel_event_id = await write_vessel_event(
+                pool=pool,
+                drone_id=drone_id,
+                mission_id=frame_mission_id,
+                tracker_id=o1["track_id"],
+                event_type="proximity_alert",
+                class_name=f"{o1['class_name']} & {o2['class_name']}",
+                confidence=min(o1["confidence"], o2["confidence"]),
+                snapshot_key=snap_obj["key"] if snap_obj else None,
+                details=details,
+            )
+            if vessel_event_id:
+                # Confirmed event (B28), same id as vessel_events
+                ctx = frame_context(f)
+                geo = ctx["geo"] or {}
+                await write_confirmed_event(
+                    drone_id=drone_id,
+                    event_type="vessel_proximity",
+                    confidence=min(o1["confidence"], o2["confidence"]),
+                    ts=frame_ts,
+                    attributes={
+                        **details,
+                        "classes": [o1["class_name"], o2["class_name"]],
+                        "mission_id": frame_mission_id,
+                        "source_table": "vessel_events",
+                        "evidence": evidence_block(
+                            [snap_obj], ctx,
+                            detection={"track_id": o1["track_id"], "class": o1["class_name"],
+                                       "bbox_xyxy": o1.get("bbox_xyxy"),
+                                       "confidence": o1["confidence"]},
+                            model=model_info("vessel", VESSEL_MODEL_PATH),
+                        ),
+                    },
+                    mission_id=frame_mission_id,
+                    latitude=geo.get("lat"),
+                    longitude=geo.get("lon"),
+                    event_id=vessel_event_id,
+                )
+                await publish_confirmed_event({
+                    "event_id": vessel_event_id,
+                    "event_type": "vessel_proximity",
+                    "drone_id": drone_id,
+                    "mission_id": frame_mission_id,
+                    "ts": frame_ts.isoformat(),
+                    **details,
+                })
+        except Exception as ex:
+            log.warning("Proximity alert error: %s", ex)
+
+    # 4. Render & Cache HUD Frame for Live Dashboard
+    vessel_count = len(tracked_objects)
+    annotated_jpeg = _draw_hud_overlay(annotated_frame, drone_id, vessel_count, avg_fps)
+    if annotated_jpeg:
+        _last_annotated[drone_id] = annotated_jpeg
+        _last_annotated_ts[drone_id] = time.monotonic()
+        _last_vessel_counts[drone_id] = vessel_count
+
+    # 5. Publish to Redis Analytics Stream for Gateway SSE
+    await publish_analytics_result("vessel", {
+        "drone_id": drone_id,
+        "mission_id": frame_mission_id,
+        "vessel_count": vessel_count,
+        "vessels": enriched_objects,
+        "fps": round(avg_fps, 1),
+        "ts": frame_ts.isoformat(),
+    })
+
+    _frames_processed += 1
+
+
+def _analyze_round(frames: Dict[str, np.ndarray]) -> Tuple[Dict[str, tuple], float, float]:
+    """GPU work of one round (worker thread): ({drone: (annotated, tracked)}, model ms/frame, total ms/frame)."""
+    t0 = time.perf_counter()
+    if hasattr(engine, "process_batch"):
+        results, model_ms = engine.process_batch(frames)
+    else:
+        results = {d: engine.process_frame(fr, drone_id=d) for d, fr in frames.items()}
+        model_ms = None
+    total_ms = (time.perf_counter() - t0) * 1000 / max(1, len(frames))
+    return results, model_ms, total_ms
+
+
+async def _persist_round(items: list) -> None:
+    for drone_id, f, frame, (annotated_frame, tracked_objects), model_ms, engine_ms, t_start in items:
+        try:
+            await _persist_vessel_frame(drone_id, f, frame, annotated_frame, tracked_objects, engine_ms)
+        except Exception as exc:
+            log.warning("Vessel persist error for %s: %s", drone_id, exc)
+        _sampler.record(drone_id, infer_ms=model_ms,
+                        total_ms=(time.perf_counter() - t_start) * 1000)
+
+
 async def _stream_loop():
-    global _stream_running, _frames_processed, _ensured_drones
+    global _stream_running, _ensured_drones
     active_drones: List[str] = []
-    log.info("Maritime vessel stream loop started (dynamic ingest stream discovery mode)")
+    log.info("Maritime vessel stream loop started (dynamic ingest stream discovery mode, GPU %s)",
+             gpu_profile.detect().as_dict())
 
     loop_count = 0
-    while _stream_running:
-        loop_count += 1
-        if loop_count % 5 == 1 or not active_drones:
+    pending: Optional[asyncio.Task] = None
+    try:
+        while _stream_running:
+            loop_count += 1
+            # Discovery: every 50 rounds (rounds are now frame-paced, not 0.5 s-paced)
+            if loop_count % 50 == 1 or not active_drones:
+                try:
+                    discovered = await scan_active_stream_drones()
+                    for d in discovered:
+                        if d not in active_drones:
+                            active_drones.append(d)
+                            log.info("Discovered active ingest stream for vessel analysis: %s", d)
+                        if d not in _ensured_drones:
+                            try:
+                                await ensure_drone(d)
+                                _ensured_drones.add(d)
+                            except Exception as ex:
+                                log.warning("Failed to ensure drone %s in drones table: %s", d, ex)
+                except Exception as e:
+                    log.debug("Stream scan error: %s", e)
+
             try:
-                discovered = await scan_active_stream_drones()
-                for d in discovered:
-                    if d not in active_drones:
-                        active_drones.append(d)
-                        log.info("Discovered active ingest stream for vessel analysis: %s", d)
-                    if d not in _ensured_drones:
-                        try:
-                            await ensure_drone(d)
-                            _ensured_drones.add(d)
-                        except Exception as ex:
-                            log.warning("Failed to ensure drone %s in drones table: %s", d, ex)
-            except Exception as e:
-                log.debug("Stream scan error: %s", e)
-
-        if not active_drones:
-            await asyncio.sleep(0.5)
-            continue
-
-        for drone_id in list(active_drones):
-            try:
-                if drone_id not in _ensured_drones:
-                    try:
-                        await ensure_drone(drone_id)
-                        _ensured_drones.add(drone_id)
-                    except Exception as ex:
-                        log.warning("Failed to ensure drone %s: %s", drone_id, ex)
-
-                frames = await xreadgroup_frames(
-                    "vessel-group", "vessel-analyzer", drone_id, ">", count=3, block_ms=100
-                )
-                if not frames:
+                await _sampler.maybe_publish()
+                # Newest frame per drone (older ones acked + counted as skipped); blocks
+                # briefly when nothing is new, so no fixed sleep is needed here.
+                round_frames = await _sampler.next_round(active_drones)
+                if not round_frames:
+                    continue
+                t_start = time.perf_counter()
+                decoded = {}
+                for drone_id, f in round_frames.items():
+                    frame = await asyncio.to_thread(decode_frame, f)
+                    if frame is not None:
+                        decoded[drone_id] = (f, frame)
+                if not decoded:
                     continue
 
-                processed_ids = []
-                pool = await get_pool()
-
-                for entry_id, f in frames:
-                    processed_ids.append(entry_id)
-                    raw = f.get("jpeg_b64", "")
-                    if not raw:
-                        continue
-
-                    # Decode base64 frame
-                    try:
-                        img_bytes = base64.b64decode(raw)
-                        nparr = np.frombuffer(img_bytes, np.uint8)
-                        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    except Exception as e:
-                        log.debug("Frame decode error: %s", e)
-                        continue
-
-                    if frame is None:
-                        continue
-
-                    t_start = time.monotonic()
-                    frame_ts = datetime.now(timezone.utc)
-
-                    # Extract mission_id from metadata if present
-                    raw_meta = f.get("metadata", "")
-                    frame_mission_id = None
-                    if raw_meta:
-                        if isinstance(raw_meta, bytes):
-                            raw_meta = raw_meta.decode()
-                        try:
-                            frame_mission_id = _json.loads(raw_meta).get("mission_id")
-                        except Exception:
-                            pass
-
-                    # 1. Run Maritime Perception & Tracking Engine
-                    annotated_frame, tracked_objects = await asyncio.to_thread(
-                        engine.process_frame, frame
-                    )
-
-                    # Calculate FPS
-                    proc_time = max(time.monotonic() - t_start, 0.001)
-                    fps = 1.0 / proc_time
-                    _fps_tracker[drone_id].append(fps)
-                    avg_fps = sum(_fps_tracker[drone_id]) / len(_fps_tracker[drone_id])
-
-                    # 2. Enrich & Update Per-Track Telemetry
-                    enriched_objects = []
-                    for obj in tracked_objects:
-                        tid = obj["track_id"]
-                        bx, by, bw, bh = obj["bbox_xywh"]
-                        cx, cy = bx + bw / 2.0, by + bh / 2.0
-
-                        # Record trajectory history
-                        traj = _track_trajectories[drone_id][tid]
-                        traj.append((cx, cy, time.time()))
-                        direction, is_stationary = _analyze_trajectory(traj)
-                        size_bucket = _classify_size(bw, bh)
-
-                        # Accumulate heatmap points
-                        _heatmap_points[drone_id].append((round(cx, 1), round(cy, 1)))
-
-                        # Auto-capture thumbnail for new track
-                        thumb_key = None
-                        if tid not in _known_track_thumbnails[drone_id]:
-                            _known_track_thumbnails[drone_id].add(tid)
-                            try:
-                                crop_x1, crop_y1 = max(0, bx), max(0, by)
-                                crop_x2, crop_y2 = min(frame.shape[1], bx + bw), min(frame.shape[0], by + bh)
-                                if crop_x2 > crop_x1 and crop_y2 > crop_y1:
-                                    crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
-                                    ok, crop_buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                                    if ok:
-                                        ts_ms = int(frame_ts.timestamp() * 1000)
-                                        t_key = f"vessels/{drone_id}/v_{tid}_{ts_ms}.jpg"
-                                        thumb_key = await minio.upload_bytes(
-                                            BUCKET_VESSELS, t_key, crop_buf.tobytes(), "image/jpeg"
-                                        )
-                            except Exception as ex:
-                                log.debug("Thumbnail capture error: %s", ex)
-
-                            # Record new track event
-                            try:
-                                await write_vessel_event(
-                                    pool=pool,
-                                    drone_id=drone_id,
-                                    mission_id=frame_mission_id,
-                                    tracker_id=tid,
-                                    event_type="vessel_detected",
-                                    class_name=obj["class_name"],
-                                    confidence=obj["confidence"],
-                                    snapshot_key=thumb_key,
-                                    details={"size": size_bucket, "direction": direction}
-                                )
-                            except Exception as ex:
-                                log.warning("Error writing vessel event: %s", ex)
-
-                        # Persist updated track state to Postgres
-                        try:
-                            traj_coords = [[round(p[0], 1), round(p[1], 1)] for p in list(traj)[-20:]]
-                            await upsert_vessel_track(
-                                pool=pool,
-                                drone_id=drone_id,
-                                mission_id=frame_mission_id,
-                                tracker_id=tid,
-                                class_id=obj["class_id"],
-                                class_name=obj["class_name"],
-                                confidence=obj["confidence"],
-                                bbox_xyxy=obj["bbox_xyxy"],
-                                size_bucket=size_bucket,
-                                direction=direction,
-                                is_stationary=is_stationary,
-                                trajectory=traj_coords,
-                                thumbnail_key=thumb_key,
-                            )
-                        except Exception as ex:
-                            log.warning("Error upserting vessel track: %s", ex)
-
-                        enriched_objects.append({
-                            **obj,
-                            "direction": direction,
-                            "is_stationary": is_stationary,
-                            "size_bucket": size_bucket,
-                        })
-
-                    # 3. Proximity Clustering Alert Detection
-                    # (cooldown 30 s per pair inside _check_proximity_clusters)
-                    proximity_pairs = _check_proximity_clusters(drone_id, tracked_objects)
-                    for (o1, o2, dist) in proximity_pairs:
-                        try:
-                            # Evidence: the source frame, hashed, uploaded before the event
-                            snap_obj = await minio.upload_object(
-                                BUCKET_VESSELS,
-                                minio.make_key("vessels", drone_id,
-                                               f"proximity_{o1['track_id']}_{o2['track_id']}.jpg",
-                                               mission_id=frame_mission_id or ""),
-                                img_bytes, "image/jpeg", kind="source_frame",
-                            )
-                            details = {
-                                "target_1": o1["track_id"],
-                                "target_2": o2["track_id"],
-                                "distance_px": round(dist, 1),
-                                "message": f"Convergence detected ({round(dist, 0)}px separation)"
-                            }
-                            vessel_event_id = await write_vessel_event(
-                                pool=pool,
-                                drone_id=drone_id,
-                                mission_id=frame_mission_id,
-                                tracker_id=o1["track_id"],
-                                event_type="proximity_alert",
-                                class_name=f"{o1['class_name']} & {o2['class_name']}",
-                                confidence=min(o1["confidence"], o2["confidence"]),
-                                snapshot_key=snap_obj["key"] if snap_obj else None,
-                                details=details,
-                            )
-                            if vessel_event_id:
-                                # Confirmed event (B28), same id as vessel_events
-                                ctx = frame_context(f)
-                                geo = ctx["geo"] or {}
-                                await write_confirmed_event(
-                                    drone_id=drone_id,
-                                    event_type="vessel_proximity",
-                                    confidence=min(o1["confidence"], o2["confidence"]),
-                                    ts=frame_ts,
-                                    attributes={
-                                        **details,
-                                        "classes": [o1["class_name"], o2["class_name"]],
-                                        "mission_id": frame_mission_id,
-                                        "source_table": "vessel_events",
-                                        "evidence": evidence_block(
-                                            [snap_obj], ctx,
-                                            detection={"track_id": o1["track_id"], "class": o1["class_name"],
-                                                       "bbox_xyxy": o1.get("bbox_xyxy"),
-                                                       "confidence": o1["confidence"]},
-                                            model=model_info("vessel", VESSEL_MODEL_PATH),
-                                        ),
-                                    },
-                                    mission_id=frame_mission_id,
-                                    latitude=geo.get("lat"),
-                                    longitude=geo.get("lon"),
-                                    event_id=vessel_event_id,
-                                )
-                                await publish_confirmed_event({
-                                    "event_id": vessel_event_id,
-                                    "event_type": "vessel_proximity",
-                                    "drone_id": drone_id,
-                                    "mission_id": frame_mission_id,
-                                    "ts": frame_ts.isoformat(),
-                                    **details,
-                                })
-                        except Exception as ex:
-                            log.warning("Proximity alert error: %s", ex)
-
-                    # 4. Render & Cache HUD Frame for Live Dashboard
-                    vessel_count = len(tracked_objects)
-                    annotated_jpeg = _draw_hud_overlay(annotated_frame, drone_id, vessel_count, avg_fps)
-                    if annotated_jpeg:
-                        _last_annotated[drone_id] = annotated_jpeg
-                        _last_annotated_ts[drone_id] = time.monotonic()
-                        _last_vessel_counts[drone_id] = vessel_count
-
-                    # 5. Publish to Redis Analytics Stream for Gateway SSE
-                    await publish_analytics_result("vessel", {
-                        "drone_id": drone_id,
-                        "mission_id": frame_mission_id,
-                        "vessel_count": vessel_count,
-                        "vessels": enriched_objects,
-                        "fps": round(avg_fps, 1),
-                        "ts": frame_ts.isoformat(),
-                    })
-
-                    _frames_processed += 1
-
-                if processed_ids:
-                    await ack_frames(drone_id, "vessel-group", *processed_ids)
-
+                # 1. Run Maritime Perception & Tracking Engine (global pass batched across drones)
+                results, model_ms, eng_ms = await asyncio.to_thread(
+                    _analyze_round, {d: fr for d, (_, fr) in decoded.items()}
+                )
+                _sampler.record_batch(len(decoded))
+                # Persist the previous round before queuing this one (keeps per-drone order);
+                # it ran concurrently with the inference above.
+                if pending:
+                    await asyncio.shield(pending)   # a stream stop must not cut a round half-written
+                pending = asyncio.create_task(_persist_round(
+                    [(d, f, fr, results[d], model_ms, eng_ms, t_start) for d, (f, fr) in decoded.items()]
+                ))
             except asyncio.CancelledError:
                 log.info("Maritime vessel stream cancelled")
-                return
+                raise
             except Exception as e:
                 err_str = str(e)
                 if "CUDA" in err_str:
@@ -465,8 +489,14 @@ async def _stream_loop():
                 else:
                     log.error("Maritime stream loop error: %s", e, exc_info=True)
                 await asyncio.sleep(0.5)
-
-        await asyncio.sleep(0.02)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if pending and not pending.done():
+            try:
+                await asyncio.shield(pending)   # a stream stop must not cut a round half-written
+            except BaseException:
+                pass
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -475,6 +505,7 @@ async def _stream_loop():
 async def startup():
     global engine, _stream_task, _stream_running
     log.info("Initializing SeaDrone YOLOv8s Maritime Perception Engine with weights: %s", VESSEL_MODEL_PATH)
+    gpu_profile.apply_torch_settings()      # FP16 / cuDNN autotune for the detected GPU
     engine = MaritimePerceptionEngine(
         weights_path=VESSEL_MODEL_PATH,
         global_imgsz=1280,
@@ -598,7 +629,7 @@ async def get_latest_annotated_frame(drone_id: str = ""):
             if recovered_frame is not None and engine is not None:
                 try:
                     annotated_frame, tracked_objects = await asyncio.to_thread(
-                        engine.process_frame, recovered_frame
+                        engine.process_frame, recovered_frame, alias
                     )
                     vessel_cnt = len(tracked_objects)
                     annotated_jpeg = _draw_hud_overlay(annotated_frame, alias, vessel_cnt, 15.0)

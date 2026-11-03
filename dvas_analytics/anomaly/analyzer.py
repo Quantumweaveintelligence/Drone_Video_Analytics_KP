@@ -16,6 +16,7 @@ import os
 import sys
 import time
 import logging
+import threading
 from typing import Dict, List, Optional, Tuple, Any
 
 import cv2
@@ -48,6 +49,72 @@ import yaml
 log = logging.getLogger("anomaly.analyzer")
 
 
+# ── Shared detector models (RunPod plan 9.6) ──────────────────────────────────
+# YOLO11x VisDrone + YOLO11n bag detector are loaded ONCE per (weights, device,
+# imgsz) and shared by every drone's AnomalyAnalyzer; trackers, rules engine,
+# scene context etc. stay per drone. Saves ~2 GB VRAM per extra drone and lets
+# the stream loop batch the newest frame of all drones through one forward pass.
+_shared_detectors: Dict[Tuple[str, str, int], AerialVisDroneDetector] = {}
+_shared_lock = threading.Lock()
+
+
+def get_shared_detector(
+    primary_weights_path: str,
+    device: str = "cuda",
+    conf_thresh: float = 0.35,
+    iou_thresh: float = 0.40,
+    imgsz: int = 640,
+) -> AerialVisDroneDetector:
+    """The process-wide detector for these weights (created on first use, CUDA → CPU fallback)."""
+    key = (primary_weights_path, device, int(imgsz))
+    with _shared_lock:
+        det = _shared_detectors.get(key)
+        if det is not None:
+            return det
+        try:
+            raw_yolo = load_aerial_yolo(primary_weights_path, device=device)
+            det = AerialVisDroneDetector(
+                model=raw_yolo,
+                imgsz=imgsz,
+                conf_thresh=conf_thresh,
+                iou_thresh=iou_thresh,
+                device=device,
+            )
+        except Exception as exc:
+            log.warning("Failed to load anomaly detector on %s, falling back to CPU: %s", device, exc)
+            raw_yolo = load_aerial_yolo(primary_weights_path, device="cpu")
+            det = AerialVisDroneDetector(
+                model=raw_yolo,
+                imgsz=imgsz,
+                conf_thresh=conf_thresh,
+                iou_thresh=iou_thresh,
+                device="cpu",
+            )
+        _shared_detectors[key] = det
+        log.info("Shared anomaly detector loaded: %s on %s (imgsz=%d)", primary_weights_path, det.device, imgsz)
+        return det
+
+
+def shared_detectors() -> List[AerialVisDroneDetector]:
+    with _shared_lock:
+        return list(_shared_detectors.values())
+
+
+def release_shared_detectors() -> None:
+    """Move the shared models to CPU and drop them (VRAM_OFFLOAD_ON_STOP)."""
+    with _shared_lock:
+        dets = list(_shared_detectors.values())
+        _shared_detectors.clear()
+    for det in dets:
+        for m in (getattr(det, "model", None), getattr(det, "object_model", None)):
+            if m is None:
+                continue
+            try:
+                m.to("cpu")
+            except Exception:
+                pass
+
+
 def format_time(seconds: float) -> str:
     mins = int(seconds // 60)
     secs = int(seconds % 60)
@@ -71,6 +138,7 @@ class AnomalyAnalyzer:
         conf_thresh: float = 0.35,
         iou_thresh: float = 0.40,
         imgsz: int = 640,
+        detector: Optional[AerialVisDroneDetector] = None,
     ):
         self.drone_id = drone_id
         self.device = device
@@ -94,26 +162,14 @@ class AnomalyAnalyzer:
             drone_id, primary_weights_path, device, conf_thresh
         )
 
-        # 1. Dual-Model Aerial Detector
-        try:
-            raw_yolo = load_aerial_yolo(primary_weights_path, device=device)
-            self.detector = AerialVisDroneDetector(
-                model=raw_yolo,
-                imgsz=imgsz,
-                conf_thresh=conf_thresh,
-                iou_thresh=iou_thresh,
-                device=device,
-            )
-        except Exception as exc:
-            log.warning("[%s] Failed to load on %s, falling back to CPU: %s", drone_id, device, exc)
-            raw_yolo = load_aerial_yolo(primary_weights_path, device="cpu")
-            self.detector = AerialVisDroneDetector(
-                model=raw_yolo,
-                imgsz=imgsz,
-                conf_thresh=conf_thresh,
-                iou_thresh=iou_thresh,
-                device="cpu",
-            )
+        # 1. Dual-Model Aerial Detector — shared across drones (RunPod plan 9.6)
+        self.detector = detector or get_shared_detector(
+            primary_weights_path,
+            device=device,
+            conf_thresh=conf_thresh,
+            iou_thresh=iou_thresh,
+            imgsz=imgsz,
+        )
 
         # Load parsed thresholds configuration
         cfg = {}
@@ -175,6 +231,8 @@ class AnomalyAnalyzer:
         self.rolling_fps = 0.0
         self.latest_annotated_frame: Optional[np.ndarray] = None
         self.active_tracks_cache: List[Dict[str, Any]] = []
+        # Per-drone pipeline state is not thread-safe (stream loop vs /annotated/latest recovery)
+        self.lock = threading.RLock()
 
     def process_frame(
         self,
@@ -187,19 +245,44 @@ class AnomalyAnalyzer:
         Returns:
             (annotated_frame_bgr, triggered_alerts, active_tracks_summary)
         """
+        with self.lock:
+            t0 = time.time()
+            # Step 1: Camera Ego-Motion Estimation (ORB + RANSAC Affine)
+            motion = self.motion_estimator.estimate_motion(frame)
+            # Step 2: Dual Aerial Object Detection (YOLO11x + YOLO11n)
+            detections = self.detector.detect(frame)
+            return self.process_detections(frame, detections, metadata, timestamp,
+                                           motion=motion, t0=t0)
+
+    def process_detections(
+        self,
+        frame: np.ndarray,
+        detections: List[Any],
+        metadata: Optional[Dict[str, Any]] = None,
+        timestamp: Optional[float] = None,
+        motion: Any = None,
+        t0: Optional[float] = None,
+    ) -> Tuple[np.ndarray, List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Steps 3–9 for one frame whose detections were computed already
+        (batched across drones by analyze_round). `motion` is this frame's step-1
+        camera motion; it is estimated here when not given. `t0` is when the
+        frame's processing started (HUD fps), default now.
+        """
+        with self.lock:
+            return self._process_detections(frame, detections, metadata, timestamp, motion, t0)
+
+    def _process_detections(self, frame, detections, metadata, timestamp, motion, t0):
         self.frame_count += 1
-        t0 = time.time()
+        if t0 is None:
+            t0 = time.time()
         if timestamp is None or timestamp <= 0:
             timestamp = time.time() - self.start_time
 
         metadata = metadata or {}
         triggered_alerts = []
 
-        # Step 1: Camera Ego-Motion Estimation (ORB + RANSAC Affine)
-        motion = self.motion_estimator.estimate_motion(frame)
-
-        # Step 2: Dual Aerial Object Detection (YOLO11x + YOLO11n)
-        detections = self.detector.detect(frame)
+        if motion is None:
+            motion = self.motion_estimator.estimate_motion(frame)
 
         # Step 3: Multi-Object Tracking with Motion Compensation
         active_tracks = self.tracker.update(
@@ -359,3 +442,57 @@ class AnomalyAnalyzer:
         self.active_tracks_cache = tracks_summary
 
         return annotated, triggered_alerts, tracks_summary
+
+
+def analyze_round(
+    items: List[Tuple["AnomalyAnalyzer", np.ndarray, Optional[Dict[str, Any]], Optional[float]]],
+    max_batch: int = 1,
+) -> List[Tuple[np.ndarray, List[Dict[str, Any]], List[Dict[str, Any]], float]]:
+    """Run the newest frame of several drones through the pipeline.
+
+    items: (analyzer, frame, metadata, timestamp) per drone. Step 1 (camera motion)
+    runs per drone, step 2 (detection) runs batched for analyzers sharing a
+    detector in chunks of `max_batch`, steps 3–9 run per drone with that drone's
+    own state. Returns (annotated, alerts, tracks_summary, detect_ms) per item, in
+    order. Output equals calling process_frame on each item.
+    """
+    n = len(items)
+    t0s = [0.0] * n
+    motions: List[Any] = [None] * n
+    dets: List[Optional[List[Any]]] = [None] * n
+    det_ms = [0.0] * n
+
+    # Step 1 per drone (needs the previous frame of the same drone)
+    for i, (an, frame, _meta, _ts) in enumerate(items):
+        t0s[i] = time.time()
+        with an.lock:
+            motions[i] = an.motion_estimator.estimate_motion(frame)
+
+    # Step 2 batched per shared detector
+    by_det: Dict[int, List[int]] = {}
+    for i, (an, _f, _m, _t) in enumerate(items):
+        by_det.setdefault(id(an.detector), []).append(i)
+    step = max(1, int(max_batch))
+    for idxs in by_det.values():
+        detector = items[idxs[0]][0].detector
+        for c in range(0, len(idxs), step):
+            chunk = idxs[c:c + step]
+            t_det = time.perf_counter()
+            frames = [items[i][1] for i in chunk]
+            if len(chunk) > 1 and hasattr(detector, "detect_batch"):
+                res = detector.detect_batch(frames)
+            else:
+                res = [detector.detect(f) for f in frames]
+            ms = (time.perf_counter() - t_det) * 1000 / len(chunk)
+            for i, d in zip(chunk, res):
+                dets[i] = d
+                det_ms[i] = ms
+
+    # Steps 3–9 per drone
+    out = []
+    for i, (an, frame, meta, ts) in enumerate(items):
+        annotated, alerts, summary = an.process_detections(
+            frame, dets[i] or [], meta, ts, motion=motions[i], t0=t0s[i],
+        )
+        out.append((annotated, alerts, summary, det_ms[i]))
+    return out

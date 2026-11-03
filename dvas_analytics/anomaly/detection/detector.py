@@ -3,12 +3,17 @@ Detector abstraction layer for Drone Suspicious Object Detection System.
 Provides a clean interface decoupling detection architectures from tracking and suspiciousness engines.
 """
 
+import threading
 from abc import ABC, abstractmethod
 from typing import List, Optional
 import numpy as np
 from ultralytics import YOLO
 
 from detection.schema import Detection  # noqa: F401  (re-exported for convenience)
+
+
+class _BatchOOM(Exception):
+    """A batched predict ran out of VRAM (caller falls back to per-frame)."""
 
 
 
@@ -46,13 +51,27 @@ class YOLODetector(ObjectDetector):
         self.device = device
         self.filter_classes = set(filter_classes) if filter_classes else None
         self.class_names = self.model.names
+        # One Ultralytics predictor per model is not thread-safe; the model may be
+        # shared by several drones' analyzers (RunPod plan 9.6)
+        self.lock = threading.RLock()
 
-    def detect(self, frame: np.ndarray) -> List[Detection]:
+    def _predict_kwargs(self, device: str) -> dict:
+        """FP16 on the GPU when the profile allows it (RunPod plan 9.3); never on CPU."""
+        if str(device).startswith("cpu"):
+            return {}
+        try:
+            from shared import gpu_profile
+            return {"half": bool(gpu_profile.predict_kwargs().get("half", False))}
+        except Exception:
+            return {}
+
+    def _predict(self, source):
+        """model.predict with the OOM emergency fallback (imgsz downscale, then CPU)."""
         import torch
         try:
             with torch.inference_mode():
                 results = self.model.predict(
-                    source=frame,
+                    source=source,
                     conf=self.conf_thresh,
                     iou=self.iou_thresh,
                     imgsz=self.imgsz,
@@ -60,6 +79,7 @@ class YOLODetector(ObjectDetector):
                     agnostic_nms=True,
                     verbose=False,
                     save=False,
+                    **self._predict_kwargs(self.device),
                 )
         except Exception as e:
             err_msg = str(e).lower()
@@ -67,29 +87,31 @@ class YOLODetector(ObjectDetector):
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 fallback_sz = 640 if self.imgsz > 640 else (480 if self.imgsz > 480 else 320)
-                print(f"[Detector WARNING] GPU VRAM constrained at {self.imgsz}. Downscaling inference resolution to {fallback_sz}...")
-                self.imgsz = fallback_sz
+                # This call only: the detector is shared by every drone, so a transient OOM
+                # must not lower the resolution for all of them until restart
+                print(f"[Detector WARNING] GPU VRAM constrained at {self.imgsz}. Retrying this frame at {fallback_sz}...")
                 try:
                     with torch.inference_mode():
                         results = self.model.predict(
-                            source=frame,
+                            source=source,
                             conf=self.conf_thresh,
                             iou=self.iou_thresh,
-                            imgsz=self.imgsz,
+                            imgsz=fallback_sz,
                             device=self.device,
                             agnostic_nms=True,
                             verbose=False,
                             save=False,
+                            **self._predict_kwargs(self.device),
                         )
                 except Exception:
                     # Final fallback: switch to CPU
                     print("[Detector WARNING] Falling back to CPU for current frame inference...")
                     with torch.inference_mode():
                         results = self.model.predict(
-                            source=frame,
+                            source=source,
                             conf=self.conf_thresh,
                             iou=self.iou_thresh,
-                            imgsz=self.imgsz,
+                            imgsz=fallback_sz,
                             device="cpu",
                             agnostic_nms=True,
                             verbose=False,
@@ -97,12 +119,78 @@ class YOLODetector(ObjectDetector):
                         )
             else:
                 raise
+        return results
 
+    def detect(self, frame: np.ndarray) -> List[Detection]:
+        with self.lock:
+            results = self._predict(frame)
+        return self._postprocess(results[0] if results else None)
+
+    def detect_batch(self, frames: List[np.ndarray]) -> List[List[Detection]]:
+        """Detections for several frames (e.g. the newest frame of each drone) in one predict.
+
+        Same conf / iou / imgsz / NMS as detect(). Only equal-shaped frames share a
+        forward pass: Ultralytics letterboxes mixed shapes to a full square, which
+        would change the input relative to the single-frame path.
+        """
+        if not frames:
+            return []
+        if len(frames) == 1:
+            return [self.detect(frames[0])]
+        out: List[Optional[List[Detection]]] = [None] * len(frames)
+        groups: dict = {}
+        for i, f in enumerate(frames):
+            groups.setdefault(f.shape, []).append(i)
+        for idxs in groups.values():
+            if len(idxs) == 1:
+                out[idxs[0]] = self.detect(frames[idxs[0]])
+                continue
+            try:
+                with self.lock:
+                    results = self._predict_batch_or_raise([frames[i] for i in idxs])
+            except _BatchOOM:
+                # A batch that does not fit: per-frame path (keeps its own imgsz fallback)
+                results = None
+            if results is None or len(results) != len(idxs):
+                for i in idxs:
+                    out[i] = self.detect(frames[i])
+            else:
+                for i, r in zip(idxs, results):
+                    out[i] = self._postprocess(r)
+        return out  # type: ignore[return-value]
+
+    def _predict_batch_or_raise(self, frames: List[np.ndarray]):
+        """Batched predict at the configured imgsz; OOM raises _BatchOOM (no imgsz change)."""
+        import torch
+        try:
+            with torch.inference_mode():
+                return self.model.predict(
+                    source=frames,
+                    conf=self.conf_thresh,
+                    iou=self.iou_thresh,
+                    imgsz=self.imgsz,
+                    device=self.device,
+                    agnostic_nms=True,
+                    verbose=False,
+                    save=False,
+                    **self._predict_kwargs(self.device),
+                )
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "out of memory" in err_msg or "cuda error" in err_msg:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print(f"[Detector WARNING] Batch of {len(frames)} did not fit in VRAM; running per frame")
+                raise _BatchOOM() from e
+            raise
+
+    def _postprocess(self, result) -> List[Detection]:
+        """Ultralytics Results -> filtered, de-duplicated Detection list."""
         detections: List[Detection] = []
-        if not results or len(results) == 0 or results[0].boxes is None:
+        if result is None or result.boxes is None:
             return detections
 
-        boxes = results[0].boxes
+        boxes = result.boxes
         for i in range(len(boxes)):
             cls_id = int(boxes.cls[i].item())
             cls_name = self.model.names.get(cls_id, str(cls_id)) if hasattr(self.model, "names") else self.class_names.get(cls_id, str(cls_id))

@@ -41,10 +41,12 @@ from shared.db import (
     confirm_watchlist_alert, dismiss_watchlist_alert,
 )
 from shared.redis_client import (
-    close_client, publish_analytics_result, publish_confirmed_event, xread_frames, xreadgroup_frames, ack_frames,
+    close_client, publish_analytics_result, publish_confirmed_event, xread_frames,
     scan_active_stream_drones,
 )
 from shared import minio_client as minio
+from shared import gpu_profile
+from shared.frame_sampler import FrameSampler, decode_frame
 from shared.evidence import evidence_block, frame_context, model_info
 from person.analyzer import PersonFaceAnalyzer
 from person.deduplicator import (
@@ -83,6 +85,8 @@ _reid_task:    Optional[asyncio.Task] = None
 _stream_running = False
 _frames_processed = 0
 _reid_frame_counter = 0
+# Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
+_sampler = FrameSampler("person", "person-group", "person-analyzer")
 _last_annotated_frames: dict = {}  # {drone_id: jpeg_bytes}
 _last_annotated_ts: dict = {}      # {drone_id: monotonic_timestamp}
 _active_drone_missions: dict = {}  # {drone_id: mission_id}
@@ -124,6 +128,7 @@ async def startup():
     for drone_id in cfg.DRONE_IDS:
         await ensure_drone(drone_id)
     await minio.ensure_all_buckets()
+    gpu_profile.apply_torch_settings()      # FP16 / cuDNN autotune for the detected GPU
     analyzer = PersonFaceAnalyzer(PERSON_MODEL, FACE_MODEL)
     resnet_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     resnet_model = load_resnet_model(resnet_device)
@@ -443,52 +448,358 @@ async def _process_watchlist_alert(
 
 
 # ── Stream control ─────────────────────────────────────────────────────────────
+async def _persist_person_frame(
+    drone_id: str, f: dict, frame: np.ndarray, result: dict, mission_id: Optional[str],
+) -> None:
+    """Recognition, annotation, live buffer, DB/MinIO writes and publish for one
+    analysed frame. Runs as a task while the next round is on the GPU; it only
+    touches service state (never the analyzer / its models)."""
+    global _frames_processed, _reid_frame_counter
+    # Tag result with mission_id for downstream consumers
+    result["mission_id"] = mission_id
+
+    # ── ArcFace recognition on detected faces ─────────────
+    recognition_results = {}  # tracker_id -> MatchResult
+    if (arcface_recognizer and arcface_recognizer.ready
+            and watchlist_matcher and watchlist_matcher.gallery_size > 0):
+        for face in result.get("faces", []):
+            face_crop_bytes = face.get("crop_bytes")
+            if not face_crop_bytes:
+                fb = face.get("bbox")
+                if fb:
+                    h_f, w_f = frame.shape[:2]
+                    fx1 = max(0, fb["x1"]); fy1 = max(0, fb["y1"])
+                    fx2 = min(w_f, fb["x2"]); fy2 = min(h_f, fb["y2"])
+                    if fx2 > fx1 and fy2 > fy1:
+                        _, fb_buf = cv2.imencode(
+                            ".jpg", frame[fy1:fy2, fx1:fx2],
+                            [cv2.IMWRITE_JPEG_QUALITY, 90]
+                        )
+                        face_crop_bytes = bytes(fb_buf)
+                        face["crop_bytes"] = face_crop_bytes
+            if not face_crop_bytes:
+                continue
+            nparr_fc = np.frombuffer(face_crop_bytes, np.uint8)
+            face_bgr = cv2.imdecode(nparr_fc, cv2.IMREAD_COLOR)
+            if face_bgr is None:
+                continue
+
+            # Enhance for drone footage (offload to worker thread)
+            if cfg.FACE_ENHANCE_ENABLED:
+                face_bgr = await asyncio.to_thread(enhance_face_crop, face_bgr)
+
+            # Extract ArcFace embedding in worker thread (prevents event loop blocking)
+            embedding = await asyncio.to_thread(arcface_recognizer.extract_embedding, face_bgr)
+            if embedding is None:
+                continue
+
+            # Match against in-memory gallery
+            match = watchlist_matcher.match(
+                embedding, cfg.ARCFACE_MATCH_THRESHOLD
+            )
+            if match:
+                tid = face.get("tracker_id")
+                recognition_results[tid] = match
+
+                # Deduplication-gated alert pipeline
+                if alert_deduplicator and alert_deduplicator.should_alert(match.watchlist_id):
+                    _ts_alert = datetime.now(timezone.utc)
+                    asyncio.create_task(_process_watchlist_alert(
+                        match=match,
+                        tid=tid,
+                        face_crop_bytes=face_crop_bytes,
+                        frame=frame,
+                        drone_id=drone_id,
+                        mission_id=mission_id,
+                        _ts_alert=_ts_alert,
+                        ctx=frame_context(f),
+                    ))
+
+    # Tag result with recognition data for SSE consumers
+    result["recognitions"] = {
+        str(tid): {
+            "name": m.name, "category": m.category,
+            "similarity": m.similarity,
+            "watchlist_id": m.watchlist_id,
+        }
+        for tid, m in recognition_results.items()
+    }
+
+    # ── Draw annotated overlay with configurable toggles ──
+    annotated = frame.copy()
+    ac = _annotation_config  # snapshot for this frame
+
+    # ── Trajectory state update for active persons ──
+    for p in result["persons"]:
+        tid = p.get("tracker_id", 0)
+        if tid > 0:
+            bb = p["bbox"]
+            # Center-bottom of bounding box (feet position on ground plane)
+            pt = ((bb["x1"] + bb["x2"]) // 2, bb["y2"] - 2)
+            _person_trajectories[drone_id][tid].append(pt)
+            _tracker_last_seen[drone_id][tid] = _frames_processed
+
+    # Periodic cleanup of lost tracks (every 50 frames)
+    if _frames_processed % 50 == 0:
+        stale_tids = [
+            t for t, f_seen in _tracker_last_seen[drone_id].items()
+            if _frames_processed - f_seen > 60
+        ]
+        for t in stale_tids:
+            _person_trajectories[drone_id].pop(t, None)
+            _tracker_last_seen[drone_id].pop(t, None)
+
+    # ── Draw Trajectories if enabled ──
+    if ac.get("trajectory", False):
+        for tid, pts in _person_trajectories[drone_id].items():
+            if len(pts) >= 2:
+                poly_pts = np.array(list(pts), dtype=np.int32).reshape((-1, 1, 2))
+                # Black outline for sharp contrast against any ground/lighting
+                cv2.polylines(annotated, [poly_pts], isClosed=False, color=(0, 0, 0), thickness=3, lineType=cv2.LINE_AA)
+                # Vibrant tactical vector path (neon cyan/sky blue)
+                cv2.polylines(annotated, [poly_pts], isClosed=False, color=(255, 215, 0), thickness=2, lineType=cv2.LINE_AA)
+                # Target marker dot at latest known position
+                cv2.circle(annotated, pts[-1], 3, (0, 255, 255), -1, lineType=cv2.LINE_AA)
+
+    for p in result["persons"]:
+        bb = p["bbox"]
+        tid = p.get("tracker_id", 0)
+        match = recognition_results.get(tid)
+
+        if match and ac.get("watchlist_alerts", True):
+            # WATCHLIST MATCH — tactical corner brackets
+            if match.category == "missing":
+                alert_color = (0, 165, 255)   # orange
+            elif match.category == "vip":
+                alert_color = (0, 255, 0)     # green
+            else:
+                alert_color = (0, 0, 255)     # red (wanted/poi)
+            _draw_corner_brackets(annotated, bb, alert_color, thickness=3, length=20)
+            if ac.get("alert_labels", True):
+                lbl = f"[{match.category.upper()}] {match.name} ({int(match.similarity*100)}%)"
+                _draw_label_bg(annotated, lbl, bb["x1"], bb["y1"] - 25, alert_color)
+        elif ac.get("person_boxes", True):
+            # Normal person box (existing teal)
+            cv2.rectangle(annotated, (bb["x1"], bb["y1"]), (bb["x2"], bb["y2"]),
+                          (191, 219, 56), 2)
+            if ac.get("track_ids", True):
+                tid_str = f'P-{tid}' if tid > 0 else f'P-{abs(tid)}'
+                label = tid_str
+                if ac.get("confidence", True):
+                    label += f'  {int(p["confidence"]*100)}%'
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(annotated, (bb["x1"], bb["y1"]-th-8),
+                              (bb["x1"]+tw+6, bb["y1"]), (191, 219, 56), -1)
+                cv2.putText(annotated, label, (bb["x1"]+3, bb["y1"]-4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+    if ac.get("face_boxes", True):
+        for fc in result["faces"]:
+            bb = fc["bbox"]
+            fc_tid = fc.get("tracker_id")
+            match = recognition_results.get(fc_tid)
+            if match and ac.get("watchlist_alerts", True):
+                # Matched face — crosshair marker
+                cx = (bb["x1"] + bb["x2"]) // 2
+                cy = (bb["y1"] + bb["y2"]) // 2
+                xh_color = (0, 0, 255) if match.category == "wanted" else (0, 165, 255)
+                cv2.drawMarker(annotated, (cx, cy), xh_color,
+                               cv2.MARKER_CROSS, 15, 2)
+            else:
+                cv2.rectangle(annotated, (bb["x1"], bb["y1"]),
+                              (bb["x2"], bb["y2"]), (0, 191, 255), 2)
+                if ac.get("confidence", True):
+                    conf_label = f'{int(fc["confidence"]*100)}%'
+                    cv2.putText(annotated, conf_label,
+                                (bb["x1"], bb["y2"]+14),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                (0, 191, 255), 1, cv2.LINE_AA)
+
+    _, ann_buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    _last_annotated_frames[drone_id] = bytes(ann_buf)
+    _last_annotated_ts[drone_id] = time.monotonic()
+
+    ts = datetime.now(timezone.utc)
+
+    # ── Populate live person buffer with crop pairs IMMEDIATELY ──
+    # Must happen before any DB / network I/O so live UI is decoupled
+    _update_live_person_buffer(
+        result, drone_id, mission_id, ts, frame
+    )
+
+    # ── Database updates (isolated so DB errors don't crash stream) ──
+    # No confirmed event per person per frame (B29): the person incident is
+    # a face-watchlist match (_process_watchlist_alert).
+    try:
+        for person in result["persons"]:
+            tracker_id = person.get("tracker_id")
+            if person["confidence"] >= 0.15:
+                await upsert_track(
+                    drone_id, None, "person", ts, ts,
+                    tracker_id=tracker_id,
+                    mission_id=mission_id,
+                )
+    except Exception as db_exc:
+        log.warning("Person track/event write error: %s", db_exc)
+
+    # 1. Process whole-body person crops + person appearance embeddings
+    try:
+        for person in result.get("persons", []):
+            p_crop_bytes = person.pop("crop_bytes", None)
+            tid = person.get("tracker_id", 0)
+            if not p_crop_bytes and tid is not None:
+                # Fallback: crop from frame using person bbox
+                pbb = person.get("bbox")
+                if pbb:
+                    h, w = frame.shape[:2]
+                    x1, y1 = max(0, int(pbb["x1"])), max(0, int(pbb["y1"]))
+                    x2, y2 = min(w, int(pbb["x2"])), min(h, int(pbb["y2"]))
+                    if x2 > x1 and y2 > y1:
+                        _, p_buf = cv2.imencode(".jpg", frame[y1:y2, x1:x2], [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        p_crop_bytes = bytes(p_buf)
+
+            if p_crop_bytes and resnet_model:
+                ts_ms = int(ts.timestamp() * 1000)
+                try:
+                    nparr = np.frombuffer(p_crop_bytes, np.uint8)
+                    img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    sharpness = get_sharpness_score(img_bgr) if img_bgr is not None else 0.0
+                except Exception:
+                    sharpness = 0.0
+
+                person_key = minio.make_key(
+                    "persons", drone_id,
+                    f"person_{ts_ms}_{tid}.jpg"
+                )
+                person_obj_key = await minio.upload_bytes(
+                    cfg.BUCKET_FACES, person_key, p_crop_bytes, "image/jpeg"
+                )
+                p_emb = extract_embedding_from_bytes(
+                    resnet_model, p_crop_bytes, resnet_device
+                )
+                if p_emb and person_obj_key:
+                    await write_person_embedding(
+                        track_id=None,
+                        image_path=person_obj_key,
+                        embedding=p_emb,
+                        drone_id=drone_id,
+                        object_key=person_obj_key,
+                        mission_id=mission_id,
+                        tracker_id=tid,
+                        sharpness_score=sharpness,
+                    )
+    except Exception as person_exc:
+        log.warning("Person appearance embedding write error: %s", person_exc)
+
+    # 2. Process face crops + face embeddings (for Detected Faces gallery)
+    try:
+        for face in result.get("faces", []):
+            face_crop_bytes = face.pop("crop_bytes", None)
+            if face_crop_bytes and resnet_model:
+                emb = extract_embedding_from_bytes(
+                    resnet_model, face_crop_bytes, resnet_device
+                )
+                if emb:
+                    face_ts_ms = int(ts.timestamp() * 1000)
+                    key = minio.make_key(
+                        "faces", drone_id,
+                        f"face_{face_ts_ms}.jpg"
+                    )
+                    face_obj_key = await minio.upload_bytes(
+                        cfg.BUCKET_FACES, key, face_crop_bytes, "image/jpeg"
+                    )
+                    # Extract ArcFace embedding if available
+                    af_emb = None
+                    if arcface_recognizer and arcface_recognizer.ready:
+                        try:
+                            nparr_f = np.frombuffer(face_crop_bytes, np.uint8)
+                            f_bgr = cv2.imdecode(nparr_f, cv2.IMREAD_COLOR)
+                            if f_bgr is not None:
+                                if cfg.FACE_ENHANCE_ENABLED:
+                                    f_bgr = enhance_face_crop(f_bgr)
+                                af_emb = arcface_recognizer.extract_embedding(f_bgr, quality_check=False)
+                        except Exception:
+                            pass
+
+                    await write_face_embedding(
+                        track_id=None,
+                        image_path=face_obj_key or "",
+                        embedding=emb,
+                        drone_id=drone_id,
+                        object_key=face_obj_key,
+                        mission_id=mission_id,
+                        arcface_embedding=af_emb,
+                    )
+    except Exception as face_exc:
+        log.warning("Face embedding write error: %s", face_exc)
+
+    try:
+        await publish_analytics_result("person", result)
+    except Exception as pub_exc:
+        log.warning("Failed to publish analytics result: %s", pub_exc)
+
+    _frames_processed += 1
+    _reid_frame_counter += 1
+
+    # Periodic cleanup of alert deduplicator cooldown state
+    if alert_deduplicator and _frames_processed % 100 == 0:
+        alert_deduplicator.cleanup()
+
+    # Periodic re-ID clustering for both Persons and Faces
+    if _reid_frame_counter >= cfg.REID_CLUSTER_INTERVAL:
+        _reid_frame_counter = 0
+        asyncio.create_task(_safe_task(_run_person_reid_clustering(), "Person Re-ID Clustering"))
+        asyncio.create_task(_safe_task(_run_reid_clustering(), "Face Re-ID Clustering"))
+
+
+async def _persist_round(items: list) -> None:
+    """Per-frame handling of one batch round, drone by drone (keeps per-drone order)."""
+    for drone_id, f, frame, result, mission_id, t_start in items:
+        try:
+            await _persist_person_frame(drone_id, f, frame, result, mission_id)
+        except Exception as exc:
+            log.warning("Person persist error for %s: %s", drone_id, exc)
+        _sampler.record(drone_id, infer_ms=result.get("model_ms"),
+                        total_ms=(time.perf_counter() - t_start) * 1000)
+
+
 async def _stream_loop():
-    global _stream_running, _frames_processed, _reid_frame_counter
-    last_ids = {d: "0" for d in cfg.DRONE_IDS}
+    global _stream_running
     active_drones = list(cfg.DRONE_IDS)
-    log.info("Person stream loop started for drones: %s", cfg.DRONE_IDS)
+    log.info("Person stream loop started for drones: %s (GPU %s)",
+             cfg.DRONE_IDS, gpu_profile.detect().as_dict())
 
     loop_count = 0
-    while _stream_running:
-        loop_count += 1
-        if loop_count % 10 == 1:
-            try:
-                discovered = await scan_active_stream_drones()
-                for d in discovered:
-                    if d not in active_drones:
-                        active_drones.append(d)
-                        last_ids[d] = "0"
-            except Exception as exc:
-                log.warning("Person stream scanner warning: %s", exc)
+    pending: Optional[asyncio.Task] = None
+    try:
+        while _stream_running:
+            loop_count += 1
+            if loop_count % 50 == 1:
+                try:
+                    discovered = await scan_active_stream_drones()
+                    for d in discovered:
+                        if d not in active_drones:
+                            active_drones.append(d)
+                except Exception as exc:
+                    log.warning("Person stream scanner warning: %s", exc)
 
-            # Evict missions and trajectory buffers for drones inactive for > 20s
-            now_mono = time.monotonic()
-            for d in list(_active_drone_missions.keys()):
-                if now_mono - _drone_last_frame_ts.get(d, 0) > 20.0:
-                    _active_drone_missions.pop(d, None)
-                    _person_trajectories.pop(d, None)
-                    _tracker_last_seen.pop(d, None)
+                # Evict missions and trajectory buffers for drones inactive for > 20s
+                now_mono = time.monotonic()
+                for d in list(_active_drone_missions.keys()):
+                    if now_mono - _drone_last_frame_ts.get(d, 0) > 20.0:
+                        _active_drone_missions.pop(d, None)
+                        _person_trajectories.pop(d, None)
+                        _tracker_last_seen.pop(d, None)
 
-        for drone_id in active_drones:
-            if drone_id not in last_ids:
-                last_ids[drone_id] = "0"
             try:
-                frames = await xreadgroup_frames(
-                    "person-group", "person-analyzer", drone_id, ">", count=2, block_ms=100
-                )
-                if not frames:
+                await _sampler.maybe_publish()
+                round_frames = await _sampler.next_round(active_drones)
+                if not round_frames:
                     continue
-
-                processed_ids = []
-                for entry_id, f in frames:
-                    processed_ids.append(entry_id)
-                    raw = f.get("jpeg_b64", "")
-                    if not raw:
-                        continue
-                    img_bytes = base64.b64decode(raw)
-                    nparr = np.frombuffer(img_bytes, np.uint8)
-                    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                t_start = time.perf_counter()
+                decoded = {}
+                for drone_id, f in round_frames.items():
+                    frame = await asyncio.to_thread(decode_frame, f)
                     if frame is None:
                         continue
 
@@ -505,312 +816,26 @@ async def _stream_loop():
                             pass
                     if mission_id:
                         _active_drone_missions[drone_id] = mission_id
+                    decoded[drone_id] = (f, frame, mission_id)
+                if not decoded:
+                    continue
 
-                    # Run inference in worker thread pool so FastAPI event loop is never blocked
-                    result = await asyncio.to_thread(
-                        analyzer.analyze_frame, frame, drone_id=drone_id, save_crops=True
-                    )
-                    # Tag result with mission_id for downstream consumers
-                    result["mission_id"] = mission_id
-
-                    # ── ArcFace recognition on detected faces ─────────────
-                    recognition_results = {}  # tracker_id -> MatchResult
-                    if (arcface_recognizer and arcface_recognizer.ready
-                            and watchlist_matcher and watchlist_matcher.gallery_size > 0):
-                        for face in result.get("faces", []):
-                            face_crop_bytes = face.get("crop_bytes")
-                            if not face_crop_bytes:
-                                fb = face.get("bbox")
-                                if fb:
-                                    h_f, w_f = frame.shape[:2]
-                                    fx1 = max(0, fb["x1"]); fy1 = max(0, fb["y1"])
-                                    fx2 = min(w_f, fb["x2"]); fy2 = min(h_f, fb["y2"])
-                                    if fx2 > fx1 and fy2 > fy1:
-                                        _, fb_buf = cv2.imencode(
-                                            ".jpg", frame[fy1:fy2, fx1:fx2],
-                                            [cv2.IMWRITE_JPEG_QUALITY, 90]
-                                        )
-                                        face_crop_bytes = bytes(fb_buf)
-                                        face["crop_bytes"] = face_crop_bytes
-                            if not face_crop_bytes:
-                                continue
-                            nparr_fc = np.frombuffer(face_crop_bytes, np.uint8)
-                            face_bgr = cv2.imdecode(nparr_fc, cv2.IMREAD_COLOR)
-                            if face_bgr is None:
-                                continue
-
-                            # Enhance for drone footage (offload to worker thread)
-                            if cfg.FACE_ENHANCE_ENABLED:
-                                face_bgr = await asyncio.to_thread(enhance_face_crop, face_bgr)
-
-                            # Extract ArcFace embedding in worker thread (prevents event loop blocking)
-                            embedding = await asyncio.to_thread(arcface_recognizer.extract_embedding, face_bgr)
-                            if embedding is None:
-                                continue
-
-                            # Match against in-memory gallery
-                            match = watchlist_matcher.match(
-                                embedding, cfg.ARCFACE_MATCH_THRESHOLD
-                            )
-                            if match:
-                                tid = face.get("tracker_id")
-                                recognition_results[tid] = match
-
-                                # Deduplication-gated alert pipeline
-                                if alert_deduplicator and alert_deduplicator.should_alert(match.watchlist_id):
-                                    _ts_alert = datetime.now(timezone.utc)
-                                    asyncio.create_task(_process_watchlist_alert(
-                                        match=match,
-                                        tid=tid,
-                                        face_crop_bytes=face_crop_bytes,
-                                        frame=frame,
-                                        drone_id=drone_id,
-                                        mission_id=mission_id,
-                                        _ts_alert=_ts_alert,
-                                        ctx=frame_context(f),
-                                    ))
-
-                    # Tag result with recognition data for SSE consumers
-                    result["recognitions"] = {
-                        str(tid): {
-                            "name": m.name, "category": m.category,
-                            "similarity": m.similarity,
-                            "watchlist_id": m.watchlist_id,
-                        }
-                        for tid, m in recognition_results.items()
-                    }
-
-                    # ── Draw annotated overlay with configurable toggles ──
-                    annotated = frame.copy()
-                    ac = _annotation_config  # snapshot for this frame
-
-                    # ── Trajectory state update for active persons ──
-                    for p in result["persons"]:
-                        tid = p.get("tracker_id", 0)
-                        if tid > 0:
-                            bb = p["bbox"]
-                            # Center-bottom of bounding box (feet position on ground plane)
-                            pt = ((bb["x1"] + bb["x2"]) // 2, bb["y2"] - 2)
-                            _person_trajectories[drone_id][tid].append(pt)
-                            _tracker_last_seen[drone_id][tid] = _frames_processed
-
-                    # Periodic cleanup of lost tracks (every 50 frames)
-                    if _frames_processed % 50 == 0:
-                        stale_tids = [
-                            t for t, f_seen in _tracker_last_seen[drone_id].items()
-                            if _frames_processed - f_seen > 60
-                        ]
-                        for t in stale_tids:
-                            _person_trajectories[drone_id].pop(t, None)
-                            _tracker_last_seen[drone_id].pop(t, None)
-
-                    # ── Draw Trajectories if enabled ──
-                    if ac.get("trajectory", False):
-                        for tid, pts in _person_trajectories[drone_id].items():
-                            if len(pts) >= 2:
-                                poly_pts = np.array(list(pts), dtype=np.int32).reshape((-1, 1, 2))
-                                # Black outline for sharp contrast against any ground/lighting
-                                cv2.polylines(annotated, [poly_pts], isClosed=False, color=(0, 0, 0), thickness=3, lineType=cv2.LINE_AA)
-                                # Vibrant tactical vector path (neon cyan/sky blue)
-                                cv2.polylines(annotated, [poly_pts], isClosed=False, color=(255, 215, 0), thickness=2, lineType=cv2.LINE_AA)
-                                # Target marker dot at latest known position
-                                cv2.circle(annotated, pts[-1], 3, (0, 255, 255), -1, lineType=cv2.LINE_AA)
-
-                    for p in result["persons"]:
-                        bb = p["bbox"]
-                        tid = p.get("tracker_id", 0)
-                        match = recognition_results.get(tid)
-
-                        if match and ac.get("watchlist_alerts", True):
-                            # WATCHLIST MATCH — tactical corner brackets
-                            if match.category == "missing":
-                                alert_color = (0, 165, 255)   # orange
-                            elif match.category == "vip":
-                                alert_color = (0, 255, 0)     # green
-                            else:
-                                alert_color = (0, 0, 255)     # red (wanted/poi)
-                            _draw_corner_brackets(annotated, bb, alert_color, thickness=3, length=20)
-                            if ac.get("alert_labels", True):
-                                lbl = f"[{match.category.upper()}] {match.name} ({int(match.similarity*100)}%)"
-                                _draw_label_bg(annotated, lbl, bb["x1"], bb["y1"] - 25, alert_color)
-                        elif ac.get("person_boxes", True):
-                            # Normal person box (existing teal)
-                            cv2.rectangle(annotated, (bb["x1"], bb["y1"]), (bb["x2"], bb["y2"]),
-                                          (191, 219, 56), 2)
-                            if ac.get("track_ids", True):
-                                tid_str = f'P-{tid}' if tid > 0 else f'P-{abs(tid)}'
-                                label = tid_str
-                                if ac.get("confidence", True):
-                                    label += f'  {int(p["confidence"]*100)}%'
-                                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                                cv2.rectangle(annotated, (bb["x1"], bb["y1"]-th-8),
-                                              (bb["x1"]+tw+6, bb["y1"]), (191, 219, 56), -1)
-                                cv2.putText(annotated, label, (bb["x1"]+3, bb["y1"]-4),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-
-                    if ac.get("face_boxes", True):
-                        for fc in result["faces"]:
-                            bb = fc["bbox"]
-                            fc_tid = fc.get("tracker_id")
-                            match = recognition_results.get(fc_tid)
-                            if match and ac.get("watchlist_alerts", True):
-                                # Matched face — crosshair marker
-                                cx = (bb["x1"] + bb["x2"]) // 2
-                                cy = (bb["y1"] + bb["y2"]) // 2
-                                xh_color = (0, 0, 255) if match.category == "wanted" else (0, 165, 255)
-                                cv2.drawMarker(annotated, (cx, cy), xh_color,
-                                               cv2.MARKER_CROSS, 15, 2)
-                            else:
-                                cv2.rectangle(annotated, (bb["x1"], bb["y1"]),
-                                              (bb["x2"], bb["y2"]), (0, 191, 255), 2)
-                                if ac.get("confidence", True):
-                                    conf_label = f'{int(fc["confidence"]*100)}%'
-                                    cv2.putText(annotated, conf_label,
-                                                (bb["x1"], bb["y2"]+14),
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                                                (0, 191, 255), 1, cv2.LINE_AA)
-
-                    _, ann_buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                    _last_annotated_frames[drone_id] = bytes(ann_buf)
-                    _last_annotated_ts[drone_id] = time.monotonic()
-
-                    ts = datetime.now(timezone.utc)
-
-                    # ── Populate live person buffer with crop pairs IMMEDIATELY ──
-                    # Must happen before any DB / network I/O so live UI is decoupled
-                    _update_live_person_buffer(
-                        result, drone_id, mission_id, ts, frame
-                    )
-
-                    # ── Database updates (isolated so DB errors don't crash stream) ──
-                    # No confirmed event per person per frame (B29): the person incident is
-                    # a face-watchlist match (_process_watchlist_alert).
-                    try:
-                        for person in result["persons"]:
-                            tracker_id = person.get("tracker_id")
-                            if person["confidence"] >= 0.15:
-                                await upsert_track(
-                                    drone_id, None, "person", ts, ts,
-                                    tracker_id=tracker_id,
-                                    mission_id=mission_id,
-                                )
-                    except Exception as db_exc:
-                        log.warning("Person track/event write error: %s", db_exc)
-
-                    # 1. Process whole-body person crops + person appearance embeddings
-                    try:
-                        for person in result.get("persons", []):
-                            p_crop_bytes = person.pop("crop_bytes", None)
-                            tid = person.get("tracker_id", 0)
-                            if not p_crop_bytes and tid is not None:
-                                # Fallback: crop from frame using person bbox
-                                pbb = person.get("bbox")
-                                if pbb:
-                                    h, w = frame.shape[:2]
-                                    x1, y1 = max(0, int(pbb["x1"])), max(0, int(pbb["y1"]))
-                                    x2, y2 = min(w, int(pbb["x2"])), min(h, int(pbb["y2"]))
-                                    if x2 > x1 and y2 > y1:
-                                        _, p_buf = cv2.imencode(".jpg", frame[y1:y2, x1:x2], [cv2.IMWRITE_JPEG_QUALITY, 85])
-                                        p_crop_bytes = bytes(p_buf)
-
-                            if p_crop_bytes and resnet_model:
-                                ts_ms = int(ts.timestamp() * 1000)
-                                try:
-                                    nparr = np.frombuffer(p_crop_bytes, np.uint8)
-                                    img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                                    sharpness = get_sharpness_score(img_bgr) if img_bgr is not None else 0.0
-                                except Exception:
-                                    sharpness = 0.0
-
-                                person_key = minio.make_key(
-                                    "persons", drone_id,
-                                    f"person_{ts_ms}_{tid}.jpg"
-                                )
-                                person_obj_key = await minio.upload_bytes(
-                                    cfg.BUCKET_FACES, person_key, p_crop_bytes, "image/jpeg"
-                                )
-                                p_emb = extract_embedding_from_bytes(
-                                    resnet_model, p_crop_bytes, resnet_device
-                                )
-                                if p_emb and person_obj_key:
-                                    await write_person_embedding(
-                                        track_id=None,
-                                        image_path=person_obj_key,
-                                        embedding=p_emb,
-                                        drone_id=drone_id,
-                                        object_key=person_obj_key,
-                                        mission_id=mission_id,
-                                        tracker_id=tid,
-                                        sharpness_score=sharpness,
-                                    )
-                    except Exception as person_exc:
-                        log.warning("Person appearance embedding write error: %s", person_exc)
-
-                    # 2. Process face crops + face embeddings (for Detected Faces gallery)
-                    try:
-                        for face in result.get("faces", []):
-                            face_crop_bytes = face.pop("crop_bytes", None)
-                            if face_crop_bytes and resnet_model:
-                                emb = extract_embedding_from_bytes(
-                                    resnet_model, face_crop_bytes, resnet_device
-                                )
-                                if emb:
-                                    face_ts_ms = int(ts.timestamp() * 1000)
-                                    key = minio.make_key(
-                                        "faces", drone_id,
-                                        f"face_{face_ts_ms}.jpg"
-                                    )
-                                    face_obj_key = await minio.upload_bytes(
-                                        cfg.BUCKET_FACES, key, face_crop_bytes, "image/jpeg"
-                                    )
-                                    # Extract ArcFace embedding if available
-                                    af_emb = None
-                                    if arcface_recognizer and arcface_recognizer.ready:
-                                        try:
-                                            nparr_f = np.frombuffer(face_crop_bytes, np.uint8)
-                                            f_bgr = cv2.imdecode(nparr_f, cv2.IMREAD_COLOR)
-                                            if f_bgr is not None:
-                                                if cfg.FACE_ENHANCE_ENABLED:
-                                                    f_bgr = enhance_face_crop(f_bgr)
-                                                af_emb = arcface_recognizer.extract_embedding(f_bgr, quality_check=False)
-                                        except Exception:
-                                            pass
-
-                                    await write_face_embedding(
-                                        track_id=None,
-                                        image_path=face_obj_key or "",
-                                        embedding=emb,
-                                        drone_id=drone_id,
-                                        object_key=face_obj_key,
-                                        mission_id=mission_id,
-                                        arcface_embedding=af_emb,
-                                    )
-                    except Exception as face_exc:
-                        log.warning("Face embedding write error: %s", face_exc)
-
-                    try:
-                        await publish_analytics_result("person", result)
-                    except Exception as pub_exc:
-                        log.warning("Failed to publish analytics result: %s", pub_exc)
-
-                    _frames_processed += 1
-                    _reid_frame_counter += 1
-
-                    # Periodic cleanup of alert deduplicator cooldown state
-                    if alert_deduplicator and _frames_processed % 100 == 0:
-                        alert_deduplicator.cleanup()
-
-                    # Periodic re-ID clustering for both Persons and Faces
-                    if _reid_frame_counter >= cfg.REID_CLUSTER_INTERVAL:
-                        _reid_frame_counter = 0
-                        asyncio.create_task(_safe_task(_run_person_reid_clustering(), "Person Re-ID Clustering"))
-                        asyncio.create_task(_safe_task(_run_reid_clustering(), "Face Re-ID Clustering"))
-
-                if processed_ids:
-                    await ack_frames(drone_id, "person-group", *processed_ids)
+                # Run inference in worker thread pool so FastAPI event loop is never blocked.
+                # One batched person-detector call for the newest frame of every drone.
+                results = await asyncio.to_thread(
+                    analyzer.analyze_batch, {d: fr for d, (_, fr, _) in decoded.items()}, True
+                )
+                _sampler.record_batch(len(decoded))
+                # Persist the previous round before queuing this one (keeps per-drone
+                # order); it ran concurrently with the inference above.
+                if pending:
+                    await asyncio.shield(pending)   # a stream stop must not cut a round half-written
+                pending = asyncio.create_task(_persist_round(
+                    [(d, f, fr, results[d], m, t_start) for d, (f, fr, m) in decoded.items()]
+                ))
 
             except asyncio.CancelledError:
-                return
+                raise
             except Exception as exc:
                 err_str = str(exc)
                 if "CUDA" in err_str and analyzer and hasattr(analyzer, 'device'):
@@ -827,8 +852,15 @@ async def _stream_loop():
                         except Exception:
                             pass
                 else:
-                    log.warning("Person stream error for %s: %s", drone_id, exc)
+                    log.warning("Person stream error: %s", exc)
                 await asyncio.sleep(1)
+    finally:
+        if pending and not pending.done():
+            try:
+                await asyncio.shield(pending)   # a stream stop must not cut a round half-written
+            except Exception:
+                pass
+
 
 
 async def _run_person_reid_clustering():

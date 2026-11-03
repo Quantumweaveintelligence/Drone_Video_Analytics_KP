@@ -11,6 +11,7 @@ import io
 import logging
 import os
 import sys
+import time as _time
 from datetime import datetime, timezone
 from typing import Optional, Dict
 
@@ -33,6 +34,8 @@ from shared.redis_client import (
     scan_active_stream_drones, get_latest_stream_frame,
 )
 from shared import minio_client as minio
+from shared import gpu_profile
+from shared.frame_sampler import FrameSampler, decode_frame
 from vehicle.analyzer import VehicleAnalyzer
 from vehicle.schema import VehicleFrameResult, VehicleStats
 
@@ -55,6 +58,8 @@ analyzer: Optional[VehicleAnalyzer] = None
 _stream_task: Optional[asyncio.Task] = None
 _stream_running = False
 _frames_processed = 0
+# Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
+_sampler = FrameSampler("vehicle", "vehicle-group", "vehicle-analyzer")
 
 # ── Annotated frame cache ─────────────────────────────────────────────────────
 # Stores the latest annotated JPEG bytes per drone_id for dashboard display
@@ -164,6 +169,7 @@ async def startup():
     for drone_id in cfg.DRONE_IDS:
         await ensure_drone(drone_id)
     await minio.ensure_all_buckets()
+    gpu_profile.apply_torch_settings()      # FP16 / cuDNN autotune for the detected GPU
     analyzer = VehicleAnalyzer(VEHICLE_MODEL)
     log.info("Vehicle Analyzer ready. Model: %s", VEHICLE_MODEL)
 
@@ -266,143 +272,154 @@ async def analyze_frame(
 
 
 # ── Continuous stream loop ─────────────────────────────────────────────────────
+async def _persist_vehicle_frame(drone_id: str, f: dict, frame: np.ndarray, result: dict) -> None:
+    """Annotate, store and publish one analysed frame (runs while the next batch infers)."""
+    global _frames_processed
+    ts     = datetime.now(timezone.utc)
+
+    # Extract mission_id from stream frame metadata
+    import json as _json
+    frame_mission_id = None
+    raw_meta = f.get("metadata", "")
+    if raw_meta:
+        if isinstance(raw_meta, bytes):
+            raw_meta = raw_meta.decode()
+        try:
+            frame_mission_id = _json.loads(raw_meta).get("mission_id")
+        except Exception:
+            pass
+
+    # ── Annotate frame and cache for dashboard ────────────────
+    import time as _time
+    annotated_bytes = await asyncio.to_thread(
+        _draw_vehicle_annotations, frame, result.get("vehicles", []), drone_id
+    )
+    if annotated_bytes:
+        _last_annotated[drone_id]    = annotated_bytes
+        _last_annotated_ts[drone_id] = _time.monotonic()
+
+    # ── Persist to DB + Redis ─────────────────────────────────
+    for veh in result.get("vehicles", []):
+        tracker_id   = veh.get("tracker_id")
+        track_id     = await upsert_track(
+            drone_id, None, "vehicle", ts, ts,
+            tracker_id=tracker_id, mission_id=frame_mission_id
+        )
+        # No confirmed event per vehicle per frame (B29): detections stay in
+        # tracks / vehicle_attributes; vehicle incidents come from ANPR (theft_alert).
+
+        colour_label = (veh.get("colour_top3") or [{}])[0].get("colour", "")
+        crop_bytes   = veh.pop("crop_bytes", None)
+        veh_image_key = None
+        if crop_bytes:
+            key = minio.make_key("vehicles", drone_id,
+                                 f"v_{tracker_id}_{int(ts.timestamp()*1000)}.jpg",
+                                 mission_id=frame_mission_id or "")
+            veh_image_key = await minio.upload_bytes(
+                cfg.BUCKET_VEHICLES, key, crop_bytes, "image/jpeg"
+            )
+
+        if veh_image_key and track_id:
+            pool = await get_pool()
+            await pool.execute(
+                """
+                UPDATE tracks
+                SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('vehicle_image_key', $1::text)
+                WHERE track_id = $2::uuid
+                """,
+                veh_image_key, track_id,
+            )
+
+        await write_vehicle_attributes(
+            track_id=track_id,
+            event_id=None,
+            vehicle_type=veh.get("vehicle_type", "unknown"),
+            colour_top3=veh.get("colour_top3", []),
+            make_model_top3=veh.get("make_model_top3", []),
+            speed_kph=veh.get("speed_info", {}).get("kph"),
+            speed_reliability=veh.get("speed_info", {}).get("reliability"),
+            mission_id=frame_mission_id,
+        )
+
+
+        await hset_vehicle_track(
+            tracker_id=tracker_id,
+            drone_id=drone_id,
+            data={
+                "vehicle_type":      veh.get("vehicle_type", "unknown"),
+                "colour":            colour_label,
+                "track_id":          track_id,
+                "vehicle_image_key": veh_image_key or "",
+                "speed_kph":         str(veh.get("speed_info", {}).get("kph") or 0),
+                "ts":                ts.isoformat(),
+                "drone_id":          drone_id,
+            },
+            ttl=cfg.VEHICLE_TRACK_TTL,
+        )
+
+    await publish_analytics_result("vehicle", {
+        **result,
+        "drone_id":  drone_id,
+        "ts":        ts.isoformat(),
+        "frame_count": _frames_processed,
+    })
+    _frames_processed += 1
+
+
+async def _persist_round(items: list) -> None:
+    for drone_id, f, frame, result, t_start in items:
+        try:
+            await _persist_vehicle_frame(drone_id, f, frame, result)
+        except Exception as exc:
+            log.warning("Vehicle persist error for %s: %s", drone_id, exc)
+        _sampler.record(drone_id, infer_ms=result.get("model_ms"),
+                        total_ms=(_time.perf_counter() - t_start) * 1000)
+
+
 async def _stream_loop():
-    global _stream_running, _frames_processed
-    last_ids = {d: "0" for d in cfg.DRONE_IDS}
+    global _stream_running
     active_drones = list(cfg.DRONE_IDS)
-    log.info("Vehicle stream loop started for drones: %s", cfg.DRONE_IDS)
+    log.info("Vehicle stream loop started for drones: %s (GPU %s)",
+             cfg.DRONE_IDS, gpu_profile.detect().as_dict())
 
     loop_count = 0
-    while _stream_running:
-        loop_count += 1
-        if loop_count % 10 == 1:
+    pending: Optional[asyncio.Task] = None
+    try:
+        while _stream_running:
+            loop_count += 1
+            if loop_count % 50 == 1:
+                try:
+                    for d in await scan_active_stream_drones():
+                        if d not in active_drones:
+                            active_drones.append(d)
+                except Exception:
+                    pass
             try:
-                discovered = await scan_active_stream_drones()
-                for d in discovered:
-                    if d not in active_drones:
-                        active_drones.append(d)
-                        last_ids[d] = "0"
-            except Exception:
-                pass
-
-        for drone_id in active_drones:
-            if drone_id not in last_ids:
-                last_ids[drone_id] = "0"
-            try:
-                frames = await xreadgroup_frames(
-                    "vehicle-group", "vehicle-analyzer", drone_id, ">", count=4, block_ms=100
+                await _sampler.maybe_publish()
+                round_frames = await _sampler.next_round(active_drones)
+                if not round_frames:
+                    continue
+                t_start = _time.perf_counter()
+                decoded = {}
+                for drone_id, f in round_frames.items():
+                    frame = await asyncio.to_thread(decode_frame, f)
+                    if frame is not None:
+                        decoded[drone_id] = (f, frame)
+                if not decoded:
+                    continue
+                results = await asyncio.to_thread(
+                    analyzer.analyze_batch, {d: fr for d, (_, fr) in decoded.items()}, True
                 )
-
-                processed_ids = []
-                for entry_id, f in frames:
-                    processed_ids.append(entry_id)
-                    raw = f.get("jpeg_b64", "")
-                    if not raw:
-                        continue
-                    img_bytes = base64.b64decode(raw)
-                    nparr  = np.frombuffer(img_bytes, np.uint8)
-                    frame  = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    if frame is None:
-                        continue
-
-                    result = await asyncio.to_thread(
-                        analyzer.analyze_frame, frame, drone_id=drone_id, save_crops=True
-                    )
-                    ts     = datetime.now(timezone.utc)
-
-                    # Extract mission_id from stream frame metadata
-                    import json as _json
-                    frame_mission_id = None
-                    raw_meta = f.get("metadata", "")
-                    if raw_meta:
-                        if isinstance(raw_meta, bytes):
-                            raw_meta = raw_meta.decode()
-                        try:
-                            frame_mission_id = _json.loads(raw_meta).get("mission_id")
-                        except Exception:
-                            pass
-
-                    # ── Annotate frame and cache for dashboard ────────────────
-                    import time as _time
-                    annotated_bytes = await asyncio.to_thread(
-                        _draw_vehicle_annotations, frame, result.get("vehicles", []), drone_id
-                    )
-                    if annotated_bytes:
-                        _last_annotated[drone_id]    = annotated_bytes
-                        _last_annotated_ts[drone_id] = _time.monotonic()
-
-                    # ── Persist to DB + Redis ─────────────────────────────────
-                    for veh in result.get("vehicles", []):
-                        tracker_id   = veh.get("tracker_id")
-                        track_id     = await upsert_track(
-                            drone_id, None, "vehicle", ts, ts,
-                            tracker_id=tracker_id, mission_id=frame_mission_id
-                        )
-                        # No confirmed event per vehicle per frame (B29): detections stay in
-                        # tracks / vehicle_attributes; vehicle incidents come from ANPR (theft_alert).
-
-                        colour_label = (veh.get("colour_top3") or [{}])[0].get("colour", "")
-                        crop_bytes   = veh.pop("crop_bytes", None)
-                        veh_image_key = None
-                        if crop_bytes:
-                            key = minio.make_key("vehicles", drone_id,
-                                                 f"v_{tracker_id}_{int(ts.timestamp()*1000)}.jpg",
-                                                 mission_id=frame_mission_id or "")
-                            veh_image_key = await minio.upload_bytes(
-                                cfg.BUCKET_VEHICLES, key, crop_bytes, "image/jpeg"
-                            )
-
-                        if veh_image_key and track_id:
-                            pool = await get_pool()
-                            await pool.execute(
-                                """
-                                UPDATE tracks
-                                SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('vehicle_image_key', $1::text)
-                                WHERE track_id = $2::uuid
-                                """,
-                                veh_image_key, track_id,
-                            )
-
-                        await write_vehicle_attributes(
-                            track_id=track_id,
-                            event_id=None,
-                            vehicle_type=veh.get("vehicle_type", "unknown"),
-                            colour_top3=veh.get("colour_top3", []),
-                            make_model_top3=veh.get("make_model_top3", []),
-                            speed_kph=veh.get("speed_info", {}).get("kph"),
-                            speed_reliability=veh.get("speed_info", {}).get("reliability"),
-                            mission_id=frame_mission_id,
-                        )
-
-
-                        await hset_vehicle_track(
-                            tracker_id=tracker_id,
-                            drone_id=drone_id,
-                            data={
-                                "vehicle_type":      veh.get("vehicle_type", "unknown"),
-                                "colour":            colour_label,
-                                "track_id":          track_id,
-                                "vehicle_image_key": veh_image_key or "",
-                                "speed_kph":         str(veh.get("speed_info", {}).get("kph") or 0),
-                                "ts":                ts.isoformat(),
-                                "drone_id":          drone_id,
-                            },
-                            ttl=cfg.VEHICLE_TRACK_TTL,
-                        )
-
-                    await publish_analytics_result("vehicle", {
-                        **result,
-                        "drone_id":  drone_id,
-                        "ts":        ts.isoformat(),
-                        "frame_count": _frames_processed,
-                    })
-                    _frames_processed += 1
-
-                if processed_ids:
-                    await ack_frames(drone_id, "vehicle-group", *processed_ids)
-
+                _sampler.record_batch(len(decoded))
+                # Persist the previous round before queuing this one (keeps per-drone order);
+                # it ran concurrently with the inference above.
+                if pending:
+                    await asyncio.shield(pending)   # a stream stop must not cut a round half-written
+                pending = asyncio.create_task(_persist_round(
+                    [(d, f, fr, results[d], t_start) for d, (f, fr) in decoded.items()]
+                ))
             except asyncio.CancelledError:
-                return
+                raise
             except Exception as exc:
                 err_str = str(exc)
                 if "CUDA" in err_str and analyzer and hasattr(analyzer, 'to_device'):
@@ -412,8 +429,14 @@ async def _stream_loop():
                     except Exception:
                         pass
                 else:
-                    log.warning("Vehicle stream error for %s: %s", drone_id, exc)
+                    log.warning("Vehicle stream error: %s", exc)
                 await asyncio.sleep(1)
+    finally:
+        if pending and not pending.done():
+            try:
+                await asyncio.shield(pending)   # a stream stop must not cut a round half-written
+            except Exception:
+                pass
 
 
 # ── Stream control ─────────────────────────────────────────────────────────────

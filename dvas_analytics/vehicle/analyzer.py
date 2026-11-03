@@ -17,6 +17,8 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
+from shared.batch_tracker import BatchTracker
+
 log = logging.getLogger(__name__)
 
 # Vehicle classes present in VisDrone model
@@ -82,9 +84,10 @@ class VehicleAnalyzer:
         log.info("VehicleAnalyzer device: %s", self.device)
 
         self.model: Optional[YOLO] = None
+        self.tracker: Optional[BatchTracker] = None
         self._load_model()
 
-        # Per-tracker state for speed estimation
+        # Per-tracker state for speed estimation (tracker ids are unique across drones)
         self._track_states: Dict[int, _TrackState] = defaultdict(_TrackState)
 
         # HSV colour classifier (lazy import to avoid issues if shared/ not on path yet)
@@ -93,6 +96,8 @@ class VehicleAnalyzer:
     def _load_model(self):
         try:
             self.model = YOLO(self.model_path)
+            # One tracker per drone; frames of all drones go through the model as one batch
+            self.tracker = BatchTracker(self.model)
             log.info("Vehicle YOLO model loaded: %s", self.model_path)
         except Exception as exc:
             log.error("Failed to load vehicle model: %s", exc)
@@ -121,6 +126,14 @@ class VehicleAnalyzer:
     def ready(self) -> bool:
         return self.model is not None
 
+    def _empty(self, drone_id: str) -> dict:
+        now = datetime.now(timezone.utc).isoformat()
+        return {"drone_id": drone_id, "ts": now, "frame_timestamp": now,
+                "vehicles": [], "vehicle_count": 0, "inference_ms": 0.0}
+
+    def _track_kwargs(self) -> dict:
+        return dict(imgsz=640, conf=0.25, device=self.device)
+
     def analyze_frame(
         self,
         frame_bgr: np.ndarray,
@@ -132,28 +145,43 @@ class VehicleAnalyzer:
         Process a single BGR frame.
         Returns structured detection dict with colour, speed, and crop data.
         """
-        if not self.ready:
-            return {
-                "drone_id": drone_id,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "frame_timestamp": datetime.now(timezone.utc).isoformat(),
-                "vehicles": [], "vehicle_count": 0, "inference_ms": 0.0,
-            }
+        try:
+            return self.analyze_batch({drone_id: frame_bgr}, save_crops, px_per_meter)[drone_id]
+        except RuntimeError as exc:     # CUDA failure on the upload / offline paths
+            log.error("Vehicle frame inference error: %s", exc)
+            return self._empty(drone_id)
 
+    def analyze_batch(
+        self,
+        frames: Dict[str, np.ndarray],
+        save_crops: bool = True,
+        px_per_meter: float = 0.1,
+    ) -> Dict[str, dict]:
+        """Newest frame of several drones → {drone_id: result}. One GPU batch, per-drone tracks."""
+        if not self.ready:
+            return {d: self._empty(d) for d in frames}
+        t0 = time.perf_counter()
+        try:
+            tracked = self.tracker.track_batch(frames, **self._track_kwargs())
+        except Exception as exc:
+            if "CUDA" in str(exc):
+                raise           # main.py moves the model to CPU and retries
+            log.error("Vehicle frame inference error: %s", exc)
+            tracked = {}
+        infer_ms = (time.perf_counter() - t0) * 1000 / max(1, len(frames))
+        return {
+            d: self._postprocess(d, frame, tracked.get(d), save_crops, px_per_meter, infer_ms)
+            for d, frame in frames.items()
+        }
+
+    def _postprocess(self, drone_id, frame_bgr, result, save_crops, px_per_meter, infer_ms) -> dict:
         t0 = time.perf_counter()
         classify_colour = self._get_colour_classifier()
         vehicles = []
         now_ts = time.time()
 
         try:
-            results = self.model.track(
-                frame_bgr,
-                persist=True,
-                imgsz=640,
-                conf=0.25,
-                device=self.device,
-                verbose=False,
-            )
+            results = [result] if result is not None else []
 
             if results and results[0].boxes:
                 class_names = self.model.names
@@ -221,7 +249,7 @@ class VehicleAnalyzer:
         except Exception as exc:
             log.error("Vehicle frame inference error: %s", exc)
 
-        elapsed_ms = (time.perf_counter() - t0) * 1000
+        elapsed_ms = infer_ms + (time.perf_counter() - t0) * 1000
         ts = datetime.now(timezone.utc)
         return {
             "drone_id":        drone_id,
@@ -230,4 +258,5 @@ class VehicleAnalyzer:
             "vehicles":        vehicles,
             "vehicle_count":   len(vehicles),
             "inference_ms":    round(elapsed_ms, 1),
+            "model_ms":        round(infer_ms, 1),
         }
