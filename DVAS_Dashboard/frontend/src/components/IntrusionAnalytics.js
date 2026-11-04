@@ -39,7 +39,7 @@ import { api, apiError } from '@/lib/api';
 import { fmtIST } from '@/lib/ist';
 import { useAnalyticsFetch, useAnalyticsSSE } from '@/lib/useAnalytics';
 import { useActiveStreams } from '@/hooks/useActiveStreams';
-import { useJpegPoller } from '@/hooks/useJpegPoller';
+import { useLiveFeed } from '@/hooks/useLiveFeed';
 
 
 
@@ -307,7 +307,8 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
 
   // ─── Annotated Frame Poller ────────────────────────────────────────
   const pollUrl = selectedDrone ? `/api/analytics/intrusion/annotated?drone_id=${encodeURIComponent(selectedDrone)}` : null;
-  const { blobUrl, hasFrame, feedDead, fps } = useJpegPoller(pollUrl, 800, subTab === 'live');
+  // Continuous MJPEG stream (falls back to polling); procFps = analyzer's real rate
+  const { blobUrl, hasFrame, feedDead, fps, procFps } = useLiveFeed(pollUrl, 800, subTab === 'live');
   // Resolution of the frame actually received (read from the decoded image)
   const [frameRes, setFrameRes] = useState(null);
   useEffect(() => { setFrameRes(null); }, [selectedDrone]);
@@ -889,8 +890,13 @@ export default function IntrusionAnalytics({ activeDrone: propActiveDrone, drone
                   </span>
                 </div>
                 <div className="flex items-center gap-3 text-slate-400">
-                  <span className="bg-slate-950 px-2 py-0.5 rounded border border-slate-800">
-                    FPS: <strong className="text-emerald-400">{fps}</strong>
+                  <span className="bg-slate-950 px-2 py-0.5 rounded border border-slate-800"
+                        title="Frames analysed per second by the intrusion analyzer">
+                    PROCESSING: <strong className="text-emerald-400">{procFps ? procFps.toFixed(1) : '—'} fps</strong>
+                  </span>
+                  <span className="bg-slate-950 px-2 py-0.5 rounded border border-slate-800"
+                        title="Frames shown per second in this view">
+                    VIEW: <strong className="text-sky-300">{fps}</strong>
                   </span>
                   <span className="bg-slate-950 px-2 py-0.5 rounded border border-slate-800">
                     {hasFrame && frameRes ? `${frameRes.w}×${frameRes.h}` : '—'}

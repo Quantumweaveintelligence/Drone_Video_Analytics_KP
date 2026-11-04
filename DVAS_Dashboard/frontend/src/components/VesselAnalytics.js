@@ -25,6 +25,7 @@ import {
 import { api, apiError } from "@/lib/api";
 import { fmtIST } from "@/lib/ist";
 import { useJpegPoller } from "@/hooks/useJpegPoller";
+import { useLiveFeed } from "@/hooks/useLiveFeed";
 import { useActiveStreams } from "@/hooks/useActiveStreams";
 
 const resolveVesselThumbnail = (key) => {
@@ -138,16 +139,18 @@ export default function VesselAnalytics({ drones, droneId: propDroneId = '', onN
     ? `/api/analytics/vessel/annotated?drone_id=${encodeURIComponent(activeDrone)}`
     : null;
 
-  // Layer 1: Raw Ingest Feed (1500ms)
-  const { blobUrl: rawSrc, ok: rawOk } = useJpegPoller(rawUrl, 1500, hasDrone);
-
-  // Layer 2: Annotated Overlay (800ms when stream running)
+  // Layer 2: annotated video — continuous MJPEG stream (falls back to polling)
   const {
     blobUrl: annotatedSrc,
     ok: annotatedOk,
     meta: annotatedMeta,
-    fps,
-  } = useJpegPoller(annotatedUrl, 800, hasDrone && streamRunning !== false);
+    fps: viewFps,
+    procFps,
+  } = useLiveFeed(annotatedUrl, 800, hasDrone && streamRunning !== false);
+  const fps = procFps ? Math.round(procFps) : viewFps;
+
+  // Layer 1: raw ingest frames only while no annotated video is available
+  const { blobUrl: rawSrc, ok: rawOk } = useJpegPoller(rawUrl, 1500, hasDrone && !annotatedOk);
 
   const displaySrc = annotatedOk ? annotatedSrc : rawSrc;
   const isAnnotated = annotatedOk && Boolean(annotatedSrc);

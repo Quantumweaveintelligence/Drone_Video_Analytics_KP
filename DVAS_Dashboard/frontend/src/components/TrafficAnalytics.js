@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 
 import { useJpegPoller } from '../hooks/useJpegPoller';
+import { useLiveFeed } from '../hooks/useLiveFeed';
 import { useActiveStreams } from '../hooks/useActiveStreams';
 import { api, apiError } from '../lib/api';
 import { fmtIST } from '../lib/ist';
@@ -136,10 +137,6 @@ function Panel({ title, icon: Icon, iconClass = 'text-teal-400', children, right
 
 /* ─── Annotated Frame Viewer ─────────────────────────────────────── */
 function AnnotatedFrameViewer({ droneId, mode = 'vehicle', streamRunning, isLive, modelLabel }) {
-  const [fps, setFps] = useState(0);
-  const fpsRef = useRef({ count: 0, ts: Date.now() });
-  const prevAnnotatedRef = useRef(null);
-
   // Disable pollers when no drone is selected yet
   const hasDrone = !!droneId;
 
@@ -153,24 +150,15 @@ function AnnotatedFrameViewer({ droneId, mode = 'vehicle', streamRunning, isLive
         : `/api/analytics/vehicle/annotated?drone_id=${encodeURIComponent(droneId)}`)
     : null;
 
-  // Layer 1: raw ingest feed — only when a drone is known
-  const { blobUrl: rawSrc, ok: rawOk } = useJpegPoller(rawUrl, 1500, hasDrone);
-
-  // Layer 2: annotated overlay — polls when stream is running or drone is known
-  const { blobUrl: annotatedSrc, ok: annotatedOk, meta: annotatedMeta } = useJpegPoller(
+  // Layer 2: annotated video — continuous MJPEG stream (falls back to polling)
+  const { blobUrl: annotatedSrc, ok: annotatedOk, meta: annotatedMeta, fps: viewFps, procFps } = useLiveFeed(
     annotatedUrl, FRAME_INTERVAL, hasDrone && streamRunning
   );
+  // Analyzer's real rate when streaming; frames shown per second otherwise
+  const fps = procFps ? Math.round(procFps) : viewFps;
 
-  // FPS counter — ticks whenever a new annotated blob URL appears
-  useEffect(() => {
-    if (!annotatedSrc || annotatedSrc === prevAnnotatedRef.current) return;
-    prevAnnotatedRef.current = annotatedSrc;
-    fpsRef.current.count++;
-    if (Date.now() - fpsRef.current.ts > 3000) {
-      setFps(Math.round(fpsRef.current.count / ((Date.now() - fpsRef.current.ts) / 1000)));
-      fpsRef.current = { count: 0, ts: Date.now() };
-    }
-  }, [annotatedSrc]);
+  // Layer 1: raw ingest feed — only while no annotated video is available
+  const { blobUrl: rawSrc, ok: rawOk } = useJpegPoller(rawUrl, 1500, hasDrone && !annotatedOk);
 
   // What to display in the <img>
   const displaySrc  = annotatedOk ? annotatedSrc : rawSrc;

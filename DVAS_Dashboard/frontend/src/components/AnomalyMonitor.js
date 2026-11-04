@@ -28,7 +28,7 @@ import {
 import { useNavigate } from "react-router-dom";
 import { api, apiError } from "@/lib/api";
 import { fmtIST } from "@/lib/ist";
-import { useJpegPoller } from "@/hooks/useJpegPoller";
+import { useLiveFeed } from "@/hooks/useLiveFeed";
 import { useActiveStreams } from "@/hooks/useActiveStreams";
 
 const resolveAnomalyThumbnail = (key) => {
@@ -211,13 +211,16 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
   const [savingConfig, setSavingConfig] = useState(false);
   const [configFeedback, setConfigFeedback] = useState("");
 
-  // Live video feed using canonical useJpegPoller
+  // Live annotated video (MJPEG stream, polling fallback)
   const streamUrl = useMemo(() => {
     if (!activeDrone || !streamRunning) return "";
     return `/api/analytics/anomaly/annotated/latest?drone_id=${encodeURIComponent(activeDrone)}`;
   }, [activeDrone, streamRunning]);
 
-  const { blobUrl, hasFrame, feedDead, fps, ok: isStreaming, error: streamError } = useJpegPoller(streamUrl, POLL_MS, streamRunning);
+  // Continuous MJPEG stream (falls back to polling); procFps = analyzer's real rate
+  const { blobUrl, hasFrame, feedDead, fps: viewFps, procFps, mode: feedMode, ok: isStreaming, error: streamError } =
+    useLiveFeed(streamUrl, POLL_MS, streamRunning);
+  const fps = procFps ? Math.round(procFps) : viewFps;
 
   // Determine if stream is live or offline
   const selectedStreamObj = activeDrones.find(d => d.drone_id === activeDrone);
@@ -616,9 +619,9 @@ export default function AnomalyMonitor({ droneId: propDroneId, drones = [] }) {
               )}
             </div>
             <div className="mono text-[10px] text-slate-500 flex items-center gap-2">
-              <span>Received: {hasActiveStream && fps > 0 ? `${fps} frames/s` : "—"}</span>
+              <span>Processing: {hasActiveStream && fps > 0 ? `${fps} frames/s` : "—"}</span>
               <span>·</span>
-              <span>Polled every {POLL_MS} ms</span>
+              <span>{feedMode === "stream" ? "Live stream" : `Polled every ${POLL_MS} ms`}</span>
             </div>
           </div>
 

@@ -180,8 +180,9 @@ export default function GpuPerformancePanel() {
         <div className="p-3.5 border-b" style={{ borderColor: "var(--dvas-border)" }}>
           <PolicyEditor policy={p} onSaved={load} />
           <div className="mono text-[10px] text-slate-500 mt-2">
-            Every analyzer except crowd aims for the target range. When the GPU is full they all slow down
-            equally, never below the floor. Only the newest frame is analysed, so the lag stays at one frame.
+            Every analyzer except crowd aims for the target range and analyses every frame in order.
+            When the GPU is full they all slow down equally (never below the floor); frames wait in the
+            queue and are worked off, also after the drone stops streaming.
           </div>
         </div>
       )}
@@ -196,13 +197,14 @@ export default function GpuPerformancePanel() {
               <th className="px-2 py-2 font-normal text-right" title="Frames the drone sends per second">Input fps</th>
               <th className="px-2 py-2 font-normal text-right" title="Model time per frame">Model ms</th>
               <th className="px-2 py-2 font-normal text-right" title="Ingest → analysis start">Lag ms</th>
-              <th className="px-2 py-2 font-normal text-right" title="Older frames dropped because a newer one was waiting">Skipped</th>
+              <th className="px-2 py-2 font-normal text-right" title="Frames waiting in the queue for this analyzer (worked off after the stream stops)">Queued</th>
+              <th className="px-2 py-2 font-normal text-right" title="Frames lost because the queue overflowed before they were analysed">Lost</th>
               <th className="px-3.5 py-2 font-normal">Status</th>
             </tr>
           </thead>
           <tbody>
             {data.services.length === 0 && (
-              <tr><td colSpan={8} className="px-3.5 py-4 text-slate-500">
+              <tr><td colSpan={9} className="px-3.5 py-4 text-slate-500">
                 <Cpu size={12} className="inline mr-1" />No analyzer is streaming right now.
               </td></tr>
             )}
@@ -219,6 +221,7 @@ export default function GpuPerformancePanel() {
                   <td className="px-2 py-1.5 text-right text-slate-400">{fmt(d?.input_fps)}</td>
                   <td className="px-2 py-1.5 text-right text-slate-400">{fmt(d?.infer_ms)}</td>
                   <td className="px-2 py-1.5 text-right text-slate-400">{fmt(d?.lag_ms, 0)}</td>
+                  <td className="px-2 py-1.5 text-right text-slate-400">{d?.queued ?? "—"}</td>
                   <td className="px-2 py-1.5 text-right text-slate-400">{d?.skipped ?? "—"}</td>
                   <td className={`px-3.5 py-1.5 ${cls}`}>{lbl}</td>
                 </tr>

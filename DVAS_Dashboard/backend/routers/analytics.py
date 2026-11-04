@@ -113,6 +113,75 @@ async def analytics_events_stream(request: Request, drone_id: str = ""):
     )
 
 
+# ── Live annotated video (MJPEG) ──────────────────────────────────────────────
+# One continuous multipart stream per viewer instead of polling one JPEG at a time
+# (the poll capped the live view at ~1 fps). Frames are ≤1920 px display copies; the
+# analyzers keep detecting on the full frame. Role policy: _analytics_policy (CRO/SO).
+_LIVE_STREAM_PATHS = {
+    "person":    (PERSON_URL, "/annotated/stream"),
+    "vehicle":   (VEHICLE_URL, "/annotated/stream"),
+    "anpr":      (ANPR_URL, "/annotated/stream"),
+    "intrusion": (INTRUSION_URL, "/intrusion/annotated/stream"),
+    "vessel":    (VESSEL_URL, "/annotated/stream"),
+    "anomaly":   (ANOMALY_URL, "/annotated/stream"),
+}
+_LIVE_MAX_TOTAL = 40          # concurrent live streams on the pod (bandwidth / sockets)
+_LIVE_MAX_PER_USER = 8
+_live_open: Dict[str, int] = {}
+
+
+@router.get("/analytics/{service}/annotated/stream")
+async def annotated_live_stream(service: str, request: Request, drone_id: str = "",
+                                user: dict = Depends(get_current_user)):
+    """multipart/x-mixed-replace stream of annotated frames for one drone."""
+    target = _LIVE_STREAM_PATHS.get(service)
+    if target is None:
+        raise HTTPException(404, "Unknown analytics service")
+    if not drone_id or len(drone_id) > 64:
+        raise HTTPException(400, "drone_id is required")
+    uid = str(user.get("id") or user.get("email"))
+    if sum(_live_open.values()) >= _LIVE_MAX_TOTAL or _live_open.get(uid, 0) >= _LIVE_MAX_PER_USER:
+        raise HTTPException(429, "Too many live video streams open")
+    base, path = target
+    url = f"{base}{path}"
+    client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=30.0))
+    try:
+        upstream = await client.send(
+            client.build_request("GET", url, params={"drone_id": drone_id}, headers=_service_headers()),
+            stream=True,
+        )
+    except httpx.RequestError:
+        await client.aclose()
+        raise HTTPException(503, f"{service} analyzer unavailable")
+    if upstream.status_code != 200:
+        await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(502 if upstream.status_code >= 500 else upstream.status_code,
+                            "Live stream unavailable")
+    _live_open[uid] = _live_open.get(uid, 0) + 1
+
+    async def relay():
+        try:
+            async for chunk in upstream.aiter_raw():
+                if await request.is_disconnected():
+                    break
+                yield chunk
+        except httpx.HTTPError:
+            pass                     # analyzer restarted / idle timeout: the browser reconnects
+        finally:
+            _live_open[uid] = max(0, _live_open.get(uid, 1) - 1)
+            if not _live_open[uid]:
+                _live_open.pop(uid, None)
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        relay(), media_type=upstream.headers.get("content-type", "multipart/x-mixed-replace"),
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no",
+                 "X-Drone-ID": upstream.headers.get("X-Drone-ID", drone_id)},
+    )
+
+
 # ── Crowd Analytics ───────────────────────────────────────────────────────────
 @router.get("/analytics/crowd")
 async def crowd_analytics(user: dict = Depends(get_current_user)):
