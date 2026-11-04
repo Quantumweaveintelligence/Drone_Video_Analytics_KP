@@ -36,6 +36,7 @@ from shared.redis_client import (
 from shared import minio_client as minio
 from shared import gpu_profile
 from shared.batch_tracker import BatchTracker
+from shared.annotated_hub import AnnotatedHub, install_stream_route
 from shared.frame_sampler import FrameSampler, decode_frame, frame_bytes as _frame_jpeg
 from shared.evidence import EventGate, bbox_xyxy, evidence_block, frame_context, model_info
 
@@ -97,6 +98,9 @@ _tracker: Optional[BatchTracker] = None
 _infer_device = "cuda:0" if torch.cuda.is_available() else "cpu"
 # Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
 _sampler = FrameSampler("intrusion", "intrusion-group", "intrusion-analyzer")
+# Live annotated video (MJPEG, ≤1920 px) for the dashboard
+_hub = AnnotatedHub("intrusion")
+install_stream_route(app, _hub, path="/intrusion/annotated/stream")
 # One intrusion_breach confirmed event per track per zone per 60 s (evidence plan E1)
 _breach_gate = EventGate(cooldown_s=60.0)
 _stream_task: Optional[asyncio.Task] = None
@@ -360,6 +364,12 @@ async def _prepare_frame(drone_id: str, f: dict, frame: np.ndarray, redis) -> Op
     return item
 
 
+def _encode_full_jpeg(img) -> bytes:
+    """Full-resolution annotated evidence frame (only encoded when an event needs it)."""
+    _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return bytes(buf)
+
+
 async def _persist_standby(item: dict, annotator: IntrusionAnnotator) -> None:
     """Standby frame: annotate with tactical HUD and store so live video is immediately available."""
     global _frames_processed
@@ -381,10 +391,8 @@ async def _persist_standby(item: dict, annotator: IntrusionAnnotator) -> None:
         annotated, telemetry_dict, polygon=None, active_intrusions_count=0,
     )
 
-    _, ann_buf = cv2.imencode(
-        ".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80],
-    )
-    jpeg_bytes = bytes(ann_buf)
+    # Live view only (no evidence on standby): ≤1920 px display copy
+    jpeg_bytes = await _hub.put_frame(drone_id, annotated)
     _last_annotated_frames[drone_id] = jpeg_bytes
     _last_annotated_ts[drone_id] = time.monotonic()
     for alias in get_drone_aliases(drone_id):
@@ -540,14 +548,12 @@ async def _persist_monitor(item: dict, results, annotator: IntrusionAnnotator) -
             annotated, telemetry_dict, gm.polygon, active_intrusions,
         )
 
-        # Encode annotated frame
-        _, ann_buf = cv2.imencode(
-            ".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80],
-        )
-        return bytes(ann_buf)
+        return annotated
 
     active_intrusions = sm.get_active_intrusion_count()
-    jpeg_bytes = await asyncio.to_thread(_annotate)
+    annotated_img = await asyncio.to_thread(_annotate)
+    # Live view: ≤1920 px copy. Evidence below is encoded from the full-resolution image.
+    jpeg_bytes = await _hub.put_frame(drone_id, annotated_img)
     _last_annotated_frames[drone_id] = jpeg_bytes
     _last_annotated_ts[drone_id] = time.monotonic()
     for alias in get_drone_aliases(drone_id):
@@ -595,8 +601,9 @@ async def _persist_monitor(item: dict, results, annotator: IntrusionAnnotator) -
                     f"intrusion/{drone_id}/{mission_id}/event_{tid}_{ts_ms}_source.jpg",
                     _frame_jpeg(f), "image/jpeg", kind="source_frame",
                 )
+                full_jpeg = await asyncio.to_thread(_encode_full_jpeg, annotated_img)
                 ann_obj = await minio.upload_object(
-                    cfg.BUCKET_INTRUSION, s_key, jpeg_bytes, "image/jpeg",
+                    cfg.BUCKET_INTRUSION, s_key, full_jpeg, "image/jpeg",
                     kind="annotated_frame",
                 )
                 snapshot_key = ann_obj["key"] if ann_obj else None

@@ -38,6 +38,7 @@ from shared.redis_client import (
 from shared import minio_client as minio
 from shared import gpu_profile
 from shared.frame_sampler import FrameSampler, decode_frame
+from shared.annotated_hub import AnnotatedHub, install_stream_route, scale_items, to_display
 from shared.evidence import EventGate, bbox_xyxy, evidence_block, frame_context, model_info, upload_context
 from anpr.analyzer import ANPRAnalyzer
 from anpr.schema import ANPRFrameResult, WatchlistEntry, TheftAlert
@@ -69,6 +70,9 @@ WATCHLIST_REFRESH_S = 60.0   # picks up rows changed in the DB or expired
 _frames_processed = 0
 # Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
 _sampler = FrameSampler("anpr", "anpr-group", "anpr-analyzer")
+# Live annotated video (MJPEG, ≤1920 px) for the dashboard
+_hub = AnnotatedHub("anpr")
+install_stream_route(app, _hub)
 
 # ── Annotated frame cache ─────────────────────────────────────────────────────
 # Stores latest JPEG with plate bboxes + OCR text drawn, per drone_id
@@ -167,6 +171,13 @@ async def _watchlist_refresh_loop():
         except Exception as exc:
             log.warning("Watchlist refresh failed (keeping %d cached plates): %s",
                         len(analyzer.watchlist), exc)
+
+
+def _live_anpr_jpeg(frame: np.ndarray, items: list, drone_id: str) -> bytes:
+    """Live-view JPEG: overlay drawn on the ≤1920 px copy with boxes scaled to it, so
+    labels keep their designed size when the drone sends 4K (detection is unaffected)."""
+    small, f = to_display(frame)
+    return _draw_anpr_annotations(small, scale_items(items, ("vehicle_bbox", "plate_bbox"), f), drone_id)
 
 
 @app.on_event("startup")
@@ -396,9 +407,10 @@ async def _persist_anpr_frame(drone_id: str, f: dict, frame: np.ndarray, result:
     # ── Annotate frame and cache for dashboard ─────────────────
     import time as _time
     annotated_bytes = await asyncio.to_thread(
-        _draw_anpr_annotations, frame, result.get("plate_reads", []), drone_id
+        _live_anpr_jpeg, frame, result.get("plate_reads", []), drone_id
     )
     if annotated_bytes:
+        _hub.put(drone_id, annotated_bytes)
         _last_annotated[drone_id]    = annotated_bytes
         _last_annotated_ts[drone_id] = _time.monotonic()
 
@@ -843,7 +855,7 @@ async def annotated_latest(drone_id: str = ""):
                         analyzer.analyze_frame, recovered_frame, drone_id=alias
                     )
                     annotated_bytes = await asyncio.to_thread(
-                        _draw_anpr_annotations, recovered_frame, result.get("plate_reads", []), alias
+                        _live_anpr_jpeg, recovered_frame, result.get("plate_reads", []), alias
                     )
                     if annotated_bytes:
                         _last_annotated[alias] = annotated_bytes

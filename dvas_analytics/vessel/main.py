@@ -38,6 +38,7 @@ from shared.redis_client import (
 )
 from shared import minio_client as minio
 from shared import gpu_profile
+from shared.annotated_hub import AnnotatedHub, install_stream_route, to_display
 from shared.frame_sampler import FrameSampler, decode_frame, frame_bytes as _frame_jpeg
 from shared.db import write_confirmed_event
 from shared.evidence import evidence_block, frame_context, model_info
@@ -89,6 +90,9 @@ _stream_running = False
 _frames_processed = 0
 # Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
 _sampler = FrameSampler("vessel", "vessel-group", "vessel-analyzer")
+# Live annotated video (MJPEG, ≤1920 px) for the dashboard
+_hub = AnnotatedHub("vessel")
+install_stream_route(app, _hub)
 
 # In-memory per-drone telemetry state
 _last_annotated: Dict[str, bytes] = {}
@@ -174,7 +178,8 @@ def _check_proximity_clusters(drone_id: str, objects: list) -> List[Tuple[dict, 
 
 
 def _draw_hud_overlay(annotated: np.ndarray, drone_id: str, count: int, fps: float) -> bytes:
-    """Draw tactical maritime HUD bar and encode to JPEG bytes."""
+    """Draw tactical maritime HUD bar on the ≤1920 px live-view copy and encode to JPEG bytes."""
+    annotated, _ = to_display(annotated)
     h, w = annotated.shape[:2]
 
     # Top tactical HUD banner
@@ -380,8 +385,9 @@ async def _persist_vessel_frame(drone_id: str, f: dict, frame: np.ndarray,
 
     # 4. Render & Cache HUD Frame for Live Dashboard
     vessel_count = len(tracked_objects)
-    annotated_jpeg = _draw_hud_overlay(annotated_frame, drone_id, vessel_count, avg_fps)
+    annotated_jpeg = await asyncio.to_thread(_draw_hud_overlay, annotated_frame, drone_id, vessel_count, avg_fps)
     if annotated_jpeg:
+        _hub.put(drone_id, annotated_jpeg)
         _last_annotated[drone_id] = annotated_jpeg
         _last_annotated_ts[drone_id] = time.monotonic()
         _last_vessel_counts[drone_id] = vessel_count

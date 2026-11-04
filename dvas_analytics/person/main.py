@@ -47,6 +47,7 @@ from shared.redis_client import (
 from shared import minio_client as minio
 from shared import gpu_profile
 from shared.frame_sampler import FrameSampler, decode_frame
+from shared.annotated_hub import AnnotatedHub, install_stream_route, scale_items, to_display
 from shared.evidence import evidence_block, frame_context, model_info
 from person.analyzer import PersonFaceAnalyzer
 from person.deduplicator import (
@@ -87,6 +88,9 @@ _frames_processed = 0
 _reid_frame_counter = 0
 # Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
 _sampler = FrameSampler("person", "person-group", "person-analyzer")
+# Live annotated video (MJPEG, ≤1920 px) for the dashboard
+_hub = AnnotatedHub("person")
+install_stream_route(app, _hub)
 _last_annotated_frames: dict = {}  # {drone_id: jpeg_bytes}
 _last_annotated_ts: dict = {}      # {drone_id: monotonic_timestamp}
 _active_drone_missions: dict = {}  # {drone_id: mission_id}
@@ -297,6 +301,84 @@ def _draw_label_bg(img, text, x, y, color):
     cv2.rectangle(img, (x, y - th - 6), (x + tw + 8, y), color, -1)
     cv2.putText(img, text, (x + 4, y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                 (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def _render_person_live(frame, persons, faces, recognition_results, trails, ac) -> bytes:
+    """Annotated live-view JPEG: person/face boxes, watchlist markers and trails, drawn on
+    the display-size copy so labels keep their size on 4K input."""
+    annotated, f = to_display(frame)
+    persons = scale_items(persons, ("bbox",), f)
+    faces = scale_items(faces, ("bbox",), f)
+    trails = {t: [(int(x * f), int(y * f)) for x, y in pts] for t, pts in trails.items()}
+
+    # ── Draw Trajectories if enabled ──
+    if ac.get("trajectory", False):
+        for tid, pts in trails.items():
+            if len(pts) >= 2:
+                poly_pts = np.array(list(pts), dtype=np.int32).reshape((-1, 1, 2))
+                # Black outline for sharp contrast against any ground/lighting
+                cv2.polylines(annotated, [poly_pts], isClosed=False, color=(0, 0, 0), thickness=3, lineType=cv2.LINE_AA)
+                # Vibrant tactical vector path (neon cyan/sky blue)
+                cv2.polylines(annotated, [poly_pts], isClosed=False, color=(255, 215, 0), thickness=2, lineType=cv2.LINE_AA)
+                # Target marker dot at latest known position
+                cv2.circle(annotated, pts[-1], 3, (0, 255, 255), -1, lineType=cv2.LINE_AA)
+
+    for p in persons:
+        bb = p["bbox"]
+        tid = p.get("tracker_id", 0)
+        match = recognition_results.get(tid)
+
+        if match and ac.get("watchlist_alerts", True):
+            # WATCHLIST MATCH — tactical corner brackets
+            if match.category == "missing":
+                alert_color = (0, 165, 255)   # orange
+            elif match.category == "vip":
+                alert_color = (0, 255, 0)     # green
+            else:
+                alert_color = (0, 0, 255)     # red (wanted/poi)
+            _draw_corner_brackets(annotated, bb, alert_color, thickness=3, length=20)
+            if ac.get("alert_labels", True):
+                lbl = f"[{match.category.upper()}] {match.name} ({int(match.similarity*100)}%)"
+                _draw_label_bg(annotated, lbl, bb["x1"], bb["y1"] - 25, alert_color)
+        elif ac.get("person_boxes", True):
+            # Normal person box (existing teal)
+            cv2.rectangle(annotated, (bb["x1"], bb["y1"]), (bb["x2"], bb["y2"]),
+                          (191, 219, 56), 2)
+            if ac.get("track_ids", True):
+                tid_str = f'P-{tid}' if tid > 0 else f'P-{abs(tid)}'
+                label = tid_str
+                if ac.get("confidence", True):
+                    label += f'  {int(p["confidence"]*100)}%'
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(annotated, (bb["x1"], bb["y1"]-th-8),
+                              (bb["x1"]+tw+6, bb["y1"]), (191, 219, 56), -1)
+                cv2.putText(annotated, label, (bb["x1"]+3, bb["y1"]-4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+    if ac.get("face_boxes", True):
+        for fc in faces:
+            bb = fc["bbox"]
+            fc_tid = fc.get("tracker_id")
+            match = recognition_results.get(fc_tid)
+            if match and ac.get("watchlist_alerts", True):
+                # Matched face — crosshair marker
+                cx = (bb["x1"] + bb["x2"]) // 2
+                cy = (bb["y1"] + bb["y2"]) // 2
+                xh_color = (0, 0, 255) if match.category == "wanted" else (0, 165, 255)
+                cv2.drawMarker(annotated, (cx, cy), xh_color,
+                               cv2.MARKER_CROSS, 15, 2)
+            else:
+                cv2.rectangle(annotated, (bb["x1"], bb["y1"]),
+                              (bb["x2"], bb["y2"]), (0, 191, 255), 2)
+                if ac.get("confidence", True):
+                    conf_label = f'{int(fc["confidence"]*100)}%'
+                    cv2.putText(annotated, conf_label,
+                                (bb["x1"], bb["y2"]+14),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                (0, 191, 255), 1, cv2.LINE_AA)
+
+    _, ann_buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return bytes(ann_buf)
 
 
 # ── Background Task & Alert Processing Helpers ─────────────────────────────────
@@ -526,7 +608,6 @@ async def _persist_person_frame(
     }
 
     # ── Draw annotated overlay with configurable toggles ──
-    annotated = frame.copy()
     ac = _annotation_config  # snapshot for this frame
 
     # ── Trajectory state update for active persons ──
@@ -549,75 +630,17 @@ async def _persist_person_frame(
             _person_trajectories[drone_id].pop(t, None)
             _tracker_last_seen[drone_id].pop(t, None)
 
-    # ── Draw Trajectories if enabled ──
-    if ac.get("trajectory", False):
-        for tid, pts in _person_trajectories[drone_id].items():
-            if len(pts) >= 2:
-                poly_pts = np.array(list(pts), dtype=np.int32).reshape((-1, 1, 2))
-                # Black outline for sharp contrast against any ground/lighting
-                cv2.polylines(annotated, [poly_pts], isClosed=False, color=(0, 0, 0), thickness=3, lineType=cv2.LINE_AA)
-                # Vibrant tactical vector path (neon cyan/sky blue)
-                cv2.polylines(annotated, [poly_pts], isClosed=False, color=(255, 215, 0), thickness=2, lineType=cv2.LINE_AA)
-                # Target marker dot at latest known position
-                cv2.circle(annotated, pts[-1], 3, (0, 255, 255), -1, lineType=cv2.LINE_AA)
-
-    for p in result["persons"]:
-        bb = p["bbox"]
-        tid = p.get("tracker_id", 0)
-        match = recognition_results.get(tid)
-
-        if match and ac.get("watchlist_alerts", True):
-            # WATCHLIST MATCH — tactical corner brackets
-            if match.category == "missing":
-                alert_color = (0, 165, 255)   # orange
-            elif match.category == "vip":
-                alert_color = (0, 255, 0)     # green
-            else:
-                alert_color = (0, 0, 255)     # red (wanted/poi)
-            _draw_corner_brackets(annotated, bb, alert_color, thickness=3, length=20)
-            if ac.get("alert_labels", True):
-                lbl = f"[{match.category.upper()}] {match.name} ({int(match.similarity*100)}%)"
-                _draw_label_bg(annotated, lbl, bb["x1"], bb["y1"] - 25, alert_color)
-        elif ac.get("person_boxes", True):
-            # Normal person box (existing teal)
-            cv2.rectangle(annotated, (bb["x1"], bb["y1"]), (bb["x2"], bb["y2"]),
-                          (191, 219, 56), 2)
-            if ac.get("track_ids", True):
-                tid_str = f'P-{tid}' if tid > 0 else f'P-{abs(tid)}'
-                label = tid_str
-                if ac.get("confidence", True):
-                    label += f'  {int(p["confidence"]*100)}%'
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                cv2.rectangle(annotated, (bb["x1"], bb["y1"]-th-8),
-                              (bb["x1"]+tw+6, bb["y1"]), (191, 219, 56), -1)
-                cv2.putText(annotated, label, (bb["x1"]+3, bb["y1"]-4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-
-    if ac.get("face_boxes", True):
-        for fc in result["faces"]:
-            bb = fc["bbox"]
-            fc_tid = fc.get("tracker_id")
-            match = recognition_results.get(fc_tid)
-            if match and ac.get("watchlist_alerts", True):
-                # Matched face — crosshair marker
-                cx = (bb["x1"] + bb["x2"]) // 2
-                cy = (bb["y1"] + bb["y2"]) // 2
-                xh_color = (0, 0, 255) if match.category == "wanted" else (0, 165, 255)
-                cv2.drawMarker(annotated, (cx, cy), xh_color,
-                               cv2.MARKER_CROSS, 15, 2)
-            else:
-                cv2.rectangle(annotated, (bb["x1"], bb["y1"]),
-                              (bb["x2"], bb["y2"]), (0, 191, 255), 2)
-                if ac.get("confidence", True):
-                    conf_label = f'{int(fc["confidence"]*100)}%'
-                    cv2.putText(annotated, conf_label,
-                                (bb["x1"], bb["y2"]+14),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                                (0, 191, 255), 1, cv2.LINE_AA)
-
-    _, ann_buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
-    _last_annotated_frames[drone_id] = bytes(ann_buf)
-    _last_annotated_ts[drone_id] = time.monotonic()
+    # Live view: drawn on a ≤1920 px copy (labels at their designed size), off the event loop
+    trails = ({t: list(pts) for t, pts in _person_trajectories[drone_id].items()}
+              if ac.get("trajectory", False) else {})
+    live_jpeg = await asyncio.to_thread(
+        _render_person_live, frame, result["persons"], result["faces"],
+        dict(recognition_results), trails, ac,
+    )
+    if live_jpeg:
+        _hub.put(drone_id, live_jpeg)
+        _last_annotated_frames[drone_id] = live_jpeg
+        _last_annotated_ts[drone_id] = time.monotonic()
 
     ts = datetime.now(timezone.utc)
 

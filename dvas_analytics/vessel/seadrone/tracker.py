@@ -146,10 +146,13 @@ class MaritimeVesselTracker:
 
             label_str = f"{trk['cls_name']} {trk['score']:.2f}"
 
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            (txt_w, txt_h), _ = cv2.getTextSize(label_str, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            # Sizes tuned for ~1920 px; scaled up on larger frames (the live view is
+            # downscaled to 1920 px, so labels keep their size on 4K input)
+            k = max(1.0, w / 1920.0)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, max(2, round(2 * k)))
+            (txt_w, txt_h), _ = cv2.getTextSize(label_str, cv2.FONT_HERSHEY_SIMPLEX, 0.45 * k, max(1, round(k)))
             cv2.rectangle(annotated, (x1, max(0, y1 - txt_h - 4)), (min(w - 1, x1 + txt_w + 4), y1), color, -1)
-            cv2.putText(annotated, label_str, (x1 + 2, max(0, y1 - 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+            cv2.putText(annotated, label_str, (x1 + 2, max(0, y1 - 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.45 * k, (0, 0, 0), max(1, round(k)), cv2.LINE_AA)
 
         return annotated, tracked_objects
 

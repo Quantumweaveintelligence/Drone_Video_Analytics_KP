@@ -42,6 +42,7 @@ from shared import minio_client as minio
 from shared.db import write_confirmed_event
 from shared.evidence import bbox_xyxy, evidence_block, frame_context, model_info
 from shared import gpu_profile
+from shared.annotated_hub import AnnotatedHub, install_stream_route
 from shared.frame_sampler import FrameSampler, decode_frame, frame_bytes
 from analyzer import AnomalyAnalyzer, analyze_round, release_shared_detectors
 
@@ -67,6 +68,9 @@ _stream_running = False
 _frames_processed = 0
 # Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
 _sampler = FrameSampler("anomaly", "anomaly-group", "anomaly-analyzer")
+# Live annotated video (MJPEG, ≤1920 px) for the dashboard
+_hub = AnnotatedHub("anomaly")
+install_stream_route(app, _hub)
 
 # In-memory per-drone telemetry & frame buffers
 _last_annotated: Dict[str, bytes] = {}
@@ -150,12 +154,11 @@ async def _persist_anomaly_frame(
     pool = await get_pool()
     img_bytes = frame_bytes(f) or b""     # source JPEG for alert evidence
 
-    # Encode annotated frame as JPEG for the live /annotated/latest endpoint
-    success, jpeg_buf = await asyncio.to_thread(
-        cv2.imencode, ".jpg", annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85]
-    )
-    if success:
-        _last_annotated[drone_id] = jpeg_buf.tobytes()
+    # Live view (/annotated/latest + MJPEG): ≤1920 px copy. Alert evidence below is
+    # encoded from the full-resolution image, only when an alert needs it.
+    live_jpeg = await _hub.put_frame(drone_id, annotated_bgr)
+    if live_jpeg:
+        _last_annotated[drone_id] = live_jpeg
         _last_annotated_ts[drone_id] = time.time()
 
     # Handle Triggered Alerts (Evidence Capture & Escalation)
@@ -223,7 +226,9 @@ async def _persist_anomaly_frame(
                 with open(snapshot_path, "rb") as sf:
                     snap_bytes = sf.read()
             else:
-                snap_bytes = jpeg_buf.tobytes() if success else b""
+                ok_full, full_buf = await asyncio.to_thread(
+                    cv2.imencode, ".jpg", annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                snap_bytes = full_buf.tobytes() if ok_full else b""
             if snap_bytes:
                 snap_obj = await minio.upload_object(
                     BUCKET_ANOMALY,

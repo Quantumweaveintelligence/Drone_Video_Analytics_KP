@@ -62,7 +62,13 @@ class IntrusionAnnotator:
         alpha: float = 0.75,
         margin: int = 3,
     ) -> Tuple[int, int, int, int]:
-        """Draw text with an alpha-blended background rectangle."""
+        """Draw text with an alpha-blended background rectangle.
+
+        Sizes are tuned for ~1920 px wide frames; on larger frames (4K) they grow with the
+        width, so labels keep their size in the 1920 px live view and in evidence.
+        """
+        k = max(1.0, img.shape[1] / 1920.0)
+        font_scale, thickness, margin = font_scale * k, max(1, round(thickness * k)), round(margin * k)
         font = cv2.FONT_HERSHEY_SIMPLEX
         (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
 

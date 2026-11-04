@@ -72,7 +72,7 @@ _frames_processed = 0
 # the env value with dvas:fps_target:crowd:<drone>.
 _rate_cap = FrameRateCap(cfg.CROWD_MAX_FPS)
 # Newest-frame reader + live fps stats; crowd keeps its own cap (not FPS-governed)
-_sampler = FrameSampler("crowd", "crowd-group", "crowd-analyzer", governed=False,
+_sampler = FrameSampler("crowd", "crowd-group", "crowd-analyzer", mode="newest", governed=False,
                         cap_fps=cfg.CROWD_MAX_FPS if cfg.CROWD_MAX_FPS > 0 else None)
 HEATMAP_EVERY_N_FRAMES = 10            # heatmap PNG/base64 is only uploaded every Nth frame
 # One crowd_threshold event per surge (B29): re-armed after the count falls below

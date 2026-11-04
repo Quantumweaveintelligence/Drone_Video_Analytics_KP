@@ -84,7 +84,10 @@ class FakeRedis:
 
     async def xreadgroup(self, groupname, consumername, streams, count, block):
         out = []
-        for key in streams:
+        for key, sid in streams.items():
+            if sid == "0":                       # own pending list: empty in these tests
+                out.append((key.encode(), []))
+                continue
             entries = self.streams.get(key, [])
             i = self.pos.get(key, 0)
             part = entries[i:i + count]
@@ -118,7 +121,7 @@ def _entries(n):
 def test_sampler_returns_newest_and_acks_backlog():
     clock = FakeClock()
     fake = FakeRedis({"drone:frames:D1": _entries(70), "drone:frames:D2": _entries(1)})
-    s = FrameSampler("vehicle", "g", "c", redis_factory=lambda: fake, clock=clock)
+    s = FrameSampler("crowd", "g", "c", mode="newest", redis_factory=lambda: fake, clock=clock)
     got = asyncio.run(s.next_round(["D1", "D2"]))
     assert got["D1"]["frame"] == b"jpg70" and got["D1"]["entry_id"] == "70-0"
     assert got["D2"]["frame"] == b"jpg1"
@@ -250,3 +253,37 @@ def test_governor_cycle_writes_caps_and_status():
 def test_unknown_gpu_holds_cap_instead_of_throttling():
     d, n = decide(22, Policy(20, 30, 5), [_pair("anpr", 4)], gpu_pct=None, overloaded_cycles=1)
     assert d.cap == 22 and d.state == "ok" and "unknown" in d.reason and n == 0
+
+
+def _seq_entries(seqs):
+    return [(f"{i}-0".encode(), {b"frame": b"jpg%d" % q, b"ts": b"0", b"frame_seq": str(q).encode()})
+            for i, q in enumerate(seqs, 1)]
+
+
+def test_ordered_mode_analyses_every_frame_in_order_including_backlog():
+    clock = FakeClock()
+    fake = FakeRedis({"drone:frames:D1": _seq_entries(range(1, 6)), "drone:frames:D2": _seq_entries([1, 2])})
+    s = FrameSampler("vehicle", "g", "c", redis_factory=lambda: fake, clock=clock)
+    seen = {"D1": [], "D2": []}
+    for _ in range(8):
+        clock.t += 1.0                                   # always due
+        for d, f in asyncio.run(s.next_round(["D1", "D2"])).items():
+            seen[d].append(f["frame"])
+    assert seen["D1"] == [b"jpg%d" % i for i in range(1, 6)]     # all five, in order
+    assert seen["D2"] == [b"jpg1", b"jpg2"]
+    assert s.stats["D1"].skipped == 0 and len(fake.acked) == 7
+
+
+def test_ordered_mode_counts_frames_lost_to_queue_overflow():
+    clock = FakeClock()
+    fake = FakeRedis({"drone:frames:D1": _seq_entries([1, 2, 7, 8])})   # 3–6 trimmed by MAXLEN
+    s = FrameSampler("person", "g", "c", redis_factory=lambda: fake, clock=clock)
+    for _ in range(6):
+        clock.t += 1.0
+        asyncio.run(s.next_round(["D1"]))
+    assert s.stats["D1"].skipped == 4
+
+
+def test_sampler_mode_is_validated():
+    with pytest.raises(ValueError):
+        FrameSampler("x", "g", "c", mode="fast")

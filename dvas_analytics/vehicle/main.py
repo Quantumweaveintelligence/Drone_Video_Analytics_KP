@@ -36,6 +36,7 @@ from shared.redis_client import (
 from shared import minio_client as minio
 from shared import gpu_profile
 from shared.frame_sampler import FrameSampler, decode_frame
+from shared.annotated_hub import AnnotatedHub, install_stream_route, scale_items, to_display
 from vehicle.analyzer import VehicleAnalyzer
 from vehicle.schema import VehicleFrameResult, VehicleStats
 
@@ -60,6 +61,9 @@ _stream_running = False
 _frames_processed = 0
 # Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
 _sampler = FrameSampler("vehicle", "vehicle-group", "vehicle-analyzer")
+# Live annotated video (MJPEG, ≤1920 px) for the dashboard
+_hub = AnnotatedHub("vehicle")
+install_stream_route(app, _hub)
 
 # ── Annotated frame cache ─────────────────────────────────────────────────────
 # Stores the latest annotated JPEG bytes per drone_id for dashboard display
@@ -160,6 +164,13 @@ def _draw_vehicle_annotations(frame: np.ndarray, vehicles: list, drone_id: str) 
     # Encode to JPEG
     ok, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 82])
     return buf.tobytes() if ok else b""
+
+
+def _live_vehicle_jpeg(frame: np.ndarray, items: list, drone_id: str) -> bytes:
+    """Live-view JPEG: overlay drawn on the ≤1920 px copy with boxes scaled to it, so
+    labels keep their designed size when the drone sends 4K (detection is unaffected)."""
+    small, f = to_display(frame)
+    return _draw_vehicle_annotations(small, scale_items(items, ("bbox",), f), drone_id)
 
 
 @app.on_event("startup")
@@ -292,9 +303,10 @@ async def _persist_vehicle_frame(drone_id: str, f: dict, frame: np.ndarray, resu
     # ── Annotate frame and cache for dashboard ────────────────
     import time as _time
     annotated_bytes = await asyncio.to_thread(
-        _draw_vehicle_annotations, frame, result.get("vehicles", []), drone_id
+        _live_vehicle_jpeg, frame, result.get("vehicles", []), drone_id
     )
     if annotated_bytes:
+        _hub.put(drone_id, annotated_bytes)
         _last_annotated[drone_id]    = annotated_bytes
         _last_annotated_ts[drone_id] = _time.monotonic()
 
@@ -530,7 +542,7 @@ async def annotated_latest(drone_id: str = ""):
                         analyzer.analyze_frame, recovered_frame, drone_id=alias, save_crops=False
                     )
                     annotated_bytes = await asyncio.to_thread(
-                        _draw_vehicle_annotations, recovered_frame, result.get("vehicles", []), alias
+                        _live_vehicle_jpeg, recovered_frame, result.get("vehicles", []), alias
                     )
                     if annotated_bytes:
                         _last_annotated[alias] = annotated_bytes

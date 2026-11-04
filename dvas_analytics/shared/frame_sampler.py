@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-DVAS Analytics — newest-frame sampler and live FPS stats (RunPod plan 9.1 / 9.2 / 10.1).
+DVAS Analytics — frame sampler and live FPS stats (RunPod plan 9.1 / 9.2 / 10.1).
 
 Every analyzer loop reads frames through FrameSampler instead of calling
 XREADGROUP per drone:
 
   * One XREADGROUP covers all drones that are due (BLOCK when nothing is new).
-  * Per drone only the NEWEST entry is returned; older ones are XACKed unread
-    and counted as `skipped`. When the analyzer keeps up there is one entry per
-    read and nothing is skipped; when the GPU is full the lag stays at one
-    frame instead of a growing backlog.
+  * mode="ordered" (default, every analyzer but crowd): every frame is analysed,
+    in order, one per drone per round. If the GPU falls behind the backlog stays
+    in the queue and is worked off — also after the edge stops streaming. Frames
+    are lost only when the queue overflows (MAXLEN); they are counted as `skipped`
+    from gaps in `frame_seq`.
+  * mode="newest" (crowd): only the newest entry per drone is analysed; older ones
+    are XACKed unread and counted as `skipped`.
   * A per-drone rate cap (the governor's `dvas:fps_cap:<service>`, else
     DVAS_FPS_MAX) keeps one service from taking the whole GPU.
   * Live stats (input fps, analysed fps, skipped, inference ms, lag) are
@@ -171,13 +174,17 @@ class DroneStats:
 
 
 class FrameSampler:
-    """Newest-frame reader + stats publisher for one analyzer service."""
+    """Frame reader (in order, or newest only) + stats publisher for one analyzer service."""
 
     def __init__(self, service: str, group: str, consumer: str, *,
+                 mode: str = "ordered",
                  governed: bool = True, cap_fps: Optional[float] = None,
                  block_ms: int = 50, redis_factory: Optional[Callable] = None,
                  clock: Callable[[], float] = time.monotonic):
+        if mode not in ("ordered", "newest"):
+            raise ValueError(f"mode must be 'ordered' or 'newest', not {mode!r}")
         self.service = service
+        self.mode = mode
         self.group = group
         self.consumer = consumer
         self.governed = governed
@@ -193,6 +200,9 @@ class FrameSampler:
         self._last_publish = 0.0
         self._last_cap_read = 0.0
         self._batch_sizes: Deque[int] = deque(maxlen=50)
+        self._pel_done: set = set()          # drones whose own pending entries were re-read
+        self._last_seq: Dict[str, int] = {}  # last analysed frame_seq per drone (gap = lost)
+        self._queued: Dict[str, Optional[int]] = {}
 
     # ── Valkey ────────────────────────────────────────────────────────────────
     def _redis(self):
@@ -208,9 +218,10 @@ class FrameSampler:
             if d in self._groups_ok or self._group_retry_at.get(d, 0.0) > now:
                 continue
             try:
-                # New group starts at the newest entry ("$"), so a fresh service never reads
-                # an old backlog. Existing stream only: a purged stream must not be recreated.
-                await client.xgroup_create(stream_key(d), self.group, id="$", mkstream=False)
+                # ordered: from the start of the queue (every frame); newest: from the end.
+                # Existing stream only: a purged stream must not be recreated.
+                await client.xgroup_create(stream_key(d), self.group,
+                                           id="0" if self.mode == "ordered" else "$", mkstream=False)
                 self._groups_ok.add(d)
             except Exception as exc:
                 if "BUSYGROUP" in str(exc):
@@ -261,6 +272,8 @@ class FrameSampler:
             return {}
 
         client = self._redis()
+        if self.mode == "ordered":
+            return await self._next_ordered(client, due)
         try:
             res = await client.xreadgroup(
                 groupname=self.group, consumername=self.consumer,
@@ -312,6 +325,73 @@ class FrameSampler:
             self.cap.mark(drone_id)
         return out
 
+    async def _next_ordered(self, client, due: List[str]) -> Dict[str, dict]:
+        """Next unread frame per due drone, in stream order (one per drone per round).
+
+        Entries this consumer was given but never acknowledged (crash / restart) are
+        re-read first ("0"), then new ones (">"). Each entry is XACKed when handed
+        to the analyzer.
+        """
+        streams = {stream_key(d): ("0" if d not in self._pel_done else ">") for d in due}
+        block = None if any(v == "0" for v in streams.values()) else self.block_ms
+        try:
+            res = await client.xreadgroup(groupname=self.group, consumername=self.consumer,
+                                          streams=streams, count=1, block=block)
+        except Exception as exc:
+            if "NOGROUP" in str(exc):
+                self._groups_ok.difference_update(due)
+                self._pel_done.difference_update(due)
+                return {}
+            raise
+        got = {}
+        for stream_name, entries in res or []:
+            got[_s(stream_name).split("drone:frames:", 1)[-1]] = entries
+        out: Dict[str, dict] = {}
+        now = self._clock()
+        for d in due:
+            entries = got.get(d) or []
+            if streams[stream_key(d)] == "0" and not entries:
+                self._pel_done.add(d)           # own pending list is empty: switch to new entries
+                continue
+            if not entries:
+                continue
+            eid, raw = entries[0]
+            if raw is None or not raw:          # pending id whose entry was trimmed away
+                await client.xack(stream_key(d), self.group, _s(eid))
+                continue
+            await client.xack(stream_key(d), self.group, _s(eid))
+            st = self.stats.setdefault(d, DroneStats())
+            st.received.append(now)
+            fields = decode_fields(raw, d, _s(eid))
+            try:
+                seq = int(fields.get("frame_seq") or fields.get("frame_sequence") or "")
+                last = self._last_seq.get(d)
+                if last is not None and seq > last + 1 and seq - last < 1_000_000:
+                    st.skipped += seq - last - 1    # overwritten by MAXLEN before we got to them
+                self._last_seq[d] = seq
+            except ValueError:
+                pass
+            ts_ms = fields.get("ts")
+            try:
+                st.lag_ms = max(0.0, time.time() * 1000 - float(ts_ms)) if ts_ms else None
+            except ValueError:
+                st.lag_ms = None
+            out[d] = fields
+            self.cap.mark(d)
+        return out
+
+    async def _refresh_queued(self) -> None:
+        """Frames still waiting for this service, per drone (for the Models page)."""
+        client = self._redis()
+        for d in list(self.stats):
+            try:
+                groups = await client.xinfo_groups(stream_key(d))
+                g = next((x for x in groups if _s(x.get("name") or x.get(b"name") or "") == self.group), None)
+                lag = None if g is None else g.get("lag")
+                self._queued[d] = None if lag is None else int(lag)
+            except Exception:
+                self._queued[d] = None
+
     async def _jump_to_newest(self, client, drone_id: str):
         """Move the group's last-delivered id to the newest entry and return that entry."""
         latest = await client.xrevrange(stream_key(drone_id), max="+", min="-", count=1)
@@ -337,6 +417,8 @@ class FrameSampler:
 
     def forget(self, drone_id: str) -> None:
         self.stats.pop(drone_id, None)
+        self._pel_done.discard(drone_id)
+        self._last_seq.pop(drone_id, None)
         self.cap.forget(drone_id)
         self._groups_ok.discard(drone_id)
 
@@ -356,6 +438,7 @@ class FrameSampler:
                 "infer_ms": None if st.infer_ms is None else round(st.infer_ms, 1),
                 "total_ms": None if st.total_ms is None else round(st.total_ms, 1),
                 "lag_ms": None if st.lag_ms is None else round(st.lag_ms),
+                "queued": self._queued.get(d),
             }
         batches = list(self._batch_sizes)
         return {
@@ -364,6 +447,7 @@ class FrameSampler:
             "cap_fps": round(self.cap.fps, 1),
             "cap_source": self.cap_source,
             "governed": self.governed,
+            "mode": self.mode,
             "gpu": gpu_profile.detect().as_dict(),
             "avg_batch": round(sum(batches) / len(batches), 2) if batches else None,
             "drones": drones,
@@ -375,6 +459,8 @@ class FrameSampler:
         if now - self._last_publish < STATS_EVERY_S:
             return
         self._last_publish = now
+        if self.mode == "ordered":
+            await self._refresh_queued()
         try:
             await self._redis().set(STATS_KEY.format(service=self.service),
                                     json.dumps(self.snapshot()), ex=STATS_TTL_S)

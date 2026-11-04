@@ -344,18 +344,19 @@ def draw_semi_transparent_label(
     Uses the exact same color as the bounding box with a 1px subtle dark shadow for legibility.
     """
     font = cv2.FONT_HERSHEY_SIMPLEX
+    t = max(1, round(image.shape[1] / 1920.0))     # thicker strokes on 4K frames
     if not line2:
         l1_y = ly + int(lh * 0.75)
         # Subtle 1px shadow for high contrast on light backgrounds without any black box
-        cv2.putText(image, line1, (lx + 1, l1_y + 1), font, font_scale, (0, 0, 0), 1, cv2.LINE_AA)
-        cv2.putText(image, line1, (lx, l1_y), font, font_scale, text_color, 1, cv2.LINE_AA)
+        cv2.putText(image, line1, (lx + 1, l1_y + 1), font, font_scale, (0, 0, 0), t, cv2.LINE_AA)
+        cv2.putText(image, line1, (lx, l1_y), font, font_scale, text_color, t, cv2.LINE_AA)
     else:
         l1_y = ly + int(lh * 0.45)
         l2_y = ly + int(lh * 0.88)
-        cv2.putText(image, line1, (lx + 1, l1_y + 1), font, font_scale, (0, 0, 0), 1, cv2.LINE_AA)
-        cv2.putText(image, line1, (lx, l1_y), font, font_scale, text_color, 1, cv2.LINE_AA)
-        cv2.putText(image, line2, (lx + 1, l2_y + 1), font, font_scale * 0.88, (0, 0, 0), 1, cv2.LINE_AA)
-        cv2.putText(image, line2, (lx, l2_y), font, font_scale * 0.88, text_color, 1, cv2.LINE_AA)
+        cv2.putText(image, line1, (lx + 1, l1_y + 1), font, font_scale, (0, 0, 0), t, cv2.LINE_AA)
+        cv2.putText(image, line1, (lx, l1_y), font, font_scale, text_color, t, cv2.LINE_AA)
+        cv2.putText(image, line2, (lx + 1, l2_y + 1), font, font_scale * 0.88, (0, 0, 0), t, cv2.LINE_AA)
+        cv2.putText(image, line2, (lx, l2_y), font, font_scale * 0.88, text_color, t, cv2.LINE_AA)
 
 
 def draw_detection_box(
@@ -399,13 +400,17 @@ def draw_detection_box(
     cv2.line(image, (x2, y2), (x2, y2 - c_len), color, c_thick)
 
     # 3. Dynamic Font & Label Sizing
-    font_scale = max(0.33, min(0.50, h_img / 1080.0 * 0.42))
+    # Tuned for ≤1080p; on 4K the label grows with the frame so it stays readable in the
+    # 1920 px live view (the frame is downscaled there)
+    k = max(1.0, image.shape[1] / 1920.0)
+    font_scale = max(0.33, min(0.50, h_img / 1080.0 * 0.42)) * k
     font = cv2.FONT_HERSHEY_SIMPLEX
+    t = max(1, round(k))
 
-    (w1, h1), _ = cv2.getTextSize(line1, font, font_scale, 1)
+    (w1, h1), _ = cv2.getTextSize(line1, font, font_scale, t)
     w2, h2 = (0, 0)
     if line2:
-        (w2, h2), _ = cv2.getTextSize(line2, font, font_scale * 0.88, 1)
+        (w2, h2), _ = cv2.getTextSize(line2, font, font_scale * 0.88, t)
 
     badge_w = max(w1, w2) + 6
     badge_h = (h1 + h2 + 8) if line2 else (h1 + 6)
