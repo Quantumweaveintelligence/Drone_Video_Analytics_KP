@@ -51,6 +51,19 @@ except ValueError:          # a bad template value must not stop ingest
 _MEM_CHECK_S = 2.0
 
 
+def _parse_id(raw) -> Optional[tuple]:
+    """Stream id "1700000000000-3" → (1700000000000, 3) for ordering; None if absent."""
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode()
+    try:
+        ms, _, seq = str(raw).partition("-")
+        return int(ms), int(seq or 0)
+    except ValueError:
+        return None
+
+
 # ── Per-drone stats ────────────────────────────────────────────────────────────
 @dataclass
 class DroneQueueStats:
@@ -178,9 +191,14 @@ class QueueManager:
 
     async def is_fully_consumed(self, drone_id: str) -> bool:
         """
-        True only when the stream has no entries OR all consumers in the 'analytics'
-        group have ACKed all entries and consumer lag is zero.
-        Never returns True if there are unconsumed frames and no consumer groups exist.
+        True only when the stream has no entries, or every analytics consumer group
+        (a group that has consumers) has been delivered the stream's last entry and has
+        nothing pending.
+
+        Valkey's `lag` is not used: it becomes null once MAXLEN trimming passes a group's
+        position (every long mission), and a null lag used to count as "caught up" — the
+        stream was deleted while an analyzer still had hundreds of frames to read.
+        Groups without consumers (e.g. the placeholder "analytics" group) are ignored.
         """
         if not self._connected:
             await self.connect()
@@ -190,21 +208,64 @@ class QueueManager:
             if xlen == 0:
                 return True
             groups = await self._client.xinfo_groups(stream_key)
-            if not groups:
+            info = await self._client.xinfo_stream(stream_key)
+            last_id = _parse_id(info.get("last-generated-id"))
+            readers = [g for g in groups if int(g.get("consumers", 0) or 0) > 0]
+            if not readers or last_id is None:
                 return False
-            has_active_consumer = False
-            for g in groups:
-                consumers = g.get("consumers", 0)
-                pending = g.get("pending", 0)
-                lag = g.get("lag", 0)
-                if consumers > 0:
-                    has_active_consumer = True
-                if pending > 0 or (lag is not None and lag > 0):
+            for g in readers:
+                if int(g.get("pending", 0) or 0) > 0:
                     return False
-            return has_active_consumer
+                delivered = _parse_id(g.get("last-delivered-id"))
+                if delivered is None or delivered < last_id:
+                    return False
+            return True
         except Exception as exc:
             log.debug("is_fully_consumed check failed for %s: %s", drone_id, exc)
             return False
+
+    async def remaining_frames(self, drone_id: str) -> int:
+        """Frames the slowest analyzer still has to process (stream length if none reads it)."""
+        unread = await self.unread_frames(drone_id)
+        if unread:
+            return max(unread.values())
+        return await self.get_queue_depth(drone_id)
+
+    async def unread_frames(self, drone_id: str) -> Dict[str, int]:
+        """{group: frames not yet analysed} for groups with consumers (pending + undelivered).
+
+        The stream length alone is not "remaining": it also counts frames every analyzer
+        has already processed.
+        """
+        stream_key = f"drone:frames:{drone_id}"
+        out: Dict[str, int] = {}
+        try:
+            groups = await self._client.xinfo_groups(stream_key)
+            info = await self._client.xinfo_stream(stream_key)
+            last_id = _parse_id(info.get("last-generated-id"))
+            for g in groups:
+                if int(g.get("consumers", 0) or 0) == 0:
+                    continue
+                name = g.get("name")
+                name = name.decode() if isinstance(name, bytes) else str(name)
+                pending = int(g.get("pending", 0) or 0)
+                lag = g.get("lag")
+                if lag is None:
+                    # Null after MAXLEN trimming passed the group, or after XGROUP SETID
+                    delivered = _parse_id(g.get("last-delivered-id"))
+                    first = info.get("first-entry")
+                    first_id = _parse_id(first[0]) if first else None
+                    if delivered is not None and last_id is not None and delivered >= last_id:
+                        lag = 0
+                    elif delivered is None or (first_id is not None and delivered < first_id):
+                        lag = int(info.get("length", 0) or 0)     # everything left is unread
+                    else:
+                        lag = 1                                   # unknown, but not done
+                # Valkey's lag can overstate after MAXLEN trimming; never more than the stream holds
+                out[name] = pending + min(int(lag), int(info.get("length", 0) or 0))
+        except Exception as exc:
+            log.debug("unread_frames failed for %s: %s", drone_id, exc)
+        return out
 
     # ── Frame publishing ──────────────────────────────────────────────────────
 

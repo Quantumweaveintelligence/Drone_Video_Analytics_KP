@@ -546,7 +546,7 @@ async def system_status() -> SystemStatusResponse:
 
     for drone_id in sorted(known_ids):
         stats      = _ingest_stats.get(drone_id, {})
-        depth      = await _qm.get_queue_depth(drone_id) if _qm else 0
+        depth      = await _qm.remaining_frames(drone_id) if _qm else 0
         total_queued += depth
         QUEUE_DEPTH.labels(drone_id=drone_id).set(depth)
 
@@ -595,7 +595,7 @@ async def drone_status(
     a single drone.
     """
     stats = _ingest_stats.get(drone_id, {})
-    depth = await _qm.get_queue_depth(drone_id) if _qm else 0
+    depth = await _qm.remaining_frames(drone_id) if _qm else 0
     QUEUE_DEPTH.labels(drone_id=drone_id).set(depth)
 
     q_stats = DroneQueueStats(
