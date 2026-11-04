@@ -67,8 +67,11 @@ which stays at `CROWD_MAX_FPS`). Full notes: `context_gpu_fps.md` at the repo ro
 
 - **GPU profile:** FP16 + cuDNN autotune on Volta+ (not GTX 16xx); drones per detector batch from VRAM
   (L40S 4, RTX PRO 6000 8). Override with `DVAS_FP16`, `DVAS_MAX_BATCH`. Inference sizes never change.
-- **Newest frame only:** when an analyzer can't keep up it analyses the newest frame and acks the rest
-  (shown as *skipped*), so lag stays at one frame.
+- **Every frame, in order:** if an analyzer falls behind, frames wait in the queue (2000 per drone) and
+  are worked off, also after the edge stops. Ingest deletes a stream only after every analyzer has read
+  it to the end. Frames are lost only when the queue overflows (Models page: *Lost*).
+- **Live video:** analytics pages use one MJPEG stream per view (≤1920 px copy, 20+ fps) and show the
+  analyzer's real processing fps. Detection and evidence stay full resolution.
 - **Governor** (analytics gateway): if the GPU is ≥ 90 % busy and analyzers fall short, all of them
   are capped equally, never below the floor (default 5 fps). `GOVERNOR_ENABLED=false` disables it.
 - **Detection Models page:** detected GPU, governor state, analysed vs input fps per analyzer and drone.

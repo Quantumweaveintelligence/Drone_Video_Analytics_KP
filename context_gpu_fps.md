@@ -11,7 +11,7 @@ Decisions taken with the product owner:
 | Which analyzers hold 20–30 fps | Every analyzer **except crowd** (crowd stays at `CROWD_MAX_FPS`, 2 fps) |
 | GPU full | All analyzers slow down **equally**, never below the floor (default 5 fps) |
 | Levers | FP16 + cuDNN autotune, and batching the newest frame of all drones. **Inference resolution is never changed** |
-| Can't keep up | Analyse the newest frame only; older ones are acked unread and counted as *skipped* |
+| Can't keep up | **Every frame, in order** (changed 2026-11-04; was newest-frame-only). The backlog waits in the queue and is worked off, also after the edge stops. Frames are lost only if the queue overflows (counted as *lost*). Crowd still analyses the newest frame only |
 | Models page | SO/SA edit the target range; CRO sees it read-only |
 | TensorRT | Not now |
 | Queue length | 2000 frames per drone |
@@ -35,7 +35,7 @@ Decisions taken with the product owner:
 edge ──► ingest ──XADD (raw JPEG, MAXLEN 2000)──► Valkey drone:frames:<drone>
                                                      │  one XREADGROUP for all due drones
                                                      ▼
-            analyzer ── FrameSampler: newest frame per drone, rest XACKed (skipped)
+            analyzer ── FrameSampler: next frame per drone, in order (crowd: newest only)
                      ── BatchTracker / batched predict: one GPU batch, one tracker per drone (FP16)
                      ── persist task (DB / MinIO / events) runs while the next batch infers
                      ── every 2 s: dvas:svc_stats:<service>
@@ -101,12 +101,45 @@ edge ──► ingest ──XADD (raw JPEG, MAXLEN 2000)──► Valkey drone:f
   at the limit every XADD would fail and ingest would stop. Above `QUEUE_MEM_GUARD_PCT` (85 %) of
   maxmemory, ingest trims the stream it writes to `MAXLEN/4` until memory recovers (logged as
   `valkey_memory_high` / `valkey_memory_ok`).
-- With newest-frame-only, analyzers never work through the backlog; the longer queue helps the
-  ingest `/latest` endpoint, drain and crowd recovery, not analysis.
-- New consumer groups start at the newest entry (`$`). When a group finds a backlog (≥ 32 waiting,
-  e.g. after a stall), it reads one chunk, then jumps with `XGROUP SETID` to the newest entry instead
-  of transferring every queued frame. After such a jump `XINFO GROUPS` reports `lag` as null until the
-  next delivery; the ingest mission drain already treats null lag as caught up.
+- Analyzers read every frame in order (one per drone per round), so the 2000-frame queue is the
+  buffer that lets them catch up: ~100 s at 20 fps. Entries a consumer was given but never acknowledged
+  (crash/restart) are re-read first. Crowd keeps reading only the newest frame.
+- **4K memory:** a 3840×2160 JPEG is ~1–1.5 MB, so 2000 frames ≈ 2–3 GB per drone. With Valkey's
+  `maxmemory 8gb`, the memory guard starts trimming (to 500 frames) at about 3 drones streaming 4K;
+  frames an analyzer has not reached by then are lost (shown as *Lost*). Raise `maxmemory` in
+  `deploy/runpod/etc/valkey.conf` if the pod has the RAM.
+
+### Mission end: the queue is worked off before cleanup (fixed 2026-11-04)
+
+When the edge ends a mission, ingest waits ≥ 20 s and then deletes the drone's stream once every
+analyzer is "fully consumed". That check trusted Valkey's `lag`, which is null once MAXLEN trimming has
+passed a group's position (every long mission), and treated null as caught up. The stream was deleted
+while an analyzer still had hundreds of frames to read (seen: 100 left in intrusion, 300 in person).
+Now a group counts as done only when its last-delivered id has reached the stream's last id and it has
+nothing pending; groups without consumers (the placeholder `analytics` group) are ignored. The
+"frames remaining" figure in ingest status is now what the slowest analyzer still has to read
+(it was the stream length, which includes frames already analysed). Verified against Valkey 7.2.
+
+## 2b. Live annotated video (MJPEG, 2026-11-04)
+
+The analytics pages showed ~1 fps because the browser downloaded one annotated JPEG at a time
+(poll every 0.6–1.5 s plus the full-size download through the RunPod proxy). That number was the
+page's refresh rate, not the analyzers' processing rate.
+
+- Each analyzer serves `GET /annotated/stream?drone_id=` (intrusion: `/intrusion/annotated/stream`):
+  `multipart/x-mixed-replace`, one part per new frame, part headers `X-Frame-Seq`, `X-Proc-Fps`
+  (the analyzer's real rate), `X-Frame-Age`. Backend relay: `GET /api/analytics/{service}/annotated/stream`
+  (CRO/SO, 8 streams per user, 40 per pod).
+- **Resolution:** detection runs on the full frame (faces, plates, tiles: unchanged). The live copy is
+  ≤ 1920 px wide (`DVAS_LIVE_MAX_WIDTH`, JPEG q80 `DVAS_LIVE_JPEG_Q`): ~200 KB per 1080p frame instead of
+  1–2 MB at 4K, so 20+ fps fits through the proxy. Overlays are drawn so labels keep their designed size
+  on 4K (vehicle/ANPR/person/vessel draw on the 1920 px copy; intrusion/anomaly scale text with width).
+  **Evidence keeps full resolution** (intrusion/anomaly annotated evidence is encoded from the full image).
+- Frontend `hooks/useLiveFeed.js` reads the stream with `fetch` (cookie or token auth), shows the newest
+  frame, pauses on hidden tabs, reconnects, and falls back to polling if the stream route is missing.
+  Pages show **Processing** fps (from the analyzer) separately from the view rate. Raw ingest frames are
+  polled only while no annotated video is available.
+- Person drew its overlay and encoded the 4K JPEG on the event loop; that now runs in a worker thread.
 
 ---
 
@@ -145,7 +178,9 @@ change it under Admin → System settings; the backend pushes it to the gateway 
 Verified locally (GTX 1650, Ultralytics 8.3.253, FP32):
 - Batched detection + per-drone tracking gives the same boxes as `.track()` for every converted service
   (vehicle, person, ANPR, intrusion, vessel, anomaly); output formats unchanged.
-- Unit tests: GPU tiers, sampler (newest frame, backlog drain, cap bounds), governor (overload,
+- In-order reading, overflow counting, crash re-read and the mission-drain check verified on a real
+  Valkey 7.2; MJPEG relay verified end to end (4K in → 1920×1080 parts, parsed by the browser hook).
+- Unit tests: GPU tiers, sampler (in-order mode, newest mode, overflow, cap bounds), governor (overload,
   hysteresis, floor, input-limited, CPU-bound), backend endpoints (roles, validation, audit, gateway
   down), crowd stream evidence. Analytics 43, backend 100, deploy 9 tests pass. Frontend builds.
 
