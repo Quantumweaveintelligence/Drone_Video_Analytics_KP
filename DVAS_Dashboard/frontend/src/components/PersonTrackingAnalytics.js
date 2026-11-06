@@ -2298,8 +2298,9 @@ function ensureOk(res) {
 
 const ALERT_REVIEW_ROLES = ['system_administrator', 'senior_officer', 'control_room_officer'];
 
-export default function PersonTrackingAnalytics({ drones, droneId = '', user, onNavigateTab }) {
-  // The page's drone selector wins; our own pill selection is only a fallback when it is empty.
+export default function PersonTrackingAnalytics({ drones, droneId = '', user, onNavigateTab, onSelectDrone }) {
+  // The page's drone selection wins; the drone pills change it through onSelectDrone (the shared
+  // command selection), or locally when the page gives no drone.
   const [selectedDrone, setSelectedDrone] = useState(null);
   const activeDrone = droneId || selectedDrone;
   const canReviewAlerts = !user?.role || ALERT_REVIEW_ROLES.includes(user.role);
@@ -2673,7 +2674,7 @@ export default function PersonTrackingAnalytics({ drones, droneId = '', user, on
       {/* LIVE ANNOTATED FEED */}
       <AnnotatedPersonFeedViewer
         activeDrone={activeDrone}
-        setActiveDrone={droneId ? null : setSelectedDrone}
+        setActiveDrone={onSelectDrone || (droneId ? null : setSelectedDrone)}
         drones={drones}
         streamRunning={streamRunning}
         onStartStream={handleStartStream}

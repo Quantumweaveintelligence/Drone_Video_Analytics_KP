@@ -762,9 +762,10 @@ function MissionExport({ hasData }) {
 /* ───────────────────────────────────────────────────────────────
    MAIN EXPORT
    ────────────────────────────────────────────────────────────── */
-export default function CrowdAnalytics({ crowdSeries, drones, droneId = '', user, onNavigateTab }) {
+export default function CrowdAnalytics({ crowdSeries, drones, droneId = '', user, onNavigateTab, onSelectDrone }) {
   const { streams } = useActiveStreams();
-  // The page's drone selector wins; our own pill selection is only a fallback when it is empty.
+  // The page's drone selection wins; the drone pills change it through onSelectDrone (the shared
+  // command selection), or locally when the page gives no drone.
   const [selectedDrone, setSelectedDrone] = useState(null);
   const activeDrone = droneId || selectedDrone;
   const canControlStream = user?.role !== 'drone_operator';
@@ -1007,7 +1008,7 @@ export default function CrowdAnalytics({ crowdSeries, drones, droneId = '', user
       <LiveFeedSection
         activeDrone={activeDrone}
         droneList={droneList}
-        setActiveDrone={droneId ? null : setSelectedDrone}
+        setActiveDrone={onSelectDrone || (droneId ? null : setSelectedDrone)}
         liveCount={liveCount}
         liveLevel={liveLevel}
         streamRunning={streamRunning}

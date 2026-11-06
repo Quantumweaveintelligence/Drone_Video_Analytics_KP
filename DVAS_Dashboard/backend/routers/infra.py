@@ -355,7 +355,11 @@ async def _models_payload(cfg: dict, user: dict) -> dict:
     }
 
 
-MODEL_ADMIN_ROLES = ("senior_officer", "system_administrator")   # M9: shared cluster config
+# Who may change the shared model set (start/stop modules, deploy). M9 limited this to SO/SA;
+# control room officers added 2026-11-06 — every change is audit-logged (model_config_update).
+MODEL_ADMIN_ROLES = ("control_room_officer", "senior_officer", "system_administrator")
+# The FPS governor policy is cluster tuning, not operations: SO/SA only
+FPS_POLICY_ROLES = ("senior_officer", "system_administrator")
 
 # Detection Models page key → analytics service that runs it
 _MODEL_SERVICE = {"face": "person", "plate": "anpr"}
@@ -421,7 +425,7 @@ def _performance_view(gov: dict, policy: dict, user: dict, local_gpu=None) -> di
         "available": ok,
         "detail": None if ok else (gov or {}).get("detail", "Analytics gateway unavailable"),
         "policy": policy,
-        "editable": user["role"] in MODEL_ADMIN_ROLES,
+        "editable": user["role"] in FPS_POLICY_ROLES,
         "governor": {k: gov.get(k) for k in ("enabled", "state", "reason", "cap_fps", "lagging",
                                              "gpu_util_pct", "updated_at")} if ok else None,
         "gpu": profile,
@@ -450,7 +454,7 @@ async def models_performance(user: dict = Depends(get_current_user)):
 @router.put("/models/performance/policy")
 @limiter.limit("20/minute")
 async def update_fps_policy(body: FpsPolicyIn, request: Request,
-                            user: dict = Depends(require_roles(*MODEL_ADMIN_ROLES))):
+                            user: dict = Depends(require_roles(*FPS_POLICY_ROLES))):
     changes = {"analytics_fps_min": body.target_min, "analytics_fps_max": body.target_max,
                "analytics_fps_floor": body.floor}
     try:

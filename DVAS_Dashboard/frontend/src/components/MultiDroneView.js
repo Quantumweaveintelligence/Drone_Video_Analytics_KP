@@ -98,7 +98,7 @@ function fmtAge(isoTs) {
 }
 
 // Roles allowed to purge a stream queue (backend returns 403 to everyone else)
-const PURGE_ROLES = ["senior_officer", "system_administrator"];
+const PURGE_ROLES = ["control_room_officer", "senior_officer", "system_administrator"];
 
 const EVENT_WINDOW_MS = 2 * 60 * 60 * 1000; // event log shows the last 2 h
 

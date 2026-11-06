@@ -6,13 +6,14 @@ import { useCommand } from "@/context/CommandContext";
 // P1/P9/P10: the component gets the selected drone, the user (role-gated tabs) and a way to
 // open other command pages (e.g. Detection Models).
 export default function PersonPage() {
-  const { user, selectedDrone, drones } = useCommand();
+  const { user, selectedDrone, setSelectedDrone } = useCommand();
   const navigate = useNavigate();
-  const activeId = selectedDrone || drones[0]?.id || "";
+  // Only a drone the officer picked; otherwise the component selects a live stream itself
+  const activeId = selectedDrone || "";
 
   return (
     <div className="w-full">
-      <PersonTrackingAnalytics droneId={activeId} user={user} onNavigateTab={(tab) => navigate(`/command/${tab}`)} />
+      <PersonTrackingAnalytics droneId={activeId} user={user} onSelectDrone={setSelectedDrone} onNavigateTab={(tab) => navigate(`/command/${tab}`)} />
     </div>
   );
 }

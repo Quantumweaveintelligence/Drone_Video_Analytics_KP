@@ -125,3 +125,33 @@ def test_live_summary_for_models_list():
     s = infra._live_summary(GOV["services"]["vehicle"])
     assert s["drones"] == 2 and s["fps"] == 13.9 and s["skipped"] == 5
     assert infra._live_summary(None) is None
+
+
+def test_control_room_officer_can_deploy_models_but_not_tune_fps(app_env, monkeypatch):
+    """2026-11-06: CRO starts/stops modules and deploys the shared set (audited); FPS policy stays SO/SA."""
+    applied = []
+
+    async def cfg(scope):
+        return {"active": ["person"], "updated_at": None, "updated_by": None}
+
+    async def apply(active, user, request=None, reason=""):
+        applied.append((active, user["role"]))
+        return {"vehicle": "started"}
+
+    async def status():
+        return {"person": True, "vehicle": False}
+
+    async def hw():
+        return {}
+
+    monkeypatch.setattr(infra, "_get_model_config", cfg)
+    monkeypatch.setattr(infra, "apply_model_config", apply)
+    monkeypatch.setattr(infra, "_get_service_stream_status", status)
+    monkeypatch.setattr(infra, "collect_system_hardware", hw)
+    cro = client(CRO)
+    assert cro.get("/api/models").json()["read_only"] is False
+    r = cro.post("/api/models", json={"active": ["person", "vehicle"]})
+    assert r.status_code == 200 and applied == [(["person", "vehicle"], "control_room_officer")]
+    assert client(DO).post("/api/models", json={"active": []}).status_code == 403
+    assert cro.put("/api/models/performance/policy",
+                   json={"target_min": 18, "target_max": 25, "floor": 6}).status_code == 403

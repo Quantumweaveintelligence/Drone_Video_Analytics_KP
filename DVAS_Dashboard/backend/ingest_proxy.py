@@ -449,6 +449,9 @@ async def ingest_latest_frame(drone_id: str, request: Request, user: dict = Depe
         raise HTTPException(500, "Frame retrieval failed")
 
 
+PURGE_ROLES = ("control_room_officer", "senior_officer", "system_administrator")
+
+
 @ingest_api.post("/streams/{drone_id}/purge")
 @ingest_api.delete("/streams/{drone_id}")
 async def proxy_purge_stream(
@@ -461,9 +464,10 @@ async def proxy_purge_stream(
     """
     from core.security import get_current_user
     user = await get_current_user(request)
-    # Purging drops queued frames for good: seniors and administrators only (MON-23)
-    if user.get("role") not in ("senior_officer", "system_administrator"):
-        raise HTTPException(status_code=403, detail="Only senior officers or administrators may purge streams")
+    # Purging drops queued frames for good: control room, seniors and administrators
+    # (MON-23; control room officers added 2026-11-06). Every purge is audit-logged below.
+    if user.get("role") not in PURGE_ROLES:
+        raise HTTPException(status_code=403, detail="Not permitted to purge streams")
     if not _DRONE_ID_RE.match(drone_id or ""):
         raise HTTPException(400, "Invalid drone id")
 
