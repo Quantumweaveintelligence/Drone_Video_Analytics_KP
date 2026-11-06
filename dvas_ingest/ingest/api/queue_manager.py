@@ -189,6 +189,18 @@ class QueueManager:
         except Exception:
             return {}
 
+    async def _last_id(self, stream_key: str, drone_id: str):
+        """Id of the newest entry: from our own XADDs (no round trip), else XINFO STREAM."""
+        cached = getattr(self, "_last_entry", {}).get(drone_id)
+        if cached:
+            return _parse_id(cached)
+        info = await self._client.xinfo_stream(stream_key)
+        return _parse_id(info.get("last-generated-id"))
+
+    async def _first_id(self, stream_key: str):
+        first = await self._client.xrange(stream_key, min="-", max="+", count=1)
+        return _parse_id(first[0][0]) if first else None
+
     async def is_fully_consumed(self, drone_id: str) -> bool:
         """
         True only when the stream has no entries, or every analytics consumer group
@@ -208,8 +220,7 @@ class QueueManager:
             if xlen == 0:
                 return True
             groups = await self._client.xinfo_groups(stream_key)
-            info = await self._client.xinfo_stream(stream_key)
-            last_id = _parse_id(info.get("last-generated-id"))
+            last_id = await self._last_id(stream_key, drone_id)
             readers = [g for g in groups if int(g.get("consumers", 0) or 0) > 0]
             if not readers or last_id is None:
                 return False
@@ -225,11 +236,21 @@ class QueueManager:
             return False
 
     async def remaining_frames(self, drone_id: str) -> int:
-        """Frames the slowest analyzer still has to process (stream length if none reads it)."""
+        """Frames the slowest analyzer still has to process (stream length if none reads it).
+
+        Cached for 1 s: dashboards poll this for every drone.
+        """
+        cache = getattr(self, "_remaining_cache", None)
+        if cache is None:
+            cache = self._remaining_cache = {}
+        hit = cache.get(drone_id)
+        now = time.monotonic()
+        if hit and now - hit[0] < 1.0:
+            return hit[1]
         unread = await self.unread_frames(drone_id)
-        if unread:
-            return max(unread.values())
-        return await self.get_queue_depth(drone_id)
+        value = max(unread.values()) if unread else await self.get_queue_depth(drone_id)
+        cache[drone_id] = (now, value)
+        return value
 
     async def unread_frames(self, drone_id: str) -> Dict[str, int]:
         """{group: frames not yet analysed} for groups with consumers (pending + undelivered).
@@ -241,8 +262,9 @@ class QueueManager:
         out: Dict[str, int] = {}
         try:
             groups = await self._client.xinfo_groups(stream_key)
-            info = await self._client.xinfo_stream(stream_key)
-            last_id = _parse_id(info.get("last-generated-id"))
+            length = int(await self._client.xlen(stream_key) or 0)
+            last_id = await self._last_id(stream_key, drone_id)
+            first_id = None
             for g in groups:
                 if int(g.get("consumers", 0) or 0) == 0:
                     continue
@@ -253,16 +275,17 @@ class QueueManager:
                 if lag is None:
                     # Null after MAXLEN trimming passed the group, or after XGROUP SETID
                     delivered = _parse_id(g.get("last-delivered-id"))
-                    first = info.get("first-entry")
-                    first_id = _parse_id(first[0]) if first else None
                     if delivered is not None and last_id is not None and delivered >= last_id:
                         lag = 0
-                    elif delivered is None or (first_id is not None and delivered < first_id):
-                        lag = int(info.get("length", 0) or 0)     # everything left is unread
                     else:
-                        lag = 1                                   # unknown, but not done
+                        if first_id is None:
+                            first_id = await self._first_id(stream_key)   # one entry, rare path
+                        if delivered is None or (first_id is not None and delivered < first_id):
+                            lag = length                                 # everything left is unread
+                        else:
+                            lag = 1                                      # unknown, but not done
                 # Valkey's lag can overstate after MAXLEN trimming; never more than the stream holds
-                out[name] = pending + min(int(lag), int(info.get("length", 0) or 0))
+                out[name] = pending + min(int(lag), length)
         except Exception as exc:
             log.debug("unread_frames failed for %s: %s", drone_id, exc)
         return out
@@ -339,6 +362,10 @@ class QueueManager:
             maxlen=maxlen,
             approximate=True,
         )
+        # Newest id per stream, so drain checks never have to fetch an entry (a 4K frame)
+        if not hasattr(self, "_last_entry"):
+            self._last_entry = {}
+        self._last_entry[drone_id] = entry_id.decode() if isinstance(entry_id, bytes) else str(entry_id)
 
         # Update stats
         if drone_id not in self._stats:
@@ -405,6 +432,8 @@ class QueueManager:
         key = self._stream_key(drone_id)
         try:
             await self._client.unlink(key)
+            getattr(self, "_last_entry", {}).pop(drone_id, None)
+            getattr(self, "_remaining_cache", {}).pop(drone_id, None)
             if drone_id in self._stats:
                 self._stats[drone_id].queue_depth = 0
             log.info("stream_purged key=%s", key)

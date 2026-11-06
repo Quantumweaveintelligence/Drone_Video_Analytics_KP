@@ -24,6 +24,9 @@ class FakeValkey:
         return {"last-generated-id": self.last.encode(), "length": self.length,
                 "first-entry": (self.first.encode(), {})}
 
+    async def xrange(self, key, min="-", max="+", count=None):
+        return [(self.first.encode(), {})]
+
 
 def manager(fake):
     m = qm.QueueManager.__new__(qm.QueueManager)
@@ -76,3 +79,26 @@ def test_remaining_is_the_slowest_reader():
 def test_ids_compare_numerically():
     assert qm._parse_id(b"1700000000000-10") > qm._parse_id("1700000000000-9")
     assert qm._parse_id(None) is None
+
+
+def test_last_id_comes_from_our_own_xadd_without_fetching_a_frame():
+    fake = FakeValkey([g("person-group", "100-0", lag=0)], last="999-0")
+
+    async def no_xinfo_stream(key):
+        raise AssertionError("XINFO STREAM returns whole frames; must not be needed")
+    fake.xinfo_stream = no_xinfo_stream
+    m = manager(fake)
+    m._last_entry = {"D1": "100-0"}
+    assert run(m.is_fully_consumed("D1")) is True
+    m._last_entry = {"D1": "101-0"}                     # one more frame arrived
+    assert run(m.is_fully_consumed("D1")) is False
+
+
+def test_remaining_is_cached_briefly():
+    fake = FakeValkey([g("person-group", "50-0", lag=30)])
+    m = manager(fake)
+    assert run(m.remaining_frames("D1")) == 30
+    fake.groups = [g("person-group", "100-0", lag=0)]
+    assert run(m.remaining_frames("D1")) == 30          # within 1 s: cached
+    m._remaining_cache["D1"] = (0.0, 30)                 # expire
+    assert run(m.remaining_frames("D1")) == 0

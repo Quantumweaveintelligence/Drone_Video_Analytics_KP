@@ -949,8 +949,45 @@ async def _auto_cleanup_consumed_streams(min_drain_sec: float = 20.0):
                     if drone_id in _qm._stats:
                         del _qm._stats[drone_id]
                     await ws_manager.broadcast({"event": "mission_drained", "drone_id": drone_id, "mission_id": mid})
+            await _cleanup_orphan_streams()
         except Exception as e:
             log.warning(f"[AUTO-CLEANUP] Error: {e}")
+
+
+ORPHAN_IDLE_S = 30.0
+
+
+async def _cleanup_orphan_streams() -> None:
+    """Streams that belong to no mission (frames that arrived after a mission was drained and
+    its stream deleted re-create it) are removed once every analyzer has read them and no
+    frame has arrived for ORPHAN_IDLE_S. Without this they stayed on the dashboard as
+    "DRAINING — 1 frames remaining" forever."""
+    client = getattr(_qm, "_client", None)
+    if client is None:
+        return
+    cursor, keys = 0, []
+    for _ in range(200):
+        cursor, batch = await client.scan(cursor=cursor, match="drone:frames:*", count=100)
+        keys.extend(batch)
+        if cursor == 0:
+            break
+    now = time.time()
+    for key in keys:
+        drone_id = (key.decode() if isinstance(key, bytes) else key).split(":", 2)[-1]
+        if not drone_id or drone_id in _active_missions:
+            continue
+        st = _qm._stats.get(drone_id)
+        last_frame = st.last_frame_ts if st else 0.0
+        if now - last_frame < ORPHAN_IDLE_S:
+            continue                                   # still receiving: not an orphan yet
+        if not await _qm.is_fully_consumed(drone_id):
+            continue                                   # analyzers are still working it off
+        log.info(f"[AUTO-CLEANUP] {drone_id}: stream without a mission fully consumed — purging")
+        await _qm.purge_stream(drone_id)
+        _latest_metadata.pop(drone_id, None)
+        _ingest_stats.pop(drone_id, None)
+        _qm._stats.pop(drone_id, None)
+        await ws_manager.broadcast({"event": "mission_drained", "drone_id": drone_id, "mission_id": None})
 
 
 async def _monitor_queue_drain(drone_id: str, mission_id: str, max_wait_sec: float = 300.0, min_drain_sec: float = 20.0):
@@ -1166,12 +1203,18 @@ async def get_active_streams():
                         pass
                 continue
 
+            # Frames the slowest analyzer still has to read (frame_count also counts
+            # frames that were already analysed and wait only for cleanup)
+            try:
+                remaining = await _qm.remaining_frames(drone_id) if frame_count else 0
+            except Exception:
+                remaining = frame_count
             drones.append({
                 "drone_id":        drone_id,
                 "stream_key":      key_str,
                 "frame_count":     frame_count,
                 "frames_received": frame_count,
-                "messages_ready":  frame_count,
+                "messages_ready":  remaining,
                 "status":          stream_status,
                 "mission_status":  mission_stat,
                 "mission_id":      meta.get("mission_id") or _active_missions.get(drone_id, {}).get("mission_id"),
