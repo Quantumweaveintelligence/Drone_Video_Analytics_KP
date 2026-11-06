@@ -214,7 +214,21 @@ export default function GpuPerformancePanel() {
                 <tr key={`${s.service}-${d?.drone_id || "none"}`} className="border-t" style={{ borderColor: "var(--dvas-border)" }}
                     data-testid={`perf-${s.service}-${d?.drone_id || "none"}`}>
                   <td className="px-3.5 py-1.5 text-slate-200">
-                    {i === 0 && <>{s.label}{s.avg_batch ? <span className="text-slate-500"> · batch {fmt(s.avg_batch)}</span> : null}</>}
+                    {i === 0 && <>
+                      {s.label}{s.avg_batch ? <span className="text-slate-500"> · batch {fmt(s.avg_batch)}</span> : null}
+                      {s.device_info?.cpu_fallback && (
+                        <span className="ml-1.5 px-1.5 py-0.5 rounded border border-red-500/40 bg-red-500/10 text-red-300"
+                              title={`CUDA error, running on the CPU (GPU retried every minute): ${s.device_info.cpu_reason || ""}`}
+                              data-testid={`cpu-fallback-${s.service}`}>
+                          CPU FALLBACK
+                        </span>
+                      )}
+                      {s.device_info?.imgsz && (
+                        <span className="text-slate-500" title="Person detector input / face tile size (native resolution)">
+                          {" "}· input {s.device_info.imgsz}{s.device_info.face_tile ? ` · face tiles ${s.device_info.face_tile}px` : ""}
+                        </span>
+                      )}
+                    </>}
                   </td>
                   <td className="px-2 py-1.5 text-slate-300">{d?.drone_id || "—"}</td>
                   <td className="px-2 py-1.5 text-right text-slate-100 font-semibold">{fmt(d?.fps)}</td>

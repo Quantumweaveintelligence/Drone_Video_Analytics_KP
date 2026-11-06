@@ -7,6 +7,7 @@ for tile-based face detection, linking faces to person tracks by IoU.
 """
 import base64
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -21,9 +22,35 @@ from shared.batch_tracker import BatchTracker
 
 log = logging.getLogger(__name__)
 
-FACE_TILE_ROWS   = 1
-FACE_TILE_COLS   = 2
-TILE_IMG_SIZE    = 640
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        return max(lo, min(hi, int(os.getenv(name, str(default)))))
+    except ValueError:
+        return default
+
+
+# Faces are searched at NATIVE resolution: the frame is cut into tiles of this size
+# (the face model's input size), so a 4K frame is not shrunk ~3x before face detection
+# (it was 2 tiles of ~2070 px squeezed into 640). 3840x2160 → 7 x 4 tiles, one GPU batch.
+FACE_TILE        = _env_int("PERSON_FACE_TILE", 640, 320, 1280)
+FACE_TILE_OVERLAP = _env_int("PERSON_FACE_TILE_OVERLAP", 96, 0, 320)
+FACE_TILE_BATCH  = _env_int("PERSON_FACE_TILE_BATCH", 32, 1, 128)
+TILE_IMG_SIZE    = FACE_TILE
+# After a CUDA failure the analyzer runs on the CPU; it retries the GPU after this long
+GPU_RETRY_S      = _env_int("PERSON_GPU_RETRY_S", 60, 10, 3600)
+
+
+def person_imgsz() -> int:
+    """Person detector input size. PERSON_IMGSZ=<n> fixes it; "auto" (default) follows the
+    GPU: drone frames are 1080p–4K and people are small, so the big cloud GPUs look at a
+    larger input (RTX PRO 6000: 1920, L40S: 1280); small GPUs keep 640."""
+    raw = os.getenv("PERSON_IMGSZ", "auto").strip().lower()
+    if raw not in ("", "auto"):
+        try:
+            return max(320, min(3840, int(raw) // 32 * 32))
+        except ValueError:
+            log.warning("PERSON_IMGSZ=%r is not a number; using auto", raw)
+    return {"xlarge": 1920, "large": 1280}.get(gpu_profile.detect().tier, 640)
 CONF_PERSON      = 0.15
 CONF_FACE        = 0.25
 NMS_IOU          = 0.40
@@ -82,40 +109,56 @@ def _face_in_person(face_bbox, person_bbox, threshold=0.1) -> bool:
     )
 
 
+def face_tiles(h_img: int, w_img: int, tile: int = FACE_TILE,
+               overlap: int = FACE_TILE_OVERLAP) -> List[Tuple[int, int, int, int]]:
+    """(x1, y1, x2, y2) windows of `tile` px covering the frame with `overlap` px overlap.
+
+    Every window is tile x tile (edge windows are shifted inwards), so all tiles share one
+    shape and go through the face model as a single batch at native resolution.
+    """
+    def starts(length: int) -> List[int]:
+        if length <= tile:
+            return [0]
+        step = max(1, tile - overlap)
+        out = list(range(0, length - tile + 1, step))
+        if out[-1] != length - tile:
+            out.append(length - tile)
+        return out
+    return [(x, y, min(w_img, x + tile), min(h_img, y + tile))
+            for y in starts(h_img) for x in starts(w_img)]
+
+
 def detect_faces_on_tiles(
     model: YOLO,
     frame: np.ndarray,
-    rows: int = FACE_TILE_ROWS,
-    cols: int = FACE_TILE_COLS,
     device=0,
+    tile: int = FACE_TILE,
+    overlap: int = FACE_TILE_OVERLAP,
 ) -> List[Tuple[int, int, int, int, float]]:
-    """Tile-based face detection. Returns list of (x1, y1, x2, y2, conf)."""
+    """Face detection at native resolution on overlapping tiles. Returns (x1, y1, x2, y2, conf)."""
     # FP16 on GPUs that support it (no effect on CPU)
     half = device != "cpu" and gpu_profile.predict_kwargs()["half"]
     h_img, w_img = frame.shape[:2]
-    step_h, step_w = h_img // rows, w_img // cols
-    overlap = 150
+    windows = face_tiles(h_img, w_img, tile, overlap)
     all_boxes, all_confidences = [], []
 
-    for r in range(rows):
-        for c in range(cols):
-            y1 = max(0, r * step_h - overlap)
-            x1 = max(0, c * step_w - overlap)
-            y2 = min(h_img, (r + 1) * step_h + overlap)
-            x2 = min(w_img, (c + 1) * step_w + overlap)
-            tile = frame[y1:y2, x1:x2]
-            results = model(
-                tile, device=device, imgsz=TILE_IMG_SIZE,
-                conf=CONF_FACE, verbose=False, agnostic_nms=True, half=half,
-            )
-            for res in results:
-                for box in res.boxes:
-                    bx1, by1, bx2, by2 = box.xyxy[0].cpu().numpy()
-                    conf = float(box.conf[0].cpu().numpy())
-                    gx1 = int(bx1 + x1); gy1 = int(by1 + y1)
-                    gx2 = int(bx2 + x1); gy2 = int(by2 + y1)
-                    all_boxes.append([gx1, gy1, gx2 - gx1, gy2 - gy1])
-                    all_confidences.append(conf)
+    for i in range(0, len(windows), FACE_TILE_BATCH):
+        part = windows[i:i + FACE_TILE_BATCH]
+        crops = [frame[y1:y2, x1:x2] for (x1, y1, x2, y2) in part]
+        results = model.predict(
+            crops, device=device, imgsz=tile,
+            conf=CONF_FACE, verbose=False, agnostic_nms=True, half=half,
+        )
+        for (x1, y1, _, _), res in zip(part, results):
+            if res.boxes is None or len(res.boxes) == 0:
+                continue
+            xyxy = res.boxes.xyxy.cpu().numpy()
+            confs = res.boxes.conf.cpu().numpy()
+            for (bx1, by1, bx2, by2), conf in zip(xyxy, confs):
+                gx1 = int(bx1 + x1); gy1 = int(by1 + y1)
+                gx2 = int(bx2 + x1); gy2 = int(by2 + y1)
+                all_boxes.append([gx1, gy1, gx2 - gx1, gy2 - gy1])
+                all_confidences.append(float(conf))
 
     if not all_boxes:
         return []
@@ -126,7 +169,31 @@ def detect_faces_on_tiles(
             x, y, w, h = all_boxes[i]
             conf = all_confidences[i]
             final.append((x, y, x + w, y + h, conf))
-    return final
+    return _drop_contained(final)
+
+
+def _drop_contained(boxes: List[Tuple[int, int, int, int, float]], ratio: float = 0.6):
+    """A face cut by a tile edge gives a partial box next to the full box from the
+    neighbouring tile; their IoU is too low for NMS. Drop a box that lies mostly
+    (>= ratio of its area) inside a larger box."""
+    keep = []
+    for i, a in enumerate(boxes):
+        area_a = max(1, (a[2] - a[0]) * (a[3] - a[1]))
+        inside = False
+        for j, b in enumerate(boxes):
+            if i == j:
+                continue
+            area_b = (b[2] - b[0]) * (b[3] - b[1])
+            if area_b <= area_a:
+                continue
+            iw = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+            ih = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+            if iw * ih >= ratio * area_a:
+                inside = True
+                break
+        if not inside:
+            keep.append(a)
+    return keep
 
 
 class PersonFaceAnalyzer:
@@ -136,7 +203,12 @@ class PersonFaceAnalyzer:
 
     def __init__(self, person_model_path: str, face_model_path: str):
         self.device = 0 if torch.cuda.is_available() else "cpu"
-        log.info("PersonFaceAnalyzer device: %s", self.device)
+        self.imgsz = person_imgsz()
+        # CPU fallback state: when, and why (shown on the Detection Models page)
+        self.cpu_since: Optional[float] = None
+        self.cpu_reason: str = ""
+        log.info("PersonFaceAnalyzer device: %s, person imgsz %d, face tiles %d px (overlap %d)",
+                 self.device, self.imgsz, FACE_TILE, FACE_TILE_OVERLAP)
         self.tracker: Optional[BatchTracker] = None
 
         try:
@@ -165,7 +237,42 @@ class PersonFaceAnalyzer:
     def _track_kwargs(self) -> dict:
         # Same arguments as the former person_model.track(...) call (persist/verbose
         # are handled by BatchTracker; FP16 comes from gpu_profile.predict_kwargs())
-        return dict(imgsz=640, conf=CONF_PERSON, classes=[0], device=self.device)
+        return dict(imgsz=self.imgsz, conf=CONF_PERSON, classes=[0], device=self.device)
+
+    def device_info(self) -> dict:
+        return {"device": "cpu" if self.device == "cpu" else "cuda",
+                "cpu_fallback": self.cpu_since is not None, "cpu_reason": self.cpu_reason,
+                "imgsz": self.imgsz, "face_tile": FACE_TILE}
+
+    def _fall_back_to_cpu(self, exc: Exception) -> None:
+        log.error("CUDA error in person/face inference — running on CPU, GPU retry in %ds: %s",
+                  GPU_RETRY_S, exc)
+        self.device = "cpu"
+        self.cpu_since = time.monotonic()
+        self.cpu_reason = str(exc)[:300]
+        for m in (self.person_model, self.face_model):
+            try:
+                if m is not None:
+                    m.to("cpu")
+            except Exception:
+                pass
+
+    def _maybe_back_to_gpu(self) -> None:
+        """A CPU fallback is temporary: after GPU_RETRY_S try the GPU again."""
+        if (self.cpu_since is None or not torch.cuda.is_available()
+                or time.monotonic() - self.cpu_since < GPU_RETRY_S):
+            return
+        try:
+            torch.cuda.empty_cache()
+            for m in (self.person_model, self.face_model):
+                if m is not None:
+                    m.to("cuda:0")
+            self.device = 0
+            self.cpu_since = None
+            log.info("Person/face models back on the GPU after CPU fallback (%s)", self.cpu_reason)
+        except Exception as exc:
+            self.cpu_since = time.monotonic()
+            log.warning("GPU still unusable, staying on CPU: %s", exc)
 
     def analyze_frame(
         self,
@@ -196,6 +303,7 @@ class PersonFaceAnalyzer:
         """
         if not frames:
             return {}
+        self._maybe_back_to_gpu()
         t0 = time.perf_counter()
         tracked: Dict[str, object] = {}
 
@@ -205,12 +313,7 @@ class PersonFaceAnalyzer:
                 tracked = self.tracker.track_batch(frames, **self._track_kwargs())
             except Exception as exc:
                 if "CUDA" in str(exc) and self.device != "cpu":
-                    log.warning("CUDA error in person tracking — falling back to CPU: %s", exc)
-                    self.device = "cpu"
-                    try:
-                        self.person_model.to("cpu")
-                    except Exception:
-                        pass
+                    self._fall_back_to_cpu(exc)
                     # Retry on CPU
                     try:
                         tracked = self.tracker.track_batch(frames, **self._track_kwargs())
@@ -339,12 +442,7 @@ class PersonFaceAnalyzer:
 
             except Exception as exc:
                 if "CUDA" in str(exc) and self.device != "cpu":
-                    log.warning("CUDA error in face detection — falling back to CPU: %s", exc)
-                    self.device = "cpu"
-                    try:
-                        self.face_model.to("cpu")
-                    except Exception:
-                        pass
+                    self._fall_back_to_cpu(exc)
                 else:
                     log.warning("Face detection error: %s", exc)
 

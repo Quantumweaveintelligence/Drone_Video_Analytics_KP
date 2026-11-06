@@ -203,6 +203,8 @@ class FrameSampler:
         self._pel_done: set = set()          # drones whose own pending entries were re-read
         self._last_seq: Dict[str, int] = {}  # last analysed frame_seq per drone (gap = lost)
         self._queued: Dict[str, Optional[int]] = {}
+        # Set by the service: {"device": "cuda"|"cpu", "cpu_fallback": bool, "cpu_reason": str, ...}
+        self.device_info: Optional[dict] = None
 
     # ── Valkey ────────────────────────────────────────────────────────────────
     def _redis(self):
@@ -448,6 +450,7 @@ class FrameSampler:
             "cap_source": self.cap_source,
             "governed": self.governed,
             "mode": self.mode,
+            "device_info": self.device_info,
             "gpu": gpu_profile.detect().as_dict(),
             "avg_batch": round(sum(batches) / len(batches), 2) if batches else None,
             "drones": drones,

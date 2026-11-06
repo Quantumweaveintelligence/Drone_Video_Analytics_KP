@@ -244,6 +244,7 @@ class Governor:
                     "cap_fps": doc.get("cap_fps"),
                     "avg_batch": doc.get("avg_batch"),
                     "drones": doc.get("drones") or {},
+                    "device_info": doc.get("device_info"),
                 }
                 for svc, doc in stats.items()
             },

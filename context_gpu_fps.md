@@ -213,3 +213,17 @@ Known limits:
 | Purge missing in Multi-Drone View | The role audit (2 Nov) limited purge to SO/SA. | Control room officers may purge too (backend `PURGE_ROLES`, frontend). Still audit-logged. |
 | CRO cannot start/stop modules on the Detection Models page | Audit item M9 made the shared model set SO/SA only. | `MODEL_ADMIN_ROLES` includes CRO (deploy is audit-logged as `model_config_update`). The FPS governor policy stays SO/SA (`FPS_POLICY_ROLES`). |
 | CRO cannot switch drones on the Person page (Crowd had the same lock) | The page always passed a drone (the selected one, else the first in the list), which disabled the feed's drone pills, and there is no drone selector at the top of those pages. | The page passes a drone only when one was picked; the pills update the shared command selection (`onSelectDrone`). |
+
+## 9. Person & face on the big GPUs (2026-11-07)
+
+Seen on the RTX PRO 6000: person at 0.2 fps, 3.3 s model time per frame, GPU 0 % busy, face
+boxes appearing and disappearing.
+
+| Cause | Fix |
+|---|---|
+| One CUDA error switched person **and** face to the CPU for good (`self.device = "cpu"`, never reset), which explains 3.3 s/frame with an idle GPU. | The fallback is temporary: the GPU is retried every `PERSON_GPU_RETRY_S` (60 s); the error is logged at ERROR level and the Detection Models page shows **CPU FALLBACK** with the CUDA message. |
+| Faces were searched on 2 tiles of ~2070 px each, shrunk to 640 px — a 4K frame lost ~3× resolution before face detection, so small faces from drone height were missed or flickered. | Faces are searched at **native resolution**: 640 px tiles with 96 px overlap (4K → 28 tiles, 1080p → 8), all in one GPU batch; partial duplicates at tile edges are removed. Local test (synthetic 4K, faces 36–71 px): old 77–98 % found with up to 121 false boxes; new 100 % with 0 false. |
+| The person detector looked at 4K frames through a 640 px input. | `PERSON_IMGSZ=auto`: 1920 on the RTX PRO 6000, 1280 on the L40S, 640 on small GPUs. |
+
+**Still to confirm on the pod:** what the original CUDA error was (`grep -iE "cuda|cpu" /var/log/dvas/person.log`).
+If it repeats on the GPU, the page will keep showing CPU FALLBACK with its message.

@@ -415,7 +415,8 @@ def _performance_view(gov: dict, policy: dict, user: dict, local_gpu=None) -> di
                            ("fps", "input_fps", "skipped", "infer_ms", "total_ms", "lag_ms", "queued")},
                            "state": state})
         rows.append({"service": svc, "label": labels.get(svc, svc), "governed": doc.get("governed", True),
-                     "cap_fps": doc.get("cap_fps"), "avg_batch": doc.get("avg_batch"), "drones": drones})
+                     "cap_fps": doc.get("cap_fps"), "avg_batch": doc.get("avg_batch"), "drones": drones,
+                     "device_info": doc.get("device_info")})
     profile = (gov.get("gpu") if ok else None) or {}
     if not profile:
         name, metrics = local_gpu or (None, None)

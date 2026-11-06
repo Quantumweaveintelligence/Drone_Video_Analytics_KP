@@ -815,6 +815,8 @@ async def _stream_loop():
                         _tracker_last_seen.pop(d, None)
 
             try:
+                if analyzer is not None:
+                    _sampler.device_info = analyzer.device_info()
                 await _sampler.maybe_publish()
                 round_frames = await _sampler.next_round(active_drones)
                 if not round_frames:
@@ -861,19 +863,9 @@ async def _stream_loop():
                 raise
             except Exception as exc:
                 err_str = str(exc)
-                if "CUDA" in err_str and analyzer and hasattr(analyzer, 'device'):
-                    log.warning("CUDA error in person stream — falling back to CPU: %s", exc)
-                    analyzer.device = "cpu"
-                    if analyzer.person_model:
-                        try:
-                            analyzer.person_model.to("cpu")
-                        except Exception:
-                            pass
-                    if analyzer.face_model:
-                        try:
-                            analyzer.face_model.to("cpu")
-                        except Exception:
-                            pass
+                if "CUDA" in err_str and analyzer and hasattr(analyzer, '_fall_back_to_cpu'):
+                    # Temporary: the analyzer retries the GPU after PERSON_GPU_RETRY_S
+                    analyzer._fall_back_to_cpu(exc)
                 else:
                     log.warning("Person stream error: %s", exc)
                 await asyncio.sleep(1)
@@ -969,6 +961,7 @@ async def stream_start():
                 except Exception as e:
                     log.warning("Failed to move face model to CUDA: %s", e)
             analyzer.device = 0
+            analyzer.cpu_since = None
         if resnet_model:
             try:
                 resnet_model.to(torch.device("cuda:0"))
