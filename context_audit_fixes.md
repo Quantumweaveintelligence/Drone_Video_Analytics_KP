@@ -53,7 +53,7 @@ Edge pages call these cloud-backend routes. Their rules changed:
 | `/api/analytics/suggestions…` | A drone operator lists only their own suggestions. Delete: owner, or senior officer / administrator. | The operator's own suggestions work as before. |
 | `POST /api/auth/login`, `/api/auth/refresh` | `access_token` is in the JSON body **only** if the request `Origin` is in `EDGE_CLIENT_ORIGINS` (default `http://localhost:8765,http://127.0.0.1:8765`). Refresh is limited to 30/minute. | **The edge app's origin must be listed** in `EDGE_CLIENT_ORIGINS` (and in `CORS_ORIGINS`), or it receives no token. `deploy/runpod/bin/dvas-init.sh` already adds `http://localhost:8765` to CORS. |
 | WebSocket `/api/ws` | `?token=` is accepted on the handshake (or the cookie). Closes with 4401 on a missing, bad or expired token. Messages are filtered per user. | The edge build passes `?token=`. |
-| `/api/ingest-server/streams/{id}/purge` | Senior officer / administrator only. | — |
+| `/api/ingest-server/streams/{id}/purge` | Control room officer, senior officer, administrator (CRO added 2026-11-06; audit-logged). | — |
 
 ---
 
@@ -172,7 +172,7 @@ Both are idempotent. Both were checked twice over an existing schema on Postgres
   - The header shows the user's scope.
   - The evidence modal has legal hold.
   - The aggregated page is senior-officer-only, with a per-district table.
-  - Models: read-only for control room officers; estimates labelled.
+  - Models: control room officers may start/stop modules and deploy the set since 2026-11-06 (audit-logged); the FPS policy stays SO/SA; estimates labelled.
   - Missions use `started_at`.
   - AAR spinner ends on `report_ready` / `report_failed`.
   - `CommandContext` handles incident/suggestion delete and clear events, drops `INC-*`/`SUGG-*` alert copies, and shows ack errors.
@@ -182,7 +182,7 @@ Both are idempotent. Both were checked twice over an existing schema on Postgres
   - Errors are shown; optimistic toggles roll back.
   - Watchlist refetches after changes; the ANPR type filter options match the data.
   - Full-history CSV; intrusion config is read back.
-  - Purge is senior officer / administrator only.
+  - Purge: control room officer, senior officer, administrator (CRO added 2026-11-06).
 - **Polling:**
   - The bell poll is a 60 s fallback.
   - Polls pause on hidden tabs.

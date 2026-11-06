@@ -202,3 +202,14 @@ Known limits:
 - Per-drone trackers are not reset when a drone stops and later resumes (old lost tracks can re-match).
 - Person / vehicle / ANPR model moves on stream stop (only with `VRAM_OFFLOAD_ON_STOP=true`, off on the
   pod) still don't take the batch lock.
+
+---
+
+## 8. Fixes 2026-11-06
+
+| Report | Cause | Fix |
+|---|---|---|
+| Stream stays "DRAINING — 1 frames remaining" after all frames were analysed | A frame still in flight from the edge arrived after the drained stream was deleted and re-created it with one entry. That stream belonged to no mission, so nothing ever cleaned it up. The page also showed the stream length, which includes frames already analysed. | Ingest removes a stream that belongs to no mission once every analyzer has read it and no frame arrived for 30 s (`_cleanup_orphan_streams`, every 15 s). `/ingest/streams/active` `messages_ready` = frames the slowest analyzer still has to read (`frame_count` stays the stream length). The newest stream id is taken from ingest's own XADDs, so the checks never download a frame. Verified on Valkey 7.2. |
+| Purge missing in Multi-Drone View | The role audit (2 Nov) limited purge to SO/SA. | Control room officers may purge too (backend `PURGE_ROLES`, frontend). Still audit-logged. |
+| CRO cannot start/stop modules on the Detection Models page | Audit item M9 made the shared model set SO/SA only. | `MODEL_ADMIN_ROLES` includes CRO (deploy is audit-logged as `model_config_update`). The FPS governor policy stays SO/SA (`FPS_POLICY_ROLES`). |
+| CRO cannot switch drones on the Person page (Crowd had the same lock) | The page always passed a drone (the selected one, else the first in the list), which disabled the feed's drone pills, and there is no drone selector at the top of those pages. | The page passes a drone only when one was picked; the pills update the shared command selection (`onSelectDrone`). |
