@@ -1336,12 +1336,13 @@ async def purge_drone_stream(
     Forcefully purges the Valkey stream queue for the given drone,
     terminating any ongoing drain process and taking the stream offline immediately.
 
-    Only the dashboard backend (its Keycloak service account) or a senior officer /
-    administrator token may purge; an operator token on the same client may not (H8).
+    Only the dashboard backend (its Keycloak service account) or a control room officer /
+    senior officer / administrator token may purge; an operator token may not (H8;
+    control room added 2026-11-06 — the dashboard forwards the officer's own token).
     """
     realm_roles = set((claims.get("realm_access") or {}).get("roles") or [])
     is_service = str(claims.get("preferred_username", "")).startswith("service-account-")
-    if not (is_service or realm_roles & {"sys-admin", "supervisor"}):
+    if not (is_service or realm_roles & {"sys-admin", "supervisor", "control-room"}):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not permitted to purge streams")
     if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", drone_id or ""):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid drone id")

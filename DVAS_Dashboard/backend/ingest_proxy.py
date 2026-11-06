@@ -472,11 +472,28 @@ async def proxy_purge_stream(
         raise HTTPException(400, "Invalid drone id")
 
     url = f"{INGEST_SERVER_URL}/ingest/streams/{drone_id}/purge"
-    token = await _get_service_token()
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    # The officer's own token first: ingest checks the realm role itself. The backend's
+    # service account (dvas-admin-service) is set up for user management and may carry no
+    # DVAS realm role, which ingest rejects — every purge failed that way. It stays as a
+    # fallback for deployments where the service account does have one.
+    auth_header = request.headers.get("Authorization")
+    cookie_token = request.cookies.get("dvas_access_token")
+    attempts = []
+    if auth_header:
+        attempts.append({"Authorization": auth_header})
+    elif cookie_token:
+        attempts.append({"Authorization": f"Bearer {cookie_token}"})
+    svc_token = await _get_service_token()
+    if svc_token:
+        attempts.append({"Authorization": f"Bearer {svc_token}"})
+    if not attempts:
+        attempts.append({})
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(url, headers=headers)
+            for headers in attempts:
+                resp = await client.post(url, headers=headers)
+                if resp.status_code not in (401, 403):
+                    break
             if resp.status_code == 200:
                 try:
                     from audit_service import write_audit_v2
@@ -510,7 +527,13 @@ async def proxy_purge_stream(
                     logger.warning(f"Websocket broadcast failed for stream purge: {e}")
 
                 return resp.json()
-            raise HTTPException(resp.status_code, "Failed to purge stream")
+            try:
+                detail = resp.json().get("detail") or resp.text[:200]
+            except ValueError:
+                detail = resp.text[:200]
+            logger.warning("Stream purge rejected by ingest for %s: %s %s", drone_id, resp.status_code, detail)
+            raise HTTPException(resp.status_code if resp.status_code < 500 else 502,
+                                f"Failed to purge stream: {detail}")
     except HTTPException:
         raise
     except Exception as exc:
