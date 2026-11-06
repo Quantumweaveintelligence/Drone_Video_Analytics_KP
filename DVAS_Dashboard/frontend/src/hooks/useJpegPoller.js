@@ -10,11 +10,22 @@ import { authFetch } from "@/lib/api";
 
 const FEED_BACKOFF = [600, 1200, 2400, 5000, 10000, 20000, 30000];
 const FEED_WATCHDOG_MS = 6000;
+const NOT_FOUND_RETRY_MS = 3000;
 
-export function useJpegPoller(url, intervalMs = 600, enabled = true) {
+/**
+ * options.notFoundRetryMs — retry delay after a 404 (default 3 s). Grid tiles pass 30 s:
+ * a 404 there means the stream is gone or the drone is outside the user's jurisdiction,
+ * neither of which fixes itself in 3 s (analytics plan A5).
+ *
+ * notFound: null | "no_frames" (ingest has no frame) | "no_access" (backend's per-drone
+ * access check answered "Drone not found").
+ */
+export function useJpegPoller(url, intervalMs = 600, enabled = true, options = {}) {
+  const notFoundRetryMs = options.notFoundRetryMs ?? NOT_FOUND_RETRY_MS;
   const [blobUrl, setBlobUrl] = useState(null);
   const [hasFrame, setHasFrame] = useState(false);
   const [feedDead, setFeedDead] = useState(false);
+  const [notFound, setNotFound] = useState(null);
   const [fps, setFps] = useState(0);
 
   const timerRef = useRef(null);
@@ -75,6 +86,7 @@ export function useJpegPoller(url, intervalMs = 600, enabled = true) {
         setBlobUrl(nextUrl);
         setHasFrame(true);
         setFeedDead(false);
+        setNotFound(null);
         errRef.current = 0;
         feedDeadRef.current = false;
         
@@ -123,6 +135,10 @@ export function useJpegPoller(url, intervalMs = 600, enabled = true) {
         const nextDelay = isOffline ? Math.max(intervalMs, 5000) : intervalMs;
         timerRef.current = setTimeout(doFetch, nextDelay);
       } else if (res.status === 404) {
+        let body = "";
+        try { body = await res.text(); } catch { /* body is optional */ }
+        if (!mountedRef.current || fetchIdRef.current !== currentFetchId) return;
+        setNotFound(/drone not found/i.test(body) ? "no_access" : "no_frames");
         if (prevBlobRef.current) {
           URL.revokeObjectURL(prevBlobRef.current);
           prevBlobRef.current = null;
@@ -133,8 +149,8 @@ export function useJpegPoller(url, intervalMs = 600, enabled = true) {
         feedDeadRef.current = true;
         setMeta({});
         
-        // Enter 3s slow-retry mode to avoid log spamming
-        timerRef.current = setTimeout(doFetch, 3000);
+        // Slow-retry mode to avoid log spamming
+        timerRef.current = setTimeout(doFetch, notFoundRetryMs);
       } else {
         throw new Error(`HTTP ${res.status}`);
       }
@@ -150,7 +166,7 @@ export function useJpegPoller(url, intervalMs = 600, enabled = true) {
       const delay = FEED_BACKOFF[Math.min(errRef.current - 1, FEED_BACKOFF.length - 1)];
       timerRef.current = setTimeout(doFetch, delay);
     }
-  }, [url, intervalMs]);
+  }, [url, intervalMs, notFoundRetryMs]);
 
   useEffect(() => {
     clearTimeout(timerRef.current);
@@ -163,6 +179,7 @@ export function useJpegPoller(url, intervalMs = 600, enabled = true) {
     }
     setBlobUrl(null);
     setHasFrame(false);
+    setNotFound(null);
 
     if (!enabled || !url) {
       setFeedDead(!enabled);
@@ -195,5 +212,5 @@ export function useJpegPoller(url, intervalMs = 600, enabled = true) {
   // For compatibility with components that expected `ok`
   const ok = hasFrame && !feedDead;
 
-  return { blobUrl, hasFrame, feedDead, fps, ok, meta };
+  return { blobUrl, hasFrame, feedDead, fps, ok, meta, notFound };
 }

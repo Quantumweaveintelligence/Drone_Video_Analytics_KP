@@ -8,6 +8,7 @@ for tile-based face detection, linking faces to person tracks by IoU.
 import base64
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -207,6 +208,10 @@ class PersonFaceAnalyzer:
         # CPU fallback state: when, and why (shown on the Detection Models page)
         self.cpu_since: Optional[float] = None
         self.cpu_reason: str = ""
+        # One Ultralytics predictor must never run in two threads at once (plan A1): the
+        # stream thread, /analyze/frame and the watchlist enrolment endpoints all use the
+        # face model. (The person model is guarded by BatchTracker's lock.)
+        self.face_lock = threading.RLock()
         log.info("PersonFaceAnalyzer device: %s, person imgsz %d, face tiles %d px (overlap %d)",
                  self.device, self.imgsz, FACE_TILE, FACE_TILE_OVERLAP)
         self.tracker: Optional[BatchTracker] = None
@@ -228,6 +233,17 @@ class PersonFaceAnalyzer:
             log.error("Failed to load face model: %s", exc)
             self.face_model = None
 
+        # cuDNN autotuning before the first drone frame (plan B8)
+        if self.tracker is not None and self.face_model is not None and self.device != "cpu" \
+                and os.getenv("DVAS_WARMUP", "1") != "0":
+            t = time.perf_counter()
+            self.tracker.warmup(self.imgsz, device=self.device)
+            try:
+                detect_faces_on_tiles(self.face_model, np.zeros((2160, 3840, 3), np.uint8), device=self.device)
+            except Exception as exc:
+                log.warning("Face model warm-up failed: %s", exc)
+            log.info("Person/face warm-up %.1fs", time.perf_counter() - t)
+
         self._frame_count = 0
 
     @property
@@ -238,6 +254,22 @@ class PersonFaceAnalyzer:
         # Same arguments as the former person_model.track(...) call (persist/verbose
         # are handled by BatchTracker; FP16 comes from gpu_profile.predict_kwargs())
         return dict(imgsz=self.imgsz, conf=CONF_PERSON, classes=[0], device=self.device)
+
+    def detect_faces(self, frame_bgr) -> List[Tuple[int, int, int, int, float]]:
+        """Native-resolution tiled face detection, serialised on the face model."""
+        with self.face_lock:
+            return detect_faces_on_tiles(self.face_model, frame_bgr, device=self.device)
+
+    def detect_faces_direct(self, img_bgr, conf: float = 0.15) -> List[Tuple[int, int, int, int, float]]:
+        """Whole-image face detection (enrolment fallback), serialised on the face model."""
+        with self.face_lock:
+            results = self.face_model(img_bgr, conf=conf, device=self.device, verbose=False)
+        out = []
+        for res in results:
+            for box in res.boxes:
+                bx1, by1, bx2, by2 = box.xyxy[0].cpu().numpy()
+                out.append((int(bx1), int(by1), int(bx2), int(by2), float(box.conf[0].cpu().numpy())))
+        return out
 
     def device_info(self) -> dict:
         return {"device": "cpu" if self.device == "cpu" else "cuda",
@@ -250,12 +282,14 @@ class PersonFaceAnalyzer:
         self.device = "cpu"
         self.cpu_since = time.monotonic()
         self.cpu_reason = str(exc)[:300]
-        for m in (self.person_model, self.face_model):
-            try:
-                if m is not None:
-                    m.to("cpu")
-            except Exception:
-                pass
+        try:
+            if self.tracker is not None:
+                self.tracker.to("cpu")            # under the predictor lock
+            with self.face_lock:
+                if self.face_model is not None:
+                    self.face_model.to("cpu")
+        except Exception:
+            pass
 
     def _maybe_back_to_gpu(self) -> None:
         """A CPU fallback is temporary: after GPU_RETRY_S try the GPU again."""
@@ -264,9 +298,11 @@ class PersonFaceAnalyzer:
             return
         try:
             torch.cuda.empty_cache()
-            for m in (self.person_model, self.face_model):
-                if m is not None:
-                    m.to("cuda:0")
+            if self.tracker is not None:
+                self.tracker.to("cuda:0")
+            with self.face_lock:
+                if self.face_model is not None:
+                    self.face_model.to("cuda:0")
             self.device = 0
             self.cpu_since = None
             log.info("Person/face models back on the GPU after CPU fallback (%s)", self.cpu_reason)
@@ -382,9 +418,7 @@ class PersonFaceAnalyzer:
         if self.face_model:
             try:
                 tf = time.perf_counter()
-                face_boxes = detect_faces_on_tiles(
-                    self.face_model, frame_bgr, device=self.device
-                )
+                face_boxes = self.detect_faces(frame_bgr)
                 face_ms = (time.perf_counter() - tf) * 1000
                 for (x1, y1, x2, y2, conf) in face_boxes:
                     face_bbox = _bbox_dict(x1, y1, x2, y2)

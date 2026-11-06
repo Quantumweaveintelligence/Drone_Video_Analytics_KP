@@ -229,7 +229,7 @@ async def analyze_frame(
     if frame is None:
         raise HTTPException(400, "Cannot decode image")
 
-    result = analyzer.analyze_frame(frame, drone_id=drone_id, save_crops=save_crops)
+    result = await asyncio.to_thread(analyzer.analyze_frame, frame, drone_id=drone_id, save_crops=save_crops)   # off the event loop (A1)
     ts = datetime.now(timezone.utc)
 
     for veh in result["vehicles"]:
@@ -532,14 +532,14 @@ async def annotated_latest(drone_id: str = ""):
             frame_age = now - _last_annotated_ts.get(best_drone, 0)
 
     # If no in-memory frame, try to recover the latest frame from the Redis stream
-    if not frame_bytes and drone_id:
+    if not frame_bytes and drone_id and not _streaming(drone_id):
         aliases = get_drone_aliases(drone_id)
         for alias in aliases:
             recovered_frame = await get_latest_stream_frame(alias)
             if recovered_frame is not None and analyzer and analyzer.ready:
                 try:
                     result = await asyncio.to_thread(
-                        analyzer.analyze_frame, recovered_frame, drone_id=alias, save_crops=False
+                        analyzer.analyze_frame, recovered_frame, drone_id=f"recovery:{alias}", save_crops=False
                     )
                     annotated_bytes = await asyncio.to_thread(
                         _live_vehicle_jpeg, recovered_frame, result.get("vehicles", []), alias
@@ -573,6 +573,13 @@ async def annotated_latest(drone_id: str = ""):
             "X-Stream-Status": feed_status,
         },
     )
+
+
+
+def _streaming(drone_id: str) -> bool:
+    """True while the stream loop is working this drone's frames (plan A2): recovery must
+    then never push the newest stream frame through the drone's live tracker."""
+    return bool(_stream_running) and any(a in _sampler.stats for a in get_drone_aliases(drone_id))
 
 
 # ── Query endpoints ────────────────────────────────────────────────────────────

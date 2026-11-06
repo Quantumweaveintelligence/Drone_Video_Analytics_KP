@@ -526,6 +526,10 @@ async def proxy_purge_stream(
                 except Exception as e:
                     logger.warning(f"Websocket broadcast failed for stream purge: {e}")
 
+                # A5: the stream is gone, so is the drone (never raises)
+                from services.drone_status import mark_drone_offline
+                await mark_drone_offline(drone_id, reason="stream_purged")
+
                 return resp.json()
             try:
                 detail = resp.json().get("detail") or resp.text[:200]

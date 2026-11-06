@@ -49,7 +49,7 @@ import {
 } from "lucide-react";
 
 
-import { useActiveStreams } from "@/hooks/useActiveStreams";
+import { useActiveStreams, framesLeft } from "@/hooks/useActiveStreams";
 import { useJpegPoller } from "@/hooks/useJpegPoller";
 import {
   useCrowdReadings,
@@ -230,17 +230,25 @@ function SignalBars({ strength }) {
    so live frames load reliably with or without cookie support.
    ───────────────────────────────────────────── */
 
+// After a 404 (stream gone, or drone outside the user's jurisdiction) retry every 30 s (A5)
+const FEED_404_RETRY_MS = 30000;
+
 function useDroneFeed(droneId, disabled, intervalMs = 700) {
-  const url = `${API}/ingest-server/frame/${encodeURIComponent(droneId)}/latest`;
-  return useJpegPoller(url, intervalMs, !disabled);
+  const url = disabled ? null : `${API}/ingest-server/frame/${encodeURIComponent(droneId)}/latest`;
+  return useJpegPoller(url, intervalMs, !disabled, { notFoundRetryMs: FEED_404_RETRY_MS });
 }
 
 function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge, canPurge }) {
   const isDegraded = drone.status === "degraded";
-  const isOffline  = drone.status === "offline";
+  const isDraining = drone.status === "draining";
+  // A5: only live tiles poll raw frames; draining and offline tiles show a placeholder
+  const isLive     = drone.status === "live" || isDegraded;
+  const isOffline  = !isLive && !isDraining;
   const isOtherSelected = hasSelection && !isSelected;
+  const left = framesLeft(drone);
 
-  const { blobUrl, hasFrame, feedDead } = useDroneFeed(drone.id, isOffline);
+  const { blobUrl, hasFrame, feedDead, notFound } = useDroneFeed(drone.id, !isLive);
+  const noAccess = notFound === "no_access";
 
   const borderColor = isDegraded
     ? "border-amber-500/40"
@@ -296,7 +304,7 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge, can
         ))}
 
         {/* Live JPEG feed or placeholder */}
-        {!isOffline && hasFrame && blobUrl ? (
+        {isLive && hasFrame && blobUrl ? (
           <img
             src={blobUrl}
             alt={`Live feed ${drone.id}`}
@@ -305,7 +313,19 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge, can
           />
         ) : (
           <div className="absolute inset-0 flex items-center justify-center">
-            {isOffline || feedDead ? (
+            {isDraining ? (
+              <div className="flex flex-col items-center gap-2">
+                <Clock size={22} className="text-amber-400/70" />
+                <span className="mono text-[10px] text-amber-300/80">
+                  DRAINING — {left} {left === 1 ? "frame" : "frames"} left
+                </span>
+              </div>
+            ) : noAccess ? (
+              <div className="flex flex-col items-center gap-2" title="This drone is outside your jurisdiction">
+                <WifiOff size={22} className="text-slate-400/60" />
+                <span className="mono text-[10px] text-slate-400/80">NO ACCESS</span>
+              </div>
+            ) : isOffline || feedDead ? (
               <div className="flex flex-col items-center gap-2">
                 <WifiOff size={22} className="text-red-400/60" />
                 <span className="mono text-[10px] text-red-400/60">FEED OFFLINE</span>
@@ -379,12 +399,12 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge, can
             {hasFrame && !feedDead && !isOffline && (
               <span className="w-2 h-2 rounded-full bg-teal-400" style={{ animation: "pulse 1.2s infinite" }} />
             )}
-            <StatusPill status={isOffline ? "offline" : feedDead ? "offline" : drone.status} />
+            <StatusPill status={isDraining ? "draining" : isOffline || feedDead ? "offline" : drone.status} />
           </div>
-          {drone.status === "draining" && (
+          {isDraining && (
             <span className="text-[10px] bg-amber-900/60 text-amber-300 px-2 py-0.5 rounded-full flex items-center gap-1 font-bold">
               <Clock className="w-2.5 h-2.5" />
-              {drone.consumer_lag ? Object.values(drone.consumer_lag).reduce((sum, v) => sum + v, 0) : (drone.messages_ready ?? 0)} frames
+              {left} frames
             </span>
           )}
         </div>
@@ -1352,16 +1372,17 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
   const userJurisdiction = currentUser?.jurisdiction || null;
 
   // Use active ingest streams to discover real drones and enrich with live metadata
-  const { mergeWithDrones, streams } = useActiveStreams();
+  const { mergeWithDrones, isGridDrone, streams } = useActiveStreams();
 
   // Start with DB drones (from Postgres, telemetry-pumped)
   // Then merge with real ingest streams (adds missing drones, enriches existing ones)
   const baseList = liveDrones && liveDrones.length > 0 ? liveDrones : [];
   let merged   = useMemo(() => mergeWithDrones(baseList), [streams, baseList, mergeWithDrones]);
 
-  // Filter to active streaming or draining drones
+  // Filter to active streaming or draining drones: the same rule as the Multi-Drone Grid
+  // and its live counter (A5) — a drone whose stream is gone gets no card
   const [purgedDrones, setPurgedDrones] = useState(new Set());
-  merged = merged.filter(d => (d.status === "live" || d.status === "degraded" || d.status === "draining" || (d.messages_ready ?? 0) > 0) && !purgedDrones.has(d.id));
+  merged = merged.filter(d => isGridDrone(d) && !purgedDrones.has(d.id));
 
   const drones = merged.sort((a, b) => {
     const ord = { live: 0, degraded: 1, draining: 2, offline: 3 };

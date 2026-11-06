@@ -109,6 +109,34 @@ def main():
     print("full analyze_batch    %8.1f / %.1f" % timed(lambda: an.analyze_batch({"bench": frame}, save_crops=True), a.frames))
     print("device after run:", an.device_info())
 
+    # C3: FP16 vs FP32 face recall on this GPU (plan Phase 1 item 7)
+    if torch.cuda.is_available():
+        from shared import gpu_profile as gp
+        def faces(half):
+            orig = gp.predict_kwargs
+            gp.predict_kwargs = lambda device=None: {**orig(device), "half": half}
+            try:
+                an.face_model.predictor = None          # rebuild for this precision
+                return pa.detect_faces_on_tiles(an.face_model, frame, device=an.device)
+            finally:
+                gp.predict_kwargs = orig
+                an.face_model.predictor = None
+        f32, f16 = faces(False), faces(True)
+        def matched(a, b):
+            n = 0
+            for x in a:
+                for y in b:
+                    ix = max(0, min(x[2], y[2]) - max(x[0], y[0])); iy = max(0, min(x[3], y[3]) - max(x[1], y[1]))
+                    i = ix * iy
+                    if i / ((x[2]-x[0])*(x[3]-x[1]) + (y[2]-y[0])*(y[3]-y[1]) - i + 1e-6) > 0.5:
+                        n += 1
+                        break
+            return n
+        print(f"\n== FP16 face check: FP32 found {len(f32)}, FP16 found {len(f16)}, "
+              f"FP32 faces also found in FP16: {matched(f32, f16)}/{len(f32)}")
+        if f32 and matched(f32, f16) < len(f32):
+            print("   !! FP16 misses faces here — set DVAS_FP16=false for the person service")
+
     if a.profile and torch.cuda.is_available():
         from torch.profiler import ProfilerActivity, profile
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:

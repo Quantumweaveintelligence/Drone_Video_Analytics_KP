@@ -169,6 +169,12 @@ async def startup():
     yolo_model = YOLO(INTRUSION_MODEL)
     # Default tracker (botsort.yaml), same as the previous yolo_model.track() call
     _tracker = BatchTracker(yolo_model)
+    try:
+        _imgsz = int(next(iter(_configs.values())).imgsz) if _configs else 1920
+    except Exception:
+        _imgsz = 1920
+    log.info("Intrusion warm-up %.1fs (imgsz %d)",
+             await asyncio.to_thread(_tracker.warmup, _imgsz, device=_infer_device), _imgsz)
     global CLASS_NAMES
     CLASS_NAMES = resolve_model_class_names(yolo_model)
     log.info("Intrusion Analyzer ready with class mapping: %s", CLASS_NAMES)

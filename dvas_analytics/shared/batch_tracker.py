@@ -13,11 +13,14 @@ own track callback performs, so results keep `boxes.id` like `.track()`.
 from __future__ import annotations
 
 import logging
+import math
+import os
 import threading
+import time
 from typing import Dict, List, Optional
 
 from shared import gpu_profile
-from shared.frame_sampler import chunks
+from shared.frame_sampler import chunks, is_late
 
 log = logging.getLogger(__name__)
 
@@ -48,10 +51,81 @@ def _make_tracker(tracker_yaml: str):
 
 _UPDATE_TAKES_FEATS: Dict[type, bool] = {}
 
+# BoT-SORT global motion compensation runs optical flow on the CPU on every frame
+# (≈137 ms per 4K frame at Ultralytics' default downscale 2). Size it to ~GMC_TARGET_PX
+# wide instead: 4K → downscale 4, 1080p → 2 (unchanged). 0 keeps Ultralytics' default.
+try:
+    GMC_TARGET_PX = max(0, int(os.getenv("DVAS_GMC_TARGET_PX", "960")))
+except ValueError:
+    GMC_TARGET_PX = 960
+
+# Every BatchTracker in this process (for idle resets from the sampler, plan A3)
+import weakref  # noqa: E402
+_INSTANCES: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def reset_everywhere(key: str) -> None:
+    for t in list(_INSTANCES):
+        t.reset(key)
+    TIMINGS.pop(key, None)
+
+
+# Per-process stage timings for the sampler's stats (plan A4): {key: {"detect": ms, "track": ms}}
+TIMINGS: Dict[str, Dict[str, float]] = {}
+
+
+def stage_ms(key: str) -> Dict[str, float]:
+    return dict(TIMINGS.get(key, {}))
+
+
+def _size_gmc(tracker, img) -> None:
+    gmc = getattr(tracker, "gmc", None)
+    if gmc is None or not GMC_TARGET_PX or getattr(tracker, "_dvas_gmc_sized", False):
+        return
+    width = img.shape[1] if hasattr(img, "shape") else 0
+    if width:
+        gmc.downscale = max(2, math.ceil(width / GMC_TARGET_PX))
+    tracker._dvas_gmc_sized = True
+
+
+def _match_without_update(tracker, result):
+    """Late frame (plan D1): give detections the ids of the drone's current tracks by IoU,
+    WITHOUT stepping the tracker (time must not go backwards). Unmatched detections are
+    dropped from the tracked result, as a new track would only be confirmed by later frames."""
+    import numpy as np  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+    tracks = [t for t in getattr(tracker, "tracked_stracks", []) if getattr(t, "is_activated", True)]
+    boxes = result.boxes
+    if not tracks or boxes is None or len(boxes) == 0:
+        return result[[]] if boxes is not None else result
+    det = boxes.xyxy.cpu().numpy()
+    trk = np.array([t.xyxy for t in tracks], dtype=float)
+    ix1 = np.maximum(det[:, None, 0], trk[None, :, 0]); iy1 = np.maximum(det[:, None, 1], trk[None, :, 1])
+    ix2 = np.minimum(det[:, None, 2], trk[None, :, 2]); iy2 = np.minimum(det[:, None, 3], trk[None, :, 3])
+    inter = np.clip(ix2 - ix1, 0, None) * np.clip(iy2 - iy1, 0, None)
+    area_d = (det[:, 2] - det[:, 0]) * (det[:, 3] - det[:, 1])
+    area_t = (trk[:, 2] - trk[:, 0]) * (trk[:, 3] - trk[:, 1])
+    iou = inter / (area_d[:, None] + area_t[None, :] - inter + 1e-6)
+    rows, used = [], set()
+    for di in np.argsort(-boxes.conf.cpu().numpy()):
+        ti = int(np.argmax(iou[di]))
+        if iou[di, ti] >= 0.3 and ti not in used:
+            used.add(ti)
+            rows.append((int(di), tracks[ti].track_id))
+    if not rows:
+        return result[[]]
+    keep = [d for d, _ in rows]
+    out = result[keep]
+    data = out.boxes.data.cpu()
+    ids = torch.tensor([[float(tid)] for _, tid in rows], dtype=data.dtype)
+    out.update(boxes=torch.cat([data[:, :4], ids, data[:, 4:]], dim=1))
+    return out
+
 
 def _update(tracker, result):
     """Apply one tracker step to an Ultralytics Results (in place, like track())."""
     import torch  # noqa: PLC0415
+    _size_gmc(tracker, result.orig_img)
     det = result.boxes.cpu().numpy()
     if _UPDATE_TAKES_FEATS.get(type(tracker)) is None:
         import inspect  # noqa: PLC0415
@@ -79,6 +153,7 @@ class BatchTracker:
         # Ultralytics predictors are not thread-safe; analyzers call from to_thread
         self._lock = threading.Lock()
         self._last_device: Optional[str] = None
+        _INSTANCES.add(self)
 
     def _model_device(self) -> str:
         try:
@@ -139,10 +214,44 @@ class BatchTracker:
         return out
 
     def track_batch(self, frames: Dict[str, object], **kw) -> Dict[str, object]:
-        """{drone: frame} → {drone: Results with boxes.id}, tracked per drone."""
+        """{drone: frame} → {drone: Results with boxes.id}, tracked per drone.
+
+        A frame flagged late by the sampler (is_late) is matched to the drone's current
+        tracks without updating them, so the live tracker never steps backwards.
+        """
+        t0 = time.perf_counter()
         results = self.predict_batch(frames, **kw)
+        detect_ms = (time.perf_counter() - t0) * 1000 / max(1, len(frames))
+        out = {}
         with self._lock:
-            return {d: _update(self._tracker_for(d), r) for d, r in results.items()}
+            for d, r in results.items():
+                t1 = time.perf_counter()
+                tracker = self._tracker_for(d)
+                out[d] = _match_without_update(tracker, r) if is_late(frames[d]) else _update(tracker, r)
+                TIMINGS[d] = {"detect": detect_ms, "track": (time.perf_counter() - t1) * 1000}
+        return out
+
+    def warmup(self, imgsz: int, batch_sizes=None, **kw) -> float:
+        if os.getenv("DVAS_WARMUP", "1") == "0":
+            return 0.0
+        return self._warmup(imgsz, batch_sizes, **kw)
+
+    def _warmup(self, imgsz: int, batch_sizes=None, **kw) -> float:
+        """Run dummy 16:9 batches once so cuDNN autotuning happens before the first drone
+        frame (plan B8). Returns seconds spent. Tracker state is not touched."""
+        import numpy as np  # noqa: PLC0415
+        if not gpu_profile.detect().available:
+            return 0.0
+        sizes = batch_sizes or sorted({1, gpu_profile.detect().max_batch})
+        frame = np.zeros((1080, 1920, 3), np.uint8)      # every 16:9 input letterboxes alike
+        t = time.perf_counter()
+        for n in sizes:
+            try:
+                self.predict_batch({f"warmup{i}": frame for i in range(n)}, imgsz=imgsz, **kw)
+            except Exception as exc:                      # never block a service start
+                log.warning("warm-up at batch %d failed: %s", n, exc)
+                break
+        return time.perf_counter() - t
 
     def track_one(self, drone_id: str, frame, **kw):
         """Single-frame variant (upload/offline paths): returns a 1-item list like .track()."""

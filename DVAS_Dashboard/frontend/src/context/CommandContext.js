@@ -58,6 +58,8 @@ export function CommandProvider({ children }) {
 
   const { mergeWithDrones } = useActiveStreams();
   const mergedDrones = mergeWithDrones(drones);
+  // mergeWithDrones marks a drone without an ingest stream offline (A5), so a drained or
+  // purged drone no longer counts here
   const liveMissionsCount = mergedDrones.filter((d) => ["live", "draining"].includes(d.status) && Boolean(d.mission_id)).length;
 
   const load = async () => {
@@ -127,6 +129,10 @@ export function CommandProvider({ children }) {
         const brandNew = msg.drones.filter((x) => !existingIds.has(x.id));
         return brandNew.length > 0 ? [...updated, ...brandNew] : updated;
       });
+    } else if (["stream_purged", "drone_offline", "mission_drained"].includes(msg.type || msg.event) && msg.drone_id) {
+      // A5: the stream is gone (purged by an officer, drained by ingest, or timed out):
+      // the drone is offline now, not after the next /drones reload
+      setDrones((prev) => prev.map((d) => (d.id === msg.drone_id ? { ...d, status: "offline", messages_ready: 0 } : d)));
     } else if (msg.type === "alert" && msg.alert) {
       // F4: the hub already filters live alerts per user (jurisdiction / mission scope)
       const a = msg.alert;

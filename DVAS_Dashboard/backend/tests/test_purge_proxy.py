@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 import core.security as security
 import ingest_proxy
+from services import drone_status
 
 CRO = {"id": "c1", "email": "cro@test", "role": "control_room_officer", "jurisdiction": "", "mission_scope": []}
 DO = {**CRO, "id": "d1", "role": "drone_operator"}
@@ -20,7 +21,7 @@ DO = {**CRO, "id": "d1", "role": "drone_operator"}
 
 @pytest.fixture
 def ingest(monkeypatch):
-    state = {"calls": [], "accept": {"Bearer user-tok"}, "svc": "svc-tok"}
+    state = {"calls": [], "accept": {"Bearer user-tok"}, "svc": "svc-tok", "offline": []}
 
     def handler(req: httpx.Request):
         auth = req.headers.get("Authorization", "")
@@ -36,6 +37,11 @@ def ingest(monkeypatch):
     async def svc():
         return state["svc"]
     monkeypatch.setattr(ingest_proxy, "_get_service_token", svc)
+
+    async def offline(drone_id, reason, mission_id=None):
+        state["offline"].append((drone_id, reason))
+        return True
+    monkeypatch.setattr(drone_status, "mark_drone_offline", offline)
     return state
 
 
@@ -53,6 +59,8 @@ def test_officer_token_is_forwarded_first(ingest, monkeypatch):
     r = c.post("/api/ingest-server/streams/DRN-0111111111/purge", cookies={"dvas_access_token": "user-tok"})
     assert r.status_code == 200 and r.json() == {"status": "purged"}
     assert ingest["calls"] == ["Bearer user-tok"]
+    # A5: a purged stream takes the drone offline right away
+    assert ingest["offline"] == [("DRN-0111111111", "stream_purged")]
 
 
 def test_service_token_is_the_fallback(ingest, monkeypatch):
@@ -66,6 +74,7 @@ def test_ingest_reason_is_reported(ingest, monkeypatch):
     ingest["accept"] = set()
     r = client(CRO, monkeypatch).post("/api/ingest-server/streams/D1/purge", cookies={"dvas_access_token": "x"})
     assert r.status_code == 403 and "Role required" in r.json()["detail"]
+    assert ingest["offline"] == []          # a failed purge leaves the drone alone
 
 
 def test_operator_and_bad_ids_are_refused_before_ingest(ingest, monkeypatch):

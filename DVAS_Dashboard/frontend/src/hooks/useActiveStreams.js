@@ -9,6 +9,7 @@
  *   streamMap    – Map<drone_id, stream_obj> for O(1) look-up
  *   droneIsLive  – (id: string) => boolean
  *   mergeWithDrones – (dbDrones: Drone[]) => Drone[]  enriched + sorted
+ *   isGridDrone  – (drone) => boolean  the grid/live-count rule (see below)
  *   loading      – bool
  *   error        – string | null
  */
@@ -27,10 +28,31 @@ function isRecentlySeen(lastSeen) {
   return diff >= 0 && diff < STALE_THRESHOLD;
 }
 
+// Statuses that get a tile in the Multi-Drone Grid / Multi-Drone View
+export const GRID_STATUSES = ["live", "degraded", "draining"];
+
+/**
+ * The one rule for grid tiles AND the live-stream counter (analytics plan A5): the drone
+ * still has an ingest stream and is live, degraded or draining. A drone whose stream was
+ * drained or purged has no tile, so nothing polls a frame that no longer exists.
+ */
+export function isGridDrone(drone, streamMap) {
+  return !!drone && !!streamMap?.has(drone.id) && GRID_STATUSES.includes(drone.status);
+}
+
+/** Frames still queued for a draining drone (consumer lag when known). */
+export function framesLeft(drone) {
+  if (drone?.consumer_lag && typeof drone.consumer_lag === "object") {
+    return Object.values(drone.consumer_lag).reduce((sum, v) => sum + (Number(v) || 0), 0);
+  }
+  return drone?.messages_ready ?? 0;
+}
+
 /** Determine stream status: live vs draining vs offline */
 function resolveDroneStatus(stream, fallbackStatus = "offline") {
   if (!stream) return fallbackStatus;
-  
+  if (stream._offline) return "offline";                // drone_offline pushed over the WebSocket
+
   if (stream.status === "draining") return "draining";  // draining takes priority
   const recent = isRecentlySeen(stream.last_seen);
   const frames = stream.frame_count ?? stream.frames_received ?? 0;
@@ -43,6 +65,8 @@ export function useActiveStreams() {
   const [streams, setStreams]   = useState([]);
   const [loading, setLoading]   = useState(true);
   const [error, setError]       = useState(null);
+  // Set after the first successful poll: from then on a drone without a stream is offline
+  const [fetched, setFetched]   = useState(false);
   const mountedRef               = useRef(true);
 
   const fetchStreams = useCallback(async () => {
@@ -53,6 +77,7 @@ export function useActiveStreams() {
       // Normalise — endpoint may return { drones: [...], count: N }
       const raw = Array.isArray(data) ? data : (data?.drones ?? []);
       setStreams(raw);
+      setFetched(true);
       setError(null);
     } catch (e) {
       if (!mountedRef.current) return;
@@ -88,12 +113,16 @@ export function useActiveStreams() {
         return s;
       }));
     } else if (msg.type === "drone_offline" || msg.event === "drone_offline") {
+      // Offline until the next poll says otherwise (A5)
       setStreams(prev => prev.map(s => {
         if (s.drone_id === msg.drone_id) {
-          return { ...s, status: "offline" };
+          return { ...s, status: "offline", _offline: true };
         }
         return s;
       }));
+    } else if (["stream_purged", "mission_drained"].includes(msg.type || msg.event)) {
+      // The stream is gone (A5): drop it now instead of waiting for the next poll
+      setStreams(prev => prev.filter(s => s.drone_id !== msg.drone_id));
     }
   });
 
@@ -154,10 +183,16 @@ export function useActiveStreams() {
       const enriched = combined.map((drone) => {
         const stream = streamMap.get(drone.id);
         if (!stream) {
+          // No ingest stream: the drone is offline, whatever its DB row still says (A5: a
+          // drained/purged drone kept "live"/"draining" and got a blank grid tile). Until
+          // the first poll answered, the DB status stands.
+          const status = fetched
+            ? "offline"
+            : (drone.status === "live" && !drone.mission_id ? "offline" : (drone.status || "offline"));
           return {
             ...drone,
-            messages_ready: drone.messages_ready ?? 0,
-            status: drone.status === "live" && !drone.mission_id ? "offline" : (drone.status || "offline"),
+            messages_ready: status === "offline" ? 0 : (drone.messages_ready ?? 0),
+            status,
           };
         }
         return {
@@ -203,9 +238,15 @@ export function useActiveStreams() {
       return enriched;
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
+    [streams, fetched]
+  );
+
+  const isGridDroneCb = useCallback(
+    (drone) => isGridDrone(drone, streamMap),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [streams]
   );
 
-  return { streams, streamMap, droneIsLive, mergeWithDrones, loading, error };
+  return { streams, streamMap, droneIsLive, mergeWithDrones, isGridDrone: isGridDroneCb, loading, error, fetched };
 }
 

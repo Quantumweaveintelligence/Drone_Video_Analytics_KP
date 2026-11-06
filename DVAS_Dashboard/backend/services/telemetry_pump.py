@@ -41,6 +41,7 @@ async def _telemetry_pump():
         try:
             # ── 1. Fetch real telemetry from the ingest server ─────────────────
             real_drones: dict[str, dict] = {}  # drone_id → telemetry dict
+            fetched = False  # ingest answered (an empty list then means "no streams")
             try:
                 from ingest_proxy import _get_service_token
                 headers = {}
@@ -52,6 +53,7 @@ async def _telemetry_pump():
                     resp = await client.get(f"{INGEST_URL_local}/ingest/streams/active", headers=headers, timeout=3.0)
                     if resp.status_code == 200:
                         data = resp.json()
+                        fetched = True
                         streams = data if isinstance(data, list) else data.get("drones", [])
                         for s in streams:
                             did = s.get("drone_id", "")
@@ -62,14 +64,18 @@ async def _telemetry_pump():
                         resp = await client.get(f"{INGEST_URL_local}/ingest/telemetry", headers=headers, timeout=2.0)
                         if resp.status_code == 200:
                             data = resp.json()
+                            fetched = True
                             for d in data.get("drones", []):
                                 real_drones[d["drone_id"]] = d
             except Exception as te:
                 logger.debug("Could not fetch ingest telemetry: %s", te)
 
-            if not real_drones:
-                logger.warning("Telemetry poll returned empty — skipping stale detection this cycle")
+            if not fetched:
+                logger.warning("Telemetry poll failed — skipping stale detection this cycle")
                 continue
+            # A5: an empty answer is "no streams". It used to skip stale detection too, so the
+            # last drone to drain stayed "live"/"draining" forever; the grace period below
+            # still covers a transient empty list.
 
             # ── 2. Upsert real drones into the DB ──────────────────────────────
             async with async_session_factory() as session:

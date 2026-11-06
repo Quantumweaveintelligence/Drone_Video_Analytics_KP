@@ -71,6 +71,12 @@ async def _start_pump():
     start_telemetry_pump()
 
 @app.on_event("startup")
+async def _start_ingest_event_listener():
+    # A5: ingest mission_drained / drone_offline -> Drone row offline
+    from services.drone_status import start_ingest_event_listener
+    start_ingest_event_listener()
+
+@app.on_event("startup")
 async def _start_sync():
     start_audit_sync_service()
 

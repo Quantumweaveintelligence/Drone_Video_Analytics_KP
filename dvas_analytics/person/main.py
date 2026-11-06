@@ -218,7 +218,7 @@ async def analyze_frame(
     if frame is None:
         raise HTTPException(400, "Cannot decode image")
 
-    result = analyzer.analyze_frame(frame, drone_id=drone_id, save_crops=save_crops)
+    result = await asyncio.to_thread(analyzer.analyze_frame, frame, drone_id=drone_id, save_crops=save_crops)
     ts = datetime.now(timezone.utc)
 
     for person in result["persons"]:
@@ -1660,8 +1660,8 @@ async def watchlist_enroll(
     if not analyzer or not analyzer.face_model:
         raise HTTPException(503, "Face detection model not loaded")
 
-    from person.analyzer import detect_faces_on_tiles
-    face_boxes = detect_faces_on_tiles(analyzer.face_model, img_bgr, device=analyzer.device)
+    # Off the event loop and serialised with the stream on the face model (plan A1)
+    face_boxes = await asyncio.to_thread(analyzer.detect_faces, img_bgr)
 
     if face_boxes:
         best_face = max(face_boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
@@ -1669,13 +1669,7 @@ async def watchlist_enroll(
         face_crop = img_bgr[max(0, int(y1)):int(y2), max(0, int(x1)):int(x2)]
     else:
         # Fallback 1: Direct full-image YOLO face detection without tiling
-        results = analyzer.face_model(img_bgr, conf=0.15, device=analyzer.device, verbose=False)
-        direct_boxes = []
-        for res in results:
-            for box in res.boxes:
-                bx1, by1, bx2, by2 = box.xyxy[0].cpu().numpy()
-                conf = float(box.conf[0].cpu().numpy())
-                direct_boxes.append((int(bx1), int(by1), int(bx2), int(by2), conf))
+        direct_boxes = await asyncio.to_thread(analyzer.detect_faces_direct, img_bgr, 0.15)
         if direct_boxes:
             best_face = max(direct_boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
             x1, y1, x2, y2, face_conf = best_face
@@ -1980,21 +1974,15 @@ async def face_search(
         raise HTTPException(400, "Cannot decode image — use JPEG or PNG")
 
     # 1. Detect face (tiled -> direct -> pre-cropped mugshot fallback)
-    from person.analyzer import detect_faces_on_tiles
-    face_boxes = detect_faces_on_tiles(analyzer.face_model, img_bgr, device=analyzer.device)
+    # Off the event loop and serialised with the stream on the face model (plan A1)
+    face_boxes = await asyncio.to_thread(analyzer.detect_faces, img_bgr)
 
     if face_boxes:
         best_face = max(face_boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
         x1, y1, x2, y2, face_conf = best_face
         face_crop = img_bgr[max(0, int(y1)):int(y2), max(0, int(x1)):int(x2)]
     else:
-        results = analyzer.face_model(img_bgr, conf=0.15, device=analyzer.device, verbose=False)
-        direct_boxes = []
-        for res in results:
-            for box in res.boxes:
-                bx1, by1, bx2, by2 = box.xyxy[0].cpu().numpy()
-                conf = float(box.conf[0].cpu().numpy())
-                direct_boxes.append((int(bx1), int(by1), int(bx2), int(by2), conf))
+        direct_boxes = await asyncio.to_thread(analyzer.detect_faces_direct, img_bgr, 0.15)
         if direct_boxes:
             best_face = max(direct_boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
             x1, y1, x2, y2, face_conf = best_face

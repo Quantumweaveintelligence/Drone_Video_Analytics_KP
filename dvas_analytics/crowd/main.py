@@ -160,7 +160,7 @@ async def analyze_frame(
     if frame is None:
         raise HTTPException(400, "Cannot decode image")
 
-    result = analyzer.analyze_frame(frame, drone_id=drone_id, include_heatmap=include_heatmap)
+    result = await asyncio.to_thread(analyzer.analyze_frame, frame, drone_id=drone_id, include_heatmap=include_heatmap)   # off the event loop (A1)
     if result is None:
         # Model became unavailable between the readiness check and inference
         raise HTTPException(503, "Model not loaded")

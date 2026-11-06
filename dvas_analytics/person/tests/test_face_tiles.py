@@ -2,6 +2,7 @@
 
 Run from dvas_analytics/:  python -m pytest person/tests -q
 """
+import threading
 import types
 
 import pytest
@@ -48,6 +49,8 @@ class FakeModel:
 def test_cpu_fallback_is_temporary_and_reported(monkeypatch):
     an = pa.PersonFaceAnalyzer.__new__(pa.PersonFaceAnalyzer)
     an.person_model, an.face_model = FakeModel(), FakeModel()
+    an.tracker = types.SimpleNamespace(to=an.person_model.to)    # BatchTracker.to moves the person model
+    an.face_lock = threading.RLock()
     an.device, an.imgsz, an.cpu_since, an.cpu_reason = 0, 1920, None, ""
     clock = [1000.0]
     monkeypatch.setattr(pa.time, "monotonic", lambda: clock[0])
@@ -65,3 +68,17 @@ def test_cpu_fallback_is_temporary_and_reported(monkeypatch):
     clock[0] += 2
     an._maybe_back_to_gpu()
     assert an.device == 0 and an.person_model.device == "cuda:0" and not an.device_info()["cpu_fallback"]
+
+
+def test_face_model_calls_are_serialised(monkeypatch):
+    """Endpoints and the stream share one lock on the face model (plan A1)."""
+    an = pa.PersonFaceAnalyzer.__new__(pa.PersonFaceAnalyzer)
+    an.face_lock, an.device, an.face_model = threading.RLock(), 0, object()
+    held = []
+
+    def fake_tiles(model, frame, device=0, **kw):
+        # RLock owned by this thread ⇔ a second acquire from another thread would block
+        held.append(an.face_lock._is_owned())
+        return []
+    monkeypatch.setattr(pa, "detect_faces_on_tiles", fake_tiles)
+    assert an.detect_faces(None) == [] and held == [True]

@@ -412,7 +412,7 @@ def _performance_view(gov: dict, policy: dict, user: dict, local_gpu=None) -> di
             else:
                 state = "below_target"
             drones.append({"drone_id": d, **{k: st.get(k) for k in
-                           ("fps", "input_fps", "skipped", "infer_ms", "total_ms", "lag_ms", "queued")},
+                           ("fps", "input_fps", "skipped", "late", "infer_ms", "total_ms", "lag_ms", "queued", "stages")},
                            "state": state})
         rows.append({"service": svc, "label": labels.get(svc, svc), "governed": doc.get("governed", True),
                      "cap_fps": doc.get("cap_fps"), "avg_batch": doc.get("avg_batch"), "drones": drones,

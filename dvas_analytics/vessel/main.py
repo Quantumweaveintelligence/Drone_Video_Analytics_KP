@@ -89,7 +89,9 @@ _stream_task: Optional[asyncio.Task] = None
 _stream_running = False
 _frames_processed = 0
 # Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
-_sampler = FrameSampler("vessel", "vessel-group", "vessel-analyzer")
+_sampler = FrameSampler("vessel", "vessel-group", "vessel-analyzer", late_policy="skip")  # own tracker: late frames counted, not re-fed
+# A drone idle for DVAS_IDLE_RESET_S starts its next flight with a fresh tracker (plan A3)
+_sampler.on_idle.append(lambda d: engine.forget_drone(d) if engine is not None else None)
 # Live annotated video (MJPEG, ≤1920 px) for the dashboard
 _hub = AnnotatedHub("vessel")
 install_stream_route(app, _hub)
@@ -594,6 +596,13 @@ async def stop_stream():
 FRAME_CACHE_TTL_SEC = 6.0
 
 
+
+def _streaming(drone_id: str) -> bool:
+    """True while the stream loop is working this drone's frames (plan A2): recovery must
+    then never push the newest stream frame through the drone's live tracker."""
+    return bool(_stream_running) and any(a in _sampler.stats for a in get_drone_aliases(drone_id))
+
+
 @app.get("/annotated/latest")
 async def get_latest_annotated_frame(drone_id: str = ""):
     """Serve the latest annotated maritime video frame with tactical headers.
@@ -628,14 +637,14 @@ async def get_latest_annotated_frame(drone_id: str = ""):
             vessel_cnt = _last_vessel_counts.get(best_drone, 0)
 
     # On-demand frame recovery from Redis stream if not in memory or stale
-    if (not frame_bytes or frame_age > FRAME_CACHE_TTL_SEC) and drone_id:
+    if (not frame_bytes or frame_age > FRAME_CACHE_TTL_SEC) and drone_id and not _streaming(drone_id):
         aliases = get_drone_aliases(drone_id)
         for alias in aliases:
             recovered_frame = await get_latest_stream_frame(alias)
             if recovered_frame is not None and engine is not None:
                 try:
                     annotated_frame, tracked_objects = await asyncio.to_thread(
-                        engine.process_frame, recovered_frame, alias
+                        engine.process_frame, recovered_frame, f"recovery:{alias}"
                     )
                     vessel_cnt = len(tracked_objects)
                     annotated_jpeg = _draw_hud_overlay(annotated_frame, alias, vessel_cnt, 15.0)

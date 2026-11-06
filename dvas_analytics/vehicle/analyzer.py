@@ -98,7 +98,8 @@ class VehicleAnalyzer:
             self.model = YOLO(self.model_path)
             # One tracker per drone; frames of all drones go through the model as one batch
             self.tracker = BatchTracker(self.model)
-            log.info("Vehicle YOLO model loaded: %s", self.model_path)
+            log.info("Vehicle YOLO model loaded: %s (warm-up %.1fs)", self.model_path,
+                     self.tracker.warmup(640, device=self.device))
         except Exception as exc:
             log.error("Failed to load vehicle model: %s", exc)
             self.model = None

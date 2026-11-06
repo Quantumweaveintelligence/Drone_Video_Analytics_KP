@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import { useCommand } from "@/context/CommandContext";
 import { useI18n } from "@/context/I18nContext";
 import LiveMap from "@/components/LiveMap";
-import { useActiveStreams } from "@/hooks/useActiveStreams";
+import { useActiveStreams, framesLeft } from "@/hooks/useActiveStreams";
 import { useJpegPoller } from "@/hooks/useJpegPoller";
 import { API } from "@/lib/api";
 import {
@@ -12,20 +12,27 @@ import {
   User as UserIcon,
 } from "lucide-react";
 
-function MiniStreamCell({ drone }) {
-  const isOffline = drone.status === "offline";
-  const isDegraded = drone.status === "degraded";
-  const isDraining = drone.status === "draining" || (drone.messages_ready ?? 0) > 0;
+// After a 404 (stream gone, or drone outside the user's jurisdiction) retry every 30 s, not 3 s
+const TILE_404_RETRY_MS = 30000;
 
-  const url = isOffline ? null : `${API}/ingest-server/frame/${encodeURIComponent(drone.id)}/latest`;
-  const { blobUrl, hasFrame, feedDead } = useJpegPoller(url, 800, !isOffline);
+function MiniStreamCell({ drone }) {
+  const isDegraded = drone.status === "degraded";
+  const isDraining = drone.status === "draining";
+  // A5: only live tiles poll raw frames; draining and offline tiles show a placeholder
+  const isLive = drone.status === "live" || isDegraded;
+  const isOffline = !isLive && !isDraining;
+  const left = framesLeft(drone);
+
+  const url = isLive ? `${API}/ingest-server/frame/${encodeURIComponent(drone.id)}/latest` : null;
+  const { blobUrl, hasFrame, feedDead, notFound } = useJpegPoller(url, 800, isLive, { notFoundRetryMs: TILE_404_RETRY_MS });
+  const noAccess = notFound === "no_access";
   const [lastSeen, setLastSeen] = useState(null);
 
   useEffect(() => {
     if (hasFrame) setLastSeen(new Date());
   }, [hasFrame, blobUrl]);
 
-  const statusColor = isDraining ? "#fbbf24" : isDegraded ? "#f59e0b" : isOffline || feedDead ? "#ef4444" : "#10b981";
+  const statusColor = isDraining ? "#fbbf24" : isOffline || feedDead ? "#ef4444" : isDegraded ? "#f59e0b" : "#10b981";
   const borderColor = isDraining || isDegraded
     ? "border-amber-500/40"
     : isOffline || feedDead
@@ -62,7 +69,7 @@ function MiniStreamCell({ drone }) {
           }}
         />
 
-        {!isOffline && hasFrame && blobUrl ? (
+        {isLive && hasFrame && blobUrl ? (
           <img
             src={blobUrl}
             alt={`Feed ${drone.id}`}
@@ -71,7 +78,18 @@ function MiniStreamCell({ drone }) {
           />
         ) : (
           <div className="absolute inset-0 flex items-center justify-center">
-            {isOffline || feedDead ? (
+            {isDraining ? (
+              <div className="mono text-[9px] text-amber-300 bg-black/70 px-2 py-1 rounded border border-amber-500/30">
+                DRAINING — {left} {left === 1 ? "frame" : "frames"} left
+              </div>
+            ) : noAccess ? (
+              <div
+                className="mono text-[9px] text-slate-300 bg-black/70 px-2 py-1 rounded border border-slate-500/30"
+                title="This drone is outside your jurisdiction"
+              >
+                NO ACCESS
+              </div>
+            ) : isOffline || feedDead ? (
               <div className="mono text-[9px] text-red-400 bg-black/70 px-2 py-1 rounded border border-red-500/30">
                 FEED OFFLINE
               </div>
@@ -121,14 +139,9 @@ function MiniStreamCell({ drone }) {
                 border: `1px solid ${statusColor}30`,
               }}
             >
-              {isOffline || feedDead ? "OFFLINE" : isDraining ? "DRAINING" : isDegraded ? "DEGRADED" : "LIVE"}
+              {isDraining ? "DRAINING" : isOffline || feedDead ? "OFFLINE" : isDegraded ? "DEGRADED" : "LIVE"}
             </span>
           </div>
-          {isDraining && (
-            <span className="mono text-[8px] px-1.5 py-0.5 rounded font-bold bg-amber-900/60 text-amber-300">
-              {drone.messages_ready ?? 0} frames
-            </span>
-          )}
         </div>
       </div>
 
@@ -162,19 +175,25 @@ function MiniStreamCell({ drone }) {
 }
 
 function MultiDroneGrid({ dbDrones, selectedDroneId, onSelectDrone }) {
-  const { mergeWithDrones, loading, streams } = useActiveStreams();
+  const { mergeWithDrones, isGridDrone, loading, streams } = useActiveStreams();
   const merged = mergeWithDrones(dbDrones);
-  const activeDrones = merged.filter((d) => d.status === "live" || d.status === "degraded" || d.status === "draining" || (d.messages_ready ?? 0) > 0);
+  // A5: the counter and the tiles use the same rule (stream present and live/degraded/draining)
+  const activeDrones = merged.filter(isGridDrone);
+  const drainingCount = activeDrones.filter((d) => d.status === "draining").length;
+  const liveCount = activeDrones.length - drainingCount;
   const slots = activeDrones.slice(0, 4);
 
   return (
     <div className="p-2 flex flex-col gap-2 h-full">
       <div className="flex items-center justify-between px-1">
         <div className="flex items-center gap-1.5">
-          <Radio size={10} className="text-teal-400" style={{ animation: streams.length > 0 ? "pulse 1.5s infinite" : "none" }} />
+          <Radio size={10} className="text-teal-400" style={{ animation: liveCount > 0 ? "pulse 1.5s infinite" : "none" }} />
           <span className="mono text-[9px] text-teal-400 font-bold">
-            {streams.length} LIVE {streams.length === 1 ? "STREAM" : "STREAMS"}
+            {liveCount} LIVE {liveCount === 1 ? "STREAM" : "STREAMS"}
           </span>
+          {drainingCount > 0 && (
+            <span className="mono text-[9px] text-amber-400 font-bold">· {drainingCount} DRAINING</span>
+          )}
         </div>
         {loading && <RefreshCw size={9} className="text-slate-500 animate-spin" />}
       </div>

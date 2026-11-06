@@ -22,6 +22,10 @@ const DRONE_STATE = {
   capped:        ["capped (by design)", "text-slate-400"],
 };
 
+// Per-frame stage split (plan A4): where each analysed frame's time goes
+const STAGE_ORDER = ["decode", "detect", "track", "model", "total"];
+const STAGE_LABEL = { decode: "decode", detect: "detect", track: "track", model: "model", total: "total" };
+
 const fmt = (v, d = 1) => (v == null ? "—" : Number(v).toFixed(d));
 
 function Stat({ label, value, sub, tone = "text-sky-400" }) {
@@ -198,13 +202,14 @@ export default function GpuPerformancePanel() {
               <th className="px-2 py-2 font-normal text-right" title="Model time per frame">Model ms</th>
               <th className="px-2 py-2 font-normal text-right" title="Ingest → analysis start">Lag ms</th>
               <th className="px-2 py-2 font-normal text-right" title="Frames waiting in the queue for this analyzer (worked off after the stream stops)">Queued</th>
-              <th className="px-2 py-2 font-normal text-right" title="Frames lost because the queue overflowed before they were analysed">Lost</th>
+              <th className="px-2 py-2 font-normal text-right" title="Frames that never arrived (gaps in the drone's frame sequence) or were trimmed from a full queue">Lost</th>
+              <th className="px-2 py-2 font-normal text-right" title="Frames that arrived after a newer one was analysed; still analysed, outside the live tracker">Late</th>
               <th className="px-3.5 py-2 font-normal">Status</th>
             </tr>
           </thead>
           <tbody>
             {data.services.length === 0 && (
-              <tr><td colSpan={9} className="px-3.5 py-4 text-slate-500">
+              <tr><td colSpan={10} className="px-3.5 py-4 text-slate-500">
                 <Cpu size={12} className="inline mr-1" />No analyzer is streaming right now.
               </td></tr>
             )}
@@ -237,7 +242,17 @@ export default function GpuPerformancePanel() {
                   <td className="px-2 py-1.5 text-right text-slate-400">{fmt(d?.lag_ms, 0)}</td>
                   <td className="px-2 py-1.5 text-right text-slate-400">{d?.queued ?? "—"}</td>
                   <td className="px-2 py-1.5 text-right text-slate-400">{d?.skipped ?? "—"}</td>
-                  <td className={`px-3.5 py-1.5 ${cls}`}>{lbl}</td>
+                  <td className="px-2 py-1.5 text-right text-slate-400">{d?.late ?? "—"}</td>
+                  <td className={`px-3.5 py-1.5 ${cls}`}>
+                    {lbl}
+                    {d?.stages && Object.keys(d.stages).length > 0 && (
+                      <div className="text-[10px] text-slate-500 whitespace-nowrap" data-testid={`stages-${s.service}-${d.drone_id}`}
+                           title="Average ms per frame for each pipeline stage">
+                        {STAGE_ORDER.filter((k) => d.stages[k] != null)
+                          .map((k) => `${STAGE_LABEL[k]} ${Math.round(d.stages[k])}`).join(" · ")}
+                      </div>
+                    )}
+                  </td>
                 </tr>
               );
             }))}

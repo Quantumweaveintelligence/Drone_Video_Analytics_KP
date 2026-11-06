@@ -67,7 +67,9 @@ _stream_task: Optional[asyncio.Task] = None
 _stream_running = False
 _frames_processed = 0
 # Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
-_sampler = FrameSampler("anomaly", "anomaly-group", "anomaly-analyzer")
+_sampler = FrameSampler("anomaly", "anomaly-group", "anomaly-analyzer", late_policy="skip")  # own tracker: late frames counted, not re-fed
+# A drone idle for DVAS_IDLE_RESET_S starts its next flight with a fresh analyzer (plan A3)
+_sampler.on_idle.append(lambda d: _analyzers.pop(d, None))
 # Live annotated video (MJPEG, ≤1920 px) for the dashboard
 _hub = AnnotatedHub("anomaly")
 install_stream_route(app, _hub)
@@ -575,6 +577,13 @@ async def stream_stop():
     return {"status": "stopped", "stream_running": False}
 
 
+
+def _streaming(drone_id: str) -> bool:
+    """True while the stream loop is working this drone's frames (plan A2): recovery must
+    then never push the newest stream frame through the drone's live tracker."""
+    return bool(_stream_running) and any(a in _sampler.stats for a in get_drone_aliases(drone_id))
+
+
 @app.get("/annotated/latest")
 async def get_latest_annotated(drone_id: str = Query("")):
     """
@@ -603,7 +612,7 @@ async def get_latest_annotated(drone_id: str = Query("")):
             frame_age = now - _last_annotated_ts.get(best_drone, 0.0)
 
     # On-demand frame recovery from Redis stream if not in memory or stale
-    if not frame_bytes or frame_age > FRAME_CACHE_TTL_SEC:
+    if (not frame_bytes or frame_age > FRAME_CACHE_TTL_SEC) and not (drone_id and _streaming(drone_id)):
         candidate_ids = get_drone_aliases(drone_id) if drone_id else []
         if not candidate_ids:
             try:
@@ -616,7 +625,8 @@ async def get_latest_annotated(drone_id: str = Query("")):
             recovered_frame = await get_latest_stream_frame(alias)
             if recovered_frame is not None:
                 try:
-                    analyzer = _get_or_create_analyzer(alias)
+                    # Separate analyzer: never the drone's live trackers (plan A2)
+                    analyzer = _get_or_create_analyzer(f"recovery:{alias}")
                     annotated_bgr, triggered_alerts, tracks_summary = await asyncio.to_thread(
                         analyzer.process_frame,
                         recovered_frame,

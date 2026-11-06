@@ -483,7 +483,8 @@ class ANPRAnalyzer:
             # One tracker per drone (model.track() default botsort.yaml); frames of all
             # drones go through the vehicle model as one batch
             self.tracker = BatchTracker(self.vehicle_model)
-            log.info("ANPR vehicle model loaded: %s", vehicle_model_path)
+            log.info("ANPR vehicle model loaded: %s (warm-up %.1fs)", vehicle_model_path,
+                     self.tracker.warmup(IMG_SIZE, device=0 if torch.cuda.is_available() else "cpu"))
 
             if hasattr(self.vehicle_model, "names") and self.vehicle_model.names:
                 names = self.vehicle_model.names
