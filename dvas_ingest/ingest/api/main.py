@@ -89,9 +89,17 @@ from models import (
     ComponentHealth,
 )
 import datetime
+import weakref
 
 # ── Queue manager (Redis Streams) ─────────────────────────────────────────────
-from queue_manager import get_queue_manager
+import queue_manager as _qmod
+from queue_manager import (
+    get_queue_manager,
+    legacy_stream_key,
+    mission_sid,
+    mission_stream_key,
+    sid_of_key,
+)
 
 _qm = None   # initialised in lifespan
 
@@ -155,12 +163,22 @@ _startup_time: float = time.monotonic()
 
 # ── WebSocket connection manager ──────────────────────────────────────────────
 
+WS_SEND_TIMEOUT_S = 2.0         # a client that cannot take one message in this time is dropped
+WS_FRAME_EVENT_INTERVAL_S = 0.5  # frame_queued is sent at most this often per drone (2 Hz)
+FRAME_LOG_INTERVAL_S = 1.0      # frame_queued is logged as a per-drone summary at most this often
+
+
 class _WSManager:
     """Tracks active WebSocket connections for the live status feed."""
 
-    def __init__(self) -> None:
+    def __init__(self, send_timeout_s: float = WS_SEND_TIMEOUT_S) -> None:
         self._clients: list[WebSocket] = []
         self._lock = asyncio.Lock()
+        self._send_timeout_s = send_timeout_s
+
+    @property
+    def has_clients(self) -> bool:
+        return bool(self._clients)
 
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
@@ -170,31 +188,548 @@ class _WSManager:
 
     async def disconnect(self, ws: WebSocket) -> None:
         async with self._lock:
+            before = len(self._clients)
             self._clients = [c for c in self._clients if c is not ws]
-        log.info("ws_client_disconnected", extra={"total": len(self._clients)})
+            removed = len(self._clients) != before
+        if removed:
+            log.info("ws_client_disconnected", extra={"total": len(self._clients)})
+
+    async def _send(self, ws: WebSocket, payload: str) -> bool:
+        try:
+            await asyncio.wait_for(ws.send_text(payload), timeout=self._send_timeout_s)
+            return True
+        except asyncio.TimeoutError:
+            log.warning("ws_client_send_timeout — dropping client (timeout %.1fs)", self._send_timeout_s)
+            return False
+        except Exception:
+            return False
+
+    async def _close_quietly(self, ws: WebSocket) -> None:
+        try:
+            await asyncio.wait_for(ws.close(code=1013), timeout=1.0)   # 1013 = try again later
+        except Exception:
+            pass
 
     async def broadcast(self, event: dict) -> None:
-        """Send JSON event to all connected clients; drop dead connections."""
+        """Send JSON event to all connected clients concurrently. A client whose send fails
+        or takes longer than the send timeout is dropped, so one slow client delays neither
+        the others nor the event loop for long."""
         if not self._clients:
             return
         payload = json.dumps(event)
-        dead: list[WebSocket] = []
         async with self._lock:
             clients = list(self._clients)
-        for ws in clients:
-            try:
-                await ws.send_text(payload)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            await self.disconnect(ws)
+        results = await asyncio.gather(*(self._send(ws, payload) for ws in clients))
+        for ws, ok in zip(clients, results):
+            if not ok:
+                await self.disconnect(ws)
+                asyncio.create_task(self._close_quietly(ws))
 
 
 ws_manager = _WSManager()
 
+
+class _FrameEventCoalescer:
+    """At most one `frame_queued` broadcast per drone per interval (default 2 Hz).
+
+    The first frame after a quiet period is sent at once; frames arriving within the
+    interval only replace the pending payload, which is sent when the interval ends.
+    So the dashboard always ends up with the latest frame's numbers, and the message
+    shape is unchanged. Other events are broadcast directly and never throttled."""
+
+    def __init__(self, manager: "_WSManager", interval_s: float = WS_FRAME_EVENT_INTERVAL_S,
+                 clock=time.monotonic) -> None:
+        self._ws = manager
+        self._interval = interval_s
+        self._clock = clock
+        self._last_sent: dict[str, float] = {}
+        self._pending: dict[str, dict] = {}
+        self._timers: dict[str, asyncio.TimerHandle] = {}
+        self._tasks: set = set()
+
+    def offer(self, drone_id: str, event: dict) -> None:
+        if not self._ws.has_clients:
+            self._pending.pop(drone_id, None)
+            return
+        now = self._clock()
+        due = self._last_sent.get(drone_id, float("-inf")) + self._interval
+        if now >= due and drone_id not in self._timers:
+            self._send(drone_id, event, now)
+            return
+        self._pending[drone_id] = event
+        if drone_id not in self._timers:
+            loop = asyncio.get_running_loop()
+            self._timers[drone_id] = loop.call_later(max(0.0, due - now), self._flush, drone_id)
+
+    def _flush(self, drone_id: str) -> None:
+        self._timers.pop(drone_id, None)
+        event = self._pending.pop(drone_id, None)
+        if event is not None:
+            self._send(drone_id, event, self._clock())
+
+    def _send(self, drone_id: str, event: dict, now: float) -> None:
+        self._last_sent[drone_id] = now
+        task = asyncio.create_task(self._ws.broadcast(event))
+        self._tasks.add(task)                       # keep a reference until it finishes
+        task.add_done_callback(self._tasks.discard)
+
+    def forget(self, drone_id: str) -> None:
+        """Drop per-drone state (after the drone's stream is purged)."""
+        t = self._timers.pop(drone_id, None)
+        if t is not None:
+            t.cancel()
+        self._pending.pop(drone_id, None)
+        self._last_sent.pop(drone_id, None)
+
+
+frame_events = _FrameEventCoalescer(ws_manager)
+
+
+class _FrameLogSummary:
+    """Replaces the per-frame `frame_queued` INFO line: one summary line per drone at most
+    every FRAME_LOG_INTERVAL_S (frames, bytes, mean / max ingest latency since the last
+    summary). Rejections and errors are still logged one by one where they happen."""
+
+    def __init__(self, logger: logging.Logger, interval_s: float = FRAME_LOG_INTERVAL_S,
+                 clock=time.monotonic) -> None:
+        self._log = logger
+        self._interval = interval_s
+        self._clock = clock
+        self._acc: dict[str, dict] = {}
+
+    def record(self, drone_id: str, mission_id: Optional[str], n_bytes: int,
+               latency_s: float, seq: Optional[int] = None) -> None:
+        now = self._clock()
+        a = self._acc.get(drone_id)
+        if a is None:
+            a = self._acc[drone_id] = {"since": now, "frames": 0, "bytes": 0,
+                                       "lat_sum": 0.0, "lat_max": 0.0}
+        a["frames"] += 1
+        a["bytes"] += n_bytes
+        a["lat_sum"] += latency_s
+        a["lat_max"] = max(a["lat_max"], latency_s)
+        a["mission"], a["seq"] = mission_id, seq
+        if now - a["since"] >= self._interval:
+            self._emit(drone_id, now)
+
+    def flush(self, drone_id: Optional[str] = None, idle_only: bool = False) -> None:
+        """Log what has accumulated (one drone, or all). With idle_only, only drones whose
+        window is older than the interval — used by a periodic task so the last frames of
+        a mission are not left unlogged."""
+        now = self._clock()
+        for did in ([drone_id] if drone_id is not None else list(self._acc)):
+            a = self._acc.get(did)
+            if a is None or (idle_only and now - a["since"] < self._interval):
+                continue
+            self._emit(did, now)
+
+    def _emit(self, drone_id: str, now: float) -> None:
+        a = self._acc.pop(drone_id)
+        if not a["frames"]:
+            return
+        window = max(now - a["since"], 1e-9)
+        mean_ms = a["lat_sum"] / a["frames"] * 1000.0
+        max_ms = a["lat_max"] * 1000.0
+        # The log format prints only the message, so the numbers are in the text as well.
+        self._log.info(
+            "frame_queued_summary drone=%s mission=%s frames=%d bytes=%d window_s=%.1f "
+            "latency_ms_mean=%.1f latency_ms_max=%.1f last_seq=%s",
+            drone_id, a["mission"], a["frames"], a["bytes"], window, mean_ms, max_ms, a["seq"],
+            extra={"drone_id": drone_id, "mission": a["mission"], "frames": a["frames"],
+                   "bytes": a["bytes"], "window_s": round(window, 2),
+                   "latency_ms_mean": round(mean_ms, 1), "latency_ms_max": round(max_ms, 1),
+                   "last_seq": a["seq"]},
+        )
+
+
+frame_log = _FrameLogSummary(log)
+
 # ── Active missions tracker ───────────────────────────────────────────────────
 _active_missions: dict[str, dict] = {}
 _drain_tasks: dict = {}   # drone_id → {mission_id, started_at, operator}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MISSION-KEYED STREAMS (plan Phase 2a, STREAM_KEY_MODE=mission)
+# ═════════════════════════════════════════════════════════════════════════════
+# Every mission has its own stream mission:frames:{sid}, an index hash with its owner
+# (the token `sub` that started it) and its drone, and is listed in drone:missions:{drone}.
+# Keys and fields: queue_manager.py header. With STREAM_KEY_MODE=drone none of this runs.
+
+DRAIN_MIN_S = 20.0      # a drained mission stays visible ("draining") at least this long
+DRAIN_MAX_S = 300.0     # the drain monitor gives up after this; the cleanup loop keeps checking
+ORPHAN_IDLE_S = 30.0    # a stream nobody writes to is purged only after this long without frames
+LIVE_STATES = ("live", "draining")
+END_ROLES = {"supervisor", "sys-admin"}
+
+_mission_drain_tasks: dict[str, asyncio.Task] = {}      # sid → drain monitor
+_drone_active_sid: dict[str, str] = {}                  # drone → sid (mirror of drone:active_mission)
+_drone_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
+_sid_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
+_reject_log_at: dict = {}
+
+
+def _mission_mode() -> bool:
+    return _qmod.mission_mode()
+
+
+def _named_lock(table, name: str) -> asyncio.Lock:
+    """One asyncio lock per name (ingest runs one uvicorn worker). Weak values: a lock
+    disappears once nobody holds or waits for it."""
+    lk = table.get(name)
+    if lk is None:
+        lk = asyncio.Lock()
+        table[name] = lk
+    return lk
+
+
+def _token_sub(claims: dict) -> str:
+    return str(claims.get("sub") or claims.get("preferred_username") or "")
+
+
+def _realm_roles(claims: dict) -> set:
+    return set((claims.get("realm_access") or {}).get("roles") or [])
+
+
+def _is_service_account(claims: dict) -> bool:
+    return str(claims.get("preferred_username", "")).startswith("service-account-")
+
+
+def _mission_http_error(code: int, error: str, message: str) -> HTTPException:
+    return HTTPException(code, {"error": error, "message": message})
+
+
+def _log_reject(drone_id: str, reason: str, message: str) -> None:
+    """Rejected uploads are logged, but at most once per 5 s per drone and reason (an edge
+    that uploads without mission/start would otherwise log 30 lines a second)."""
+    now = time.monotonic()
+    k = (drone_id, reason)
+    if now - _reject_log_at.get(k, -1e9) >= 5.0:
+        _reject_log_at[k] = now
+        log.warning("frame_rejected drone=%s reason=%s %s", drone_id, reason, message)
+
+
+def _f(v, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _iso(epoch: float) -> Optional[str]:
+    if not epoch:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(epoch))
+
+
+async def _check_frame_mission(drone_id: str, mission_id: str, claims: dict):
+    """Mission-mode admission of one frame: (sid, index). Raises 409 / 403 / 503."""
+    if _qm is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Queue service temporarily unavailable")
+    sid = mission_sid(mission_id)
+    try:
+        idx = await _qm.get_mission_index(sid)
+    except Exception as exc:
+        log.error("mission_index_read_failed sid=%s error=%s", sid, exc)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Queue service temporarily unavailable")
+    if not idx:
+        raise _mission_http_error(409, "mission_not_started",
+                                  f"Mission {mission_id!r} was not started (POST /ingest/mission/start first)")
+    if idx.get("operator_sub") != _token_sub(claims):
+        raise _mission_http_error(403, "not_mission_operator",
+                                  "Only the operator who started the mission may upload its frames")
+    if idx.get("drone_id") != drone_id:
+        raise _mission_http_error(409, "drone_mismatch",
+                                  f"Mission {mission_id!r} belongs to drone {idx.get('drone_id')!r}")
+    if idx.get("status") in LIVE_STATES:
+        return sid, idx
+    # ended (stream drained, or purged by an officer): only in-flight retries, within the grace
+    ended_at = _f(idx.get("ended_at"))
+    if idx.get("purged_at") or not ended_at or time.time() - ended_at > _qmod.MISSION_GRACE_S:
+        raise _mission_http_error(409, "mission_ended", f"Mission {mission_id!r} has ended")
+    return sid, idx
+
+
+async def _start_mission_registry(req: MissionStartRequest, claims: dict) -> dict:
+    """Mission-mode part of mission/start: ownership checks, then index / registry / pointer.
+
+    409 when the mission id belongs to another operator or drone, or when the drone is
+    flying (live/draining) another operator's mission. The same operator re-sending start
+    is idempotent (a draining/ended mission becomes live again). A new mission by the same
+    operator puts their previous live mission on that drone into draining."""
+    sub = _token_sub(claims)
+    if not sub:
+        raise _mission_http_error(403, "no_subject", "Token carries no subject")
+    sid = mission_sid(req.mission_id)
+    superseded: list = []
+    async with _named_lock(_drone_locks, req.drone_id):
+        async with _named_lock(_sid_locks, sid):
+            idx = await _qm.get_mission_index(sid)
+            if idx and (idx.get("operator_sub") != sub or idx.get("drone_id") != req.drone_id):
+                raise _mission_http_error(
+                    409, "mission_id_taken",
+                    f"Mission id {req.mission_id!r} is registered to another operator or drone")
+            others = []
+            for other in await _qm.drone_mission_sids(req.drone_id):
+                if other == sid:
+                    continue
+                oi = await _qm.get_mission_index(other)
+                if not oi or oi.get("status") not in LIVE_STATES:
+                    continue
+                if oi.get("operator_sub") != sub:
+                    raise _mission_http_error(
+                        409, "drone_in_use",
+                        f"Drone {req.drone_id!r} is flying mission {oi.get('mission_id')!r} "
+                        "of another operator")
+                others.append((other, oi))
+            resumed = bool(idx)
+            started_at = _f(idx.get("started_at")) if idx else 0.0
+            started_at = started_at or time.time()
+            await _qm.write_mission_start(sid, req.drone_id, req.mission_id, sub, started_at)
+            _drone_active_sid[req.drone_id] = sid
+        task = _mission_drain_tasks.pop(sid, None)     # resumed while draining
+        if task:
+            task.cancel()
+        for other, oi in others:
+            if oi.get("status") == "live":
+                await _qm.set_mission_draining(other)
+                _start_mission_drain(other, req.drone_id, oi.get("mission_id") or other)
+                superseded.append(oi.get("mission_id") or other)
+                log.info("mission_superseded drone=%s old=%s new=%s",
+                         req.drone_id, oi.get("mission_id"), req.mission_id)
+    return {"sid": sid, "resumed": resumed, "superseded": superseded, "started_at": started_at}
+
+
+def _start_mission_drain(sid: str, drone_id: str, mission_id: str) -> None:
+    old = _mission_drain_tasks.pop(sid, None)
+    if old:
+        old.cancel()
+    _mission_drain_tasks[sid] = asyncio.create_task(_monitor_mission_drain(sid, drone_id, mission_id))
+
+
+async def _forget_drone(drone_id: str) -> None:
+    """In-memory state of a drone that has no mission and no stream left."""
+    _drone_active_sid.pop(drone_id, None)
+    _active_missions.pop(drone_id, None)
+    _latest_metadata.pop(drone_id, None)
+    _ingest_stats.pop(drone_id, None)
+    frame_events.forget(drone_id)
+    if _qm is not None:
+        _qm._stats.pop(drone_id, None)
+    ACTIVE_MISSIONS.set(len(_active_missions))
+
+
+async def _try_finalize_mission(sid: str, min_age_s: float, idle_s: float) -> Optional[str]:
+    """Purge a mission stream once it is safe. Returns "finalized", "live" (mission is live
+    again: stop draining it), "gone" (no index), or None (not yet).
+
+    draining: ended at least min_age_s ago and every analyzer has read every frame.
+    ended:    a late retry re-created the stream: no frame for idle_s and fully consumed.
+    live:     never purged."""
+    key = mission_stream_key(sid)
+    async with _named_lock(_sid_locks, sid):          # no frame is added between check and purge
+        idx = await _qm.get_mission_index(sid)
+        if not idx:
+            return "gone"
+        st = idx.get("status")
+        if st == "live":
+            return "live"
+        now = time.time()
+        if now - _f(idx.get("ended_at")) < min_age_s:
+            return None
+        if now - getattr(_qm, "_last_publish", {}).get(key, 0.0) < idle_s:
+            return None
+        existed = bool(await _qm._client.exists(key))
+        if existed and not await _qm.is_fully_consumed(key):
+            return None
+        drone_id = idx.get("drone_id") or ""
+        await _qm.finalize_mission(sid, drone_id)
+    mission_id = idx.get("mission_id") or sid
+    log.info("[DRAIN] mission %s (drone %s): fully consumed — stream purged", mission_id, drone_id)
+    await _after_mission_finalized(drone_id, mission_id, announce=(st != "ended" or existed))
+    return "finalized"
+
+
+async def _after_mission_finalized(drone_id: str, mission_id: Optional[str], announce: bool = True) -> None:
+    still_active = bool(drone_id) and (await _qm.drone_active_sid(drone_id)) is not None
+    if drone_id and not still_active:
+        try:
+            await _qm._client.delete(f"mission:active:{drone_id}")
+        except Exception as e:
+            log.warning(f"Failed to clean mission from Valkey: {e}")
+        await _forget_drone(drone_id)
+    if announce and drone_id:
+        # drone_still_active: a newer mission of this drone is still registered, so the
+        # drone itself is not offline (the event shape is otherwise unchanged)
+        await ws_manager.broadcast({"event": "mission_drained", "drone_id": drone_id,
+                                    "mission_id": mission_id, "drone_still_active": still_active})
+
+
+async def _monitor_mission_drain(sid: str, drone_id: str, mission_id: str) -> None:
+    """Purge the mission's stream once every analyzer has read it (after DRAIN_MIN_S).
+    Gives up after DRAIN_MAX_S; the periodic cleanup keeps checking after that."""
+    start = time.monotonic()
+    try:
+        while time.monotonic() - start < DRAIN_MAX_S:
+            try:
+                res = await _try_finalize_mission(sid, DRAIN_MIN_S, 0.0)
+                if res is not None:
+                    return
+            except Exception as e:
+                log.warning(f"[DRAIN] {drone_id}/{mission_id}: error checking consumers: {e}")
+            await asyncio.sleep(2.0)
+        log.warning(f"[DRAIN] {drone_id}/{mission_id}: not consumed after {DRAIN_MAX_S}s — "
+                    "left to the periodic cleanup / manual purge")
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if _mission_drain_tasks.get(sid) is asyncio.current_task():
+            _mission_drain_tasks.pop(sid, None)
+
+
+async def _scan_keys(pattern: str) -> list[str]:
+    client = _qm._client
+    cursor, out = 0, []
+    for _ in range(200):
+        cursor, batch = await client.scan(cursor=cursor, match=pattern, count=200)
+        out.extend(k.decode() if isinstance(k, bytes) else k for k in batch)
+        if cursor == 0:
+            break
+    return out
+
+
+async def _registry_drones() -> list[str]:
+    return [k.split(":", 2)[2] for k in await _scan_keys("drone:missions:*") if k.count(":") >= 2]
+
+
+async def _mission_cleanup_pass() -> None:
+    """Restart-safe drain: every mission stream / registry entry that is not live is purged
+    once consumed (draining: DRAIN_MIN_S after its end; ended with late frames: after
+    ORPHAN_IDLE_S without frames). Streams without an index are purged once consumed and idle."""
+    sids: dict[str, None] = {}
+    for key in await _scan_keys("mission:frames:*"):
+        sids[sid_of_key(key)] = None
+    for drone_id in await _registry_drones():
+        for sid in await _qm.drone_mission_sids(drone_id):
+            sids[sid] = None
+    for sid in sids:
+        if not sid or sid in _mission_drain_tasks:
+            continue                                   # its drain monitor is on it
+        try:
+            idx = await _qm.get_mission_index(sid)
+            if idx is None:
+                key = mission_stream_key(sid)
+                idle = time.time() - getattr(_qm, "_last_publish", {}).get(key, 0.0) >= ORPHAN_IDLE_S
+                if idle and await _qm.is_fully_consumed(key):
+                    async with _named_lock(_sid_locks, sid):
+                        await _qm.purge_stream(key)
+                    log.info("[AUTO-CLEANUP] mission stream %s without an index fully consumed — purged", sid)
+                continue
+            if idx.get("status") == "draining":
+                await _try_finalize_mission(sid, DRAIN_MIN_S, 0.0)
+            elif idx.get("status") == "ended":
+                await _try_finalize_mission(sid, 0.0, ORPHAN_IDLE_S)
+        except Exception as e:
+            log.warning(f"[AUTO-CLEANUP] mission {sid}: {e}")
+
+
+async def _drone_stream_entries(drone_id: str, extra_sids=()) -> list[tuple]:
+    """(stream key, sid or None, index or None) for every stream of the drone: legacy first,
+    then its missions oldest first (the active one included even before its first frame)."""
+    client = _qm._client
+    out = []
+    legacy = legacy_stream_key(drone_id)
+    if await client.exists(legacy):
+        out.append((legacy, None, None))
+    sids = list(await _qm.drone_mission_sids(drone_id))
+    active = _drone_active_sid.get(drone_id) or await _qm.drone_active_sid(drone_id)
+    for s in list(extra_sids) + ([active] if active else []):
+        if s and s not in sids:
+            sids.append(s)
+    for sid in sids:
+        out.append((mission_stream_key(sid), sid, await _qm.get_mission_index(sid)))
+    return out
+
+
+async def _drone_view(drone_id: str, extra_sids=()) -> dict:
+    """Per-drone aggregate of all its streams (mission mode)."""
+    client = _qm._client
+    active_sid = await _qm.drone_active_sid(drone_id)
+    missions, total, remaining = [], 0, 0
+    any_live = any_draining = False
+    active_idx = None
+    for key, sid, idx in await _drone_stream_entries(drone_id, extra_sids):
+        try:
+            n = int(await client.xlen(key) or 0)
+        except Exception:
+            n = 0
+        try:
+            rem = await _qm.remaining_frames(key) if n else 0
+        except Exception:
+            rem = n
+        total += n
+        remaining += rem
+        st = (idx or {}).get("status") or ("legacy" if sid is None else "ended")
+        any_live |= st == "live"
+        any_draining |= st == "draining"
+        if sid is not None and sid == active_sid:
+            active_idx = idx
+        missions.append({
+            "mission_id":  (idx or {}).get("mission_id") or (None if sid is None else sid),
+            "status":      st,
+            "frame_count": n,
+            "remaining":   rem,
+            "stream_key":  key,
+            "started_at":  _iso(_f((idx or {}).get("started_at"))),
+        })
+    if any_live:
+        mission_stat = "active"
+    elif any_draining:
+        mission_stat = "draining"
+    else:
+        mission_stat = "ended" if missions else "idle"
+    return {
+        "missions": missions, "frame_count": total, "remaining": remaining,
+        "active_sid": active_sid, "active_idx": active_idx,
+        "mission_status": mission_stat, "is_active": any_live or any_draining,
+        "stream_key": (mission_stream_key(active_sid) if active_sid
+                       else (missions[-1]["stream_key"] if missions else legacy_stream_key(drone_id))),
+    }
+
+
+async def _drone_remaining(drone_id: str) -> tuple[int, str]:
+    """(frames the slowest analyzer still has to read, queue name) for a drone, both modes."""
+    if not _qm:
+        return 0, legacy_stream_key(drone_id)
+    if not _mission_mode():
+        return await _qm.remaining_frames(drone_id), f"drone:frames:{drone_id}"
+    try:
+        v = await _drone_view(drone_id)
+        return v["remaining"], v["stream_key"]
+    except Exception as exc:
+        log.debug("drone_remaining failed for %s: %s", drone_id, exc)
+        return 0, legacy_stream_key(drone_id)
+
+
+async def _resolve_drone_stream(drone_id: str, for_live: bool = False) -> Optional[str]:
+    """Stream with the drone's newest frames: active mission, else newest mission whose
+    stream exists, else legacy. for_live: the active mission's key even before its first
+    frame (an MJPEG reader blocks on it until frames arrive)."""
+    client = _qm._client
+    if not _mission_mode():
+        return legacy_stream_key(drone_id)
+    active = await _qm.drone_active_sid(drone_id)
+    if active and await client.exists(mission_stream_key(active)):
+        return mission_stream_key(active)
+    for sid in reversed(await _qm.drone_mission_sids(drone_id)):
+        if await client.exists(mission_stream_key(sid)):
+            return mission_stream_key(sid)
+    legacy = legacy_stream_key(drone_id)
+    if await client.exists(legacy):
+        return legacy
+    if for_live:
+        return mission_stream_key(active) if active else legacy
+    return None
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -207,10 +742,13 @@ async def lifespan(app: FastAPI):
     _qm = get_queue_manager()
     try:
         await _qm.connect()
-        for did in KNOWN_DRONES:
-            await _qm.declare_drone_queue(did)
+        if not _mission_mode():
+            for did in KNOWN_DRONES:
+                await _qm.declare_drone_queue(did)
+        # mission mode: no stream before mission/start; analytics create their own groups
         asyncio.create_task(_auto_cleanup_consumed_streams())
-        log.info("ingest_server_ready — redis_streams_declared", extra={"drones": len(KNOWN_DRONES)})
+        log.info("ingest_server_ready — redis_streams_declared stream_key_mode=%s",
+                 _qmod.STREAM_KEY_MODE, extra={"drones": len(KNOWN_DRONES)})
 
         # Restore saved geofences from disk to Redis on startup
         try:
@@ -253,7 +791,7 @@ async def lifespan(app: FastAPI):
                             v_str = v.decode() if isinstance(v, bytes) else v
                             decoded[k_str] = v_str
                         key_str = key.decode() if isinstance(key, bytes) else key
-                        drone_id = key_str.split(":")[-1]
+                        drone_id = key_str.split(":", 2)[-1]   # ids may contain ":"
                         _active_missions[drone_id] = decoded
                         
                         _latest_metadata.setdefault(drone_id, {}).update({
@@ -269,6 +807,12 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             log.warning(f"Failed to restore missions from Valkey: {e}")
 
+        if _mission_mode():
+            try:
+                await _restore_mission_registry()
+            except Exception as e:
+                log.warning(f"Failed to restore the mission registry from Valkey: {e}")
+
     except Exception as exc:
         log.error("startup_redis_connect_failed", extra={"error": str(exc)})
         # Continue anyway — will reconnect on first frame
@@ -278,6 +822,31 @@ async def lifespan(app: FastAPI):
     log.info("ingest_server_shutting_down")
     if _qm:
         await _qm.close()
+
+
+async def _restore_mission_registry() -> None:
+    """Mission mode, after a restart: active-mission pointers into memory, and an
+    _active_missions entry for drones whose active mission is still live/draining but had
+    no mission:active hash. Draining missions are drained by the periodic cleanup."""
+    for key in await _scan_keys("drone:active_mission:*"):
+        drone_id = key.split(":", 2)[2]
+        sid = await _qm.drone_active_sid(drone_id)
+        if not sid:
+            continue
+        _drone_active_sid[drone_id] = sid
+        idx = await _qm.get_mission_index(sid) or {}
+        if idx.get("status") in LIVE_STATES and drone_id not in _active_missions:
+            _active_missions[drone_id] = {
+                "mission_id": idx.get("mission_id"),
+                "status":     "active" if idx.get("status") == "live" else "draining",
+                "started_at": _iso(_f(idx.get("started_at"))),
+            }
+            _latest_metadata.setdefault(drone_id, {}).update({
+                "mission_id": idx.get("mission_id"),
+                "mission_status": _active_missions[drone_id]["status"],
+            })
+        log.info(f"[RECOVERY] drone {drone_id}: active mission {idx.get('mission_id') or sid}")
+    ACTIVE_MISSIONS.set(len(_active_missions))
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
@@ -391,7 +960,13 @@ async def ingest_frame(
     - 413 — frame too large
     - 415 — unsupported content type
     - 422 — invalid metadata JSON
-    - 503 — RabbitMQ unavailable
+    - 503 — Valkey unavailable
+
+    STREAM_KEY_MODE=mission (plan Phase 2a): the frame goes to `mission:frames:{sid}`.
+    - 409 `mission_not_started` — no mission/start for this mission id
+    - 403 `not_mission_operator` — token subject is not the mission's operator
+    - 409 `drone_mismatch` — metadata drone_id differs from the mission's drone
+    - 409 `mission_ended` — mission ended more than MISSION_GRACE_S ago (or was purged)
     """
     t_start = time.monotonic()
 
@@ -439,21 +1014,60 @@ async def ingest_frame(
         )
 
     # ── Publish to Redis Stream ───────────────────────────────────────────────
-    try:
-        msg_id = await _publish_frame(drone_id, meta.model_dump(), data)
-    except Exception as exc:
-        log.error("publish_failed", extra={"drone_id": drone_id, "error": str(exc)})
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Queue service temporarily unavailable",
-        )
+    stream_key = None
+    is_active_stream = True     # the drone's current mission (telemetry, live events)
+    if _mission_mode():
+        # Phase 2a: the frame goes to its own mission's stream, only for the operator who
+        # started that mission; a frame for an ended mission only within the grace period.
+        sid = mission_sid(mission_id)
+        async with _named_lock(_sid_locks, sid):     # never between a drain check and its purge
+            try:
+                sid, idx = await _check_frame_mission(drone_id, mission_id, claims)
+            except HTTPException as exc:
+                if exc.status_code in (403, 409):
+                    reason = (exc.detail or {}).get("error", "rejected") if isinstance(exc.detail, dict) else "rejected"
+                    _record_rejection(drone_id)
+                    FRAMES_RECEIVED.labels(drone_id=drone_id, status="rejected_mission").inc()
+                    _log_reject(drone_id, reason, f"mission={mission_id!r} seq={meta.frame_sequence}")
+                raise
+            stream_key = mission_stream_key(sid)
+            try:
+                msg_id = await _qm.publish_frame(drone_id, data, meta.model_dump(), stream_key=stream_key)
+                if idx.get("status") == "ended":
+                    # late retry: its stream may have been purged — list it again for the
+                    # analyzers and the cleanup
+                    await _qm.register_late_stream(sid, drone_id, _f(idx.get("started_at")) or time.time())
+            except Exception as exc:
+                log.error("publish_failed", extra={"drone_id": drone_id, "error": str(exc)})
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Queue service temporarily unavailable",
+                )
+        is_active_stream = _drone_active_sid.get(drone_id, sid) == sid
+    else:
+        try:
+            msg_id = await _publish_frame(drone_id, meta.model_dump(), data)
+        except Exception as exc:
+            log.error("publish_failed", extra={"drone_id": drone_id, "error": str(exc)})
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Queue service temporarily unavailable",
+            )
 
     # ── Record stats ──────────────────────────────────────────────────────────
-    _record_frame(drone_id, len(data), mission_id, meta.frames_total)
+    _record_frame(drone_id, len(data), mission_id if is_active_stream else None, meta.frames_total)
     FRAMES_RECEIVED.labels(drone_id=drone_id, status="queued").inc()
     FRAMES_BYTES.labels(drone_id=drone_id).inc(len(data))
     elapsed = time.monotonic() - t_start
     INGEST_LATENCY.labels(drone_id=drone_id).observe(elapsed)
+
+    queue_name = stream_key or f"drone:frames:{drone_id}"
+    frame_log.record(drone_id, mission_id, len(data), elapsed, meta.frame_sequence)
+    if not is_active_stream:
+        # A late retry for an earlier mission of this drone: queued in that mission's
+        # stream, but the drone's telemetry and live events stay on its current mission.
+        return IngestResponse(status="queued", drone_id=drone_id, frame_sequence=meta.frame_sequence,
+                              queue_name=queue_name, message_id=msg_id)
 
     # ── Cache latest telemetry ────────────────────────────────────────────────
     active_m = _active_missions.get(drone_id, {})
@@ -482,38 +1096,22 @@ async def ingest_frame(
         "gps_lock":    getattr(meta, "gps_lock", None) if getattr(meta, "gps_lock", None) is not None else (meta.latitude is not None and meta.longitude is not None and (meta.latitude != 0.0 or meta.longitude != 0.0)),
     }
 
-    queue_name = f"drone:frames:{drone_id}"
-    log.info(
-        "frame_queued",
-        extra={
-            "drone_id":  drone_id,
-            "mission":   mission_id,
-            "seq":       meta.frame_sequence,
-            "score":     round(meta.change_score, 3),
-            "bytes":     len(data),
-            "latency_ms": round(elapsed * 1000, 1),
-            "operator":  extract_username(claims),
-        },
-    )
-
-    # ── Broadcast to WS clients ───────────────────────────────────────────────
-    asyncio.create_task(
-        ws_manager.broadcast({
-            "event":          "frame_queued",
-            "drone_id":       drone_id,
-            "mission_id":     mission_id,
-            "frame_sequence": meta.frame_sequence,
-            "change_score":   meta.change_score,
-            "timestamp":      meta.timestamp,
-            "bytes":          len(data),
-            "latency_ms":     round(elapsed * 1000, 1),
-            "latitude":       meta.latitude,
-            "longitude":      meta.longitude,
-            "altitude_m":     meta.altitude_m,
-            "battery_pct":    meta.battery_pct,
-            "speed_mps":      meta.speed_mps,
-        })
-    )
+    # ── Broadcast to WS clients (coalesced to ≤ 2 Hz per drone) ──────────────
+    frame_events.offer(drone_id, {
+        "event":          "frame_queued",
+        "drone_id":       drone_id,
+        "mission_id":     mission_id,
+        "frame_sequence": meta.frame_sequence,
+        "change_score":   meta.change_score,
+        "timestamp":      meta.timestamp,
+        "bytes":          len(data),
+        "latency_ms":     round(elapsed * 1000, 1),
+        "latitude":       meta.latitude,
+        "longitude":      meta.longitude,
+        "altitude_m":     meta.altitude_m,
+        "battery_pct":    meta.battery_pct,
+        "speed_mps":      meta.speed_mps,
+    })
 
     return IngestResponse(
         status         = "queued",
@@ -543,15 +1141,22 @@ async def system_status() -> SystemStatusResponse:
     total_queued = 0
 
     known_ids = set(KNOWN_DRONES) | set(_ingest_stats.keys())
+    if _qm and _mission_mode():
+        # every drone with a registered mission stream, and legacy streams left in place
+        try:
+            known_ids |= set(await _registry_drones()) | set(_active_missions.keys())
+            known_ids |= {k.split(":", 2)[2] for k in await _scan_keys("drone:frames:*") if k.count(":") >= 2}
+        except Exception as exc:
+            log.debug("status registry scan failed: %s", exc)
 
     for drone_id in sorted(known_ids):
         stats      = _ingest_stats.get(drone_id, {})
-        depth      = await _qm.remaining_frames(drone_id) if _qm else 0
+        depth, queue_name = await _drone_remaining(drone_id)
         total_queued += depth
         QUEUE_DEPTH.labels(drone_id=drone_id).set(depth)
 
         q_stats = DroneQueueStats(
-            queue_name     = f"drone:frames:{drone_id}",
+            queue_name     = queue_name,
             messages_ready = depth,
             consumers      = 0,
         )
@@ -595,11 +1200,11 @@ async def drone_status(
     a single drone.
     """
     stats = _ingest_stats.get(drone_id, {})
-    depth = await _qm.remaining_frames(drone_id) if _qm else 0
+    depth, queue_name = await _drone_remaining(drone_id)
     QUEUE_DEPTH.labels(drone_id=drone_id).set(depth)
 
     q_stats = DroneQueueStats(
-        queue_name     = f"drone:frames:{drone_id}",
+        queue_name     = queue_name,
         messages_ready = depth,
         consumers      = 0,
     )  # consumers field: 0 for Redis Streams (no AMQP consumer concept)
@@ -638,8 +1243,16 @@ async def mission_start(
     Registers a new mission for a drone. Publishes a `mission_start` event
     to the `drone.events.confirmed` queue and broadcasts to WS clients.
     """
+    if _mission_mode():
+        # Phase 2a: ownership checks + registry (409 on conflicts). Earlier missions of the
+        # drone keep their own streams and drains.
+        if _qm is None:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Queue service temporarily unavailable")
+        reg = await _start_mission_registry(req, claims)
+        log.info("mission_registered drone=%s mission=%s sid=%s resumed=%s superseded=%s",
+                 req.drone_id, req.mission_id, reg["sid"], reg["resumed"], reg["superseded"])
     # Cancel any pending drain from a previous mission on the same drone
-    if req.drone_id in _drain_tasks:
+    elif req.drone_id in _drain_tasks:
         old_task = _drain_tasks.pop(req.drone_id)
         old_task.cancel()
         log.info(f"[MISSION-START] Cancelled pending drain for {req.drone_id} (new mission starting)")
@@ -919,6 +1532,14 @@ async def _auto_cleanup_consumed_streams(min_drain_sec: float = 20.0):
     """Periodically check for fully-consumed draining streams and auto-clean after grace period."""
     while True:
         await asyncio.sleep(15)
+        frame_log.flush(idle_only=True)        # summary for drones that stopped sending
+        if _mission_mode():
+            try:
+                await _mission_cleanup_pass()
+                await _cleanup_orphan_streams()
+            except Exception as e:
+                log.warning(f"[AUTO-CLEANUP] Error: {e}")
+            continue
         try:
             for drone_id in list(_active_missions.keys()):
                 mission = _active_missions[drone_id]
@@ -946,6 +1567,7 @@ async def _auto_cleanup_consumed_streams(min_drain_sec: float = 20.0):
                     _active_missions.pop(drone_id, None)
                     _latest_metadata.pop(drone_id, None)
                     _ingest_stats.pop(drone_id, None)
+                    frame_events.forget(drone_id)
                     if drone_id in _qm._stats:
                         del _qm._stats[drone_id]
                     await ws_manager.broadcast({"event": "mission_drained", "drone_id": drone_id, "mission_id": mid})
@@ -954,7 +1576,6 @@ async def _auto_cleanup_consumed_streams(min_drain_sec: float = 20.0):
             log.warning(f"[AUTO-CLEANUP] Error: {e}")
 
 
-ORPHAN_IDLE_S = 30.0
 
 
 async def _cleanup_orphan_streams() -> None:
@@ -973,8 +1594,23 @@ async def _cleanup_orphan_streams() -> None:
             break
     now = time.time()
     for key in keys:
-        drone_id = (key.decode() if isinstance(key, bytes) else key).split(":", 2)[-1]
-        if not drone_id or drone_id in _active_missions:
+        key = key.decode() if isinstance(key, bytes) else key
+        drone_id = key.split(":", 2)[-1]
+        if not drone_id:
+            continue
+        if _mission_mode():
+            # Legacy per-drone stream (written before the upgrade): nothing writes to it any
+            # more, so it is purged as soon as every analyzer has read it — even while the
+            # drone flies a new mission in its own stream.
+            if now - getattr(_qm, "_last_publish", {}).get(key, 0.0) < ORPHAN_IDLE_S:
+                continue
+            if not await _qm.is_fully_consumed(key):
+                continue
+            log.info(f"[AUTO-CLEANUP] {drone_id}: legacy stream fully consumed — purging")
+            await _qm.purge_stream(key)
+            await _after_mission_finalized(drone_id, None)
+            continue
+        if drone_id in _active_missions:
             continue
         st = _qm._stats.get(drone_id)
         last_frame = st.last_frame_ts if st else 0.0
@@ -986,6 +1622,7 @@ async def _cleanup_orphan_streams() -> None:
         await _qm.purge_stream(drone_id)
         _latest_metadata.pop(drone_id, None)
         _ingest_stats.pop(drone_id, None)
+        frame_events.forget(drone_id)
         _qm._stats.pop(drone_id, None)
         await ws_manager.broadcast({"event": "mission_drained", "drone_id": drone_id, "mission_id": None})
 
@@ -1019,6 +1656,7 @@ async def _monitor_queue_drain(drone_id: str, mission_id: str, max_wait_sec: flo
                 _active_missions.pop(drone_id, None)
                 _latest_metadata.pop(drone_id, None)
                 _ingest_stats.pop(drone_id, None)
+                frame_events.forget(drone_id)
                 if drone_id in _qm._stats:
                     del _qm._stats[drone_id]
                 await ws_manager.broadcast({
@@ -1054,6 +1692,9 @@ async def mission_end(
     """
     ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
 
+    if _mission_mode():
+        return await _mission_end_registry(req, claims, ts)
+
     if _qm:
         _qm.mark_mission_draining(req.drone_id, req.mission_id, req.frames_sent)
     if req.drone_id in _active_missions:
@@ -1082,6 +1723,7 @@ async def mission_end(
     if req.drone_id in _drain_tasks:
         _drain_tasks[req.drone_id].cancel()
     _drain_tasks[req.drone_id] = asyncio.create_task(_monitor_queue_drain(req.drone_id, req.mission_id))
+    frame_log.flush(req.drone_id)      # last partial summary of this mission
 
     await _publish_event("mission_end", req.drone_id, {
         "mission_id":  req.mission_id,
@@ -1113,6 +1755,67 @@ async def mission_end(
     )
 
 
+async def _mission_end_registry(req: MissionEndRequest, claims: dict, ts: str) -> MissionResponse:
+    """Mission mode mission/end: only the mission's operator, a supervisor / sys-admin, or
+    the backend service account. Marks the mission draining (ended_at = now, kept on a
+    repeat) and starts its drain monitor."""
+    if _qm is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Queue service temporarily unavailable")
+    sid = mission_sid(req.mission_id)
+    idx = await _qm.get_mission_index(sid)
+    if not idx:
+        raise _mission_http_error(409, "mission_not_started", f"Mission {req.mission_id!r} was not started")
+    if idx.get("drone_id") != req.drone_id:
+        raise _mission_http_error(409, "drone_mismatch",
+                                  f"Mission {req.mission_id!r} belongs to drone {idx.get('drone_id')!r}")
+    if not (idx.get("operator_sub") == _token_sub(claims)
+            or _realm_roles(claims) & END_ROLES or _is_service_account(claims)):
+        raise _mission_http_error(403, "not_mission_operator",
+                                  "Only the mission's operator, a supervisor or an administrator may end it")
+
+    async with _named_lock(_sid_locks, sid):
+        idx = await _qm.get_mission_index(sid) or idx
+        state = idx.get("status")
+        if state in LIVE_STATES:
+            await _qm.set_mission_draining(sid)
+            state = "draining"
+    if state == "draining" and sid not in _mission_drain_tasks:
+        _start_mission_drain(sid, req.drone_id, req.mission_id)
+
+    is_current = (_drone_active_sid.get(req.drone_id) or await _qm.drone_active_sid(req.drone_id)) == sid
+    if is_current and state == "draining":
+        _qm.mark_mission_draining(req.drone_id, req.mission_id, req.frames_sent)
+        m = _active_missions.setdefault(req.drone_id, {"mission_id": req.mission_id, "drone_id": req.drone_id})
+        m["status"] = "draining"
+        m["drain_started_at"] = time.time()
+        try:
+            await _qm._client.hset(f"mission:active:{req.drone_id}", "status", "draining")
+        except Exception as e:
+            log.warning(f"Failed to update mission status in Valkey: {e}")
+        if req.drone_id in _latest_metadata:
+            _latest_metadata[req.drone_id]["mission_status"] = "draining"
+            _latest_metadata[req.drone_id]["status"] = "draining"
+            _latest_metadata[req.drone_id]["drain_started_at"] = ts
+        frame_log.flush(req.drone_id)      # last partial summary of this mission
+
+    await _publish_event("mission_end", req.drone_id, {
+        "mission_id":  req.mission_id,
+        "frames_sent": req.frames_sent,
+        "notes":       req.notes,
+    })
+    asyncio.create_task(ws_manager.broadcast({
+        "event":       "mission_end",
+        "drone_id":    req.drone_id,
+        "mission_id":  req.mission_id,
+        "timestamp":   ts,
+        "data":        {"frames_sent": req.frames_sent, "status": state},
+    }))
+    log.info("mission_ending_draining drone=%s mission=%s frames_sent=%s status=%s ended_by=%s",
+             req.drone_id, req.mission_id, req.frames_sent, state, extract_username(claims))
+    return MissionResponse(status=state or "draining", drone_id=req.drone_id,
+                           mission_id=req.mission_id, timestamp=ts)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # TELEMETRY & FRAME RETRIEVAL ENDPOINTS
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1130,6 +1833,12 @@ async def get_active_streams():
     """
     if not _qm:
         return {"drones": [], "count": 0}
+    if _mission_mode():
+        try:
+            return await _active_streams_mission_mode()
+        except Exception as exc:
+            log.warning("streams_active_error: %s", exc)
+            return {"drones": [], "count": 0}
     try:
         client = _qm._client
         pattern = "drone:frames:*"
@@ -1246,6 +1955,103 @@ async def get_active_streams():
 
 
 
+def _recently_seen(last_seen_str: Optional[str]) -> bool:
+    """A frame within the last 15 s — strong live signal."""
+    if not last_seen_str:
+        return False
+    try:
+        last_seen_dt = datetime.datetime.strptime(last_seen_str, "%Y-%m-%dT%H:%M:%S.%fZ")
+        age_sec = (datetime.datetime.utcnow() - last_seen_dt).total_seconds()
+        return 0.0 <= age_sec < 15.0
+    except Exception:
+        return False
+
+
+async def _active_streams_mission_mode() -> dict:
+    """streams/active with STREAM_KEY_MODE=mission: one entry per DRONE, aggregating its
+    mission streams and any legacy drone:frames stream. frame_count = total XLEN,
+    messages_ready = sum of what the slowest analyzer still has to read per stream,
+    mission_id = the drone's active mission, missions = per-stream breakdown."""
+    client = _qm._client
+    drone_ids: dict[str, list] = {d: [] for d in await _registry_drones()}
+    for key in await _scan_keys("drone:frames:*"):
+        if key.count(":") >= 2:
+            drone_ids.setdefault(key.split(":", 2)[2], [])
+    for d in _active_missions:
+        drone_ids.setdefault(d, [])
+    # mission streams missing from their drone's registry (should not happen; never hide frames)
+    listed = set()
+    for d in list(drone_ids):
+        listed.update(await _qm.drone_mission_sids(d))
+    for key in await _scan_keys("mission:frames:*"):
+        sid = sid_of_key(key)
+        if sid and sid not in listed:
+            idx = await _qm.get_mission_index(sid)
+            if idx and idx.get("drone_id"):
+                drone_ids.setdefault(idx["drone_id"], []).append(sid)
+
+    drones = []
+    for drone_id, extra in drone_ids.items():
+        v = await _drone_view(drone_id, extra)
+        frame_count = v["frame_count"]
+        meta = _latest_metadata.get(drone_id) or {}
+        active_info = _active_missions.get(drone_id, {})
+        last_seen_str = meta.get("last_seen")
+        recently_seen = _recently_seen(last_seen_str)
+        is_active_mission = v["is_active"]
+        mission_stat = v["mission_status"]
+
+        if frame_count == 0 and not is_active_mission and not recently_seen:
+            legacy = legacy_stream_key(drone_id)
+            if drone_id not in KNOWN_DRONES and await client.exists(legacy):
+                try:
+                    await client.delete(legacy)          # empty legacy stream (as before)
+                except Exception:
+                    pass
+            continue
+
+        stream_status = "live"
+        if mission_stat == "draining":
+            stream_status = "draining"
+        elif not is_active_mission and not recently_seen:
+            stream_status = "draining" if frame_count > 0 else "offline"
+        elif frame_count == 0 and not recently_seen:
+            stream_status = "offline"
+        if stream_status == "offline" and frame_count == 0:
+            continue
+
+        aidx = v["active_idx"] or {}
+        drones.append({
+            "drone_id":        drone_id,
+            "stream_key":      v["stream_key"],
+            "frame_count":     frame_count,
+            "frames_received": frame_count,
+            "messages_ready":  v["remaining"],
+            "status":          stream_status,
+            "mission_status":  mission_stat,
+            "mission_id":      aidx.get("mission_id") or meta.get("mission_id") or active_info.get("mission_id"),
+            "mission_name":    meta.get("mission_name") or active_info.get("mission_name"),
+            "operator":        meta.get("operator") or active_info.get("operator"),
+            "location":        meta.get("location") or active_info.get("location"),
+            "last_seen":       last_seen_str,
+            "started_at":      active_info.get("started_at") or _iso(_f(aidx.get("started_at"))),
+            "latitude":        meta.get("latitude"),
+            "longitude":       meta.get("longitude"),
+            "battery_pct":     meta.get("battery_pct"),
+            "altitude_m":      meta.get("altitude_m"),
+            "abs_alt":         meta.get("abs_alt"),
+            "gb_yaw":          meta.get("gb_yaw"),
+            "gb_pitch":        meta.get("gb_pitch"),
+            "gb_roll":         meta.get("gb_roll"),
+            "focal_len":       meta.get("focal_len"),
+            "dzoom_ratio":     meta.get("dzoom_ratio"),
+            "gps_lock":        meta.get("gps_lock", True),
+            "missions":        v["missions"],
+        })
+    drones.sort(key=lambda d: (d["status"] == "live", d["frame_count"]), reverse=True)
+    return {"drones": drones, "count": len(drones)}
+
+
 @app.get(
     "/ingest/telemetry",
     summary = "Latest telemetry for all active drones",
@@ -1276,8 +2082,10 @@ async def get_latest_frame(
     if not _qm:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Queue unavailable")
     try:
-        stream_key = f"drone:frames:{drone_id}"
-        entries = await _qm._client.xrevrange(stream_key, max="+", min="-", count=1)
+        # mission mode: the drone's active mission stream (else its newest, else legacy)
+        stream_key = await _resolve_drone_stream(drone_id)
+        entries = (await _qm._client.xrevrange(stream_key, max="+", min="-", count=1)
+                   if stream_key else [])
         if not entries:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"No frames available for drone {drone_id}")
 
@@ -1286,6 +2094,12 @@ async def get_latest_frame(
 
         # Determine if stream is truly live based on active mission OR recent frames
         _is_live = drone_id in _active_missions
+        sid = sid_of_key(stream_key)
+        if sid is not None:
+            f_mid = entries[0][1].get(b"mission_id") or entries[0][1].get("mission_id")
+            idx = await _qm.get_mission_index(sid) or {}
+            mission_id = (f_mid.decode() if isinstance(f_mid, bytes) else f_mid) or idx.get("mission_id") or mission_id
+            _is_live = idx.get("status") == "live"
         if not _is_live:
             try:
                 import datetime
@@ -1348,7 +2162,11 @@ async def purge_drone_stream(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid drone id")
     if not _qm:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Queue unavailable")
-    
+
+    purged_missions: list = []
+    if _mission_mode():
+        purged_missions = await _purge_drone_missions(drone_id)
+        await _qm.purge_stream(legacy_stream_key(drone_id))
     await _qm.purge_stream(drone_id)
     try:
         valkey = getattr(_qm, "_client", None) or getattr(_qm, "_redis", None)
@@ -1357,12 +2175,14 @@ async def purge_drone_stream(
             await valkey.delete(f"drone:frames:{drone_id}")
     except Exception as e:
         log.warning(f"Failed to clean mission from Valkey: {e}")
+    _drone_active_sid.pop(drone_id, None)
     _qm.end_mission(drone_id, "")
     if drone_id in _qm._stats:
         del _qm._stats[drone_id]
     _active_missions.pop(drone_id, None)
     _latest_metadata.pop(drone_id, None)
     _ingest_stats.pop(drone_id, None)
+    frame_events.forget(drone_id)
     if drone_id in _drain_tasks:
         try:
             _drain_tasks.pop(drone_id).cancel()
@@ -1380,8 +2200,36 @@ async def purge_drone_stream(
         "drone_id":    drone_id,
         "timestamp":   time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
     })
-    log.info("stream_manually_purged", extra={"drone_id": drone_id})
-    return {"status": "purged", "drone_id": drone_id}
+    log.info("stream_manually_purged drone=%s missions=%s by=%s", drone_id, purged_missions,
+             extract_username(claims), extra={"drone_id": drone_id})
+    resp = {"status": "purged", "drone_id": drone_id}
+    if _mission_mode():
+        resp["missions"] = purged_missions
+    return resp
+
+
+async def _purge_drone_missions(drone_id: str) -> list:
+    """Officer purge (mission mode): every mission stream of the drone is unlinked, its
+    index set to ended (+ purged_at, so the edge's further uploads are refused at once)
+    with the 7-day TTL, and the drone's registry and active pointer are removed."""
+    client = _qm._client
+    sids = list(await _qm.drone_mission_sids(drone_id))
+    active = await _qm.drone_active_sid(drone_id)
+    if active and active not in sids:
+        sids.append(active)
+    purged = []
+    for sid in sids:
+        task = _mission_drain_tasks.pop(sid, None)
+        if task:
+            task.cancel()
+        async with _named_lock(_sid_locks, sid):
+            idx = await _qm.get_mission_index(sid)
+            if idx and idx.get("drone_id") not in (None, "", drone_id):
+                continue                     # not this drone's mission (stale pointer)
+            await _qm.finalize_mission(sid, drone_id, purged=True)
+        purged.append((idx or {}).get("mission_id") or sid)
+    await client.delete(f"drone:missions:{drone_id}", f"drone:active_mission:{drone_id}")
+    return purged
 
 
 
@@ -1417,11 +2265,21 @@ async def _mjpeg_frame_generator(drone_id: str) -> AsyncGenerator[bytes, None]:
     # Start at current position — do NOT replay old frames
     last_id = "$"
     BLOCK_MS = 2000   # 2-second long-poll per XREAD call
+    resolved_at = 0.0
 
     BOUNDARY = b"--frame\r\n"
     KEEPALIVE = b"--frame\r\nContent-Type: text/plain\r\n\r\n\r\n"
 
     while True:
+        if _mission_mode() and time.monotonic() - resolved_at >= BLOCK_MS / 1000.0:
+            # follow the drone's active mission (a new mission is a new stream)
+            resolved_at = time.monotonic()
+            try:
+                key = await _resolve_drone_stream(drone_id, for_live=True)
+            except Exception:
+                key = None
+            if key and key != stream_key:
+                stream_key, last_id = key, "$"
         try:
             results = await _qm._client.xread(
                 {stream_key: last_id},

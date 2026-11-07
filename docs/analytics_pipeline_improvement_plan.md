@@ -232,48 +232,72 @@ Also collect: `grep -iE "cuda|cpu|provider" /var/log/dvas/person.log | tail -40`
 **Goal:** every flight has its own queue, its own analytics state and its own owner. The mission id
 is the identity; the drone id becomes a label.
 
-**Ingest**
-- Stream key `mission:frames:{mission_id}` (one per flight) instead of `drone:frames:{drone_id}`.
-- Mission registry in Valkey: `mission:index:{mission_id}` → `{drone_id, operator_sub, status,
-  started_at, ended_at}`; `drone:active_mission:{drone_id}` → mission id (for pages that pick a
-  drone); set `missions:active`.
-- `mission/start`: validates the mission id (`^[A-Za-z0-9_.:-]{3,80}$`), records the operator's
-  token subject; a mission id that already exists for another operator or drone → **409** (no
-  hijacking, no reuse); the same operator re-sending start → idempotent.
-- `frame`: requires a registered mission; the token's subject must be the mission's operator and the
-  metadata `drone_id` must match the mission's drone, else **409/403**. Frames for an ended mission
-  are accepted only within a grace period (default 30 s, for in-flight retries) and go to **that
-  mission's** stream — never into another flight's queue.
-- Drain, purge, orphan cleanup, "remaining" and the memory guard work per mission stream.
+*As built (2026-11-07). The first draft keyed every analytics structure and dashboard tile by
+mission id; the implementation keeps the drone id as the key above the queue and makes the queue
+itself per mission. That gives the same isolation — one flight per stream, fresh trackers per
+mission — without changing the dashboard, the Models page, results or database rows. It works
+because ingest now refuses two operators flying the same drone id at the same time (below), so at
+any moment a drone id names at most one live flight.*
 
-**Analytics**
-- `FrameSampler` discovers `missions:active` (+ draining missions) instead of scanning drone keys;
-  every per-stream structure is keyed by mission id: consumer groups, re-order window (D1),
-  trackers (`BatchTracker`), Re-ID / ANPR state, live video hub, stats, governor rows.
-- A new mission ⇒ a new stream ⇒ fresh trackers and caches automatically (A3 reduces to cleanup of
-  ended missions); two edges with the same drone id never share state.
-- `drone_id` still travels with each frame and is written to the database rows exactly as today
-  (all tables already carry `mission_id`), so reports and history do not change.
-- Intrusion geofences: looked up by mission id first (already stored under `drone:geofence:{mission}`),
-  drone id as fallback.
+**Valkey layout** (`sid` = mission id with characters outside `[A-Za-z0-9_.:-]` replaced by `_`;
+mission ids may contain spaces)
 
-**Backend / dashboard**
-- Live video, annotated frames, raw frames, Models page rows and the Multi-Drone grid address a
-  **mission**; pages that start from a drone resolve it through `drone:active_mission:{drone}`.
-  Tiles are per mission (two flights of the same drone id show as two tiles).
-- Access checks: the officer's jurisdiction is checked against the **mission's** record (the
-  `missions` table), so a guessed mission id gives nothing.
+| Key | Type | Content |
+|---|---|---|
+| `mission:frames:{sid}` | stream | frames of one mission (same fields as before, plus `mission_id`) |
+| `mission:index:{sid}` | hash | `drone_id`, `mission_id`, `operator_sub`, `status` (`live`/`draining`/`ended`), `started_at`, `ended_at`; kept 7 days after purge for audit |
+| `drone:missions:{drone_id}` | sorted set | sids of the drone's missions whose stream exists, scored by start time |
+| `drone:active_mission:{drone_id}` | string | sid of the drone's newest mission |
+
+**Ingest** (`dvas_ingest/ingest/api/`)
+- `mission/start` records the caller's token subject as the operator. **409** when the mission id
+  exists for another operator or drone, or when the drone has a live/draining mission of a
+  **different operator** (two flights never share a drone id). The same operator re-sending start
+  is idempotent; the same operator starting a new mission on the drone moves the previous one to
+  `draining`.
+- `frame` requires a started mission (**409** `mission_not_started`), the mission's operator
+  (**403**) and the mission's drone id (**409**). Frames of an ended mission are accepted within
+  `MISSION_GRACE_S` (30 s) for in-flight retries and go to **that** mission's stream.
+- `mission/end`: the mission's operator, a supervisor/sys-admin, or the backend service account.
+- Drain, purge, orphan cleanup, remaining/unread counts and the memory guard work per stream; a
+  drained mission's stream is removed with its registry entries and `mission_drained` is broadcast
+  as before. No placeholder `analytics` group is created on mission streams.
+- Drone-addressed endpoints keep their URLs and response shape (`/streams/active`, `/status`,
+  `/frame/{drone}/latest`, MJPEG, purge): they aggregate the drone's mission streams;
+  `/streams/active` adds a `missions` list per drone.
+
+**Analytics** (`shared/mission_streams.py`, `shared/frame_sampler.py`, `shared/redis_client.py`)
+- Drones are discovered from `drone:missions:*` (plus non-empty legacy `drone:frames:*`).
+- Per drone the sampler reads its streams **oldest first** — legacy stream, then missions by start
+  time — and moves to the next one only when the current mission no longer takes frames (status
+  `live`, or `draining` for less than `DVAS_MISSION_SWITCH_S` = 5 s) **and** this service's group
+  has read all of it. Frames of one mission are therefore never analysed after the next mission's.
+- At each mission boundary the sampler clears the re-order window and sequence state and resets the
+  drone's trackers (`BatchTracker.reset_everywhere`) and per-drone analyzer state (`on_idle` hooks:
+  vessel, anomaly) — a new mission never continues the last one's tracks (A3).
+- Consumer groups, pending re-reads and "queued" counts are per stream; "queued" on the Models page
+  sums every stream of the drone. Recovery frames, `get_latest_stream_frame` and `dvas-ctl lag`
+  use the drone's active mission stream.
+- Unchanged: drone id as the key of trackers, stats, governor rows, results and database rows
+  (which already carry `mission_id`); detection, OCR and face models see the same frames.
+
+**Backend / dashboard:** no change needed — they address drones, and a drone id names one live
+flight at a time. Per-mission tiles (two simultaneous flights with the same drone id) are not
+needed because ingest refuses that case.
 
 **Compatibility and rollout (RunPod)**
-- `STREAM_KEY_MODE=mission|drone` in `dvas-init.sh` (default `mission` after the test).
-- One release reads both: analytics drain any remaining `drone:frames:*` streams while new frames go
-  to `mission:frames:*`; the release after removes the old path.
+- `STREAM_KEY_MODE=mission|drone` in `dvas-init.sh`, default `mission` (confirmed). `drone` is the
+  rollback: today's per-drone streams, no ownership checks — set it for ingest and analytics alike.
+- Pods upgrade with data in place: existing `drone:frames:*` streams are still listed, drained and
+  purged, and analytics read them before the drone's first mission stream.
 - **Edge contract:** the edge already sends `mission_id` in every frame and calls `mission/start`
   first (MissionControl, `edge_sender`), so no edge change is expected. Before release, confirm with
   the edge owner that (a) every upload follows a `mission/start`, and (b) each laptop uses its own
   operator account; uploads that break either rule would get 409/403.
-- Tests: two missions with the same drone id stream at once → two streams, two tile sets, no mixed
-  tracks; a mission restart on the same drone starts with empty trackers; a frame with a foreign
+- Tests (real Valkey, `dvas_ingest/ingest/tests/test_mission_streams.py`,
+  `dvas_analytics/shared/tests/test_mission_streams.py`): a second operator starting a mission on a
+  live drone id → 409; missions of one drone are analysed oldest first with one tracker reset
+  between them; a mission restart on the same drone starts with empty trackers; a frame with a foreign
   token or another drone id → rejected; late retries after mission end land in their own mission's
   stream and are drained, not orphaned.
 

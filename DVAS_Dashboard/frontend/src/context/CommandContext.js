@@ -129,7 +129,8 @@ export function CommandProvider({ children }) {
         const brandNew = msg.drones.filter((x) => !existingIds.has(x.id));
         return brandNew.length > 0 ? [...updated, ...brandNew] : updated;
       });
-    } else if (["stream_purged", "drone_offline", "mission_drained"].includes(msg.type || msg.event) && msg.drone_id) {
+    } else if (["stream_purged", "drone_offline", "mission_drained"].includes(msg.type || msg.event) && msg.drone_id
+               && !msg.drone_still_active) {   // an older mission drained; the drone flies a newer one
       // A5: the stream is gone (purged by an officer, drained by ingest, or timed out):
       // the drone is offline now, not after the next /drones reload
       setDrones((prev) => prev.map((d) => (d.id === msg.drone_id ? { ...d, status: "offline", messages_ready: 0 } : d)));

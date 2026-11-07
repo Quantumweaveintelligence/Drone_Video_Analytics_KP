@@ -120,7 +120,7 @@ export function useActiveStreams() {
         }
         return s;
       }));
-    } else if (["stream_purged", "mission_drained"].includes(msg.type || msg.event)) {
+    } else if (["stream_purged", "mission_drained"].includes(msg.type || msg.event) && !msg.drone_still_active) {
       // The stream is gone (A5): drop it now instead of waiting for the next poll
       setStreams(prev => prev.filter(s => s.drone_id !== msg.drone_id));
     }

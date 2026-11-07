@@ -25,8 +25,11 @@ case "$cmd" in
   logs)     tail -n 200 -F "/var/log/dvas/${1:?program}.log" ;;
   health)   "$BIN/healthcheck.sh" ;;
   lag)
-    for key in $(valkey-cli -h 127.0.0.1 --scan --pattern 'drone:frames:*'); do
-      echo "== $key  (length $(valkey-cli -h 127.0.0.1 XLEN "$key"))"
+    # Mission streams (mission:frames:<mission>) and legacy per-drone streams (drone:frames:<drone>)
+    for key in $(valkey-cli -h 127.0.0.1 --scan --pattern 'mission:frames:*'; valkey-cli -h 127.0.0.1 --scan --pattern 'drone:frames:*'); do
+      sid=${key#mission:frames:}
+      who=""; [ "$sid" != "$key" ] && who="  drone $(valkey-cli -h 127.0.0.1 HGET "mission:index:$sid" drone_id) · $(valkey-cli -h 127.0.0.1 HGET "mission:index:$sid" status)"
+      echo "== $key  (length $(valkey-cli -h 127.0.0.1 XLEN "$key"))$who"
       valkey-cli -h 127.0.0.1 XINFO GROUPS "$key" | paste - - | awk '{printf "   %s\n", $0}'
     done ;;
   disk)

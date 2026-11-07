@@ -4,8 +4,23 @@ queue_manager.py  (Redis Streams edition)
 Replaces the aio-pika / RabbitMQ queue manager with Redis Streams.
 Redis Streams provide the same durable, per-drone message queuing semantics.
 
-Stream key pattern : drone:frames:{drone_id}    (one stream per drone)
+Stream key pattern : mission:frames:{sid}       (one stream per mission, STREAM_KEY_MODE=mission)
+                     drone:frames:{drone_id}     (one stream per drone, STREAM_KEY_MODE=drone,
+                                                  and legacy streams left from before the upgrade)
 Events stream      : drone:events:confirmed
+
+Mission registry (STREAM_KEY_MODE=mission, plan Phase 2a; analytics read the same keys,
+dvas_analytics/shared/mission_streams.py):
+  mission:index:{sid}             HASH drone_id, mission_id, operator_sub, status
+                                  (live | draining | ended), started_at, ended_at (epoch s);
+                                  kept 7 days (EXPIRE) after its stream is purged
+  drone:missions:{drone_id}       ZSET sid → started_at, missions whose stream still exists
+  drone:active_mission:{drone_id} sid of the drone's newest mission
+  sid = mission id with every character outside [A-Za-z0-9_.:-] replaced by "_"
+
+The per-stream helpers (is_fully_consumed, unread_frames, remaining_frames, purge_stream,
+get_queue_depth) take a "stream ref": a full frame-stream key, or a bare drone id meaning
+drone:frames:{drone_id} (today's callers). Caches are keyed by that ref.
 
 All behaviour (publish, declare, stats) is identical to the RabbitMQ version
 from the consumer's perspective.
@@ -26,9 +41,10 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import redis.asyncio as aioredis
 
@@ -37,7 +53,6 @@ log = logging.getLogger(__name__)
 # ── Config (from env) ─────────────────────────────────────────────────────────
 REDIS_URL        = os.getenv("REDIS_URL", "redis://redis:6379/0")
 QUEUE_MAX_LEN    = int(os.getenv("QUEUE_MAX_LENGTH",  "2000"))
-QUEUE_MSG_TTL_MS = int(os.getenv("QUEUE_MSG_TTL_MS",  "30000"))
 # Analytics read the raw `frame` field (RunPod plan 9.1); the base64 copy doubled
 # Valkey memory per frame. Re-enable only for an analytics build older than 9.1.
 QUEUE_WRITE_JPEG_B64 = os.getenv("QUEUE_WRITE_JPEG_B64", "false").lower() == "true"
@@ -49,6 +64,65 @@ try:
 except ValueError:          # a bad template value must not stop ingest
     QUEUE_MEM_GUARD_PCT = 85.0
 _MEM_CHECK_S = 2.0
+
+# Phase 2a: one stream per mission (default) or the legacy one stream per drone (rollback).
+STREAM_KEY_MODE = (os.getenv("STREAM_KEY_MODE", "mission") or "mission").strip().lower()
+if STREAM_KEY_MODE not in ("mission", "drone"):
+    log.warning("STREAM_KEY_MODE=%r is not 'mission' or 'drone' — using 'mission'", STREAM_KEY_MODE)
+    STREAM_KEY_MODE = "mission"
+# Frames for an ended mission are still accepted this long after mission end (in-flight retries)
+try:
+    MISSION_GRACE_S = max(0.0, float(os.getenv("MISSION_GRACE_S", "30")))
+except ValueError:
+    MISSION_GRACE_S = 30.0
+MISSION_INDEX_TTL_S = 7 * 24 * 3600      # index hash of a purged mission is kept for audit
+
+LEGACY_PREFIX = "drone:frames:"
+MISSION_PREFIX = "mission:frames:"
+_FRAME_PREFIXES = (LEGACY_PREFIX, MISSION_PREFIX)
+_UNSAFE_SID = re.compile(r"[^A-Za-z0-9_.:-]")
+
+
+def mission_mode() -> bool:
+    return STREAM_KEY_MODE == "mission"
+
+
+def mission_sid(mission_id: str) -> str:
+    """Valkey-safe mission id (mission ids may contain spaces)."""
+    return _UNSAFE_SID.sub("_", mission_id)
+
+
+def mission_stream_key(sid: str) -> str:
+    return f"{MISSION_PREFIX}{sid}"
+
+
+def mission_index_key(sid: str) -> str:
+    return f"mission:index:{sid}"
+
+
+def drone_missions_key(drone_id: str) -> str:
+    return f"drone:missions:{drone_id}"
+
+
+def drone_active_key(drone_id: str) -> str:
+    return f"drone:active_mission:{drone_id}"
+
+
+def legacy_stream_key(drone_id: str) -> str:
+    return f"{LEGACY_PREFIX}{drone_id}"
+
+
+def stream_key_for(ref: str) -> str:
+    """A full frame-stream key is used as is; a bare drone id means its legacy stream."""
+    return ref if ref.startswith(_FRAME_PREFIXES) else legacy_stream_key(ref)
+
+
+def sid_of_key(key: str) -> Optional[str]:
+    return key[len(MISSION_PREFIX):] if key.startswith(MISSION_PREFIX) else None
+
+
+def _s(v) -> str:
+    return v.decode("utf-8", errors="replace") if isinstance(v, bytes) else str(v)
 
 
 def _parse_id(raw) -> Optional[tuple]:
@@ -182,16 +256,16 @@ class QueueManager:
 
     async def get_consumer_lag(self, drone_id: str) -> dict:
         """Returns {consumer_name: pending_count} for all registered consumers."""
-        stream_key = f"drone:frames:{drone_id}"
+        stream_key = stream_key_for(drone_id)
         try:
             info = await self._client.xinfo_groups(stream_key)
             return {g.get("name", "unknown"): g.get("pending", 0) for g in info}
         except Exception:
             return {}
 
-    async def _last_id(self, stream_key: str, drone_id: str):
+    async def _last_id(self, stream_key: str, ref: str):
         """Id of the newest entry: from our own XADDs (no round trip), else XINFO STREAM."""
-        cached = getattr(self, "_last_entry", {}).get(drone_id)
+        cached = getattr(self, "_last_entry", {}).get(ref)
         if cached:
             return _parse_id(cached)
         info = await self._client.xinfo_stream(stream_key)
@@ -201,7 +275,7 @@ class QueueManager:
         first = await self._client.xrange(stream_key, min="-", max="+", count=1)
         return _parse_id(first[0][0]) if first else None
 
-    async def is_fully_consumed(self, drone_id: str) -> bool:
+    async def is_fully_consumed(self, ref: str) -> bool:
         """
         True only when the stream has no entries, or every analytics consumer group
         (a group that has consumers) has been delivered the stream's last entry and has
@@ -214,13 +288,13 @@ class QueueManager:
         """
         if not self._connected:
             await self.connect()
-        stream_key = f"drone:frames:{drone_id}"
+        stream_key = stream_key_for(ref)
         try:
             xlen = await self._client.xlen(stream_key)
             if xlen == 0:
                 return True
             groups = await self._client.xinfo_groups(stream_key)
-            last_id = await self._last_id(stream_key, drone_id)
+            last_id = await self._last_id(stream_key, ref)
             readers = [g for g in groups if int(g.get("consumers", 0) or 0) > 0]
             if not readers or last_id is None:
                 return False
@@ -232,10 +306,10 @@ class QueueManager:
                     return False
             return True
         except Exception as exc:
-            log.debug("is_fully_consumed check failed for %s: %s", drone_id, exc)
+            log.debug("is_fully_consumed check failed for %s: %s", ref, exc)
             return False
 
-    async def remaining_frames(self, drone_id: str) -> int:
+    async def remaining_frames(self, ref: str) -> int:
         """Frames the slowest analyzer still has to process (stream length if none reads it).
 
         Cached for 1 s: dashboards poll this for every drone.
@@ -243,27 +317,27 @@ class QueueManager:
         cache = getattr(self, "_remaining_cache", None)
         if cache is None:
             cache = self._remaining_cache = {}
-        hit = cache.get(drone_id)
+        hit = cache.get(ref)
         now = time.monotonic()
         if hit and now - hit[0] < 1.0:
             return hit[1]
-        unread = await self.unread_frames(drone_id)
-        value = max(unread.values()) if unread else await self.get_queue_depth(drone_id)
-        cache[drone_id] = (now, value)
+        unread = await self.unread_frames(ref)
+        value = max(unread.values()) if unread else await self.get_queue_depth(ref)
+        cache[ref] = (now, value)
         return value
 
-    async def unread_frames(self, drone_id: str) -> Dict[str, int]:
+    async def unread_frames(self, ref: str) -> Dict[str, int]:
         """{group: frames not yet analysed} for groups with consumers (pending + undelivered).
 
         The stream length alone is not "remaining": it also counts frames every analyzer
         has already processed.
         """
-        stream_key = f"drone:frames:{drone_id}"
+        stream_key = stream_key_for(ref)
         out: Dict[str, int] = {}
         try:
             groups = await self._client.xinfo_groups(stream_key)
             length = int(await self._client.xlen(stream_key) or 0)
-            last_id = await self._last_id(stream_key, drone_id)
+            last_id = await self._last_id(stream_key, ref)
             first_id = None
             for g in groups:
                 if int(g.get("consumers", 0) or 0) == 0:
@@ -287,7 +361,7 @@ class QueueManager:
                 # Valkey's lag can overstate after MAXLEN trimming; never more than the stream holds
                 out[name] = pending + min(int(lag), length)
         except Exception as exc:
-            log.debug("unread_frames failed for %s: %s", drone_id, exc)
+            log.debug("unread_frames failed for %s: %s", ref, exc)
         return out
 
     # ── Frame publishing ──────────────────────────────────────────────────────
@@ -318,9 +392,11 @@ class QueueManager:
         drone_id:   str,
         frame_bytes: bytes,
         metadata:   Dict[str, Any],
+        stream_key: Optional[str] = None,
     ) -> str:
         """
-        Publish a frame to the per-drone Redis Stream.
+        Publish a frame to the per-drone Redis Stream, or to `stream_key` (a mission stream,
+        STREAM_KEY_MODE=mission; the entry then also carries `mission_id`).
         Returns the Redis stream entry ID (acts as message_id).
 
         Field layout
@@ -337,7 +413,8 @@ class QueueManager:
         if not self._connected:
             await self.connect()
 
-        key = self._stream_key(drone_id)
+        key = stream_key or self._stream_key(drone_id)
+        ref = stream_key or drone_id          # cache key, same ref the drain checks use
         fields: Dict[str, Any] = {
             "frame":          frame_bytes,
             "metadata":       json.dumps(metadata),
@@ -352,6 +429,9 @@ class QueueManager:
             "capture_ts":     str(metadata.get("capture_ts") or ""),
         }
 
+        if stream_key:
+            fields["mission_id"] = str(metadata.get("mission_id") or "")
+
         if QUEUE_WRITE_JPEG_B64:
             fields["jpeg_b64"] = base64.b64encode(frame_bytes).decode("ascii")
 
@@ -365,7 +445,10 @@ class QueueManager:
         # Newest id per stream, so drain checks never have to fetch an entry (a 4K frame)
         if not hasattr(self, "_last_entry"):
             self._last_entry = {}
-        self._last_entry[drone_id] = entry_id.decode() if isinstance(entry_id, bytes) else str(entry_id)
+        self._last_entry[ref] = entry_id.decode() if isinstance(entry_id, bytes) else str(entry_id)
+        if not hasattr(self, "_last_publish"):
+            self._last_publish = {}
+        self._last_publish[ref] = time.time()   # idle check for orphan / late-frame streams
 
         # Update stats
         if drone_id not in self._stats:
@@ -381,13 +464,13 @@ class QueueManager:
 
     # ── Queue depth stats ─────────────────────────────────────────────────────
 
-    async def get_queue_depth(self, drone_id: str) -> int:
+    async def get_queue_depth(self, ref: str) -> int:
         if not self._connected:
             return 0
         try:
-            depth = await self._client.xlen(self._stream_key(drone_id))
-            if drone_id in self._stats:
-                self._stats[drone_id].queue_depth = depth
+            depth = await self._client.xlen(stream_key_for(ref))
+            if ref in self._stats:
+                self._stats[ref].queue_depth = depth
             return depth
         except Exception:
             return 0
@@ -425,20 +508,103 @@ class QueueManager:
             self._stats[drone_id].mission_id     = None
             self._stats[drone_id].mission_status = "ended"
 
-    async def purge_stream(self, drone_id: str) -> None:
+    async def purge_stream(self, ref: str) -> None:
         """Unlinks/deletes the stream from Valkey when queue is drained."""
         if not self._connected:
             await self.connect()
-        key = self._stream_key(drone_id)
+        key = stream_key_for(ref)
         try:
             await self._client.unlink(key)
-            getattr(self, "_last_entry", {}).pop(drone_id, None)
-            getattr(self, "_remaining_cache", {}).pop(drone_id, None)
-            if drone_id in self._stats:
-                self._stats[drone_id].queue_depth = 0
+            getattr(self, "_last_entry", {}).pop(ref, None)
+            getattr(self, "_remaining_cache", {}).pop(ref, None)
+            getattr(self, "_last_publish", {}).pop(ref, None)
+            if ref in self._stats:
+                self._stats[ref].queue_depth = 0
             log.info("stream_purged key=%s", key)
         except Exception as exc:
             log.warning("stream_purge_failed key=%s error=%s", key, exc)
+
+    # ── Mission registry (STREAM_KEY_MODE=mission, plan Phase 2a) ───────────────
+
+    async def get_mission_index(self, sid: str) -> Optional[Dict[str, str]]:
+        """mission:index:{sid} as a str dict, or None when the mission was never started
+        (or its index expired 7 days after the purge)."""
+        if not self._connected:
+            await self.connect()
+        raw = await self._client.hgetall(mission_index_key(sid))
+        return {_s(k): _s(v) for k, v in raw.items()} if raw else None
+
+    async def drone_mission_sids(self, drone_id: str) -> List[str]:
+        """The drone's missions whose stream still exists, oldest start first."""
+        return [_s(m) for m in await self._client.zrange(drone_missions_key(drone_id), 0, -1)]
+
+    async def drone_active_sid(self, drone_id: str) -> Optional[str]:
+        v = await self._client.get(drone_active_key(drone_id))
+        return _s(v) if v else None
+
+    async def write_mission_start(self, sid: str, drone_id: str, mission_id: str,
+                                  operator_sub: str, started_at: float) -> None:
+        """Index (status live), registry entry and active pointer, in one transaction."""
+        idx = mission_index_key(sid)
+        pipe = self._client.pipeline(transaction=True)
+        pipe.hset(idx, mapping={
+            "drone_id": drone_id, "mission_id": mission_id, "operator_sub": operator_sub,
+            "status": "live", "started_at": repr(float(started_at)), "ended_at": "",
+        })
+        pipe.hdel(idx, "purged_at")
+        pipe.persist(idx)                         # a re-started purged mission loses its TTL
+        pipe.zadd(drone_missions_key(drone_id), {sid: float(started_at)})
+        pipe.set(drone_active_key(drone_id), sid)
+        await pipe.execute()
+
+    async def set_mission_draining(self, sid: str, ended_at: Optional[float] = None) -> float:
+        """Status draining; ended_at is set once (a repeated mission/end keeps the first)."""
+        idx = mission_index_key(sid)
+        current = await self._client.hget(idx, "ended_at")
+        if current and _s(current):
+            try:
+                ended_at = float(_s(current))
+            except ValueError:
+                ended_at = None
+        if ended_at is None:
+            ended_at = time.time()
+        await self._client.hset(idx, mapping={"status": "draining", "ended_at": repr(float(ended_at))})
+        return float(ended_at)
+
+    async def register_late_stream(self, sid: str, drone_id: str, started_at: float) -> None:
+        """A frame accepted for an ended mission re-created its stream: list it again so the
+        analyzers find it and the cleanup purges it (ZADD is idempotent)."""
+        await self._client.zadd(drone_missions_key(drone_id), {sid: float(started_at)})
+
+    _DEL_IF_EQUAL = ("if redis.call('GET', KEYS[1]) == ARGV[1] then "
+                     "return redis.call('DEL', KEYS[1]) end return 0")
+
+    async def finalize_mission(self, sid: str, drone_id: Optional[str],
+                               purged: bool = False) -> bool:
+        """Mission stream drained (or purged by an officer): UNLINK the stream, drop it from
+        drone:missions, index → ended with a 7-day TTL, and clear drone:active_mission only
+        if it still points to this mission. Returns True when the pointer was cleared (the
+        drone has no newer mission)."""
+        await self.purge_stream(mission_stream_key(sid))
+        idx = mission_index_key(sid)
+        now = time.time()
+        pipe = self._client.pipeline(transaction=True)
+        if drone_id:
+            pipe.zrem(drone_missions_key(drone_id), sid)
+        pipe.hget(idx, "ended_at")
+        res = await pipe.execute()
+        ended = _s(res[-1]) if res[-1] else ""
+        fields = {"status": "ended", "ended_at": ended or repr(now)}
+        if purged:
+            fields["purged_at"] = repr(now)
+        pipe = self._client.pipeline(transaction=True)
+        pipe.hset(idx, mapping=fields)
+        pipe.expire(idx, MISSION_INDEX_TTL_S)
+        await pipe.execute()
+        if not drone_id:
+            return False
+        cleared = await self._client.eval(self._DEL_IF_EQUAL, 1, drone_active_key(drone_id), sid)
+        return bool(cleared)
 
     # ── Events ────────────────────────────────────────────────────────────────
 

@@ -12,6 +12,31 @@ from pydantic import BaseModel, Field, field_validator, ConfigDict
 import re
 
 
+# ── Identifier rules ──────────────────────────────────────────────────────────
+# drone_id becomes a Valkey stream key (drone:frames:{id}), an in-memory stats key
+# and a Prometheus label, so it is bounded. Same rule as the dashboard backend's
+# _DRONE_ID_RE (DVAS_Dashboard/backend/ingest_proxy.py). The edge already sends
+# ^[A-Z0-9_-]{3,30}$ (dvas_edge/edge_api_server.py start_mission), a subset.
+DRONE_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+# mission_id ends up in file names (data/geofences/{mission_id}_geofence.json) and
+# Valkey keys. Edge ids look like MSN-20261106-2215-08-ALPHA, where the suffix is the
+# operator-typed squadron (MissionControl.js, uppercased but not otherwise cleaned),
+# so a space is allowed as well; path separators and control characters are not.
+MISSION_ID_RE = re.compile(r"[A-Za-z0-9_.: -]{1,80}")
+
+
+def check_drone_id(v: str) -> str:
+    if not isinstance(v, str) or not DRONE_ID_RE.fullmatch(v):
+        raise ValueError("drone_id must be 1-64 characters of A-Z a-z 0-9 _ . : -")
+    return v
+
+
+def check_mission_id(v: str) -> str:
+    if not isinstance(v, str) or not MISSION_ID_RE.fullmatch(v):
+        raise ValueError("mission_id must be 1-80 characters of A-Z a-z 0-9 _ . : - or space")
+    return v
+
+
 # ── Ingest Request ────────────────────────────────────────────────────────────
 
 class FrameMetadata(BaseModel):
@@ -57,11 +82,12 @@ class FrameMetadata(BaseModel):
     @field_validator("drone_id")
     @classmethod
     def validate_drone_id(cls, v: str) -> str:
-        if not re.match(r"^[A-Z0-9_\-]{3,30}$", v):
-            raise ValueError(
-                "drone_id must be 3-30 uppercase alphanumeric/underscore characters"
-            )
-        return v
+        return check_drone_id(v)
+
+    @field_validator("mission_id")
+    @classmethod
+    def validate_mission_id(cls, v: str) -> str:
+        return check_mission_id(v)
 
     @field_validator("timestamp")
     @classmethod
@@ -149,11 +175,31 @@ class MissionStartRequest(BaseModel):
     notes:      Optional[str]  = None
     geofence:   Optional[dict] = None
 
+    @field_validator("drone_id")
+    @classmethod
+    def validate_drone_id(cls, v: str) -> str:
+        return check_drone_id(v)
+
+    @field_validator("mission_id")
+    @classmethod
+    def validate_mission_id(cls, v: str) -> str:
+        return check_mission_id(v)
+
 
 class GeofenceUpdateRequest(BaseModel):
     drone_id:   str
     mission_id: str
     geofence:   dict
+
+    @field_validator("drone_id")
+    @classmethod
+    def validate_drone_id(cls, v: str) -> str:
+        return check_drone_id(v)
+
+    @field_validator("mission_id")
+    @classmethod
+    def validate_mission_id(cls, v: str) -> str:
+        return check_mission_id(v)
 
 
 class MissionEndRequest(BaseModel):
@@ -161,6 +207,16 @@ class MissionEndRequest(BaseModel):
     mission_id: str
     frames_sent: Optional[int] = None
     notes:       Optional[str] = None
+
+    @field_validator("drone_id")
+    @classmethod
+    def validate_drone_id(cls, v: str) -> str:
+        return check_drone_id(v)
+
+    @field_validator("mission_id")
+    @classmethod
+    def validate_mission_id(cls, v: str) -> str:
+        return check_mission_id(v)
 
 
 class MissionResponse(BaseModel):

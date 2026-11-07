@@ -1195,7 +1195,7 @@ curl -s -X POST $URL/ingest/frame -H "Authorization: Bearer $TOKEN" \
   -F "frame=@test.jpg;type=image/jpeg" \
   -F 'metadata_json={"drone_id":"DRN-TEST","mission_id":"MSN-SMOKE-1","timestamp":"2026-10-26T10:00:00Z"}'
 ```
-Use the real `FrameMetadata` field names from `ingest/api/models.py`. Then check on the pod: `valkey-cli XLEN drone:frames:DRN-TEST`.
+Use the real `FrameMetadata` field names from `ingest/api/models.py`. Then check on the pod: `valkey-cli XLEN mission:frames:$(valkey-cli GET drone:active_mission:DRN-TEST)` (`drone:frames:DRN-TEST` with STREAM_KEY_MODE=drone).
 
 Confirm what the pod actually sees as the client IP:
 - `tail /var/log/dvas/nginx_access.log` should show **your** public IP.
@@ -1315,7 +1315,7 @@ Confirm what the pod actually sees as the client IP:
 
 - **`measure.py`** (runs on the pod, every 5 s, writes CSV to `/workspace/dvas/calibration/run-<ts>.csv`):
   - processed fps per analyzer — delta of `frames_processed` from each `/health`
-  - stream lag per consumer group — `XINFO GROUPS drone:frames:<id>` → `lag`, `pending`
+  - stream lag per consumer group — `XINFO GROUPS mission:frames:<mission>` (legacy `drone:frames:<id>`) → `lag`, `pending`
   - GPU util/VRAM per process — `nvidia-smi --query-compute-apps` + `pynvml`
   - CPU % per program — psutil by supervisord PID
   - Postgres TPS — `pg_stat_database`
@@ -1719,7 +1719,7 @@ dvas-ctl restart analytics            # all analyzers + gateway
 dvas-ctl restart backend
 dvas-ctl logs person
 supervisorctl -c /etc/dvas/supervisord.conf tail -f analytics:anomaly
-valkey-cli XINFO GROUPS drone:frames:DRN-001
+valkey-cli XINFO GROUPS "mission:frames:$(valkey-cli GET drone:active_mission:DRN-001)"
 su postgres -c "psql -d dvas_dashboard"
 mc ls local/dvas-evidence
 nvidia-smi dmon -s um                 # live GPU util / memory

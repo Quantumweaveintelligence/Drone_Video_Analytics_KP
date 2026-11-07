@@ -84,7 +84,10 @@ def main():
     if a.drone:
         import redis
         r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"))
-        last = r.xrevrange(f"drone:frames:{a.drone}", count=1)
+        # The drone's active mission stream, else its legacy per-drone stream
+        sid = r.get(f"drone:active_mission:{a.drone}")
+        key = f"mission:frames:{sid.decode()}" if sid else f"drone:frames:{a.drone}"
+        last = r.xrevrange(key, count=1) or r.xrevrange(f"drone:frames:{a.drone}", count=1)
         if last:
             jpeg = last[0][1].get(b"frame")
             print(f"using the newest frame of {a.drone} ({len(jpeg) // 1024} KB)")

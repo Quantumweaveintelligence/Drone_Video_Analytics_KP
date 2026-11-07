@@ -609,7 +609,7 @@ async def get_latest_annotated_frame(drone_id: str = ""):
     
     If in-memory cache exists and is fresh, returns it immediately.
     If not in memory, attempts on-demand frame recovery from Redis Valkey stream
-    (drone:frames:{drone_id}), runs perception and HUD drawing, caches and returns.
+    (the drone's active mission stream), runs perception and HUD drawing, caches and returns.
     If feed offline or expired, returns 404 so frontend two-layer viewer can display
     the raw ingest camera feed seamlessly.
     """

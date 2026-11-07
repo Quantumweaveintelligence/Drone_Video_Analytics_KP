@@ -209,7 +209,6 @@ services:
       # Frame settings
       MAX_FRAME_MB:      "5"
       QUEUE_MAX_LENGTH:  "1000"
-      QUEUE_MSG_TTL_MS:  "30000"
       JWKS_CACHE_TTL_S:  "300"
       # Drone registry
       KNOWN_DRONES: "${KNOWN_DRONES:-DRONE_KL_001,DRONE_KL_002,DRONE_KL_003,DRONE_KL_004,DRONE_KL_005}"

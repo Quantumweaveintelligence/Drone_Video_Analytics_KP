@@ -91,6 +91,8 @@ async def handle_ingest_event(msg) -> bool:
     event = msg.get("event") or msg.get("type")
     if event not in STREAM_END_EVENTS:
         return False
+    if msg.get("drone_still_active"):
+        return False        # an older mission drained while the drone flies a newer one (Phase 2a)
     return await mark_drone_offline(str(msg.get("drone_id") or ""), reason=f"ingest:{event}",
                                     mission_id=msg.get("mission_id"))
 

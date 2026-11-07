@@ -1,6 +1,7 @@
 """
 DVAS Analytics — Valkey/Redis Stream Client
-Reads frames from drone:frames:{drone_id} streams and publishes confirmed events.
+Reads drone frames (per-mission streams, see shared/mission_streams.py) and publishes
+confirmed events.
 """
 import json
 import logging
@@ -8,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import redis.asyncio as aioredis
 
+from shared import mission_streams
 from shared.config import cfg
 
 log = logging.getLogger(__name__)
@@ -37,6 +39,12 @@ def _get_raw_client() -> aioredis.Redis:
     return _raw_client
 
 
+async def _frames_key(client, drone_id: str) -> str:
+    """Stream with the drone's newest frames (active mission, else legacy key)."""
+    return (await mission_streams.latest_stream(client, drone_id)
+            or mission_streams.legacy_key(drone_id))
+
+
 async def close_client():
     global _client, _raw_client
     if _client:
@@ -54,7 +62,7 @@ async def xread_frames(
     block_ms: int = 5000,
 ) -> Tuple[str, List[Dict]]:
     """
-    Read up to `count` frames from drone:frames:{drone_id}.
+    Read up to `count` frames from the drone's current stream.
     Returns (new_last_id, list_of_frame_dicts).
     Each frame dict has: entry_id, frame (raw JPEG bytes), timestamp, drone_id
 
@@ -63,7 +71,7 @@ async def xread_frames(
     decoded; 'frame' stays bytes.
     """
     raw_client = _get_raw_client()
-    stream_key = f"drone:frames:{drone_id}"
+    stream_key = await _frames_key(raw_client, drone_id)
     block_val = block_ms if block_ms and block_ms > 0 else None
     results = await raw_client.xread(
         {stream_key.encode(): last_id.encode()},
@@ -103,7 +111,7 @@ async def xread_frames(
 
 
 async def get_latest_stream_frame(drone_id: str) -> Optional[Any]:
-    """Retrieve and decode the most recent frame from drone:frames:{drone_id}.
+    """Retrieve and decode the drone's most recent frame (its active mission's stream).
     
     Checks both the binary 'frame' field and the base64 'jpeg_b64' field.
     Returns a BGR numpy image (as decoded by cv2.imdecode), or None if no frames exist.
@@ -114,7 +122,7 @@ async def get_latest_stream_frame(drone_id: str) -> Optional[Any]:
 
     try:
         raw_client = _get_raw_client()
-        stream_key = f"drone:frames:{drone_id}"
+        stream_key = await _frames_key(raw_client, drone_id)
         entries = await raw_client.xrevrange(stream_key, max="+", min="-", count=1)
         if not entries:
             return None
@@ -146,7 +154,7 @@ async def xreadgroup_frames(group: str, consumer: str, drone_id: str,
                             last_id: str = ">", count: int = 1, block_ms: int = 100):
     """Read frames using consumer group. Returns list of (entry_id, fields) tuples."""
     client = _get_raw_client()
-    stream_key = f"drone:frames:{drone_id}"
+    stream_key = await _frames_key(client, drone_id)
     block_val = block_ms if block_ms and block_ms > 0 else None
     try:
         result = await client.xreadgroup(
@@ -194,7 +202,7 @@ async def ack_frames(drone_id: str, group: str, *message_ids):
     if not message_ids:
         return
     client = get_client()
-    stream_key = f"drone:frames:{drone_id}"
+    stream_key = await _frames_key(client, drone_id)
     await client.xack(stream_key, group, *message_ids)
 
 
@@ -231,7 +239,7 @@ async def publish_analytics_result(service: str, result: Dict[str, Any]) -> None
 async def get_stream_info(drone_id: str) -> Dict:
     """Get info about a drone's frame stream."""
     client = get_client()
-    stream_key = f"drone:frames:{drone_id}"
+    stream_key = await _frames_key(client, drone_id)
     try:
         info = await client.xinfo_stream(stream_key)
         return {
@@ -312,35 +320,12 @@ async def hget_vehicle_track(
 
 async def scan_active_stream_drones() -> List[str]:
     """
-    Scans Valkey for keys matching `drone:frames:*` and extracts active drone_id strings.
-    Allows microservices to dynamically consume streams published under any drone ID.
-    Only includes streams that contain frames (xlen > 0).
+    Drone ids with frames in Valkey: drones with a mission stream (drone:missions:*) and
+    drones with a non-empty legacy drone:frames:* stream. Lets services pick up any drone
+    id without configuration.
     """
     try:
-        client = get_client()
-        pattern = "drone:frames:*"
-        cursor = 0
-        found_keys = []
-        for _ in range(200):
-            cursor, keys = await client.scan(cursor=cursor, match=pattern, count=100)
-            found_keys.extend(keys)
-            if cursor == 0:
-                break
-        drone_ids = []
-        for key in found_keys:
-            key_str = key.decode() if isinstance(key, bytes) else key
-            parts = key_str.split(":", 2)
-            if len(parts) >= 3 and parts[2]:
-                did = parts[2]
-                try:
-                    # xlen is an integer query — completely safe from binary decoding errors
-                    length = await client.xlen(key)
-                    if length > 0:
-                        drone_ids.append(did)
-                except Exception:
-                    drone_ids.append(did)
-        return drone_ids
+        return await mission_streams.discover_drones(get_client())
     except Exception as exc:
         log.warning("Failed to scan active stream drones from Valkey: %s", exc)
         return []
-

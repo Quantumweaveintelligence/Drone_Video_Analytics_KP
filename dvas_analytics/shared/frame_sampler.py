@@ -21,6 +21,12 @@ XREADGROUP per drone:
 
 Frame bytes come from the raw `frame` field; `jpeg_b64` is only a fallback
 for entries written by an older ingest.
+
+Streams (plan Phase 2a): each mission has its own stream (shared/mission_streams.py).
+The drone id stays the key everywhere here; per drone the sampler reads its streams
+oldest first and moves to the next one when the current mission has ended and this
+service has read all of it. At that boundary the drone's trackers and state are reset,
+so a new mission never continues the last one's tracks.
 """
 from __future__ import annotations
 
@@ -34,6 +40,8 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
+
+from shared import mission_streams
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +64,7 @@ try:
 except ValueError:
     IDLE_RESET_S = 120.0
 GROUP_RETRY_S = 5.0
+RESOLVE_EVERY_S = 1.0      # how often a drone's current stream is re-checked
 _FPS_WINDOW_S = 5.0
 # Hard limits for a cap coming from Valkey (defence in depth: the key is
 # written by the gateway, but never trust a number that throttles everything)
@@ -70,7 +79,13 @@ def default_cap() -> float:
 
 
 def stream_key(drone_id: str) -> str:
-    return f"drone:frames:{drone_id}"
+    """Legacy per-drone stream (STREAM_KEY_MODE=drone and pre-upgrade data)."""
+    return mission_streams.legacy_key(drone_id)
+
+
+def _g(d: dict, k: str):
+    """Field of an XINFO reply from either a decoding or a raw client."""
+    return d.get(k, d.get(k.encode()))
 
 
 def _s(v) -> str:
@@ -231,7 +246,7 @@ class FrameSampler:
                  mode: str = "ordered", late_policy: str = "analyse",
                  governed: bool = True, cap_fps: Optional[float] = None,
                  block_ms: int = 50, redis_factory: Optional[Callable] = None,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, stream_mode: Optional[str] = None):
         if mode not in ("ordered", "newest"):
             raise ValueError(f"mode must be 'ordered' or 'newest', not {mode!r}")
         if late_policy not in ("analyse", "skip"):
@@ -251,19 +266,23 @@ class FrameSampler:
         self.cap = RateCap(self._static_cap, clock)
         self.cap_source = "env"
         self.stats: Dict[str, DroneStats] = {}
-        self._groups_ok: set = set()
+        self.stream_mode = stream_mode or mission_streams.MODE
+        self._streams: Dict[str, str] = {}        # drone → stream being read
+        self._cands: Dict[str, List[str]] = {}    # drone → its streams, oldest first
+        self._resolved_at: Dict[str, float] = {}
+        self._groups_ok: set = set()              # stream keys with this service's group
         self._group_retry_at: Dict[str, float] = {}
         self._last_publish = 0.0
         self._last_cap_read = 0.0
         self._batch_sizes: Deque[int] = deque(maxlen=50)
-        self._pel_done: set = set()          # drones whose own pending entries were re-read
+        self._pel_done: set = set()          # stream keys whose own pending entries were re-read
         self._last_seq: Dict[str, int] = {}  # last analysed frame_seq per drone (gap = lost)
         self._held: Dict[str, List[tuple]] = {}   # drone → [(seq, arrived_mono, fields)] re-order buffer
         self._gaps: Dict[str, set] = {}           # drone → seqs counted as lost (a late arrival refunds)
         self._last_frame_at: Dict[str, float] = {}
         self._last_idle_check = 0.0
-        # Called with the drone id when it goes idle (vessel / anomaly drop their own state);
-        # BatchTracker trackers are reset automatically.
+        # Called with the drone id when it goes idle or starts a new mission (vessel / anomaly
+        # drop their own state); BatchTracker trackers are reset automatically.
         self.on_idle: List[Callable[[str], None]] = []
         self._queued: Dict[str, Optional[int]] = {}
         # Set by the service: {"device": "cuda"|"cpu", "cpu_fallback": bool, "cpu_reason": str, ...}
@@ -276,24 +295,91 @@ class FrameSampler:
         from shared.redis_client import _get_raw_client  # noqa: PLC0415
         return _get_raw_client()
 
+    def _key(self, d: str) -> str:
+        return self._streams.get(d) or stream_key(d)
+
     async def _ensure_groups(self, drones: Iterable[str]) -> None:
         client = self._redis()
         now = self._clock()
         for d in drones:
-            if d in self._groups_ok or self._group_retry_at.get(d, 0.0) > now:
+            key = self._key(d)
+            if key in self._groups_ok or self._group_retry_at.get(key, 0.0) > now:
                 continue
             try:
                 # ordered: from the start of the queue (every frame); newest: from the end.
                 # Existing stream only: a purged stream must not be recreated.
-                await client.xgroup_create(stream_key(d), self.group,
+                await client.xgroup_create(key, self.group,
                                            id="0" if self.mode == "ordered" else "$", mkstream=False)
-                self._groups_ok.add(d)
+                self._groups_ok.add(key)
             except Exception as exc:
                 if "BUSYGROUP" in str(exc):
-                    self._groups_ok.add(d)
+                    self._groups_ok.add(key)
                 else:
                     # "no such key": the drone is not streaming yet — retry in a few seconds
-                    self._group_retry_at[d] = now + GROUP_RETRY_S
+                    self._group_retry_at[key] = now + GROUP_RETRY_S
+
+    # ── Which stream (plan Phase 2a) ──────────────────────────────────────────
+    async def _resolve(self, client, drones: Iterable[str]) -> None:
+        now = self._clock()
+        for d in drones:
+            if d in self._streams and now - self._resolved_at.get(d, -1e9) < RESOLVE_EVERY_S:
+                continue
+            self._resolved_at[d] = now
+            try:
+                key = await self._pick_stream(client, d)
+            except Exception as exc:
+                log.debug("[%s] stream lookup failed for %s: %s", self.service, d, exc)
+                continue
+            old = self._streams.get(d)
+            if key is None or key == old:
+                continue
+            self._streams[d] = key
+            if old is not None:
+                log.info("[%s] %s: %s finished — reading %s with fresh trackers",
+                         self.service, d, old, key)
+                self._last_seq.pop(d, None)
+                self._held.pop(d, None)
+                self._gaps.pop(d, None)
+                self._reset_state(d)
+
+    async def _pick_stream(self, client, d: str) -> Optional[str]:
+        """The stream to read for a drone: the oldest one this service has not finished.
+
+        A stream is finished when its mission no longer takes frames and this group has
+        read every entry. The newest stream is read when all are finished.
+        """
+        if self.mode == "newest":
+            key = await mission_streams.latest_stream(client, d, self.stream_mode)
+            self._cands[d] = [key] if key else []
+            return key
+        cands = await mission_streams.drone_streams(client, d, self.stream_mode)
+        self._cands[d] = cands
+        if not cands:
+            return None
+        cur = self._streams.get(d)
+        if cur in cands and self._held.get(d):
+            return cur                          # frames of it are still in the re-order buffer
+        for key in cands[:-1]:
+            if await self._unread(client, key) or await mission_streams.is_live(client, key):
+                return key
+        return cands[-1]
+
+    async def _unread(self, client, key: str) -> int:
+        """Entries of a stream this service's group has not read yet (0 when gone)."""
+        try:
+            groups = await client.xinfo_groups(key)
+        except Exception:
+            return 0                            # no such stream (purged)
+        g = next((x for x in groups if _s(_g(x, "name") or "") == self.group), None)
+        if g is None:
+            return int(await client.xlen(key))
+        lag = _g(g, "lag")
+        if lag is None:
+            # Valkey cannot count the lag (entries deleted mid-stream): compare ids instead
+            info = await client.xinfo_stream(key)
+            done = _s(_g(g, "last-delivered-id") or "") == _s(_g(info, "last-generated-id") or "")
+            return 0 if done else 1
+        return int(lag)
 
     async def _refresh_cap(self) -> None:
         now = self._clock()
@@ -331,38 +417,40 @@ class FrameSampler:
         if not due:
             await asyncio.sleep(min(self.cap.wait_s(drones), 0.25))
             return {}
+        client = self._redis()
+        await self._resolve(client, due)
         await self._ensure_groups(due)
-        due = [d for d in due if d in self._groups_ok]
+        due = [d for d in due if self._key(d) in self._groups_ok]
         if not due:
             await asyncio.sleep(self.block_ms / 1000)
             return {}
 
-        client = self._redis()
         if self.mode == "ordered":
             return await self._next_ordered(client, due)
+        by_key = {self._key(d): d for d in due}
         try:
             res = await client.xreadgroup(
                 groupname=self.group, consumername=self.consumer,
-                streams={stream_key(d): ">" for d in due},
+                streams={k: ">" for k in by_key},
                 count=READ_CHUNK, block=self.block_ms,
             )
         except Exception as exc:
             if "NOGROUP" in str(exc):
-                self._groups_ok.difference_update(due)   # stream purged → recreate next round
+                self._groups_ok.difference_update(by_key)   # stream purged → recreate next round
                 return {}
             raise
 
         out: Dict[str, dict] = {}
         now = self._clock()
         for stream_name, entries in res or []:
-            drone_id = _s(stream_name).split("drone:frames:", 1)[-1]
-            if not entries:
+            drone_id = by_key.get(_s(stream_name))
+            if drone_id is None or not entries:
                 continue
             ids = [_s(e[0]) for e in entries]
             newest = entries[-1]
             st = self.stats.setdefault(drone_id, DroneStats())
             try:
-                await client.xack(stream_key(drone_id), self.group, *ids)
+                await client.xack(self._key(drone_id), self.group, *ids)
                 if len(entries) == READ_CHUNK:
                     # Backlog (first start on an old group / after a stall): jump the group to
                     # the newest entry instead of transferring every queued frame
@@ -377,7 +465,7 @@ class FrameSampler:
                     st.skipped += len(ids) - 1
             except Exception as exc:
                 if "NOGROUP" in str(exc):
-                    self._groups_ok.discard(drone_id)
+                    self._groups_ok.discard(self._key(drone_id))
                     continue
                 raise
             st.received.extend([now] * len(ids))
@@ -401,7 +489,9 @@ class FrameSampler:
         now = self._clock()
         # Drones whose buffer already holds a frame that may go out now need no read wait
         ready_now = any(self._ready(d, now) is not None for d in due)
-        streams = {stream_key(d): ("0" if d not in self._pel_done else ">") for d in due}
+        keys = {d: self._key(d) for d in due}
+        by_key = {k: d for d, k in keys.items()}
+        streams = {k: ("0" if k not in self._pel_done else ">") for k in by_key}
         if any(v == "0" for v in streams.values()) or ready_now:
             block = None
         else:
@@ -413,21 +503,23 @@ class FrameSampler:
                                           streams=streams, count=count, block=block)
         except Exception as exc:
             if "NOGROUP" in str(exc):
-                self._groups_ok.difference_update(due)
-                self._pel_done.difference_update(due)
+                self._groups_ok.difference_update(by_key)
+                self._pel_done.difference_update(by_key)
                 return {}
             raise
         got = {}
         for stream_name, entries in res or []:
-            got[_s(stream_name).split("drone:frames:", 1)[-1]] = entries
+            d = by_key.get(_s(stream_name))
+            if d is not None:
+                got[d] = entries
         now = self._clock()
         for d in due:
             entries = got.get(d) or []
-            if streams[stream_key(d)] == "0" and not entries:
-                self._pel_done.add(d)           # own pending list is empty: switch to new entries
+            if streams[keys[d]] == "0" and not entries:
+                self._pel_done.add(keys[d])     # own pending list is empty: switch to new entries
             ids = [_s(e[0]) for e in entries]
             if ids:
-                await client.xack(stream_key(d), self.group, *ids)
+                await client.xack(keys[d], self.group, *ids)
             st = self.stats.setdefault(d, DroneStats())
             for eid, raw in entries:
                 if raw is None or not raw:      # pending id whose entry was trimmed away
@@ -463,14 +555,18 @@ class FrameSampler:
             log.info("[%s] %s idle for %.0fs — resetting its trackers and state", self.service, d, now - at)
             self._last_frame_at.pop(d, None)
             self.forget(d)
-            bt = sys.modules.get("shared.batch_tracker")
-            if bt is not None:
-                bt.reset_everywhere(d)
-            for cb in self.on_idle:
-                try:
-                    cb(d)
-                except Exception as exc:
-                    log.warning("[%s] idle reset hook failed for %s: %s", self.service, d, exc)
+            self._reset_state(d)
+
+    def _reset_state(self, d: str) -> None:
+        """Fresh trackers and per-drone analyzer state (idle drone, or a new mission)."""
+        bt = sys.modules.get("shared.batch_tracker")
+        if bt is not None:
+            bt.reset_everywhere(d)
+        for cb in self.on_idle:
+            try:
+                cb(d)
+            except Exception as exc:
+                log.warning("[%s] state reset hook failed for %s: %s", self.service, d, exc)
 
     # ── Re-order buffer ───────────────────────────────────────────────────────
     def _ready(self, d: str, now: float):
@@ -531,20 +627,20 @@ class FrameSampler:
         client = self._redis()
         for d in list(self.stats):
             try:
-                groups = await client.xinfo_groups(stream_key(d))
-                g = next((x for x in groups if _s(x.get("name") or x.get(b"name") or "") == self.group), None)
-                lag = None if g is None else g.get("lag")
-                self._queued[d] = None if lag is None else int(lag)
+                # Every stream of the drone counts: a mission still being worked off and the next
+                self._queued[d] = sum([await self._unread(client, k)
+                                       for k in self._cands.get(d) or [self._key(d)]])
             except Exception:
                 self._queued[d] = None
 
     async def _jump_to_newest(self, client, drone_id: str):
         """Move the group's last-delivered id to the newest entry and return that entry."""
-        latest = await client.xrevrange(stream_key(drone_id), max="+", min="-", count=1)
+        key = self._key(drone_id)
+        latest = await client.xrevrange(key, max="+", min="-", count=1)
         if not latest:
             return None
         eid = _s(latest[0][0])
-        await client.xgroup_setid(stream_key(drone_id), self.group, eid)
+        await client.xgroup_setid(key, self.group, eid)
         return latest[0]
 
     # ── Stats ─────────────────────────────────────────────────────────────────
@@ -575,12 +671,15 @@ class FrameSampler:
 
     def forget(self, drone_id: str) -> None:
         self.stats.pop(drone_id, None)
-        self._pel_done.discard(drone_id)
+        key = self._streams.pop(drone_id, None) or stream_key(drone_id)
+        self._pel_done.discard(key)
+        self._groups_ok.discard(key)
+        self._cands.pop(drone_id, None)
+        self._resolved_at.pop(drone_id, None)
         self._last_seq.pop(drone_id, None)
         self._held.pop(drone_id, None)
         self._gaps.pop(drone_id, None)
         self.cap.forget(drone_id)
-        self._groups_ok.discard(drone_id)
 
     def snapshot(self) -> dict:
         from shared import gpu_profile  # noqa: PLC0415
@@ -612,6 +711,7 @@ class FrameSampler:
             "cap_source": self.cap_source,
             "governed": self.governed,
             "mode": self.mode,
+            "stream_mode": self.stream_mode,
             "device_info": self.device_info,
             "gpu": gpu_profile.detect().as_dict(),
             "avg_batch": round(sum(batches) / len(batches), 2) if batches else None,

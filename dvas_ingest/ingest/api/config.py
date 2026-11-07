@@ -52,7 +52,6 @@ REDIS_URL: str = os.getenv("REDIS_URL", "redis://valkey:6379/0")
 
 # Per-drone stream settings
 QUEUE_MAX_LENGTH: int = int(os.getenv("QUEUE_MAX_LENGTH", "2000"))
-QUEUE_MSG_TTL_MS: int = int(os.getenv("QUEUE_MSG_TTL_MS", "30000"))
 
 # ── Frame Validation ──────────────────────────────────────────────────────────
 MAX_FRAME_BYTES: int    = int(os.getenv("MAX_FRAME_MB", "5")) * 1024 * 1024

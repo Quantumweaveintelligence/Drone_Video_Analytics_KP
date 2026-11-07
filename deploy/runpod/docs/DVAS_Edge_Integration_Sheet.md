@@ -123,6 +123,6 @@ with backoff.
 
 1. Install with the `edge.env` above (laptop 1), log in as `operator@dvas.kp`, start a mission on `DRN-001`, send ~30 s
    of frames, end the mission.
-2. Tell me the time. I check on the pod: `dvas-ctl lag` (stream `drone:frames:DRN-001`, consumer groups advancing)
+2. Tell me the time. I check on the pod: `dvas-ctl lag` (stream `mission:frames:<mission id>` of DRN-001, consumer groups advancing)
    and the dashboard *Multi-drone* view.
 3. Send back: installer version, laptop OS, upload fps/resolution/JPEG quality, any 401/403/422/429 you saw.

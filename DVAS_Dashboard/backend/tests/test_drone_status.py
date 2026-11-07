@@ -141,3 +141,10 @@ def test_pump_skips_stale_detection_when_ingest_does_not_answer(st, monkeypatch)
               polls=telemetry_pump._GRACE_POLLS + 3)
     assert st.status()["DRN-010"] == "draining" and st.status()["DRN-011"] == "live"
     assert st.sent == []
+
+
+def test_older_mission_drained_while_the_drone_flies_on(st):
+    # Phase 2a: one of the drone's missions drained, a newer one is still streaming
+    assert st.run(drone_status.handle_ingest_event(
+        {"event": "mission_drained", "drone_id": "DRN-010", "mission_id": "M1", "drone_still_active": True})) is False
+    assert st.sent == []
