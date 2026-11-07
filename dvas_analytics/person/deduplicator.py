@@ -70,6 +70,33 @@ def extract_embedding_from_bytes(
         return None
 
 
+def extract_embeddings_from_bytes(
+    model: nn.Module,
+    images: List[bytes],
+    device: torch.device,
+) -> List[Optional[List[float]]]:
+    """2048-dim ResNet50 embeddings of several JPEGs in batches (None where one fails)."""
+    import io
+    out: List[Optional[List[float]]] = [None] * len(images)
+    tensors, index = [], []
+    for i, image_bytes in enumerate(images):
+        try:
+            tensors.append(_PREPROCESS(Image.open(io.BytesIO(image_bytes)).convert("RGB")))
+            index.append(i)
+        except Exception as exc:
+            log.warning("Embedding extraction failed: %s", exc)
+    for k in range(0, len(tensors), BATCH_SIZE):
+        try:
+            with torch.no_grad():
+                feat = model(torch.stack(tensors[k:k + BATCH_SIZE]).to(device))
+                feat = nn.functional.normalize(feat, p=2, dim=1)
+            for j, vec in enumerate(feat.cpu().tolist()):
+                out[index[k + j]] = vec
+        except Exception as exc:
+            log.warning("Embedding extraction failed: %s", exc)
+    return out
+
+
 def cluster_embeddings(
     embeddings: List[List[float]],
     distance_threshold: float = DISTANCE_THRESHOLD,

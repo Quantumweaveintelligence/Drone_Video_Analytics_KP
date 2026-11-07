@@ -34,8 +34,8 @@ from shared.redis_client import (
     scan_active_stream_drones, get_latest_stream_frame,
 )
 from shared import minio_client as minio
-from shared import gpu_profile
-from shared.frame_sampler import FrameSampler, decode_frame
+from shared import gpu_profile, persist_gate
+from shared.frame_sampler import FrameSampler
 from shared.annotated_hub import AnnotatedHub, install_stream_route, scale_items, to_display
 from vehicle.analyzer import VehicleAnalyzer
 from vehicle.schema import VehicleFrameResult, VehicleStats
@@ -61,6 +61,7 @@ _stream_running = False
 _frames_processed = 0
 # Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
 _sampler = FrameSampler("vehicle", "vehicle-group", "vehicle-analyzer")
+_gate = persist_gate.TrackGate()   # routine per-track writes (plan B1)
 # Live annotated video (MJPEG, ≤1920 px) for the dashboard
 _hub = AnnotatedHub("vehicle")
 install_stream_route(app, _hub)
@@ -310,50 +311,46 @@ async def _persist_vehicle_frame(drone_id: str, f: dict, frame: np.ndarray, resu
         _last_annotated[drone_id]    = annotated_bytes
         _last_annotated_ts[drone_id] = _time.monotonic()
 
-    # ── Persist to DB + Redis ─────────────────────────────────
-    for veh in result.get("vehicles", []):
+    # ── Persist to DB + Redis (routine copies throttled per track, plan B1 / §3) ──
+    vehicles = result.get("vehicles", [])
+    scores = await asyncio.to_thread(
+        lambda: [persist_gate.crop_score(frame, v["bbox"]) if v.get("crop_bytes") and v.get("bbox") else 0.0
+                 for v in vehicles])
+    for veh, score in zip(vehicles, scores):
         tracker_id   = veh.get("tracker_id")
-        track_id     = await upsert_track(
-            drone_id, None, "vehicle", ts, ts,
-            tracker_id=tracker_id, mission_id=frame_mission_id
-        )
+        st = _gate.seen(drone_id, tracker_id, ts, frame_mission_id)
+        if _gate.want_row(st):
+            st.track_id = await upsert_track(
+                drone_id, None, "vehicle", ts, ts,
+                tracker_id=tracker_id, mission_id=frame_mission_id
+            )
+        track_id = st.track_id
         # No confirmed event per vehicle per frame (B29): detections stay in
         # tracks / vehicle_attributes; vehicle incidents come from ANPR (theft_alert).
 
         colour_label = (veh.get("colour_top3") or [{}])[0].get("colour", "")
         crop_bytes   = veh.pop("crop_bytes", None)
-        veh_image_key = None
         if crop_bytes:
-            key = minio.make_key("vehicles", drone_id,
-                                 f"v_{tracker_id}_{int(ts.timestamp()*1000)}.jpg",
-                                 mission_id=frame_mission_id or "")
-            veh_image_key = await minio.upload_bytes(
-                cfg.BUCKET_VEHICLES, key, crop_bytes, "image/jpeg"
+            if _gate.want_crop(st, score):
+                await _upload_vehicle_crop(drone_id, tracker_id, st, crop_bytes, ts)
+            else:
+                st.pending = crop_bytes         # the final crop if the track ends now
+
+        speed_kph = veh.get("speed_info", {}).get("kph")
+        if track_id and _gate.want_attrs(st, (veh.get("vehicle_type"), colour_label,
+                                              persist_gate.speed_bucket(speed_kph))):
+            await write_vehicle_attributes(
+                track_id=track_id,
+                event_id=None,
+                vehicle_type=veh.get("vehicle_type", "unknown"),
+                colour_top3=veh.get("colour_top3", []),
+                make_model_top3=veh.get("make_model_top3", []),
+                speed_kph=speed_kph,
+                speed_reliability=veh.get("speed_info", {}).get("reliability"),
+                mission_id=frame_mission_id,
             )
 
-        if veh_image_key and track_id:
-            pool = await get_pool()
-            await pool.execute(
-                """
-                UPDATE tracks
-                SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('vehicle_image_key', $1::text)
-                WHERE track_id = $2::uuid
-                """,
-                veh_image_key, track_id,
-            )
-
-        await write_vehicle_attributes(
-            track_id=track_id,
-            event_id=None,
-            vehicle_type=veh.get("vehicle_type", "unknown"),
-            colour_top3=veh.get("colour_top3", []),
-            make_model_top3=veh.get("make_model_top3", []),
-            speed_kph=veh.get("speed_info", {}).get("kph"),
-            speed_reliability=veh.get("speed_info", {}).get("reliability"),
-            mission_id=frame_mission_id,
-        )
-
-
+        # Live state for ANPR / the track list: every frame (one Valkey hash write)
         await hset_vehicle_track(
             tracker_id=tracker_id,
             drone_id=drone_id,
@@ -361,8 +358,8 @@ async def _persist_vehicle_frame(drone_id: str, f: dict, frame: np.ndarray, resu
                 "vehicle_type":      veh.get("vehicle_type", "unknown"),
                 "colour":            colour_label,
                 "track_id":          track_id,
-                "vehicle_image_key": veh_image_key or "",
-                "speed_kph":         str(veh.get("speed_info", {}).get("kph") or 0),
+                "vehicle_image_key": st.image_key or "",
+                "speed_kph":         str(speed_kph or 0),
                 "ts":                ts.isoformat(),
                 "drone_id":          drone_id,
             },
@@ -378,6 +375,41 @@ async def _persist_vehicle_frame(drone_id: str, f: dict, frame: np.ndarray, resu
     _frames_processed += 1
 
 
+async def _upload_vehicle_crop(drone_id: str, tracker_id, st, crop_bytes: bytes, ts) -> None:
+    """Store a vehicle crop and point the track row at it."""
+    key = minio.make_key("vehicles", drone_id,
+                         f"v_{tracker_id}_{int(ts.timestamp()*1000)}.jpg",
+                         mission_id=st.mission_id or "")
+    image_key = await minio.upload_bytes(cfg.BUCKET_VEHICLES, key, crop_bytes, "image/jpeg")
+    st.pending = None
+    if not image_key:
+        return
+    st.image_key = image_key
+    if st.track_id:
+        pool = await get_pool()
+        await pool.execute(
+            """
+            UPDATE tracks
+            SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('vehicle_image_key', $1::text)
+            WHERE track_id = $2::uuid
+            """,
+            image_key, st.track_id,
+        )
+
+
+async def _flush_ended_tracks(force: bool = False) -> None:
+    """Final row (exact last_seen) and final crop of tracks that ended (all when force)."""
+    for (drone_id, tracker_id), st in _gate.ended(force=force):
+        try:
+            if st.last_ts is not None and st.row_at is not None:
+                st.track_id = await upsert_track(drone_id, None, "vehicle", st.last_ts, st.last_ts,
+                                                 tracker_id=tracker_id, mission_id=st.mission_id)
+            if st.pending:
+                await _upload_vehicle_crop(drone_id, tracker_id, st, st.pending, st.last_ts)
+        except Exception as exc:
+            log.warning("Vehicle final write failed for %s/%s: %s", drone_id, tracker_id, exc)
+
+
 async def _persist_round(items: list) -> None:
     for drone_id, f, frame, result, t_start in items:
         try:
@@ -386,6 +418,7 @@ async def _persist_round(items: list) -> None:
             log.warning("Vehicle persist error for %s: %s", drone_id, exc)
         _sampler.record(drone_id, infer_ms=result.get("model_ms"),
                         total_ms=(_time.perf_counter() - t_start) * 1000)
+    await _flush_ended_tracks()
 
 
 async def _stream_loop():
@@ -406,17 +439,12 @@ async def _stream_loop():
                             active_drones.append(d)
                 except Exception:
                     pass
+                await _flush_ended_tracks()     # also when no frames arrive
             try:
                 await _sampler.maybe_publish()
-                round_frames = await _sampler.next_round(active_drones)
-                if not round_frames:
-                    continue
+                # Decoded in parallel; the next round decodes while this one is on the GPU (B2)
+                decoded = await _sampler.next_decoded(active_drones)
                 t_start = _time.perf_counter()
-                decoded = {}
-                for drone_id, f in round_frames.items():
-                    frame = await asyncio.to_thread(decode_frame, f)
-                    if frame is not None:
-                        decoded[drone_id] = (f, frame)
                 if not decoded:
                     continue
                 results = await asyncio.to_thread(
@@ -449,6 +477,10 @@ async def _stream_loop():
                 await asyncio.shield(pending)   # a stream stop must not cut a round half-written
             except Exception:
                 pass
+        try:
+            await _flush_ended_tracks(force=True)
+        except Exception as exc:
+            log.warning("Vehicle final writes at stream stop failed: %s", exc)
 
 
 # ── Stream control ─────────────────────────────────────────────────────────────
@@ -591,7 +623,11 @@ async def active_tracks(limit: int = 100, drone_id: str = ""):
         SELECT t.track_id, t.drone_id, t.metadata->>'tracker_id' AS tracker_id, t.first_seen, t.last_seen,
                va.vehicle_type, va.colour_top3, va.speed_kph
         FROM tracks t
-        LEFT JOIN vehicle_attributes va ON va.track_id = t.track_id
+        -- newest attributes per track: one row per vehicle (attributes are throttled, B1)
+        LEFT JOIN LATERAL (
+            SELECT vehicle_type, colour_top3, speed_kph FROM vehicle_attributes
+            WHERE track_id = t.track_id ORDER BY created_at DESC LIMIT 1
+        ) va ON true
         WHERE t.track_type = 'vehicle'
           AND t.last_seen > now() - interval '10 minutes'
     """
@@ -636,7 +672,10 @@ async def recent_vehicles(limit: int = 50):
         SELECT t.track_id, t.drone_id, t.metadata->>'tracker_id' AS tracker_id, t.last_seen,
                va.vehicle_type, va.colour_top3, va.speed_kph
         FROM tracks t
-        LEFT JOIN vehicle_attributes va ON va.track_id = t.track_id
+        LEFT JOIN LATERAL (
+            SELECT vehicle_type, colour_top3, speed_kph FROM vehicle_attributes
+            WHERE track_id = t.track_id ORDER BY created_at DESC LIMIT 1
+        ) va ON true
         WHERE t.track_type = 'vehicle'
         ORDER BY t.last_seen DESC
         LIMIT $1
@@ -676,7 +715,13 @@ async def get_vehicle_image(tracker_id: int, drone_id: str = "DRONE_KL_001"):
 async def stats_summary():
     pool = await get_pool()
     rows = await pool.fetch(
-        "SELECT vehicle_type, COUNT(*) as cnt FROM vehicle_attributes GROUP BY vehicle_type"
+        # Vehicles (tracks) by their newest type — not attribute rows, which are throttled (§3 rule 6)
+        """
+        SELECT vehicle_type, COUNT(*) AS cnt FROM (
+            SELECT DISTINCT ON (track_id) track_id, vehicle_type FROM vehicle_attributes
+            ORDER BY track_id, created_at DESC
+        ) v GROUP BY vehicle_type
+        """
     )
     by_type   = {r["vehicle_type"]: r["cnt"] for r in rows}
     total     = sum(by_type.values())
@@ -706,8 +751,11 @@ async def stats_by_colour():
         SELECT
             colour_top3->0->>'colour' AS colour,
             COUNT(*) AS cnt
-        FROM vehicle_attributes
-        WHERE colour_top3 IS NOT NULL AND colour_top3 != '[]'::jsonb
+        FROM (   -- one row per vehicle: its newest colour (§3 rule 6)
+            SELECT DISTINCT ON (track_id) track_id, colour_top3 FROM vehicle_attributes
+            WHERE colour_top3 IS NOT NULL AND colour_top3 != '[]'::jsonb
+            ORDER BY track_id, created_at DESC
+        ) v
         GROUP BY colour_top3->0->>'colour'
         ORDER BY cnt DESC
         LIMIT 12
@@ -727,7 +775,10 @@ async def stats_flow_24h():
             va.vehicle_type,
             COUNT(*) AS cnt
         FROM tracks t
-        LEFT JOIN vehicle_attributes va ON va.track_id = t.track_id
+        LEFT JOIN LATERAL (   -- one row per vehicle (§3 rule 6)
+            SELECT vehicle_type FROM vehicle_attributes
+            WHERE track_id = t.track_id ORDER BY created_at DESC LIMIT 1
+        ) va ON true
         WHERE t.track_type = 'vehicle'
           AND t.last_seen > now() - interval '24 hours'
         GROUP BY hour_ts, va.vehicle_type

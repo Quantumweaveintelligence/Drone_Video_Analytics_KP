@@ -140,6 +140,22 @@ def main():
         if f32 and matched(f32, f16) < len(f32):
             print("   !! FP16 misses faces here — set DVAS_FP16=false for the person service")
 
+    # B5: does ArcFace (onnxruntime) really run on the GPU, and without errors?
+    try:
+        from person.face_recognizer import ArcFaceRecognizer
+        from shared.config import cfg
+        rec = ArcFaceRecognizer(cfg.ARCFACE_MODEL_PATH)
+        face = cv2.resize(frame[:200, :200], (112, 112))
+        rec.extract_embedding(face, quality_check=False)            # first call: session warm-up
+        print("\n== ArcFace %-10s %8.1f / %.1f ms per face   %s" % (
+            rec.status()["provider"],
+            *timed(lambda: rec.extract_embedding(face, quality_check=False), a.frames),
+            rec.status()))
+        if rec.status()["provider"] != "cuda" or rec.status()["errors"]:
+            print("   !! ArcFace is not on the GPU (or fails) — check onnxruntime-gpu for compute 12.0")
+    except Exception as exc:
+        print("\n== ArcFace check failed:", exc)
+
     if a.profile and torch.cuda.is_available():
         from torch.profiler import ProfilerActivity, profile
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:

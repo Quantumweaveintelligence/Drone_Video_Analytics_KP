@@ -163,6 +163,27 @@ A change that fails stays off (env flag) and is reported.
 Every phase = one image release (`build_image.sh` → `push_ghcr.sh` → set the image **on the pod**
 → restart → `RELEASES.md`), with the benchmark run on the pod before and after.
 
+**Status (2026-11-07):** Phase 1, Phase 2a and Phase 2 are implemented on `runpod-v1` (not yet
+released to the pod). Phase 1b and Phase 3 wait for the Phase 0 numbers from the pod
+(`bench_person.py`, which now also reports the ArcFace provider). Still to verify on the pod:
+the §3 rule 7 clip run (same events, each with its crop and source frame; every track ≥ 1 crop)
+and the "done when" fps targets. Phase 2 as built:
+- B1: `shared/persist_gate.py` (one gate per service). Vehicle: track rows, trail crops and
+  attribute rows throttled; the Valkey track hash stays per frame (ANPR reads it). Person: track
+  rows and whole-body crops + appearance embeddings throttled; face crops / embeddings and
+  watchlist alerts unchanged. ANPR: track and attribute rows throttled; every plate read and its
+  crops written as before. Final row and crop written when a track ends, at stream stop too.
+  Rule 6 audit: the vehicle service's type / colour / flow statistics and track lists counted or
+  joined attribute rows; they now use the newest attributes per track (one row per vehicle).
+  Track-row counts (gateway, person) were already per track. The person identity gallery's
+  `embedding_count` is a count of stored images and becomes smaller.
+- B2: `FrameSampler.next_decoded` — a round's drones decode in parallel, and the next round is
+  read and decoded while the models run on this one (all ordered services; crowd keeps the
+  newest-frame path).
+- B3: person ResNet embeddings batched per frame and, with ArcFace, run in a worker thread.
+- B5: the Models page shows ArcFace's execution provider and inference errors.
+- D6: nginx limits ingest per bearer token (150 r/s, burst 300) plus 600 r/s per client IP.
+
 ### Phase 0 — Measure on the pod (½ day, no code change on the pod)
 
 `deploy/runpod/tools/bench_person.py` (added; read-only, loads its own model copy) reports the

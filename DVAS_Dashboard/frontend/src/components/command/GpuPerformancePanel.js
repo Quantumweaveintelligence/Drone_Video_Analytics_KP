@@ -233,6 +233,18 @@ export default function GpuPerformancePanel() {
                           {" "}· input {s.device_info.imgsz}{s.device_info.face_tile ? ` · face tiles ${s.device_info.face_tile}px` : ""}
                         </span>
                       )}
+                      {s.device_info?.arcface?.ready && (
+                        // B5: which device ArcFace (face recognition) really runs on
+                        <span className={(s.device_info.arcface.provider !== "cuda" && s.device_info.device === "cuda")
+                                         || s.device_info.arcface.errors ? "text-amber-300" : "text-slate-500"}
+                              title={s.device_info.arcface.errors
+                                ? `ArcFace inference errors: ${s.device_info.arcface.errors} — ${s.device_info.arcface.last_error}`
+                                : "ArcFace (face recognition) execution provider"}
+                              data-testid={`arcface-${s.service}`}>
+                          {" "}· ArcFace {String(s.device_info.arcface.provider).toUpperCase()}
+                          {s.device_info.arcface.errors ? ` · ${s.device_info.arcface.errors} errors` : ""}
+                        </span>
+                      )}
                     </>}
                   </td>
                   <td className="px-2 py-1.5 text-slate-300">{d?.drone_id || "—"}</td>

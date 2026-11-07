@@ -121,3 +121,21 @@ def test_duplicates_are_dropped_and_sequence_restart_is_not_late(monkeypatch):
 def test_late_policy_is_validated():
     with pytest.raises(ValueError):
         FrameSampler("x", "g", "c", late_policy="drop")
+
+
+def test_next_decoded_prefetches_the_following_round(monkeypatch):
+    """B2: the round after is read and decoded while the caller works on this one."""
+    monkeypatch.setattr(fs, "REORDER_MS", 0)
+    monkeypatch.setattr(fs, "decode_frame", lambda f: "img" + f["frame_seq"])
+    s, st, c = sampler()
+    st.arrive(1, 2, 3)
+
+    async def go():
+        got = []
+        for _ in range(8):
+            c.t += 0.02
+            r = await s.next_decoded(["D"])
+            got += [(f["frame_seq"], img) for f, img in r.values()]
+            await asyncio.sleep(0)              # "GPU work": the prefetch runs meanwhile
+        return got
+    assert asyncio.run(go()) == [("1", "img1"), ("2", "img2"), ("3", "img3")]

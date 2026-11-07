@@ -43,7 +43,7 @@ from shared.db import write_confirmed_event
 from shared.evidence import bbox_xyxy, evidence_block, frame_context, model_info
 from shared import gpu_profile
 from shared.annotated_hub import AnnotatedHub, install_stream_route
-from shared.frame_sampler import FrameSampler, decode_frame, frame_bytes
+from shared.frame_sampler import FrameSampler, frame_bytes
 from analyzer import AnomalyAnalyzer, analyze_round, release_shared_detectors
 
 logging.basicConfig(
@@ -395,19 +395,6 @@ async def _persist_round(items: list) -> None:
         _sampler.record(drone_id, infer_ms=detect_ms, total_ms=t_elapsed * 1000)
 
 
-def _decode_round(round_frames: Dict[str, dict]) -> Dict[str, Tuple[dict, np.ndarray]]:
-    out = {}
-    for drone_id, f in round_frames.items():
-        try:
-            frame = decode_frame(f)
-        except Exception as e:
-            log.debug("Frame decode error: %s", e)
-            frame = None
-        if frame is not None:
-            out[drone_id] = (f, frame)
-    return out
-
-
 async def _stream_loop():
     active_drones: List[str] = []
     log.info("Anomaly stream loop started (dynamic stream discovery mode, GPU %s)",
@@ -435,11 +422,9 @@ async def _stream_loop():
             try:
                 await _sampler.maybe_publish()
                 # Newest due frame per drone (older ones acked unread, counted as skipped)
-                round_frames = await _sampler.next_round(active_drones)
-                if not round_frames:
-                    continue
+                # Decoded in parallel; the next round decodes while this one is on the GPU (B2)
+                decoded = await _sampler.next_decoded(active_drones)
                 t_start = time.monotonic()
-                decoded = await asyncio.to_thread(_decode_round, round_frames)
                 if not decoded:
                     continue
 

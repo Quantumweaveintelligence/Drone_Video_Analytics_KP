@@ -163,6 +163,14 @@ def decode_frame(fields: dict):
     return img
 
 
+def _decode_quietly(fields: dict):
+    try:
+        return decode_frame(fields)
+    except Exception as exc:
+        log.debug("frame decode failed for %s: %s", fields.get("drone_id"), exc)
+        return None
+
+
 def _seq_of(fields: dict) -> Optional[int]:
     try:
         return int(fields.get("frame_seq") or fields.get("frame_sequence") or "")
@@ -285,6 +293,7 @@ class FrameSampler:
         # drop their own state); BatchTracker trackers are reset automatically.
         self.on_idle: List[Callable[[str], None]] = []
         self._queued: Dict[str, Optional[int]] = {}
+        self._prefetch: Optional[asyncio.Task] = None   # the next round, read + decoded (B2)
         # Set by the service: {"device": "cuda"|"cpu", "cpu_fallback": bool, "cpu_reason": str, ...}
         self.device_info: Optional[dict] = None
 
@@ -478,6 +487,27 @@ class FrameSampler:
             out[drone_id] = fields
             self.cap.mark(drone_id)
         return out
+
+    async def next_decoded(self, drones: List[str]) -> Dict[str, Tuple[dict, object]]:
+        """Next round with every frame decoded: {drone_id: (fields, BGR ndarray)} (plan B2).
+
+        The drones of a round are decoded in parallel worker threads, and the round after
+        is read and decoded in the background while the caller runs its models on this
+        one. Frames that cannot be decoded are left out. A prefetched round survives a
+        stream stop (the sampler lives as long as the process) and is returned first on
+        the next start, so no frame is skipped.
+        """
+        task, self._prefetch = self._prefetch, None
+        got = await task if task is not None else await self._read_decoded(list(drones))
+        self._prefetch = asyncio.create_task(self._read_decoded(list(drones)))
+        return got
+
+    async def _read_decoded(self, drones: List[str]) -> Dict[str, Tuple[dict, object]]:
+        frames = await self.next_round(drones)
+        if not frames:
+            return {}
+        imgs = await asyncio.gather(*(asyncio.to_thread(_decode_quietly, f) for f in frames.values()))
+        return {d: (f, img) for (d, f), img in zip(frames.items(), imgs) if img is not None}
 
     async def _next_ordered(self, client, due: List[str]) -> Dict[str, dict]:
         """Next frame per due drone in frame_seq order (one per drone per round).

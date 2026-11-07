@@ -37,7 +37,7 @@ from shared import minio_client as minio
 from shared import gpu_profile
 from shared.batch_tracker import BatchTracker
 from shared.annotated_hub import AnnotatedHub, install_stream_route
-from shared.frame_sampler import FrameSampler, decode_frame, frame_bytes as _frame_jpeg
+from shared.frame_sampler import FrameSampler, frame_bytes as _frame_jpeg
 from shared.evidence import EventGate, bbox_xyxy, evidence_block, frame_context, model_info
 
 from intrusion.projection import CameraProjection
@@ -816,18 +816,16 @@ async def _stream_loop():
 
             try:
                 await _sampler.maybe_publish()
-                round_frames = await _sampler.next_round(active_drones)
+                # Decoded in parallel; the next round decodes while this one is on the GPU (B2)
+                round_frames = await _sampler.next_decoded(active_drones)
                 if not round_frames:
                     continue
                 t_start = time.perf_counter()
 
                 items: List[dict] = []
-                for drone_id, f in round_frames.items():
+                for drone_id, (f, frame) in round_frames.items():
                     if drone_id not in _geofence_managers:     # configured drone missing state
                         _init_drone_state(drone_id)
-                    frame = await asyncio.to_thread(decode_frame, f)
-                    if frame is None:
-                        continue
                     item = await _prepare_frame(drone_id, f, frame, redis)
                     if item is not None:
                         items.append(item)

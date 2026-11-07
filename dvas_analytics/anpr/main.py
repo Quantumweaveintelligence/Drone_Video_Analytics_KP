@@ -36,8 +36,8 @@ from shared.redis_client import (
     scan_active_stream_drones, get_latest_stream_frame,
 )
 from shared import minio_client as minio
-from shared import gpu_profile
-from shared.frame_sampler import FrameSampler, decode_frame
+from shared import gpu_profile, persist_gate
+from shared.frame_sampler import FrameSampler
 from shared.annotated_hub import AnnotatedHub, install_stream_route, scale_items, to_display
 from shared.evidence import EventGate, bbox_xyxy, evidence_block, frame_context, model_info, upload_context
 from anpr.analyzer import ANPRAnalyzer
@@ -70,6 +70,7 @@ WATCHLIST_REFRESH_S = 60.0   # picks up rows changed in the DB or expired
 _frames_processed = 0
 # Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
 _sampler = FrameSampler("anpr", "anpr-group", "anpr-analyzer")
+_gate = persist_gate.TrackGate()   # routine track / attribute rows (plan B1)
 # Live annotated video (MJPEG, ≤1920 px) for the dashboard
 _hub = AnnotatedHub("anpr")
 install_stream_route(app, _hub)
@@ -450,10 +451,15 @@ async def _persist_anpr_frame(drone_id: str, f: dict, frame: np.ndarray, result:
         if not (has_valid_plate or has_plate_crop):
             continue
         tracker_id = plate.get("tracker_id")
-        track_id   = await upsert_track(
-            drone_id, None, "vehicle", ts, ts,
-            tracker_id=tracker_id, mission_id=frame_mission_id
-        )
+        # Plate reads and their crops are evidence: written for every read (§3 rule 2). Only the
+        # track row and the attribute row are routine copies (first, periodic, on change).
+        st = _gate.seen(drone_id, tracker_id, ts, frame_mission_id)
+        if _gate.want_row(st):
+            st.track_id = await upsert_track(
+                drone_id, None, "vehicle", ts, ts,
+                tracker_id=tracker_id, mission_id=frame_mission_id
+            )
+        track_id = st.track_id
         plate_image_key = None
         plate_obj = None
         plate_crop_b64  = plate.get("plate_crop_b64")
@@ -497,16 +503,17 @@ async def _persist_anpr_frame(drone_id: str, f: dict, frame: np.ndarray, result:
                 mission_id=frame_mission_id,
             )
 
-        await write_vehicle_attributes(
-            track_id=track_id,
-            event_id=None,
-            vehicle_type=plate.get("vehicle_type", "car"),
-            colour_top3=[],
-            make_model_top3=[],
-            speed_kph=None,
-            speed_reliability=None,
-            mission_id=frame_mission_id,
-        )
+        if _gate.want_attrs(st, plate.get("vehicle_type", "car")):
+            await write_vehicle_attributes(
+                track_id=track_id,
+                event_id=None,
+                vehicle_type=plate.get("vehicle_type", "car"),
+                colour_top3=[],
+                make_model_top3=[],
+                speed_kph=None,
+                speed_reliability=None,
+                mission_id=frame_mission_id,
+            )
 
         if (vehicle_image_key or plate_image_key) and track_id:
             pool = await get_pool()
@@ -612,6 +619,18 @@ async def _persist_anpr_frame(drone_id: str, f: dict, frame: np.ndarray, result:
     _frames_processed += 1
 
 
+async def _flush_ended_tracks(force: bool = False) -> None:
+    """Final track row (exact last_seen) of tracks that ended (§3 rule 4)."""
+    for (drone_id, tracker_id), st in _gate.ended(force=force):
+        if st.last_ts is None or st.row_at is None:
+            continue
+        try:
+            await upsert_track(drone_id, None, "vehicle", st.last_ts, st.last_ts,
+                               tracker_id=tracker_id, mission_id=st.mission_id)
+        except Exception as exc:
+            log.warning("ANPR final track write failed for %s/%s: %s", drone_id, tracker_id, exc)
+
+
 async def _persist_round(items: list) -> None:
     for drone_id, f, frame, result, frame_mission_id, t_start in items:
         try:
@@ -620,6 +639,7 @@ async def _persist_round(items: list) -> None:
             log.warning("ANPR persist error for %s: %s", drone_id, exc)
         _sampler.record(drone_id, infer_ms=result.get("model_ms"),
                         total_ms=(_time.perf_counter() - t_start) * 1000)
+    await _flush_ended_tracks()
 
 
 def _frame_mission(f: dict) -> Optional[str]:
@@ -660,18 +680,14 @@ async def _stream_loop():
                             active_drones.append(d)
                 except Exception:
                     pass
+                await _flush_ended_tracks()     # also when no frames arrive
             try:
                 await _sampler.maybe_publish()
                 # Newest frame per drone; older ones are acked unread and counted as skipped
-                round_frames = await _sampler.next_round(active_drones)
-                if not round_frames:
-                    continue
+                # Decoded in parallel; the next round decodes while this one is on the GPU (B2)
+                decoded = {d: (f, frame, _frame_mission(f))
+                           for d, (f, frame) in (await _sampler.next_decoded(active_drones)).items()}
                 t_start = _time.perf_counter()
-                decoded = {}
-                for drone_id, f in round_frames.items():
-                    frame = await asyncio.to_thread(decode_frame, f)
-                    if frame is not None:
-                        decoded[drone_id] = (f, frame, _frame_mission(f))
                 if not decoded:
                     continue
 
@@ -730,6 +746,10 @@ async def _stream_loop():
                 await asyncio.shield(pending)   # a stream stop must not cut a round half-written
             except Exception:
                 pass
+        try:
+            await _flush_ended_tracks(force=True)
+        except Exception as exc:
+            log.warning("ANPR final writes at stream stop failed: %s", exc)
 
 
 # ── Stream control ─────────────────────────────────────────────────────────────

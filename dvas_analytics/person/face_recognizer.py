@@ -99,6 +99,8 @@ class ArcFaceRecognizer:
         self._session = None
         self._input_name: Optional[str] = None
         self._provider: str = "none"
+        self.errors = 0                     # inference errors since start (plan B5)
+        self.last_error: str = ""
         self.ready = False
 
         self._load_model()
@@ -226,8 +228,17 @@ class ArcFaceRecognizer:
             return embedding
 
         except Exception as exc:
+            self.errors += 1
+            self.last_error = str(exc)[:300]
             log.warning("ArcFace inference error: %s", exc)
             return None
+
+    def status(self) -> dict:
+        """Provider actually in use and inference errors, for the Models page (plan B5)."""
+        provider = {"CUDAExecutionProvider": "cuda", "CPUExecutionProvider": "cpu",
+                    "TensorrtExecutionProvider": "tensorrt"}.get(self._provider, self._provider)
+        return {"ready": self.ready, "provider": provider,
+                "errors": self.errors, "last_error": self.last_error}
 
     def extract_embedding_from_bytes(
         self, image_bytes: bytes, quality_check: bool = True

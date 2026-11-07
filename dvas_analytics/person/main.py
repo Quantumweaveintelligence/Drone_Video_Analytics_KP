@@ -45,14 +45,14 @@ from shared.redis_client import (
     scan_active_stream_drones,
 )
 from shared import minio_client as minio
-from shared import gpu_profile
-from shared.frame_sampler import FrameSampler, decode_frame
+from shared import gpu_profile, persist_gate
+from shared.frame_sampler import FrameSampler
 from shared.annotated_hub import AnnotatedHub, install_stream_route, scale_items, to_display
 from shared.evidence import evidence_block, frame_context, model_info
 from person.analyzer import PersonFaceAnalyzer
 from person.deduplicator import (
     cluster_embeddings, find_duplicates_in_clusters, load_resnet_model,
-    extract_embedding_from_bytes, get_identity_representatives,
+    extract_embedding_from_bytes, extract_embeddings_from_bytes, get_identity_representatives,
     update_cluster_labels_db, update_person_cluster_labels_db, get_sharpness_score,
 )
 from person.schema import FrameAnalysisResult, DeduplicationResult
@@ -88,6 +88,7 @@ _frames_processed = 0
 _reid_frame_counter = 0
 # Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
 _sampler = FrameSampler("person", "person-group", "person-analyzer")
+_gate = persist_gate.TrackGate()   # routine per-track writes (plan B1)
 # Live annotated video (MJPEG, ≤1920 px) for the dashboard
 _hub = AnnotatedHub("person")
 install_stream_route(app, _hub)
@@ -653,106 +654,75 @@ async def _persist_person_frame(
     # ── Database updates (isolated so DB errors don't crash stream) ──
     # No confirmed event per person per frame (B29): the person incident is
     # a face-watchlist match (_process_watchlist_alert).
+    # Track rows: first sighting, then every PERSIST_TRACK_EVERY_S, and at track end (B1).
     try:
         for person in result["persons"]:
             tracker_id = person.get("tracker_id")
             if person["confidence"] >= 0.15:
-                await upsert_track(
-                    drone_id, None, "person", ts, ts,
-                    tracker_id=tracker_id,
-                    mission_id=mission_id,
-                )
+                st = _gate.seen(drone_id, tracker_id, ts, mission_id)
+                if _gate.want_row(st):
+                    st.track_id = await upsert_track(
+                        drone_id, None, "person", ts, ts,
+                        tracker_id=tracker_id,
+                        mission_id=mission_id,
+                    )
     except Exception as db_exc:
         log.warning("Person track/event write error: %s", db_exc)
 
-    # 1. Process whole-body person crops + person appearance embeddings
+    # 1. Whole-body person crops + appearance embeddings (§3: first / better / periodic /
+    #    final per tracked person; untracked boxes only with the analyzer's every-5th crop)
     try:
-        for person in result.get("persons", []):
+        persons = result.get("persons", [])
+        scores = await asyncio.to_thread(
+            lambda: [persist_gate.crop_score(frame, _xyxy(p["bbox"])) if p.get("bbox") else 0.0
+                     for p in persons])
+        uploads = []                            # (tid, crop bytes)
+        for person, score in zip(persons, scores):
             p_crop_bytes = person.pop("crop_bytes", None)
             tid = person.get("tracker_id", 0)
-            if not p_crop_bytes and tid is not None:
-                # Fallback: crop from frame using person bbox
-                pbb = person.get("bbox")
-                if pbb:
-                    h, w = frame.shape[:2]
-                    x1, y1 = max(0, int(pbb["x1"])), max(0, int(pbb["y1"]))
-                    x2, y2 = min(w, int(pbb["x2"])), min(h, int(pbb["y2"]))
-                    if x2 > x1 and y2 > y1:
-                        _, p_buf = cv2.imencode(".jpg", frame[y1:y2, x1:x2], [cv2.IMWRITE_JPEG_QUALITY, 85])
-                        p_crop_bytes = bytes(p_buf)
-
-            if p_crop_bytes and resnet_model:
-                ts_ms = int(ts.timestamp() * 1000)
-                try:
-                    nparr = np.frombuffer(p_crop_bytes, np.uint8)
-                    img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    sharpness = get_sharpness_score(img_bgr) if img_bgr is not None else 0.0
-                except Exception:
-                    sharpness = 0.0
-
-                person_key = minio.make_key(
-                    "persons", drone_id,
-                    f"person_{ts_ms}_{tid}.jpg"
-                )
-                person_obj_key = await minio.upload_bytes(
-                    cfg.BUCKET_FACES, person_key, p_crop_bytes, "image/jpeg"
-                )
-                p_emb = extract_embedding_from_bytes(
-                    resnet_model, p_crop_bytes, resnet_device
-                )
-                if p_emb and person_obj_key:
-                    await write_person_embedding(
-                        track_id=None,
-                        image_path=person_obj_key,
-                        embedding=p_emb,
-                        drone_id=drone_id,
-                        object_key=person_obj_key,
-                        mission_id=mission_id,
-                        tracker_id=tid,
-                        sharpness_score=sharpness,
-                    )
+            if tid is None:
+                continue
+            if tid > 0:
+                st = _gate.seen(drone_id, tid, ts, mission_id)
+                if not _gate.want_crop(st, score):
+                    st.pending = _bbox_crop(frame, person.get("bbox"))   # final crop if it ends now
+                    continue
+                st.pending = None
+                p_crop_bytes = p_crop_bytes or _encode_crop(_bbox_crop(frame, person.get("bbox")))
+            if p_crop_bytes:
+                uploads.append((tid, p_crop_bytes))
+        if uploads and resnet_model:
+            await _store_person_crops(drone_id, mission_id, ts, uploads)
     except Exception as person_exc:
         log.warning("Person appearance embedding write error: %s", person_exc)
 
-    # 2. Process face crops + face embeddings (for Detected Faces gallery)
+    # 2. Face crops + face embeddings (Detected Faces gallery) — every crop, as before;
+    #    ResNet (batched) and ArcFace run in a worker thread, off the event loop (B3)
     try:
-        for face in result.get("faces", []):
-            face_crop_bytes = face.pop("crop_bytes", None)
-            if face_crop_bytes and resnet_model:
-                emb = extract_embedding_from_bytes(
-                    resnet_model, face_crop_bytes, resnet_device
+        faces = [(face, face.pop("crop_bytes", None)) for face in result.get("faces", [])]
+        faces = [(face, b) for face, b in faces if b]
+        if faces and resnet_model:
+            embs = await asyncio.to_thread(_face_embeddings, [b for _, b in faces])
+            for (face, face_crop_bytes), (emb, af_emb) in zip(faces, embs):
+                if not emb:
+                    continue
+                face_ts_ms = int(ts.timestamp() * 1000)
+                key = minio.make_key(
+                    "faces", drone_id,
+                    f"face_{face_ts_ms}.jpg"
                 )
-                if emb:
-                    face_ts_ms = int(ts.timestamp() * 1000)
-                    key = minio.make_key(
-                        "faces", drone_id,
-                        f"face_{face_ts_ms}.jpg"
-                    )
-                    face_obj_key = await minio.upload_bytes(
-                        cfg.BUCKET_FACES, key, face_crop_bytes, "image/jpeg"
-                    )
-                    # Extract ArcFace embedding if available
-                    af_emb = None
-                    if arcface_recognizer and arcface_recognizer.ready:
-                        try:
-                            nparr_f = np.frombuffer(face_crop_bytes, np.uint8)
-                            f_bgr = cv2.imdecode(nparr_f, cv2.IMREAD_COLOR)
-                            if f_bgr is not None:
-                                if cfg.FACE_ENHANCE_ENABLED:
-                                    f_bgr = enhance_face_crop(f_bgr)
-                                af_emb = arcface_recognizer.extract_embedding(f_bgr, quality_check=False)
-                        except Exception:
-                            pass
-
-                    await write_face_embedding(
-                        track_id=None,
-                        image_path=face_obj_key or "",
-                        embedding=emb,
-                        drone_id=drone_id,
-                        object_key=face_obj_key,
-                        mission_id=mission_id,
-                        arcface_embedding=af_emb,
-                    )
+                face_obj_key = await minio.upload_bytes(
+                    cfg.BUCKET_FACES, key, face_crop_bytes, "image/jpeg"
+                )
+                await write_face_embedding(
+                    track_id=None,
+                    image_path=face_obj_key or "",
+                    embedding=emb,
+                    drone_id=drone_id,
+                    object_key=face_obj_key,
+                    mission_id=mission_id,
+                    arcface_embedding=af_emb,
+                )
     except Exception as face_exc:
         log.warning("Face embedding write error: %s", face_exc)
 
@@ -775,6 +745,89 @@ async def _persist_person_frame(
         asyncio.create_task(_safe_task(_run_reid_clustering(), "Face Re-ID Clustering"))
 
 
+def _xyxy(bb: dict) -> tuple:
+    return bb["x1"], bb["y1"], bb["x2"], bb["y2"]
+
+
+def _bbox_crop(frame: np.ndarray, bb: Optional[dict]) -> Optional[np.ndarray]:
+    if not bb:
+        return None
+    h, w = frame.shape[:2]
+    x1, y1 = max(0, int(bb["x1"])), max(0, int(bb["y1"]))
+    x2, y2 = min(w, int(bb["x2"])), min(h, int(bb["y2"]))
+    return frame[y1:y2, x1:x2].copy() if x2 > x1 and y2 > y1 else None
+
+
+def _encode_crop(crop: Optional[np.ndarray]) -> Optional[bytes]:
+    if crop is None:
+        return None
+    ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return bytes(buf) if ok else None
+
+
+def _person_embeddings(crops: list) -> list:
+    """(ResNet embedding, sharpness) per JPEG crop, batched — runs in a worker thread."""
+    embs = extract_embeddings_from_bytes(resnet_model, crops, resnet_device)
+    out = []
+    for b, emb in zip(crops, embs):
+        img = cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR)
+        out.append((emb, get_sharpness_score(img) if img is not None else 0.0))
+    return out
+
+
+def _face_embeddings(crops: list) -> list:
+    """(ResNet embedding, ArcFace embedding or None) per face crop — runs in a worker thread."""
+    embs = extract_embeddings_from_bytes(resnet_model, crops, resnet_device)
+    out = []
+    for b, emb in zip(crops, embs):
+        af_emb = None
+        if emb and arcface_recognizer and arcface_recognizer.ready:
+            try:
+                f_bgr = cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR)
+                if f_bgr is not None:
+                    if cfg.FACE_ENHANCE_ENABLED:
+                        f_bgr = enhance_face_crop(f_bgr)
+                    af_emb = arcface_recognizer.extract_embedding(f_bgr, quality_check=False)
+            except Exception:
+                pass
+        out.append((emb, af_emb))
+    return out
+
+
+async def _store_person_crops(drone_id: str, mission_id: Optional[str], ts, uploads: list) -> None:
+    """Upload person crops and write their appearance embeddings (one batched ResNet call)."""
+    embs = await asyncio.to_thread(_person_embeddings, [b for _, b in uploads])
+    ts_ms = int(ts.timestamp() * 1000)
+    for (tid, crop_bytes), (p_emb, sharpness) in zip(uploads, embs):
+        person_key = minio.make_key("persons", drone_id, f"person_{ts_ms}_{tid}.jpg")
+        person_obj_key = await minio.upload_bytes(cfg.BUCKET_FACES, person_key, crop_bytes, "image/jpeg")
+        if p_emb and person_obj_key:
+            await write_person_embedding(
+                track_id=None,
+                image_path=person_obj_key,
+                embedding=p_emb,
+                drone_id=drone_id,
+                object_key=person_obj_key,
+                mission_id=mission_id,
+                tracker_id=tid,
+                sharpness_score=sharpness,
+            )
+
+
+async def _flush_ended_tracks(force: bool = False) -> None:
+    """Final track row (exact last_seen) and final person crop of tracks that ended (§3)."""
+    for (drone_id, tracker_id), st in _gate.ended(force=force):
+        try:
+            if st.last_ts is not None and st.row_at is not None:
+                await upsert_track(drone_id, None, "person", st.last_ts, st.last_ts,
+                                   tracker_id=tracker_id, mission_id=st.mission_id)
+            crop = await asyncio.to_thread(_encode_crop, st.pending) if st.pending is not None else None
+            if crop and resnet_model and st.last_ts is not None:
+                await _store_person_crops(drone_id, st.mission_id, st.last_ts, [(tracker_id, crop)])
+        except Exception as exc:
+            log.warning("Person final write failed for %s/%s: %s", drone_id, tracker_id, exc)
+
+
 async def _persist_round(items: list) -> None:
     """Per-frame handling of one batch round, drone by drone (keeps per-drone order)."""
     for drone_id, f, frame, result, mission_id, t_start in items:
@@ -784,6 +837,7 @@ async def _persist_round(items: list) -> None:
             log.warning("Person persist error for %s: %s", drone_id, exc)
         _sampler.record(drone_id, infer_ms=result.get("model_ms"),
                         total_ms=(time.perf_counter() - t_start) * 1000)
+    await _flush_ended_tracks()
 
 
 async def _stream_loop():
@@ -813,21 +867,22 @@ async def _stream_loop():
                         _active_drone_missions.pop(d, None)
                         _person_trajectories.pop(d, None)
                         _tracker_last_seen.pop(d, None)
+                await _flush_ended_tracks()     # also when no frames arrive
 
             try:
                 if analyzer is not None:
-                    _sampler.device_info = analyzer.device_info()
+                    _sampler.device_info = {
+                        **analyzer.device_info(),
+                        "arcface": arcface_recognizer.status() if arcface_recognizer else None,
+                    }
                 await _sampler.maybe_publish()
-                round_frames = await _sampler.next_round(active_drones)
+                # Decoded in parallel; the next round decodes while this one is on the GPU (B2)
+                round_frames = await _sampler.next_decoded(active_drones)
                 if not round_frames:
                     continue
                 t_start = time.perf_counter()
                 decoded = {}
-                for drone_id, f in round_frames.items():
-                    frame = await asyncio.to_thread(decode_frame, f)
-                    if frame is None:
-                        continue
-
+                for drone_id, (f, frame) in round_frames.items():
                     _drone_last_frame_ts[drone_id] = time.monotonic()
 
                     # ── Extract mission_id from frame metadata ────────
@@ -875,7 +930,10 @@ async def _stream_loop():
                 await asyncio.shield(pending)   # a stream stop must not cut a round half-written
             except Exception:
                 pass
-
+        try:
+            await _flush_ended_tracks(force=True)
+        except Exception as exc:
+            log.warning("Person final writes at stream stop failed: %s", exc)
 
 
 async def _run_person_reid_clustering():
