@@ -63,8 +63,12 @@ def main():
         archs = torch.cuda.get_arch_list()
         print("GPU", p.name, cc, f"{p.total_memory / 1024**3:.0f} GB")
         print("PyTorch built for:", " ".join(archs))
-        print("  ->", "native kernels for this GPU" if cc in archs else
-              f"!! {cc} NOT in the build list: kernels come from PTX JIT / compatibility paths")
+        # A cubin runs on any GPU of the same major version with an equal or higher minor
+        # (sm_86 code runs natively on an sm_89 L40S); otherwise only PTX JIT is left.
+        native = [a for a in archs if a.startswith("sm_") and len(a) > 4
+                  and int(a[3:-1]) == p.major and int(a[-1]) <= p.minor]
+        print("  ->", f"native kernels for this GPU ({native[-1]})" if native else
+              f"!! no {cc}-compatible kernels in the build: they come from PTX JIT / slow paths")
     print("threads: torch", torch.get_num_threads(), "| cv2", cv2.getNumThreads(),
           "| OMP_NUM_THREADS", os.getenv("OMP_NUM_THREADS"), "| DVAS_CPUS", os.getenv("DVAS_CPUS"))
     print("cudnn.benchmark", torch.backends.cudnn.benchmark, "| DVAS_FP16", os.getenv("DVAS_FP16", "auto"),
@@ -95,7 +99,8 @@ def main():
         img = np.random.randint(0, 255, (2160, 3840, 3), np.uint8)
         img = cv2.GaussianBlur(img, (9, 9), 0)
         jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()
-        print("using a synthetic 3840x2160 frame")
+        print("using a synthetic 3840x2160 frame"
+              + (f" — no frames found for {a.drone} (is it the drone that is streaming?)" if a.drone else ""))
 
     print("\n== stages (median / worst of", a.frames, "frames, ms)")
     frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)

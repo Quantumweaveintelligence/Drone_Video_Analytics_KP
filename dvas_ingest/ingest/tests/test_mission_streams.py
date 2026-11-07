@@ -344,6 +344,27 @@ def test_drain_purges_only_when_every_analyzer_read_everything(client, valkey):
     assert client.get("/ingest/streams/active").json()["count"] == 0
 
 
+def test_switched_off_analyzer_does_not_hold_the_drain(client, valkey, monkeypatch):
+    # crowd read part of the mission once and was switched off; person read everything
+    assert start(client, "DRN-012", "MSN-1").status_code == 201
+    for seq in range(1, 4):
+        assert frame(client, "DRN-012", "MSN-1", seq).status_code == 202
+    key = "mission:frames:MSN-1"
+    valkey.xgroup_create(key, "crowd-group", id="0")
+    valkey.xreadgroup("crowd-group", "crowd-analyzer", {key: ">"}, count=1)
+    valkey.xack(key, "crowd-group", *[e[0] for e in valkey.xrange(key, count=1)])
+    assert end(client, "DRN-012", "MSN-1").status_code == 200
+    stop_drain(client, "MSN-1")
+    consume_all(valkey, key)                 # person-group (fresh consumer)
+    assert finalize(client, "MSN-1") is None                            # crowd still counts
+    monkeypatch.setattr(qm, "QUEUE_READER_IDLE_S", 0.2)
+    import time as _t
+    _t.sleep(0.3)
+    valkey.xreadgroup("person-group", "c1", {key: ">"}, count=1)       # person polls on
+    assert finalize(client, "MSN-1") == "finalized"
+    assert valkey.exists(key) == 0
+
+
 def test_cleanup_pass_drains_after_restart_and_skips_live(client, valkey):
     # a draining mission without a monitor (ingest restarted) and a live one, both read fully
     assert start(client, "DRN-1", "MSN-1").status_code == 201

@@ -28,7 +28,7 @@ from shared.db import (
     close_pool, ensure_drone, get_pool, upsert_track,
     write_confirmed_event, get_all_face_embeddings, delete_face_embeddings,
     write_face_embedding, update_face_embedding_cluster,
-    write_person_embedding, get_all_person_embeddings, get_person_embeddings_by_mission,
+    write_person_embedding, get_person_embeddings_by_mission,
     update_person_embedding_cluster, get_distinct_missions_person_embeddings,
     write_evidence_frame, get_person_identities, upsert_person_identity,
     get_face_embeddings_by_mission, get_distinct_missions_face_embeddings,
@@ -50,6 +50,7 @@ from shared.frame_sampler import FrameSampler
 from shared.annotated_hub import AnnotatedHub, install_stream_route, scale_items, to_display
 from shared.evidence import evidence_block, frame_context, model_info
 from person.analyzer import PersonFaceAnalyzer
+from person import reid
 from person.deduplicator import (
     cluster_embeddings, find_duplicates_in_clusters, load_resnet_model,
     extract_embedding_from_bytes, extract_embeddings_from_bytes, get_identity_representatives,
@@ -85,7 +86,7 @@ _stream_task:  Optional[asyncio.Task] = None
 _reid_task:    Optional[asyncio.Task] = None
 _stream_running = False
 _frames_processed = 0
-_reid_frame_counter = 0
+_reid_last_run = 0.0
 # Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
 _sampler = FrameSampler("person", "person-group", "person-analyzer")
 _gate = persist_gate.TrackGate()   # routine per-track writes (plan B1)
@@ -537,7 +538,7 @@ async def _persist_person_frame(
     """Recognition, annotation, live buffer, DB/MinIO writes and publish for one
     analysed frame. Runs as a task while the next round is on the GPU; it only
     touches service state (never the analyzer / its models)."""
-    global _frames_processed, _reid_frame_counter
+    global _frames_processed, _reid_last_run
     # Tag result with mission_id for downstream consumers
     result["mission_id"] = mission_id
 
@@ -732,15 +733,15 @@ async def _persist_person_frame(
         log.warning("Failed to publish analytics result: %s", pub_exc)
 
     _frames_processed += 1
-    _reid_frame_counter += 1
 
     # Periodic cleanup of alert deduplicator cooldown state
     if alert_deduplicator and _frames_processed % 100 == 0:
         alert_deduplicator.cleanup()
 
     # Periodic re-ID clustering for both Persons and Faces
-    if _reid_frame_counter >= cfg.REID_CLUSTER_INTERVAL:
-        _reid_frame_counter = 0
+    # Re-ID clustering on a timer, per mission (was every 50 frames over every embedding)
+    if time.monotonic() - _reid_last_run >= cfg.REID_CLUSTER_EVERY_S:
+        _reid_last_run = time.monotonic()
         asyncio.create_task(_safe_task(_run_person_reid_clustering(), "Person Re-ID Clustering"))
         asyncio.create_task(_safe_task(_run_reid_clustering(), "Face Re-ID Clustering"))
 
@@ -937,68 +938,23 @@ async def _stream_loop():
 
 
 async def _run_person_reid_clustering():
-    """Background Person Re-ID clustering on whole-body person embeddings with re-entrancy lock."""
+    """Person Re-ID clustering, per mission (person/reid.py); one pass at a time."""
     if _person_clustering_lock.locked():
         return
     async with _person_clustering_lock:
         try:
-            rows = await get_all_person_embeddings()
-            if len(rows) < 2:
-                if len(rows) == 1:
-                    r = rows[0]
-                    await upsert_person_identity(
-                        cluster_id=0,
-                        best_image_key=None,
-                        drone_id=r.get("drone_id"),
-                        embedding_count=1,
-                        best_person_image_key=r.get("object_key"),
-                        mission_id=r.get("mission_id"),
-                    )
-                return
-
-            ids = [str(r["id"]) for r in rows]
-            embeddings = [list(r["embedding"]) for r in rows]
-            sharpness_scores = [float(r.get("sharpness_score") or 0.0) for r in rows]
-
-            labels = await asyncio.to_thread(cluster_embeddings, embeddings, cfg.REID_DISTANCE_THRESHOLD)
-            duplicate_ids, unique_count = await asyncio.to_thread(find_duplicates_in_clusters, ids, labels, sharpness_scores)
-            dup_set = set(duplicate_ids)
-            await update_person_cluster_labels_db(ids, labels, dup_set)
-
-            # Upsert person identities from best representative whole-body crops
-            reps = get_identity_representatives(ids, labels, sharpness_scores)
-            for cluster_id, rep_id in reps.items():
-                rep_row = next((r for r in rows if str(r["id"]) == rep_id), None)
-                if rep_row and rep_row.get("object_key"):
-                    await upsert_person_identity(
-                        cluster_id=cluster_id,
-                        best_image_key=None,
-                        drone_id=rep_row.get("drone_id"),
-                        embedding_count=sum(1 for l in labels if l == cluster_id),
-                        best_person_image_key=rep_row.get("object_key"),
-                        mission_id=rep_row.get("mission_id"),
-                    )
-            log.info("Person Re-ID clustering: %d person embeddings → %d unique person identities", len(rows), unique_count)
+            await reid.recluster("person")
         except Exception as exc:
             log.warning("Person Re-ID clustering failed: %s", exc)
 
 
 async def _run_reid_clustering():
-    """Background Face Re-ID clustering with re-entrancy lock."""
+    """Face Re-ID clustering, per mission (person/reid.py); one pass at a time."""
     if _face_clustering_lock.locked():
         return
     async with _face_clustering_lock:
         try:
-            rows = await get_all_face_embeddings()
-            if len(rows) < 2:
-                return
-            ids        = [str(r["id"]) for r in rows]
-            embeddings = [list(r["embedding"]) for r in rows]
-            labels = await asyncio.to_thread(cluster_embeddings, embeddings, cfg.REID_DISTANCE_THRESHOLD)
-            duplicate_ids, unique_count = await asyncio.to_thread(find_duplicates_in_clusters, ids, labels)
-            dup_set = set(duplicate_ids)
-            await update_cluster_labels_db(ids, labels, dup_set)
-            log.info("Face Re-ID clustering: %d embeddings → %d clusters", len(rows), unique_count)
+            await reid.recluster("face")
         except Exception as exc:
             log.warning("Face Re-ID clustering failed: %s", exc)
 

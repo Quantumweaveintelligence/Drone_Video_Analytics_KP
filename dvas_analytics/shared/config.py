@@ -54,7 +54,10 @@ class Config:
     DETECTION_CONFIDENCE:  float = float(os.getenv("DETECTION_CONFIDENCE", "0.25"))
 
     # ── Re-ID / deduplication ──────────────────────────────────────────────
-    REID_CLUSTER_INTERVAL: int   = int(os.getenv("REID_CLUSTER_INTERVAL", "50"))   # re-cluster every N frames
+    # Re-ID clustering runs per mission on a timer (person/reid.py); a mission larger than
+    # REID_CLUSTER_MAX embeddings gets new ones assigned to its clusters instead of a full re-run
+    REID_CLUSTER_EVERY_S:  float = float(os.getenv("REID_CLUSTER_EVERY_S", "60"))
+    REID_CLUSTER_MAX:      int   = int(os.getenv("REID_CLUSTER_MAX", "3000"))
     REID_DISTANCE_THRESHOLD: float = float(os.getenv("REID_DISTANCE_THRESHOLD", "0.25"))
     USE_PGVECTOR:          bool  = os.getenv("USE_PGVECTOR", "false").lower() == "true"
 

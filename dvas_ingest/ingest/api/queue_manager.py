@@ -65,6 +65,15 @@ except ValueError:          # a bad template value must not stop ingest
     QUEUE_MEM_GUARD_PCT = 85.0
 _MEM_CHECK_S = 2.0
 
+# A consumer group counts as a reader of a stream only while one of its consumers has
+# touched it within this many seconds. A service that was switched off keeps its consumer
+# entry for ever; it must not hold a mission's stream from draining (or the drone's
+# "frames left" up). Covers service restarts and model loading with room to spare.
+try:
+    QUEUE_READER_IDLE_S = max(10.0, float(os.getenv("QUEUE_READER_IDLE_S", "300")))
+except ValueError:
+    QUEUE_READER_IDLE_S = 300.0
+
 # Phase 2a: one stream per mission (default) or the legacy one stream per drone (rollback).
 STREAM_KEY_MODE = (os.getenv("STREAM_KEY_MODE", "mission") or "mission").strip().lower()
 if STREAM_KEY_MODE not in ("mission", "drone"):
@@ -284,7 +293,8 @@ class QueueManager:
         Valkey's `lag` is not used: it becomes null once MAXLEN trimming passes a group's
         position (every long mission), and a null lag used to count as "caught up" — the
         stream was deleted while an analyzer still had hundreds of frames to read.
-        Groups without consumers (e.g. the placeholder "analytics" group) are ignored.
+        Groups without consumers (e.g. the placeholder "analytics" group), and groups whose
+        consumers have not read for QUEUE_READER_IDLE_S (service switched off), are ignored.
         """
         if not self._connected:
             await self.connect()
@@ -295,7 +305,7 @@ class QueueManager:
                 return True
             groups = await self._client.xinfo_groups(stream_key)
             last_id = await self._last_id(stream_key, ref)
-            readers = [g for g in groups if int(g.get("consumers", 0) or 0) > 0]
+            readers = await self._active_groups(stream_key, groups)
             if not readers or last_id is None:
                 return False
             for g in readers:
@@ -308,6 +318,23 @@ class QueueManager:
         except Exception as exc:
             log.debug("is_fully_consumed check failed for %s: %s", ref, exc)
             return False
+
+    async def _active_groups(self, stream_key: str, groups: list) -> list:
+        """Groups with a consumer that read within QUEUE_READER_IDLE_S."""
+        out = []
+        for g in groups:
+            if int(g.get("consumers", 0) or 0) == 0:
+                continue
+            name = g.get("name")
+            name = name.decode() if isinstance(name, bytes) else str(name)
+            try:
+                consumers = await self._client.xinfo_consumers(stream_key, name)
+                idle_ms = min(int(c.get("idle", 0) or 0) for c in consumers) if consumers else None
+            except Exception:
+                idle_ms = 0                     # cannot tell: count it (never drain too early)
+            if idle_ms is not None and idle_ms <= QUEUE_READER_IDLE_S * 1000:
+                out.append(g)
+        return out
 
     async def remaining_frames(self, ref: str) -> int:
         """Frames the slowest analyzer still has to process (stream length if none reads it).
@@ -327,7 +354,7 @@ class QueueManager:
         return value
 
     async def unread_frames(self, ref: str) -> Dict[str, int]:
-        """{group: frames not yet analysed} for groups with consumers (pending + undelivered).
+        """{group: frames not yet analysed} for groups still being read (pending + undelivered).
 
         The stream length alone is not "remaining": it also counts frames every analyzer
         has already processed.
@@ -339,9 +366,7 @@ class QueueManager:
             length = int(await self._client.xlen(stream_key) or 0)
             last_id = await self._last_id(stream_key, ref)
             first_id = None
-            for g in groups:
-                if int(g.get("consumers", 0) or 0) == 0:
-                    continue
+            for g in await self._active_groups(stream_key, groups):
                 name = g.get("name")
                 name = name.decode() if isinstance(name, bytes) else str(name)
                 pending = int(g.get("pending", 0) or 0)

@@ -184,6 +184,18 @@ and the "done when" fps targets. Phase 2 as built:
 - B5: the Models page shows ArcFace's execution provider and inference errors.
 - D6: nginx limits ingest per bearer token (150 r/s, burst 300) plus 600 r/s per client IP.
 
+**Phase 0 on the pod (2026-11-07, L40S, image `20261107-9e9ceda`):** the GPU and PyTorch are
+fine (FP16 matmul 226 TFLOP/s; sm_86 kernels run natively on the L40S's sm_89 — Phase 1b not
+needed there). Person + face model work is ≈ 60–80 ms per frame, but frames took 113–1219 ms
+with the GPU at 0–7 %: Re-ID clustering ran every 50 frames over every embedding ever stored
+(32,600 person / 25,500 face rows), back to back, decrypting on the event loop and writing each
+label with its own UPDATE. Fixed in `person/reid.py`: per mission, every 60 s, only missions
+with new embeddings; full re-clustering up to 3,000 embeddings per mission (≈ 6 s in a worker
+thread, ≤ 0.1 s event-loop stall), nearest-centroid assignment beyond; stable cluster ids,
+batched writes. Also found: a consumer group of a switched-off service (crowd) kept a mission's
+stream from draining — ingest now ignores groups idle longer than `QUEUE_READER_IDLE_S` (300 s).
+Note: clusters no longer span missions (identities were already per mission).
+
 ### Phase 0 — Measure on the pod (½ day, no code change on the pod)
 
 `deploy/runpod/tools/bench_person.py` (added; read-only, loads its own model copy) reports the
