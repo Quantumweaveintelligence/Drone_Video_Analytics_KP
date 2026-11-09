@@ -4,7 +4,8 @@
 ; Compile with:
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DClientSecret=xxx /DEdgeApiKey=yyy ^
 ;       [/DIngestPassword=zzz] [/DDefaultIngestUrl=https://<pod>-80.proxy.runpod.net] dvas_edge_installer.iss
-; ClientSecret and EdgeApiKey are required (the build stops without them).
+; ClientSecret is required (the build stops without it). Leave EdgeApiKey unset: each laptop
+; then generates its own random key on first start.
 ; ============================================================
 
 #define AppName      "Kerala Police DVAS Edge Operator"

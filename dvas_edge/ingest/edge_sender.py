@@ -182,6 +182,8 @@ class IngestClient:
         Fetch a new token from Keycloak using the Resource Owner Password
         Credentials Grant (direct access) using machine credentials.
         """
+        if not self._ep().token:
+            raise RuntimeError("Keycloak token URL not configured in the install (edge.env)")
         async with httpx.AsyncClient(timeout=10.0, verify=_tls_param()) as client:
             resp = await client.post(
                 self._ep().token,

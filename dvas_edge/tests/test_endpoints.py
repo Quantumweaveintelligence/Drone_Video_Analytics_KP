@@ -57,3 +57,9 @@ def test_plain_http_refused_unless_lan_flag(monkeypatch) -> None:
     with pytest.raises(InvalidIngestURL):
         normalize_base("http://attacker.example")
     assert normalize_base(POD) == POD
+
+
+def test_install_config_may_use_http_without_flag(monkeypatch) -> None:
+    monkeypatch.setenv("DVAS_ALLOW_HTTP_INGEST", "false")
+    monkeypatch.setenv("INGEST__BASE_URL", "http://10.0.0.5:8000")
+    assert IngestEndpoints.from_env().base == "http://10.0.0.5:8000"     # LAN install upgrade keeps working

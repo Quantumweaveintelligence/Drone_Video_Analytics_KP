@@ -35,6 +35,7 @@ import subprocess
 import json
 import copy
 import re
+import hmac
 import math
 import random
 from typing import Optional, Union
@@ -449,7 +450,7 @@ def _ingest_endpoints() -> Optional[IngestEndpoints]:
             return installed
         # The Keycloak token URL (where the client secret / laptop password are sent) is
         # pinned to the install configuration; an edited setting can never redirect it.
-        return replace(ep, token=installed.token) if installed else ep
+        return replace(ep, token=installed.token if installed else "")
     return installed
 
 
@@ -1281,7 +1282,7 @@ async def verify_edge_auth(
     3. Validates dvas_access_token Cookie or query param ?token= (Officer Browser / Stream)
     """
     # 1. API Key Header Match
-    if x_edge_api_key and EDGE_API_KEY and x_edge_api_key == EDGE_API_KEY:
+    if x_edge_api_key and EDGE_API_KEY and hmac.compare_digest(x_edge_api_key, EDGE_API_KEY):
         return {"auth_type": "api_key", "role": "edge_m2m"}
 
     # 2. Extract Bearer / Query / Cookie Token
@@ -1295,7 +1296,7 @@ async def verify_edge_auth(
         bearer_token = request.cookies.get("dvas_access_token")
 
     if bearer_token:
-        if EDGE_API_KEY and bearer_token == EDGE_API_KEY:
+        if EDGE_API_KEY and hmac.compare_digest(bearer_token, EDGE_API_KEY):
             return {"auth_type": "token_match", "role": "edge_m2m"}
         try:
             from jose import jwt as jose_jwt

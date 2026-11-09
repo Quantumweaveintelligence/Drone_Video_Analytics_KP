@@ -22,10 +22,12 @@ import http.cookiejar
 import logging
 import os
 import pathlib
+import posixpath
 import socket
 import sys
 import threading
 import webbrowser
+from typing import Optional
 from urllib.parse import urlsplit
 
 # ── Paths & imports from the edge package ─────────────────────────────────────
@@ -141,16 +143,21 @@ client = httpx.AsyncClient(
 )
 
 
+_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _is_local(host_header: Optional[str]) -> bool:
+    return (urlsplit("//" + (host_header or "")).hostname or "") in _LOCAL_HOSTS
+
+
 @app.middleware("http")
 async def _local_origin_only(request: Request, call_next):
     """Block DNS rebinding (foreign Host) and cross-site writes (foreign Origin)."""
-    host = (request.headers.get("host") or "").split(":")[0].lower()
-    if host not in ("localhost", "127.0.0.1", "[::1]"):
+    if not _is_local(request.headers.get("host")):
         return JSONResponse({"detail": "Forbidden host"}, status_code=403)
     origin = request.headers.get("origin")
     if origin and request.method not in ("GET", "HEAD", "OPTIONS"):
-        o_host = urlsplit(origin).hostname or ""
-        if o_host not in ("localhost", "127.0.0.1", "::1"):
+        if (urlsplit(origin).hostname or "") not in _LOCAL_HOSTS:
             return JSONResponse({"detail": "Forbidden origin"}, status_code=403)
     return await call_next(request)
 
@@ -206,7 +213,7 @@ async def launcher_health():
 @app.api_route("/edge-api/{path:path}", methods=METHODS)
 async def edge_core(path: str, request: Request):
     """Proxy to the local edge core on the dynamically assigned core port."""
-    if path.lstrip("/").lower().startswith("internal"):
+    if posixpath.normpath("/" + path).lower().startswith("/internal") or ".." in path.split("/"):
         return JSONResponse({"detail": "Not Found"}, status_code=404)
     target_core = getattr(request.app.state, "core_url", CORE)
     try:
@@ -218,6 +225,10 @@ async def edge_core(path: str, request: Request):
 @app.websocket("/api/ws")
 async def ws_proxy(ws: WebSocket):
     """Bidirectional WebSocket proxy to the cloud backend."""
+    origin = ws.headers.get("origin")
+    if not _is_local(ws.headers.get("host")) or (origin and (urlsplit(origin).hostname or "") not in _LOCAL_HOSTS):
+        await ws.close(code=1008)
+        return
     await ws.accept()
     target = (
         CLOUD.replace("https://", "wss://").replace("http://", "ws://")

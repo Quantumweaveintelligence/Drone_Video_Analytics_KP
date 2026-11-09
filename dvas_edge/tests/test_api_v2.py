@@ -104,3 +104,9 @@ def test_cors_rejects_foreign_origin(core) -> None:
     _, client = core
     r = client.get("/api/edge/snapshot", headers={**HDR, "Origin": "https://evil.example"})
     assert r.headers.get("access-control-allow-origin") is None
+
+
+def test_no_token_url_without_install_config(core, monkeypatch) -> None:
+    mod, client = core
+    client.post("/api/edge/settings", headers=HDR, json={"transmission": {"ingest_base_url": "https://other-host.example"}})
+    assert mod._ingest_endpoints().token == ""

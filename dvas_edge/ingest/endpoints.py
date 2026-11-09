@@ -24,13 +24,15 @@ class InvalidIngestURL(ValueError):
     """The entered URL cannot be used as an ingest base URL."""
 
 
-def normalize_base(url: str) -> str:
-    """Return scheme://host[:port] for an entered ingest URL, or raise InvalidIngestURL."""
+def normalize_base(url: str, allow_http: bool = False) -> str:
+    """Return scheme://host[:port] for an entered ingest URL, or raise InvalidIngestURL.
+
+    allow_http: True only for the install configuration (edge.env), never for edited settings."""
     raw = (url or "").strip().rstrip("/")
     parts = urlsplit(raw)
     if parts.scheme not in ("http", "https"):
         raise InvalidIngestURL("URL must start with http:// or https://")
-    if parts.scheme == "http" and os.getenv("DVAS_ALLOW_HTTP_INGEST", "false").lower() != "true":
+    if parts.scheme == "http" and not allow_http and os.getenv("DVAS_ALLOW_HTTP_INGEST", "false").lower() != "true":
         raise InvalidIngestURL("https:// is required (plain http only on LAN installs with DVAS_ALLOW_HTTP_INGEST=true)")
     if not parts.hostname:
         raise InvalidIngestURL("URL has no host")
@@ -64,8 +66,8 @@ class IngestEndpoints:
         return self.base.startswith("https://")
 
     @classmethod
-    def from_base(cls, url: str) -> "IngestEndpoints":
-        base = normalize_base(url)
+    def from_base(cls, url: str, allow_http: bool = False) -> "IngestEndpoints":
+        base = normalize_base(url, allow_http)
         ws_base = "wss://" + base[len("https://"):] if base.startswith("https://") else "ws://" + base[len("http://"):]
         return cls(
             base=base,
@@ -84,6 +86,6 @@ class IngestEndpoints:
         url = os.getenv("INGEST__BASE_URL") or os.getenv("INGEST__URL") or os.getenv("INGEST_URL")
         if not url:
             return None
-        endpoints = cls.from_base(url)
+        endpoints = cls.from_base(url, allow_http=True)
         token = os.getenv("INGEST__TOKEN_URL")   # LAN installs reach Keycloak directly on :8080
         return replace(endpoints, token=token) if token else endpoints

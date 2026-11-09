@@ -57,3 +57,14 @@ def test_gateway_client_never_stores_or_replays_cloud_cookies(gateway) -> None:
 def test_foreign_host_or_origin_blocked(gateway, headers, method) -> None:
     tc, _ = gateway
     assert tc.request(method, "/api/me", headers=headers).status_code == 403
+
+
+@pytest.mark.parametrize("path", ["internal/shutdown", "x/../internal/shutdown", "a/./../internal/shutdown"])
+def test_internal_routes_unreachable_through_gateway(gateway, path) -> None:
+    tc, _ = gateway
+    assert tc.post(f"/edge-api/{path}").status_code == 404
+
+
+def test_ipv6_loopback_host_accepted(gateway) -> None:
+    tc, _ = gateway
+    assert tc.get("/edge-launcher/health", headers={"host": "[::1]:8765"}).status_code == 200
