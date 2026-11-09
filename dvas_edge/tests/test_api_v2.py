@@ -89,3 +89,18 @@ def test_no_fabricated_system_logs(core) -> None:
     messages = " ".join(e["message"] for e in mod.SYSTEM_LOGS_DEQUE)
     for fake in ("RTMP connected", "Battery: 78%", "Temp: 54", "ACK received", "14 satellites"):
         assert fake not in messages
+
+
+def test_token_url_cannot_be_redirected_by_settings(core, monkeypatch) -> None:
+    mod, client = core
+    monkeypatch.setenv("INGEST__BASE_URL", "https://installed-pod-80.proxy.runpod.net")
+    client.post("/api/edge/settings", headers=HDR, json={"transmission": {"ingest_base_url": "https://other-host.example"}})
+    ep = mod._ingest_endpoints()
+    assert ep.frame.startswith("https://other-host.example")
+    assert ep.token.startswith("https://installed-pod-80.proxy.runpod.net/realms/")
+
+
+def test_cors_rejects_foreign_origin(core) -> None:
+    _, client = core
+    r = client.get("/api/edge/snapshot", headers={**HDR, "Origin": "https://evil.example"})
+    assert r.headers.get("access-control-allow-origin") is None

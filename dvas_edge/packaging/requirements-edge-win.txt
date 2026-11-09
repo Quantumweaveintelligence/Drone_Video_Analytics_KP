@@ -53,4 +53,4 @@ websockets>=11.0
 
 # v2: windowless launcher tray icon, H.264 video uplink (pinned)
 pystray==0.19.5
-av==19.0.2
+av==18.1.0

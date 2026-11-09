@@ -26,6 +26,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Deque, Optional
+from urllib.parse import urlencode
 
 import websockets
 from websockets.asyncio.client import connect
@@ -81,7 +82,7 @@ class VideoUplink:
         on_fallback: Callable[[bool], None] = lambda _active: None,
         on_error: Callable[[str], None] = lambda _msg: None,
     ) -> None:
-        self._url = f"{url}?drone_id={drone_id}&mission_id={mission_id}"
+        self._url = f"{url}?{urlencode({'drone_id': drone_id, 'mission_id': mission_id})}"
         self._client = client
         self._drone_id = drone_id
         self._mission_id = mission_id

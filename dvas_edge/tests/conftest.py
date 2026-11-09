@@ -12,6 +12,7 @@ from typing import List
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from src.video.drone_video_source import VideoFrame
 
@@ -60,3 +61,9 @@ def make_mock_cap(
 
     cap.read.side_effect = _read
     return cap
+
+
+@pytest.fixture(autouse=True)
+def _allow_http_test_servers(monkeypatch):
+    """Test servers run on plain http://127.0.0.1; production requires https (see test_endpoints)."""
+    monkeypatch.setenv("DVAS_ALLOW_HTTP_INGEST", "true")

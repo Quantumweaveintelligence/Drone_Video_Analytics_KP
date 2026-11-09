@@ -30,6 +30,8 @@ def normalize_base(url: str) -> str:
     parts = urlsplit(raw)
     if parts.scheme not in ("http", "https"):
         raise InvalidIngestURL("URL must start with http:// or https://")
+    if parts.scheme == "http" and os.getenv("DVAS_ALLOW_HTTP_INGEST", "false").lower() != "true":
+        raise InvalidIngestURL("https:// is required (plain http only on LAN installs with DVAS_ALLOW_HTTP_INGEST=true)")
     if not parts.hostname:
         raise InvalidIngestURL("URL has no host")
     if parts.username or parts.password:

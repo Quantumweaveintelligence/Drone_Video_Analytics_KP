@@ -18,7 +18,8 @@
   #error ClientSecret not set. Build with: ISCC.exe /DClientSecret=... /DEdgeApiKey=... dvas_edge_installer.iss
 #endif
 #ifndef EdgeApiKey
-  #error EdgeApiKey not set. Build with: ISCC.exe /DClientSecret=... /DEdgeApiKey=... dvas_edge_installer.iss
+  ; Empty: each laptop generates its own random key on first start (stored with DPAPI)
+  #define EdgeApiKey ""
 #endif
 #ifndef IngestPassword
   #define IngestPassword ""
@@ -140,7 +141,11 @@ begin
       if Pos('https://', LowerUrl) = 1 then
         Lines.Add('INGEST__TLS_VERIFY=true')
       else
+      begin
         Lines.Add('INGEST__TLS_VERIFY=false');
+        Lines.Add('# Plain http accepted only because the installer was given an http:// LAN address');
+        Lines.Add('DVAS_ALLOW_HTTP_INGEST=true');
+      end;
       Lines.Add('EDGE_API_KEY={#EdgeApiKey}');
       Lines.Add('REQUIRE_EDGE_AUTH=true');
       Lines.Add('# Local ports (auto-detects free port if busy)');

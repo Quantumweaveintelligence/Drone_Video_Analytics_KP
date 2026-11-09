@@ -92,6 +92,16 @@ class RedactingFilter(logging.Filter):
         return True
 
 
+class RedactingFormatter(logging.Formatter):
+    """Redacts the final text, so exception tracebacks (exc_info) are covered too."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact(super().format(record))
+
+
+LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s  %(message)s"
+
+
 def build_handlers(log_file: Optional[str]) -> list:
     """Console handler only when a console exists (not under pythonw), plus a rotating file."""
     handlers: list[logging.Handler] = []
@@ -102,6 +112,7 @@ def build_handlers(log_file: Optional[str]) -> list:
         handlers.append(RotatingFileHandler(log_file, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8"))
     for h in handlers:
         h.addFilter(RedactingFilter())
+        h.setFormatter(RedactingFormatter(LOG_FORMAT))
     return handlers
 
 

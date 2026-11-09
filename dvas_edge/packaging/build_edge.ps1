@@ -16,6 +16,16 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Run a native tool: success is its exit code, not stderr (PowerShell 5.1 turns any
+# stderr line of a native command into a terminating error under "Stop").
+function Invoke-Native([scriptblock]$Command, [string]$What) {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { & $Command 2>&1 | ForEach-Object { Write-Host "  $_" } }
+    finally { $ErrorActionPreference = $prev }
+    if ($LASTEXITCODE -ne 0) { throw "$What failed (exit $LASTEXITCODE)" }
+}
 Set-StrictMode -Version Latest
 
 # Paths
@@ -81,7 +91,7 @@ if (-not (Test-Path $getPip)) {
 Write-Host "  pip installed"
 
 $reqFile = Join-Path $ScriptDir "requirements-edge-win.txt"
-& $python -m pip install --no-warn-script-location -r $reqFile 2>&1 | ForEach-Object { Write-Host "  $_" }
+Invoke-Native { & $python -m pip install --no-warn-script-location -r $reqFile } "pip install"
 Write-Host "  All dependencies installed"
 
 # Step 4: Copy application code
@@ -140,7 +150,7 @@ if ($SkipFrontend) {
             $env:REACT_APP_DEPLOYMENT_TARGET = "edge"
             $env:REACT_APP_BACKEND_URL = ""
             $env:GENERATE_SOURCEMAP = "false"
-            & npm run build 2>&1 | ForEach-Object { Write-Host "  $_" }
+            Invoke-Native { & npm run build } "frontend build"
 
             $buildOut = Join-Path $FrontendDir "build"
             if (Test-Path $buildOut) {

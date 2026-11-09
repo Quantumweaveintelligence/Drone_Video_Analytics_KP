@@ -18,6 +18,7 @@ Start with --console (python.exe) to also see logs in a terminal for support.
 from __future__ import annotations
 
 import asyncio
+import http.cookiejar
 import logging
 import os
 import pathlib
@@ -25,6 +26,7 @@ import socket
 import sys
 import threading
 import webbrowser
+from urllib.parse import urlsplit
 
 # ── Paths & imports from the edge package ─────────────────────────────────────
 APP_DIR  = pathlib.Path(__file__).resolve().parent
@@ -120,11 +122,37 @@ def is_dvas_edge_running(port: int) -> bool:
 
 # ── FastAPI App ───────────────────────────────────────────────────────────────
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+class _NoCookieJar(http.cookiejar.CookieJar):
+    """The gateway is shared by every local client: it must never keep one officer's
+    session cookie and replay it for the next request. Cookies stay in each browser."""
+
+    def set_cookie(self, cookie) -> None:
+        return None
+
+    def extract_cookies(self, response, request) -> None:
+        return None
+
+
 client = httpx.AsyncClient(
     timeout=httpx.Timeout(30.0, read=None),
     verify=True,
-    follow_redirects=True,
+    follow_redirects=False,
+    cookies=_NoCookieJar(),
 )
+
+
+@app.middleware("http")
+async def _local_origin_only(request: Request, call_next):
+    """Block DNS rebinding (foreign Host) and cross-site writes (foreign Origin)."""
+    host = (request.headers.get("host") or "").split(":")[0].lower()
+    if host not in ("localhost", "127.0.0.1", "[::1]"):
+        return JSONResponse({"detail": "Forbidden host"}, status_code=403)
+    origin = request.headers.get("origin")
+    if origin and request.method not in ("GET", "HEAD", "OPTIONS"):
+        o_host = urlsplit(origin).hostname or ""
+        if o_host not in ("localhost", "127.0.0.1", "::1"):
+            return JSONResponse({"detail": "Forbidden origin"}, status_code=403)
+    return await call_next(request)
 
 
 # ── Proxy helpers ─────────────────────────────────────────────────────────────
@@ -327,6 +355,7 @@ def main():
     # 3. Secrets: plain text in edge.env -> DPAPI store, then into this process env
     try:
         credentials.migrate(ENV_FILE, SECRETS_FILE)
+        credentials.ensure_edge_api_key(SECRETS_FILE)
         credentials.apply(SECRETS_FILE)
     except OSError as exc:
         log.error("credential_store_unavailable: %s", exc)

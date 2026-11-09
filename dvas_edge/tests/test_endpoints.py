@@ -50,3 +50,10 @@ def test_from_env_v1_key_and_unset(monkeypatch) -> None:
     assert IngestEndpoints.from_env() is None
     monkeypatch.setenv("INGEST__URL", POD + "/ingest/frame")
     assert IngestEndpoints.from_env().base == POD
+
+
+def test_plain_http_refused_unless_lan_flag(monkeypatch) -> None:
+    monkeypatch.setenv("DVAS_ALLOW_HTTP_INGEST", "false")
+    with pytest.raises(InvalidIngestURL):
+        normalize_base("http://attacker.example")
+    assert normalize_base(POD) == POD

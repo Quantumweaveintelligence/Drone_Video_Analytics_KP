@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 from pathlib import Path
 from typing import Dict, List
 
@@ -61,6 +62,16 @@ def migrate(env_file: Path, store: Path) -> List[str]:
     tmp.replace(env_file)                           # ... then remove the plain text
     log.info("secrets_moved_to_dpapi names=%s", sorted(found))
     return sorted(found)
+
+
+def ensure_edge_api_key(store: Path) -> None:
+    """A random per-laptop EDGE_API_KEY when none was provisioned (never a shared default)."""
+    stored = dpapi.load_secrets(store)
+    if stored.get("EDGE_API_KEY") or os.environ.get("EDGE_API_KEY"):
+        return
+    stored["EDGE_API_KEY"] = secrets.token_urlsafe(32)
+    dpapi.save_secrets(store, stored)
+    log.info("edge_api_key_generated_per_laptop")
 
 
 def apply(store: Path) -> None:

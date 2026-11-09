@@ -17,6 +17,7 @@ include = [
     "tests/test_logging_and_credentials.py",
     "tests/test_supervisor.py",
     "tests/test_api_v2.py",
+    "tests/test_launcher_gateway.py",
     "ingest/ts_muxer.py",
     "ingest/video_uplink.py",
     "src/buffer/packet_ring.py",

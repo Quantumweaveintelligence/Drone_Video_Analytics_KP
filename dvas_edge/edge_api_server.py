@@ -45,6 +45,7 @@ import psutil
 from fastapi import FastAPI, Depends, HTTPException, Request, Header, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
+from starlette.background import BackgroundTask
 import shutil
 from pathlib import Path
 from pydantic import BaseModel
@@ -208,6 +209,7 @@ from ingest.edge_sender import IngestClient
 from ingest.offline_buffer import OfflineBuffer
 from ingest.seq_store import SeqStore
 from ingest.endpoints import IngestEndpoints, InvalidIngestURL, normalize_base
+from dataclasses import replace
 from ingest.video_uplink import StreamInfo, VideoUplink
 from src.video.uplink_source import UplinkVideoSource, _source_kind
 
@@ -438,12 +440,17 @@ def _ingest_endpoints() -> Optional[IngestEndpoints]:
     """Endpoints from the operator's ingest URL (Settings), else from edge.env."""
     t = settings_manager.get_all().get("transmission", {})
     url = t.get("ingest_base_url") or t.get("ingest_url")   # ingest_url: settings saved by v1
+    installed = IngestEndpoints.from_env()
     if url:
         try:
-            return IngestEndpoints.from_base(url)
+            ep = IngestEndpoints.from_base(url)
         except InvalidIngestURL as exc:
             log.error(f"configured_ingest_url_invalid: {exc}")
-    return IngestEndpoints.from_env()
+            return installed
+        # The Keycloak token URL (where the client secret / laptop password are sent) is
+        # pinned to the install configuration; an edited setting can never redirect it.
+        return replace(ep, token=installed.token) if installed else ep
+    return installed
 
 
 def _tls_verify() -> bool:
@@ -1226,7 +1233,6 @@ CORS_ORIGINS = [origin.strip() for origin in _RAW_CORS.split(",") if origin.stri
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_origin_regex=r"^https?://.*(:[0-9]+)?$",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -1237,14 +1243,20 @@ app.add_middleware(
 _ACTIVE_OPERATOR_TOKEN: Optional[str] = None
 _ACTIVE_OPERATOR_TOKEN_EXPIRY: float = 0.0
 
-def update_active_operator_token(token: str, expiry: float = 0.0) -> None:
+def update_active_operator_token(token: str, expiry: float = 0.0, sub: str = "") -> None:
     """
     Store the latest valid JWT bearer token from the operator's browser session
     and immediately propagate it to any active Ingest sender thread.
+
+    During a mission only the same user's token replaces it: another user's request must
+    not take over the uplink identity (ingest would refuse it as not the mission operator).
     """
-    global _ACTIVE_OPERATOR_TOKEN, _ACTIVE_OPERATOR_TOKEN_EXPIRY
+    global _ACTIVE_OPERATOR_TOKEN, _ACTIVE_OPERATOR_TOKEN_EXPIRY, _ACTIVE_OPERATOR_SUB
     if not token:
         return
+    if pipeline is not None and pipeline._running and _ACTIVE_OPERATOR_SUB and sub != _ACTIVE_OPERATOR_SUB:
+        return
+    _ACTIVE_OPERATOR_SUB = sub
     _ACTIVE_OPERATOR_TOKEN = token
     _ACTIVE_OPERATOR_TOKEN_EXPIRY = expiry if expiry > 0 else (time.time() + 300)
     if pipeline and hasattr(pipeline, "sender_thread") and pipeline.sender_thread:
@@ -1253,6 +1265,9 @@ def update_active_operator_token(token: str, expiry: float = 0.0) -> None:
 # ── Edge Security & Authentication Guard ──────────────────────────────────────
 EDGE_API_KEY = os.getenv("EDGE_API_KEY", "")
 REQUIRE_EDGE_AUTH = os.getenv("REQUIRE_EDGE_AUTH", "true").lower() in ("true", "1", "yes")
+# Realm roles allowed to operate the edge (override per deployment with EDGE_ALLOWED_ROLES=a,b)
+EDGE_ALLOWED_ROLES = {r.strip() for r in os.getenv("EDGE_ALLOWED_ROLES", "drone-operator,sys-admin").split(",") if r.strip()}
+_ACTIVE_OPERATOR_SUB = ""
 
 async def verify_edge_auth(
     request: Request,
@@ -1293,16 +1308,21 @@ async def verify_edge_auth(
                 options={"verify_signature": True, "verify_aud": False}
             )
             if payload and payload.get("exp", float("inf")) >= time.time():
+                roles = set((payload.get("realm_access") or {}).get("roles") or [])
+                if not roles & EDGE_ALLOWED_ROLES:
+                    raise HTTPException(status_code=403, detail="Operator role required")
                 token_exp = float(payload.get("exp", time.time() + 300))
-                update_active_operator_token(bearer_token, token_exp)
+                update_active_operator_token(bearer_token, token_exp, str(payload.get("sub") or ""))
                 return {
                     "auth_type": "jwt",
                     "user": payload.get("preferred_username") or payload.get("sub"),
                     "token": bearer_token,
                     "token_expiry": token_exp,
                 }
+        except HTTPException:
+            raise
         except Exception as e:
-            log.warning(f"JWT verification failed: {e}")
+            log.warning(f"JWT verification failed: {type(e).__name__}")
 
     # 3. Development Loopback Exception (strictly disabled in production)
     is_prod = os.getenv("ENV", "").lower().startswith("prod") or os.getenv("ENVIRONMENT", "").lower().startswith("prod")
@@ -1684,12 +1704,13 @@ async def test_transmission_connection(req: TestConnectionRequest, auth: dict = 
                 "http_status": r.status_code,
                 "target": base_url,
             }
-    except Exception as e:
+    except httpx.HTTPError as e:
         latency_ms = round((time.time() - start_time) * 1000, 1)
+        log.warning(f"test_connection_failed target={base_url} error={type(e).__name__}")
         return {
             "status": "unreachable",
             "latency_ms": latency_ms,
-            "error": str(e),
+            "error": "Server not reachable",
             "target": base_url,
         }
 
@@ -1761,9 +1782,10 @@ def _extract_and_save_evidence_clip(
     end_ms = anchor_ms + int(post_event_s * 1000)
 
     active_m = pipeline.active_mission or {}
-    m_id = mission_id or active_m.get("mission_id") or "M-101"
-    drone_id = active_m.get("drone_id", "DRN-001")
-    operator = active_m.get("operator", "Govind")
+    # Evidence must never carry an invented identity: unknown stays "UNKNOWN"
+    m_id = mission_id or active_m.get("mission_id") or "UNKNOWN"
+    drone_id = active_m.get("drone_id") or "UNKNOWN"
+    operator = active_m.get("operator") or "UNKNOWN"
 
     utc_now = datetime.datetime.now(datetime.timezone.utc)
     ist_now = utc_now + datetime.timedelta(hours=5, minutes=30)
@@ -2260,6 +2282,7 @@ _SSE_MAX_CLIENTS = 8
 _snapshot_lock = threading.Lock()
 _snapshot_cache: dict = {"t": 0.0, "data": None}
 _sse_clients = 0
+_sse_lock = threading.Lock()
 
 
 def _uplink_view() -> dict:
@@ -2302,12 +2325,21 @@ def get_snapshot(auth: dict = Depends(verify_edge_auth)):
 @app.get("/api/edge/events")
 async def stream_events(request: Request, auth: dict = Depends(verify_edge_auth)):
     """Server-Sent Events: the snapshot when it changes (at most once per second)."""
-    if _sse_clients >= _SSE_MAX_CLIENTS:
-        raise HTTPException(status_code=429, detail="Too many live connections")
+    global _sse_clients
+    with _sse_lock:
+        if _sse_clients >= _SSE_MAX_CLIENTS:
+            raise HTTPException(status_code=429, detail="Too many live connections")
+        _sse_clients += 1
+    released = [False]
+
+    def release() -> None:
+        global _sse_clients
+        with _sse_lock:
+            if not released[0]:
+                released[0] = True
+                _sse_clients -= 1
 
     async def events():
-        global _sse_clients
-        _sse_clients += 1          # counted only once streaming starts, so finally always pairs it
         last_body, last_sent = None, 0.0
         try:
             while not await request.is_disconnected():
@@ -2321,12 +2353,14 @@ async def stream_events(request: Request, auth: dict = Depends(verify_edge_auth)
                     last_sent = now
                 await asyncio.sleep(_SSE_INTERVAL_S)
         finally:
-            _sse_clients -= 1
+            release()
 
+    # BackgroundTask also releases the slot when the stream never started (client gone early)
     return StreamingResponse(
         events(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        background=BackgroundTask(release),
     )
 
 
