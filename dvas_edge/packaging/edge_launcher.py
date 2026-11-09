@@ -213,7 +213,8 @@ async def launcher_health():
 @app.api_route("/edge-api/{path:path}", methods=METHODS)
 async def edge_core(path: str, request: Request):
     """Proxy to the local edge core on the dynamically assigned core port."""
-    if posixpath.normpath("/" + path).lower().startswith("/internal") or ".." in path.split("/"):
+    norm = posixpath.normpath("/" + path.lstrip("/")).lower()
+    if norm.startswith("/internal") or ".." in path.split("/"):
         return JSONResponse({"detail": "Not Found"}, status_code=404)
     target_core = getattr(request.app.state, "core_url", CORE)
     try:
