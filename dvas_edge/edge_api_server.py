@@ -34,6 +34,8 @@ import subprocess
 import json
 import copy
 import re
+import math
+import random
 from typing import Optional, Union
 
 # ── Third party ──────────────────────────────────────────────────────────────
@@ -108,8 +110,8 @@ DEFAULT_SETTINGS = {
         "mission_start_url": os.getenv("INGEST__MISSION_START_URL", "http://drone_nginx/ingest/mission/start"),
         "mission_end_url": os.getenv("INGEST__MISSION_END_URL", "http://drone_nginx/ingest/mission/end"),
         "bypass_target_fps": 30,
-        "jpeg_quality": 75,
-        "max_resolution": "720p",
+        "jpeg_quality": 80,
+        "max_resolution": "1080p",
         "concurrency_semaphore": 10,
     },
     "storage": {
@@ -225,6 +227,7 @@ from src.cognitive_frame_selector import CognitiveFrameSelector
 from src.cognitive_frame_selector.selected_frame import SelectedFrame
 from ingest.edge_sender import IngestClient
 from ingest.offline_buffer import OfflineBuffer
+from ingest.seq_store import SeqStore
 
 
 # ---------------------------------------------------------------------------
@@ -263,8 +266,16 @@ class EdgeSenderThread(threading.Thread):
     def __init__(self, client: IngestClient, server_send_initial: bool = False, max_queue: int = 64) -> None:
         super().__init__(name="EdgeSenderThread", daemon=True)
         self._client   = client
-        self._buffer   = OfflineBuffer()
-        self._buffer.clear()  # Purge stale frames from previous missions
+        mission_id     = client.mission_id
+        buffer_dir     = _EDGE_DATA_DIR / "buffer_storage"
+        self._buffer   = OfflineBuffer(
+            db_path=str(buffer_dir / "buffer.db"),
+            frames_dir=str(buffer_dir / "frames"),
+            mission_id=mission_id,
+        )
+        # Purge frames of other missions; keep this mission's unsent frames (restart / resume)
+        self._buffer.clear(keep_mission_id=mission_id)
+        self._seq      = SeqStore(_EDGE_DATA_DIR / "missions", mission_id)
         self._loop:    Optional[asyncio.AbstractEventLoop] = None
         self._running  = True
         self._mission_started = False
@@ -340,12 +351,20 @@ class EdgeSenderThread(threading.Thread):
         tel["longitude"] = tel_lon
         tel["altitude_m"] = tel_alt
         tel["change_score"] = frame.change_score
-        
-        self._buffer.put("selected", jpeg_bytes, tel)
+        tel["seq"] = self._seq.next()
+        tel["capture_ts"] = frame.utc_timestamp_ms / 1000.0
 
-    def put_raw_frame(self, jpeg_bytes: bytes, telemetry: dict = None) -> None:
-        """Queue raw JPEG bytes (pipeline bypass mode) with optional telemetry."""
-        self._buffer.put("raw", jpeg_bytes, telemetry or {})
+        self._buffer.put("selected", jpeg_bytes, tel, seq=tel["seq"], score=frame.cognitive_score)
+
+    def put_raw_frame(self, jpeg_bytes: bytes, telemetry: dict = None, capture_ts_ms: Optional[int] = None) -> None:
+        """Queue raw JPEG bytes (pipeline bypass mode). capture_ts_ms: when the frame was captured."""
+        tel = dict(telemetry or {})
+        tel["seq"] = self._seq.next()
+        tel["capture_ts"] = (capture_ts_ms / 1000.0) if capture_ts_ms else time.time()
+        self._buffer.put("raw", jpeg_bytes, tel, seq=tel["seq"], score=float(tel.get("change_score") or 0.0))
+
+    def buffer_stats(self) -> dict:
+        return self._buffer.stats()
 
     def stop(self) -> None:
         self._running = False
@@ -363,126 +382,120 @@ class EdgeSenderThread(threading.Thread):
         if self._server_send_initial:
             await self._do_start_mission()
 
-        semaphore = asyncio.Semaphore(10)
-        in_flight_ids = set()
-        tasks = set()
-
-        async def _send_task(frame_id, kind, jpeg_bytes, tel):
-            async with semaphore:
-                try:
-                    speed   = tel.get("speed_mps")
-                    battery = tel.get("battery_pct")
-                    # Extended telemetry from SRT metadata
-                    ext_tel = {
-                        "abs_alt":     tel.get("abs_alt"),
-                        "gb_yaw":      tel.get("gb_yaw"),
-                        "gb_pitch":    tel.get("gb_pitch"),
-                        "gb_roll":     tel.get("gb_roll"),
-                        "focal_len":   tel.get("focal_len"),
-                        "dzoom_ratio": tel.get("dzoom_ratio"),
-                    }
-                    lat = tel.get("latitude") if tel.get("latitude") is not None else tel.get("lat")
-                    lon = tel.get("longitude") if tel.get("longitude") is not None else tel.get("lon")
-                    alt = tel.get("altitude_m") if tel.get("altitude_m") is not None else tel.get("alt")
-
-                    # Sanitize telemetry to strictly comply with Ingest Server Pydantic schema
-                    if lat is not None:
-                        try:
-                            lat = max(-90.0, min(90.0, float(lat)))
-                        except (ValueError, TypeError):
-                            lat = None
-                    if lon is not None:
-                        try:
-                            lon = max(-180.0, min(180.0, float(lon)))
-                        except (ValueError, TypeError):
-                            lon = None
-                    if alt is not None:
-                        try:
-                            alt = max(0.0, min(10000.0, float(alt)))
-                        except (ValueError, TypeError):
-                            alt = None
-                    if speed is not None:
-                        try:
-                            speed = max(0.0, float(speed))
-                        except (ValueError, TypeError):
-                            speed = None
-                    if battery is not None:
-                        try:
-                            battery = max(0.0, min(100.0, float(battery)))
-                        except (ValueError, TypeError):
-                            battery = None
-
-                    score = tel.get("change_score", 0.0)
-                    try:
-                        score = max(0.0, min(1.0, float(score)))
-                    except (ValueError, TypeError):
-                        score = 0.0
-                    
-                    if kind == "selected":
-                        await self._client.send_frame_bytes(
-                            frame_bytes  = jpeg_bytes,
-                            change_score = score,
-                            lat          = lat,
-                            lon          = lon,
-                            alt          = alt,
-                            speed_mps    = speed,
-                            battery_pct  = battery,
-                            **ext_tel,
-                        )
-                    elif kind == "raw":
-                        await self._client.send_frame_bytes(
-                            frame_bytes  = jpeg_bytes,
-                            change_score = 0.0,
-                            lat          = lat,
-                            lon          = lon,
-                            alt          = alt,
-                            speed_mps    = speed,
-                            battery_pct  = battery,
-                            **ext_tel,
-                        )
-                        
-                    # Success! Remove from buffer
-                    self._buffer.commit(frame_id)
-                except Exception as exc:
-                    err_msg = getattr(getattr(exc, "response", None), "text", None) or str(exc)
-                    log.error(f"edge_sender_frame_failed_buffering id={frame_id} error={err_msg}")
-                    # Do NOT commit, meaning it will be retried on next loop.
-                    await asyncio.sleep(2.0)
-                finally:
-                    in_flight_ids.remove(frame_id)
+        loop = asyncio.get_event_loop()
+        in_flight: dict = {}          # frame_id -> asyncio.Task
+        self._rtt_ema = 0.5           # seconds; seeded with a typical Kerala -> pod round trip
+        self._consecutive_failures = 0
 
         while self._running:
-            # Clean up finished tasks
-            done_tasks = {t for t in tasks if t.done()}
-            tasks.difference_update(done_tasks)
-            
-            # Throttle fetching if we have hit max concurrency
-            if len(in_flight_ids) >= 5:
-                await asyncio.sleep(0.1)
+            for fid in [f for f, t in in_flight.items() if t.done()]:
+                del in_flight[fid]
+
+            if self._consecutive_failures:
+                await asyncio.sleep(_backoff_s(self._consecutive_failures))
+                if self._consecutive_failures >= _LINK_DOWN_AFTER:
+                    # Link looks down: make everything queued durable before waiting longer
+                    await loop.run_in_executor(None, self._buffer.spill_all)
+
+            window = _send_window(_target_fps(), self._rtt_ema)
+            if len(in_flight) >= window:
+                await asyncio.sleep(0.02)
                 continue
 
-            item = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self._buffer.get(timeout=1.0, exclude_ids=list(in_flight_ids))
-            )
-            
+            exclude = list(in_flight)
+            item = await loop.run_in_executor(None, lambda: self._buffer.get(timeout=0.5, exclude_ids=exclude))
             if item is None:
                 continue
-                
             frame_id, kind, jpeg_bytes, tel = item
-            in_flight_ids.add(frame_id)
-            
-            task = asyncio.create_task(_send_task(frame_id, kind, jpeg_bytes, tel))
-            tasks.add(task)
-                
-        # Graceful shutdown cleanup
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-            
+            in_flight[frame_id] = asyncio.create_task(self._send_one(frame_id, kind, jpeg_bytes, tel))
+
+        if in_flight:
+            await asyncio.gather(*in_flight.values(), return_exceptions=True)
         self._buffer.close()
         try:
             await self._client.end_mission()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning(f"edge_sender_end_mission_failed: {exc}")
+
+    async def _send_one(self, frame_id: int, kind: str, jpeg_bytes: bytes, tel: dict) -> None:
+        """Send one frame. Success -> commit; permanent 4xx -> discard; transient -> stays queued."""
+        t0 = time.monotonic()
+        score = (_clamp(tel.get("change_score"), 0.0, 1.0) or 0.0) if kind == "selected" else 0.0
+        try:
+            await self._client.send_frame_bytes(
+                frame_bytes=jpeg_bytes,
+                change_score=score,
+                seq=tel.get("seq"),
+                capture_ts=tel.get("capture_ts"),
+                **_sanitize_telemetry(tel),
+            )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 401:
+                self._client.token_expiry = 0.0      # force a fresh token on the next send
+                self._consecutive_failures += 1
+            elif status in _TRANSIENT_STATUS:
+                self._consecutive_failures += 1
+            else:
+                self._buffer.discard(frame_id, f"http_{status}")
+            return
+        except Exception as exc:
+            log.error(f"edge_sender_frame_failed id={frame_id} error={exc}")
+            self._consecutive_failures += 1
+            return
+        self._buffer.commit(frame_id)
+        self._consecutive_failures = 0
+        self._rtt_ema = 0.8 * self._rtt_ema + 0.2 * (time.monotonic() - t0)
+
+
+_LINK_DOWN_AFTER = 3
+_TRANSIENT_STATUS = {408, 425, 429}
+
+
+def _backoff_s(failures: int) -> float:
+    """0.5 -> 1 -> 2 -> 4 -> 8 s with +/-20 % jitter, so laptops do not retry in lockstep."""
+    return min(8.0, 0.5 * (2 ** (failures - 1))) * random.uniform(0.8, 1.2)
+
+
+def _send_window(target_fps: float, rtt_s: float) -> int:
+    """Frames in flight needed to sustain target_fps at the measured round trip, bounded 2..24."""
+    return max(2, min(24, math.ceil(target_fps * rtt_s * 1.5)))
+
+
+def _target_fps() -> float:
+    try:
+        return float(settings_manager.get_all().get("transmission", {}).get("bypass_target_fps", 10))
+    except (TypeError, ValueError):
+        return 10.0
+
+
+def _clamp(value, lo: float, hi: float) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return max(lo, min(hi, float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _sanitize_telemetry(tel: dict) -> dict:
+    """Clamp telemetry to the ingest server's FrameMetadata schema ranges."""
+    lat = tel.get("latitude") if tel.get("latitude") is not None else tel.get("lat")
+    lon = tel.get("longitude") if tel.get("longitude") is not None else tel.get("lon")
+    alt = tel.get("altitude_m") if tel.get("altitude_m") is not None else tel.get("alt")
+    return {
+        "lat":         _clamp(lat, -90.0, 90.0),
+        "lon":         _clamp(lon, -180.0, 180.0),
+        "alt":         _clamp(alt, 0.0, 10000.0),
+        "speed_mps":   _clamp(tel.get("speed_mps"), 0.0, float("inf")),
+        "battery_pct": _clamp(tel.get("battery_pct"), 0.0, 100.0),
+        "abs_alt":     tel.get("abs_alt"),
+        "gb_yaw":      tel.get("gb_yaw"),
+        "gb_pitch":    tel.get("gb_pitch"),
+        "gb_roll":     tel.get("gb_roll"),
+        "focal_len":   tel.get("focal_len"),
+        "dzoom_ratio": tel.get("dzoom_ratio"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +517,7 @@ class PipelineManager:
         self.pipeline_frames_in: int = 0
         self.server_send_enabled: bool = False
         self.pipeline_bypass: bool = False
-        self._bypass_frame_counter: int = 0
+        self._bypass_next_t: float = 0.0
         self._start_wall: float = 0
         self.history_deque = collections.deque(maxlen=60)
         self._history_thread: Optional[threading.Thread] = None
@@ -577,7 +590,7 @@ class PipelineManager:
                                 ok, buf = _cv2.imencode(".jpg", resized, [_cv2.IMWRITE_JPEG_QUALITY, 80])
                                 if ok:
                                     tel = self.source.get_current_telemetry() if self.source else {}
-                                    self.sender_thread.put_raw_frame(bytes(buf), telemetry=tel)
+                                    self.sender_thread.put_raw_frame(bytes(buf), telemetry=tel, capture_ts_ms=event.timestamp_ms)
                                     self.frames_selected += 1
                             except Exception:
                                 pass
@@ -647,11 +660,15 @@ class PipelineManager:
 
                 # Pipeline bypass: send frames directly at target FPS configured in settings
                 if self.pipeline_bypass:
-                    self._bypass_frame_counter += 1
                     curr_settings = settings_manager.get_all()
-                    target_fps = int(curr_settings.get("transmission", {}).get("bypass_target_fps", 10))
-                    sample_interval = max(1, round(30 / max(1, target_fps)))
-                    if (self._bypass_frame_counter % sample_interval == 0
+                    target_fps = max(0.1, float(curr_settings.get("transmission", {}).get("bypass_target_fps", 10)))
+                    t_cap = vf.utc_timestamp_ms / 1000.0
+                    due = t_cap >= self._bypass_next_t
+                    if due:
+                        self._bypass_next_t += 1.0 / target_fps
+                        if self._bypass_next_t < t_cap:   # after a pause: resume the grid, no burst
+                            self._bypass_next_t = t_cap + 1.0 / target_fps
+                    if (due
                             and self.server_send_enabled
                             and self.sender_thread is not None):
                         try:
@@ -672,7 +689,7 @@ class PipelineManager:
                             ok, buf = _cv2.imencode(".jpg", resized_frame, [_cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
                             if ok:
                                 tel = vf.telemetry or {}
-                                self.sender_thread.put_raw_frame(bytes(buf), telemetry=tel)
+                                self.sender_thread.put_raw_frame(bytes(buf), telemetry=tel, capture_ts_ms=vf.utc_timestamp_ms)
                         except Exception:
                             pass
                     return  # skip change detection + cognitive pipeline
@@ -887,7 +904,7 @@ class PipelineManager:
             self.server_send_enabled = False
             self.pipeline_bypass = False
             self.pipeline_frames_in = 0
-            self._bypass_frame_counter = 0
+            self._bypass_next_t = 0.0
             self.geofence = None
 
             log.info("mission_ended", mission_id=mission_id, frames_processed=frames_processed, frames_selected=frames_selected)
@@ -1400,7 +1417,7 @@ def toggle_pipeline(req: TogglePipelineRequest, auth: dict = Depends(verify_edge
     """Toggle change detection + cognitive frame selection pipeline.
     When disabled (bypass), frames are sampled directly at ~10 fps."""
     pipeline.pipeline_bypass = not req.enabled
-    pipeline._bypass_frame_counter = 0
+    pipeline._bypass_next_t = 0.0
     return {"pipeline_enabled": not pipeline.pipeline_bypass}
 
 

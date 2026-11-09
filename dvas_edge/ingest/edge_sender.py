@@ -101,6 +101,12 @@ logging.basicConfig(
 log = logging.getLogger("edge_sender")
 
 
+def _iso_utc(epoch_s: float) -> str:
+    """ISO-8601 UTC with milliseconds, e.g. 2026-11-09T10:30:00.123Z."""
+    total_ms = int(epoch_s * 1000)
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(total_ms // 1000)) + f".{total_ms % 1000:03d}Z"
+
+
 class IngestClient:
     """
     Authenticated HTTP client for the drone ingest server.
@@ -228,6 +234,21 @@ class IngestClient:
 
     # ── Frame upload ──────────────────────────────────────────────────────────
 
+    def _frame_identity(self, seq: Optional[int], capture_ts: Optional[float]) -> tuple:
+        """Use the capture-time identity given by the caller.
+
+        Only callers without a capture pipeline (the CLI below, legacy main.py) pass None;
+        they get the next local counter and the current time.
+        """
+        if seq is None:
+            self.frame_seq += 1
+            seq = self.frame_seq
+        else:
+            self.frame_seq = max(self.frame_seq, int(seq))
+        if capture_ts is None:
+            capture_ts = time.time()
+        return int(seq), float(capture_ts)
+
     async def send_frame(
         self,
         frame_path:   str,
@@ -236,6 +257,8 @@ class IngestClient:
         lon:          Optional[float] = None,
         alt:          Optional[float] = None,
         retries:      int = 3,
+        seq:          Optional[int] = None,
+        capture_ts:   Optional[float] = None,
     ) -> dict:
         """
         Send a JPEG/PNG frame to the ingest server.
@@ -253,19 +276,19 @@ class IngestClient:
             httpx.HTTPStatusError on non-retryable errors.
         """
         token = await self.get_token()
-        self.frame_seq += 1
+        seq, capture_ts = self._frame_identity(seq, capture_ts)
 
         meta = {
             "drone_id":          self.drone_id,
             "mission_id":        self.mission_id,
-            "timestamp":         time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-            "frame_sequence":    self.frame_seq,
+            "timestamp":         _iso_utc(capture_ts),
+            "frame_sequence":    seq,
             "change_score":      change_score,
             "latitude":          lat,
             "longitude":         lon,
             "altitude_m":        alt,
-            "frame_seq":         self.frame_seq,
-            "capture_ts":        time.time(),
+            "frame_seq":         seq,
+            "capture_ts":        capture_ts,
             "laptop_id":         self.laptop_id,
             "laptop_name":       self.laptop_id,
             "uploader_username": self.username,
@@ -294,7 +317,7 @@ class IngestClient:
                         "frame_sent",
                         extra={
                             "drone":    self.drone_id,
-                            "seq":      self.frame_seq,
+                            "seq":      seq,
                             "score":    change_score,
                             "status":   resp.status_code,
                             "msg_id":   data.get("message_id", ""),
@@ -335,6 +358,8 @@ class IngestClient:
         focal_len:    Optional[float] = None,
         dzoom_ratio:  Optional[float] = None,
         retries:      int = 3,
+        seq:          Optional[int] = None,
+        capture_ts:   Optional[float] = None,
     ) -> dict:
         """
         Send raw JPEG bytes to the ingest server (no file path needed).
@@ -362,13 +387,13 @@ class IngestClient:
             Response JSON dict on success.
         """
         token = await self.get_token()
-        self.frame_seq += 1
+        seq, capture_ts = self._frame_identity(seq, capture_ts)
 
         meta = {
             "drone_id":          self.drone_id,
             "mission_id":        self.mission_id,
-            "timestamp":         time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-            "frame_sequence":    self.frame_seq,
+            "timestamp":         _iso_utc(capture_ts),
+            "frame_sequence":    seq,
             "change_score":      change_score,
             "latitude":          lat,
             "longitude":         lon,
@@ -382,8 +407,8 @@ class IngestClient:
             "gb_roll":           gb_roll,
             "focal_len":         focal_len,
             "dzoom_ratio":       dzoom_ratio,
-            "frame_seq":         self.frame_seq,
-            "capture_ts":        time.time(),
+            "frame_seq":         seq,
+            "capture_ts":        capture_ts,
             "laptop_id":         self.laptop_id,
             "laptop_name":       self.laptop_id,
             "uploader_username": self.username,
@@ -410,7 +435,7 @@ class IngestClient:
                         "frame_sent",
                         extra={
                             "drone":    self.drone_id,
-                            "seq":      self.frame_seq,
+                            "seq":      seq,
                             "score":    change_score,
                             "status":   resp.status_code,
                             "msg_id":   data.get("message_id", ""),
