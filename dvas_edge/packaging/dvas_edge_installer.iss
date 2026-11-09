@@ -9,7 +9,20 @@
 ; ============================================================
 
 #define AppName      "Kerala Police DVAS Edge Operator"
-#define AppVersion   "1.0.0"
+#ifndef AppVersion
+  #define AppVersion "2.0.0"
+#endif
+; Pilot builds open a console window with live logs; build with /DConsoleMode=0 to hide it.
+#ifndef ConsoleMode
+  #define ConsoleMode "1"
+#endif
+#if ConsoleMode == "1"
+  #define LaunchExe  "python.exe"
+  #define LaunchArgs " --console"
+#else
+  #define LaunchExe  "pythonw.exe"
+  #define LaunchArgs ""
+#endif
 #define AppPublisher "Kerala Police — Drone Video Analytics"
 #define AppExeName   "edge_launcher.py"
 
@@ -62,16 +75,16 @@ Name: "{localappdata}\DVAS_Edge\logs"
 Name: "{localappdata}\DVAS_Edge\data\buffer_storage"
 
 [Icons]
-; Desktop shortcut (no console window: pythonw.exe; logs go to %LOCALAPPDATA%\DVAS_Edge\logs)
-Name: "{autodesktop}\DVAS Edge Operator"; Filename: "{app}\python_runtime\pythonw.exe"; Parameters: """{app}\edge_launcher.py"""; WorkingDir: "{app}"; IconFilename: "{app}\static\favicon.ico"; Comment: "Launch DVAS Edge Operator"
+; Desktop shortcut (console window in pilot builds; logs always go to %LOCALAPPDATA%\DVAS_Edge\logs)
+Name: "{autodesktop}\DVAS Edge Operator"; Filename: "{app}\python_runtime\{#LaunchExe}"; Parameters: """{app}\edge_launcher.py""{#LaunchArgs}"; WorkingDir: "{app}"; IconFilename: "{app}\static\favicon.ico"; Comment: "Launch DVAS Edge Operator"
 ; Start menu shortcuts
-Name: "{autoprograms}\DVAS Edge\DVAS Edge Operator"; Filename: "{app}\python_runtime\pythonw.exe"; Parameters: """{app}\edge_launcher.py"""; WorkingDir: "{app}"; IconFilename: "{app}\static\favicon.ico"
+Name: "{autoprograms}\DVAS Edge\DVAS Edge Operator"; Filename: "{app}\python_runtime\{#LaunchExe}"; Parameters: """{app}\edge_launcher.py""{#LaunchArgs}"; WorkingDir: "{app}"; IconFilename: "{app}\static\favicon.ico"
 Name: "{autoprograms}\DVAS Edge\DVAS Edge (support console)"; Filename: "{app}\python_runtime\python.exe"; Parameters: """{app}\edge_launcher.py"" --console"; WorkingDir: "{app}"; IconFilename: "{app}\static\favicon.ico"; Comment: "Same app with a console window showing live logs"
 Name: "{autoprograms}\DVAS Edge\Change Ingest URL"; Filename: "notepad.exe"; Parameters: """{localappdata}\DVAS_Edge\config\edge.env"""
 Name: "{autoprograms}\DVAS Edge\View Logs"; Filename: "{localappdata}\DVAS_Edge\logs"
 
 [Run]
-Filename: "{app}\python_runtime\pythonw.exe"; Parameters: """{app}\edge_launcher.py"""; WorkingDir: "{app}"; Description: "Launch DVAS Edge now"; Flags: postinstall skipifsilent nowait
+Filename: "{app}\python_runtime\{#LaunchExe}"; Parameters: """{app}\edge_launcher.py""{#LaunchArgs}"; WorkingDir: "{app}"; Description: "Launch DVAS Edge now"; Flags: postinstall skipifsilent nowait
 
 [UninstallDelete]
 ; Clean up Python bytecode on uninstall (but NOT the data directory)
