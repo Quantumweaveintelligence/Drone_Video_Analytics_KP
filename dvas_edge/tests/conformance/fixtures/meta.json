@@ -1,0 +1,23 @@
+{
+  "type": "meta",
+  "seq": 1234,
+  "pts_ms": 41233.4,
+  "capture_ts": 1762671000.123,
+  "key": false,
+  "change_score": 0.12,
+  "cognitive_score": 0.81,
+  "cfs_selected": true,
+  "tel": {
+    "latitude": 8.52,
+    "longitude": 76.93,
+    "altitude_m": 85.0,
+    "abs_alt": 120.1,
+    "speed_mps": 4.2,
+    "battery_pct": 71,
+    "gb_yaw": 142.5,
+    "gb_pitch": -35.0,
+    "gb_roll": 0.0,
+    "focal_len": 24.0,
+    "dzoom_ratio": 1.0
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "type": "hello",
+  "v": 1,
+  "drone_id": "DRN-012",
+  "mission_id": "MSN-TEST",
+  "laptop_id": "LAPTOP-01",
+  "codec": "h264",
+  "container": "mpegts",
+  "width": 1920,
+  "height": 1080,
+  "fps": 29.97,
+  "source": "rtsp",
+  "next_seq": 1,
+  "analytics": true,
+  "t_edge": 1762671000.12
+}

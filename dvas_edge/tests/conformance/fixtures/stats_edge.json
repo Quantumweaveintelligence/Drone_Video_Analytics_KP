@@ -1,0 +1,7 @@
+{
+  "type": "stats_edge",
+  "level": "L0",
+  "behind_s": 0.3,
+  "clock_offset_ms": -41,
+  "dropped_frames": 0
+}

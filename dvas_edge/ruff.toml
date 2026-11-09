@@ -17,6 +17,13 @@ include = [
     "tests/test_logging_and_credentials.py",
     "tests/test_supervisor.py",
     "tests/test_api_v2.py",
+    "ingest/ts_muxer.py",
+    "ingest/video_uplink.py",
+    "src/buffer/packet_ring.py",
+    "src/video/local_decoder.py",
+    "src/video/uplink_source.py",
+    "tests/test_video_uplink.py",
+    "tests/conformance/*.py",
 ]
 
 [lint]
@@ -27,4 +34,4 @@ ignore = ["S101", "S311", "S603"]
 
 [lint.per-file-ignores]
 # Fake credentials and a system tool (tasklist) used only inside tests
-"tests/*" = ["S105", "S106", "S607"]
+"tests/**" = ["S105", "S106", "S107", "S607"]

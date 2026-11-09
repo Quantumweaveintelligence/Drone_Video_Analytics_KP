@@ -1,0 +1,5 @@
+{
+  "type": "error",
+  "code": "not_mission_operator",
+  "detail": "Only the operator who started the mission may stream to it"
+}

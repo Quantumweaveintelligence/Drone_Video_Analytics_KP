@@ -155,6 +155,7 @@ class IngestClient:
         self.password      = password
         self.token:        Optional[str] = session_token
         self.token_expiry: float         = token_expiry if (session_token and token_expiry > 0) else (time.time() + 300 if session_token else 0.0)
+        self.token_issued: float         = time.time() if session_token else 0.0
         self.frame_seq:    int           = 0
         # Persistent HTTP client — avoids TCP+TLS handshake per frame
         self._http_client: Optional[httpx.AsyncClient] = None
@@ -169,6 +170,7 @@ class IngestClient:
         if not token:
             return
         self.token = token
+        self.token_issued = time.time()
         self.token_expiry = expiry if expiry > 0 else (time.time() + 300)
         log.info(
             "session_token_updated",
@@ -195,7 +197,8 @@ class IngestClient:
             data = resp.json()
 
         self.token        = data["access_token"]
-        self.token_expiry = time.time() + data.get("expires_in", 300)
+        self.token_issued = time.time()
+        self.token_expiry = self.token_issued + data.get("expires_in", 300)
         log.info(
             "token_acquired",
             extra={"expires_in_s": data.get("expires_in"), "user": self.username},
@@ -229,6 +232,17 @@ class IngestClient:
             return self.token
 
         raise RuntimeError("No valid Keycloak session token or credentials available for ingest transmission")
+
+    async def refresh_token(self, force: bool = False) -> Optional[str]:
+        """Get a fresh token before expiry (video uplink in-band refresh).
+
+        With machine credentials a new token is requested from Keycloak; otherwise the newest
+        operator session token forwarded by the UI is returned (it may be unchanged).
+        """
+        if self.username and self.password and CLIENT_SEC:
+            if force or time.time() >= self.token_expiry - 15:
+                return await self._acquire_token()
+        return self.token
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Return the persistent HTTP client, creating it on first use."""

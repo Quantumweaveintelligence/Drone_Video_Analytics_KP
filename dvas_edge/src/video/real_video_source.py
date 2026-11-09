@@ -372,6 +372,44 @@ def _empty_telemetry() -> dict:
     }
 
 
+def telemetry_for_frame(srt_telemetry: Dict[int, dict], frame_keys: List[int], frame_index: int) -> dict:
+    """Closest SRT telemetry entry for a frame index (empty telemetry when there is no SRT)."""
+    if not srt_telemetry or not frame_keys:
+        return _empty_telemetry()
+
+    # Binary search for closest frame count
+    import bisect
+    pos = bisect.bisect_left(frame_keys, frame_index)
+
+    # Find the closest key
+    if pos == 0:
+        closest_key = frame_keys[0]
+    elif pos >= len(frame_keys):
+        closest_key = frame_keys[-1]
+    else:
+        before = frame_keys[pos - 1]
+        after = frame_keys[pos]
+        closest_key = before if (frame_index - before) <= (after - frame_index) else after
+
+    srt_data = srt_telemetry[closest_key]
+
+    # Build the full telemetry dict with SRT data
+    tel = _empty_telemetry()
+    tel["latitude"] = srt_data.get("latitude", 0.0)
+    tel["longitude"] = srt_data.get("longitude", 0.0)
+    tel["altitude_m"] = srt_data.get("altitude_m", 0.0)  # Already mapped from rel_alt
+    tel["rel_alt"] = srt_data.get("rel_alt", 0.0)
+    tel["abs_alt"] = srt_data.get("abs_alt", 0.0)
+    tel["gb_yaw"] = srt_data.get("gb_yaw", 0.0)
+    tel["gb_pitch"] = srt_data.get("gb_pitch", 0.0)
+    tel["gb_roll"] = srt_data.get("gb_roll", 0.0)
+    tel["focal_len"] = srt_data.get("focal_len", 0.0)
+    tel["dzoom_ratio"] = srt_data.get("dzoom_ratio", 0.0)
+    tel["gps_lock"] = tel["latitude"] != 0.0 or tel["longitude"] != 0.0
+
+    return tel
+
+
 # ---------------------------------------------------------------------------
 # RealVideoSource
 # ---------------------------------------------------------------------------
@@ -471,40 +509,7 @@ class RealVideoSource:
         Look up the closest SRT telemetry entry for a given frame index.
         Returns an empty telemetry dict if no SRT data is available.
         """
-        if not self._srt_telemetry or not self._srt_frame_keys:
-            return _empty_telemetry()
-
-        # Binary search for closest frame count
-        import bisect
-        pos = bisect.bisect_left(self._srt_frame_keys, frame_index)
-
-        # Find the closest key
-        if pos == 0:
-            closest_key = self._srt_frame_keys[0]
-        elif pos >= len(self._srt_frame_keys):
-            closest_key = self._srt_frame_keys[-1]
-        else:
-            before = self._srt_frame_keys[pos - 1]
-            after = self._srt_frame_keys[pos]
-            closest_key = before if (frame_index - before) <= (after - frame_index) else after
-
-        srt_data = self._srt_telemetry[closest_key]
-
-        # Build the full telemetry dict with SRT data
-        tel = _empty_telemetry()
-        tel["latitude"] = srt_data.get("latitude", 0.0)
-        tel["longitude"] = srt_data.get("longitude", 0.0)
-        tel["altitude_m"] = srt_data.get("altitude_m", 0.0)  # Already mapped from rel_alt
-        tel["rel_alt"] = srt_data.get("rel_alt", 0.0)
-        tel["abs_alt"] = srt_data.get("abs_alt", 0.0)
-        tel["gb_yaw"] = srt_data.get("gb_yaw", 0.0)
-        tel["gb_pitch"] = srt_data.get("gb_pitch", 0.0)
-        tel["gb_roll"] = srt_data.get("gb_roll", 0.0)
-        tel["focal_len"] = srt_data.get("focal_len", 0.0)
-        tel["dzoom_ratio"] = srt_data.get("dzoom_ratio", 0.0)
-        tel["gps_lock"] = tel["latitude"] != 0.0 or tel["longitude"] != 0.0
-
-        return tel
+        return telemetry_for_frame(self._srt_telemetry, self._srt_frame_keys, frame_index)
 
     def get_current_telemetry(self) -> dict:
         """Return the most recently synced telemetry data."""

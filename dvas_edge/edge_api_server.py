@@ -95,6 +95,9 @@ DEFAULT_SETTINGS = {
         "bypass_target_fps": 30,
         "jpeg_quality": 80,
         "max_resolution": "1080p",
+        "transport": "h264_ws",        # h264_ws (continuous video) | jpeg_http (v1 path)
+        "local_fps": 10,
+        "local_width": 960,
         "concurrency_semaphore": 10,
     },
     "storage": {
@@ -205,6 +208,8 @@ from ingest.edge_sender import IngestClient
 from ingest.offline_buffer import OfflineBuffer
 from ingest.seq_store import SeqStore
 from ingest.endpoints import IngestEndpoints, InvalidIngestURL, normalize_base
+from ingest.video_uplink import StreamInfo, VideoUplink
+from src.video.uplink_source import UplinkVideoSource, _source_kind
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +245,8 @@ _QueueItem = Union[SelectedFrame, tuple, None]
 
 
 class EdgeSenderThread(threading.Thread):
-    def __init__(self, client: IngestClient, server_send_initial: bool = False, max_queue: int = 64) -> None:
+    def __init__(self, client: IngestClient, server_send_initial: bool = False, max_queue: int = 64,
+                 seq_store: Optional[SeqStore] = None) -> None:
         super().__init__(name="EdgeSenderThread", daemon=True)
         self._client   = client
         mission_id     = client.mission_id
@@ -252,7 +258,8 @@ class EdgeSenderThread(threading.Thread):
         )
         # Purge frames of other missions; keep this mission's unsent frames (restart / resume)
         self._buffer.clear(keep_mission_id=mission_id)
-        self._seq      = SeqStore(_EDGE_DATA_DIR / "missions", mission_id)
+        # One store per mission, shared with the video uplink (two stores would reuse numbers)
+        self._seq      = seq_store or SeqStore(_EDGE_DATA_DIR / "missions", mission_id)
         self._loop:    Optional[asyncio.AbstractEventLoop] = None
         self._running  = True
         self._mission_started = False
@@ -311,7 +318,7 @@ class EdgeSenderThread(threading.Thread):
         except Exception as e:
             log.warning(f"edge_sender_start_mission_failed: {e}")
 
-    def put_frame(self, frame: SelectedFrame, telemetry: dict = None) -> None:
+    def put_frame(self, frame: SelectedFrame, telemetry: dict = None, seq: Optional[int] = None) -> None:
         """Queue a SelectedFrame (from cognitive pipeline) with optional telemetry."""
         jpeg_bytes = frame.encode_jpeg()
         
@@ -328,15 +335,17 @@ class EdgeSenderThread(threading.Thread):
         tel["longitude"] = tel_lon
         tel["altitude_m"] = tel_alt
         tel["change_score"] = frame.change_score
-        tel["seq"] = self._seq.next()
+        tel["seq"] = seq if seq is not None else self._seq.next()
         tel["capture_ts"] = frame.utc_timestamp_ms / 1000.0
 
         self._buffer.put("selected", jpeg_bytes, tel, seq=tel["seq"], score=frame.cognitive_score)
 
-    def put_raw_frame(self, jpeg_bytes: bytes, telemetry: dict = None, capture_ts_ms: Optional[int] = None) -> None:
-        """Queue raw JPEG bytes (pipeline bypass mode). capture_ts_ms: when the frame was captured."""
+    def put_raw_frame(self, jpeg_bytes: bytes, telemetry: dict = None, capture_ts_ms: Optional[int] = None,
+                      seq: Optional[int] = None) -> None:
+        """Queue raw JPEG bytes (pipeline bypass mode). capture_ts_ms: when the frame was captured;
+        seq: the video frame's number when the frame came from the video uplink source."""
         tel = dict(telemetry or {})
-        tel["seq"] = self._seq.next()
+        tel["seq"] = seq if seq is not None else self._seq.next()
         tel["capture_ts"] = (capture_ts_ms / 1000.0) if capture_ts_ms else time.time()
         self._buffer.put("raw", jpeg_bytes, tel, seq=tel["seq"], score=float(tel.get("change_score") or 0.0))
 
@@ -506,6 +515,9 @@ class PipelineManager:
         self.change_engine: Optional[ChangeDetectionEngine] = None
         self.cognitive_selector: Optional[CognitiveFrameSelector] = None
         self.sender_thread: Optional[EdgeSenderThread] = None
+        self.video_uplink: Optional[VideoUplink] = None
+        self.transport: str = "jpeg_http"
+        self.uplink_note: str = ""
         self.frames_selected: int = 0
         self.pipeline_frames_in: int = 0
         self.server_send_enabled: bool = False
@@ -570,7 +582,7 @@ class PipelineManager:
                 def _on_change_event(event: ChangeEvent) -> None:
                     if self.cognitive_selector is not None:
                         self.cognitive_selector.evaluate(event)
-                    elif self.server_send_enabled and self.sender_thread is not None:
+                    elif self.server_send_enabled and self.sender_thread is not None and self._jpeg_path_active():
                         # Fallback: no cognitive selector — send change-detected frames directly
                         if event.raw_frame is not None:
                             try:
@@ -583,7 +595,8 @@ class PipelineManager:
                                 ok, buf = _cv2.imencode(".jpg", resized, [_cv2.IMWRITE_JPEG_QUALITY, 80])
                                 if ok:
                                     tel = self.source.get_current_telemetry() if self.source else {}
-                                    self.sender_thread.put_raw_frame(bytes(buf), telemetry=tel, capture_ts_ms=event.timestamp_ms)
+                                    self.sender_thread.put_raw_frame(bytes(buf), telemetry=tel, capture_ts_ms=event.timestamp_ms,
+                                                                     seq=self._video_seq(event.frame_index))
                                     self.frames_selected += 1
                             except Exception:
                                 pass
@@ -607,11 +620,11 @@ class PipelineManager:
             self.cognitive_selector = None
             if cfs_cfg.enabled and cd_cfg.enabled:
                 def _on_selected_frame(frame: SelectedFrame) -> None:
-                    if self.server_send_enabled and self.sender_thread is not None:
+                    if self.server_send_enabled and self.sender_thread is not None and self._jpeg_path_active():
                         self.frames_selected += 1
                         # Get real telemetry from the video source (SRT data or zeros)
                         tel = self.source.get_current_telemetry() if self.source else {}
-                        self.sender_thread.put_frame(frame, telemetry=tel)
+                        self.sender_thread.put_frame(frame, telemetry=tel, seq=self._video_seq(frame.frame_index))
 
                 self.cognitive_selector = CognitiveFrameSelector(
                     drone_id=drone_id,
@@ -663,6 +676,7 @@ class PipelineManager:
                             self._bypass_next_t = t_cap + 1.0 / target_fps
                     if (due
                             and self.server_send_enabled
+                            and self._jpeg_path_active()
                             and self.sender_thread is not None):
                         try:
                             import cv2 as _cv2
@@ -682,7 +696,8 @@ class PipelineManager:
                             ok, buf = _cv2.imencode(".jpg", resized_frame, [_cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
                             if ok:
                                 tel = vf.telemetry or {}
-                                self.sender_thread.put_raw_frame(bytes(buf), telemetry=tel, capture_ts_ms=vf.utc_timestamp_ms)
+                                self.sender_thread.put_raw_frame(bytes(buf), telemetry=tel, capture_ts_ms=vf.utc_timestamp_ms,
+                                                                 seq=self._video_seq(vf.frame_index))
                         except Exception:
                             pass
                     return  # skip change detection + cognitive pipeline
@@ -747,13 +762,35 @@ class PipelineManager:
                         except Exception as exc:
                             log.warning("ffmpeg_extraction_error", error=str(exc))
 
-            self.source = RealVideoSource(
-                drone_id=drone_id,
-                video_source=clean_video_source,
-                on_frame=_on_frame,
-                on_complete=self.end_mission,
-                initial_play_state=self.server_send_enabled,
-            )
+            seq_store = SeqStore(_EDGE_DATA_DIR / "missions", req.mission_id)
+            tx = settings_manager.get_all().get("transmission", {})
+            self.transport = tx.get("transport", "h264_ws")
+            self.video_uplink = None
+            self.uplink_note = ""
+            if self.transport == "h264_ws":
+                def _on_stream_ready(stream, fps: float) -> None:
+                    self._attach_video_uplink(stream, fps, client, drone_id, req.mission_id, laptop_id,
+                                              _source_kind(clean_video_source))
+
+                self.source = UplinkVideoSource(
+                    drone_id=drone_id,
+                    video_source=clean_video_source,
+                    seq_store=seq_store,
+                    on_frame=_on_frame,
+                    on_complete=self.end_mission,
+                    on_stream_ready=_on_stream_ready,
+                    initial_play_state=self.server_send_enabled,
+                    local_fps=float(tx.get("local_fps", 10)),
+                    local_width=int(tx.get("local_width", 960)),
+                )
+            else:
+                self.source = RealVideoSource(
+                    drone_id=drone_id,
+                    video_source=clean_video_source,
+                    on_frame=_on_frame,
+                    on_complete=self.end_mission,
+                    initial_play_state=self.server_send_enabled,
+                )
 
             # ── Edge Sender Thread ─────────────────────────────────────────
             effective_token = session_token or _ACTIVE_OPERATOR_TOKEN
@@ -777,6 +814,7 @@ class PipelineManager:
             self.sender_thread = EdgeSenderThread(
                 client=client,
                 server_send_initial=self.server_send_enabled,
+                seq_store=seq_store,
             )
             self.sender_thread.set_mission_details(
                 mission_name=req.mission_name,
@@ -863,6 +901,8 @@ class PipelineManager:
                     self.buffer.close()
                 except Exception:
                     pass
+            if self.video_uplink is not None:
+                self.video_uplink.stop()
             if self.sender_thread is not None:
                 self.sender_thread.stop()
 
@@ -895,6 +935,7 @@ class PipelineManager:
             self.change_engine = None
             self.cognitive_selector = None
             self.sender_thread = None
+            self.video_uplink = None
             self.server_send_enabled = False
             self.pipeline_bypass = False
             self.pipeline_frames_in = 0
@@ -963,8 +1004,51 @@ class PipelineManager:
                     self.source.pause()
             if enabled and self.sender_thread is not None:
                 self.sender_thread.on_server_send_enabled(self.geofence)
+            if self.video_uplink is not None:
+                if enabled and not self.video_uplink.running:
+                    self.video_uplink.start()
+                elif not enabled and self.video_uplink.running:
+                    threading.Thread(target=self.video_uplink.stop, daemon=True).start()   # closes with 1000
             log.info("server_send_toggled", enabled=enabled, source_active=self.source is not None)
             return self.server_send_enabled
+
+    # ── Video uplink (h264_ws transport) ──────────────────────────────────
+
+    def _jpeg_path_active(self) -> bool:
+        """The JPEG sender carries frames unless the video uplink is up (not in fallback)."""
+        if self.transport != "h264_ws":
+            return True
+        return self.video_uplink is None or self.video_uplink.fallback_active
+
+    def _video_seq(self, frame_index: int) -> Optional[int]:
+        """In h264_ws mode a decoded frame's index IS its video seq: reuse it for its JPEG."""
+        return frame_index if self.transport == "h264_ws" else None
+
+    def _attach_video_uplink(self, stream, fps: float, client, drone_id: str, mission_id: str,
+                             laptop_id: str, source_kind: str) -> None:
+        if self.video_uplink is not None:
+            return                                   # reconnect of a live source: keep the uplink
+        endpoints = _ingest_endpoints()
+        codec = stream.codec_context.name
+        if endpoints is None:
+            self.uplink_note = "Ingest server URL not configured"
+            return
+        if codec != "h264":
+            # Copy mode only in this release; transcoding (HEVC etc.) arrives with the ladder.
+            self.uplink_note = f"{codec} source: sending JPEG frames (video uplink needs H.264)"
+            log.warning("video_uplink_codec_unsupported", codec=codec)
+            return
+        uplink = VideoUplink(
+            url=endpoints.video_ws, client=client, drone_id=drone_id, mission_id=mission_id,
+            laptop_id=laptop_id, template_stream=stream, ring=self.source.ring,
+            info=StreamInfo(codec="h264", width=stream.width, height=stream.height, fps=fps, source=source_kind),
+            on_error=lambda msg: emit_system_log("ingest", "ERROR", f"Video uplink stopped: {msg}"),
+        )
+        self.source.add_packet_listener(uplink.push)
+        self.video_uplink = uplink
+        if self.server_send_enabled:
+            uplink.start()
+        log.info("video_uplink_attached", url=endpoints.video_ws, width=stream.width, height=stream.height, fps=round(fps, 2))
 
     # ── Status / Telemetry ────────────────────────────────────────────────
 
@@ -1581,16 +1665,13 @@ def purge_temp_files(auth: dict = Depends(verify_edge_auth)):
 
 @app.post("/api/edge/transmission/test-connection")
 async def test_transmission_connection(req: TestConnectionRequest, auth: dict = Depends(verify_edge_auth)):
-    curr_settings = settings_manager.get_all()
     try:
         endpoints = IngestEndpoints.from_base(req.url) if req.url else _ingest_endpoints()
     except InvalidIngestURL as exc:
         raise HTTPException(status_code=422, detail=f"Ingest server URL: {exc}")
     if endpoints is None:
         raise HTTPException(status_code=422, detail="Ingest server URL is not configured")
-    target_url = endpoints.frame
     base_url = endpoints.base
-
 
     start_time = time.time()
     try:
@@ -2190,6 +2271,10 @@ def _uplink_view() -> dict:
         "rtt_ms": round(getattr(sender, "_rtt_ema", 0.0) * 1000, 1),
         "consecutive_failures": getattr(sender, "_consecutive_failures", 0),
         "buffer": sender.buffer_stats(),
+        "transport": pipeline.transport,
+        "note": pipeline.uplink_note,
+        "video": pipeline.video_uplink.stats() if pipeline.video_uplink is not None else None,
+        "decoder": pipeline.source.decoder.stats() if getattr(pipeline.source, "decoder", None) else None,
     }
 
 

@@ -1,0 +1,11 @@
+{
+  "type": "stats",
+  "rx_fps": 29.9,
+  "rx_kbps": 5200,
+  "decoded_fps": 29.9,
+  "analytics_fps": 20.0,
+  "analytics_lag_frames": 3,
+  "last_seq": 1234,
+  "e2e_ms_p50": 1450,
+  "e2e_ms_p95": 2380
+}
