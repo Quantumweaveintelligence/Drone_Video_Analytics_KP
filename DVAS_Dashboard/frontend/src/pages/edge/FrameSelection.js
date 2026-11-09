@@ -6,6 +6,7 @@ import {
 } from "recharts";
 import { Image as ImageIcon, History } from 'lucide-react';
 import { authFetch } from '@/lib/api';
+import { useEdgeLive } from "@/lib/edgeLive";
 
 const COLORS = ['#34d399', '#475569']; // emerald-400 (Selected), slate-600 (Discarded)
 
@@ -39,22 +40,29 @@ export default function FrameSelection() {
     initialized: false
   });
 
-  // Poll for live edge stats & mission history
+  const { getSnapshot } = useEdgeLive();
+  const historyRef = useRef({ key: null, rows: [] });
+
+  // Live edge stats from the shared snapshot; mission history only when the mission changes
   useEffect(() => {
     const fetchStats = async () => {
       try {
-        const [statusResp, historyResp, activeResp] = await Promise.all([
-          authFetch('/edge-api/api/edge/status'),
-          authFetch('/edge-api/api/edge/mission/history'),
-          authFetch('/edge-api/api/edge/mission/active')
-        ]);
+        const snap = getSnapshot();
+        if (!snap) return;
+        const missionKey = snap.mission?.active ? `${snap.mission.mission_id}` : 'none';
+        if (historyRef.current.key !== missionKey) {
+          const historyResp = await authFetch('/edge-api/api/edge/mission/history');
+          if (historyResp.ok) {
+            historyRef.current = { key: missionKey, rows: await historyResp.json() };
+          }
+        }
 
         let totalFrames = 0;
         let selectedFrames = 0;
         let discarded = 0;
 
-        if (statusResp.ok) {
-          const data = await statusResp.json();
+        {
+          const data = snap.status || {};
           totalFrames = data.frames_total || 0;
           selectedFrames = data.frames_selected || 0;
           discarded = data.frames_discarded !== undefined
@@ -92,18 +100,8 @@ export default function FrameSelection() {
         }
 
         // Process mission history
-        let serverHistory = [];
-        if (historyResp.ok) {
-          serverHistory = await historyResp.json();
-        }
-
-        let activeMission = null;
-        if (activeResp.ok) {
-          const activeData = await activeResp.json();
-          if (activeData.active) {
-            activeMission = activeData;
-          }
-        }
+        const serverHistory = historyRef.current.rows;
+        const activeMission = snap.mission?.active ? snap.mission : null;
 
         setMissionHistory(prev => {
           let merged = Array.isArray(serverHistory) && serverHistory.length > 0 ? [...serverHistory] : [...prev];
@@ -140,7 +138,7 @@ export default function FrameSelection() {
     fetchStats();
     const interval = setInterval(fetchStats, 2000);
     return () => clearInterval(interval);
-  }, []);
+  }, [getSnapshot]);
 
   // TX Reduction: Percentage of frames that are being discarded
   const txReduction = stats.framesReceived > 0 

@@ -12,7 +12,9 @@ Usage:
 from __future__ import annotations
 
 import logging
+import re
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional, Any
 
@@ -54,17 +56,62 @@ class _StdlibLogger:
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
+_SECRET_PATTERNS = [
+    # Authorization: Bearer <token>  /  bearer=<token>
+    (re.compile(r"(?i)(bearer[\s=:]+)[A-Za-z0-9\-._~+/]+=*"), r"\1[REDACTED]"),
+    # Bare JWTs (three base64url segments)
+    (re.compile(r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}"), "[REDACTED-JWT]"),
+    # key=value / "key": "value" for secret-like keys, in logs, URLs and JSON
+    (re.compile(r"(?i)((?:password|passwd|client_secret|secret|api[_-]?key|access_token|refresh_token|token)"
+                r"[\"']?\s*[:=]\s*[\"']?)[^\"'&\s,}]+"), r"\1[REDACTED]"),
+    # Credentials embedded in URLs: scheme://user:pass@host
+    (re.compile(r"(?i)([a-z][a-z0-9+.-]*://[^/\s:@]+:)[^@\s/]+@"), r"\1[REDACTED]@"),
+]
+
+LOG_MAX_BYTES = 20 * 1024 * 1024
+LOG_BACKUPS = 10
+
+
+def redact(text: str) -> str:
+    """Remove tokens, passwords and credentials from a log line."""
+    for pattern, repl in _SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+class RedactingFilter(logging.Filter):
+    """Applied to every handler so no secret reaches a log file or console."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:   # a malformed record must still be logged, never dropped
+            message = str(record.msg)
+        record.msg = redact(message)
+        record.args = None
+        return True
+
+
+def build_handlers(log_file: Optional[str]) -> list:
+    """Console handler only when a console exists (not under pythonw), plus a rotating file."""
+    handlers: list[logging.Handler] = []
+    if sys.stdout is not None:
+        handlers.append(logging.StreamHandler(sys.stdout))
+    if log_file:
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(RotatingFileHandler(log_file, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8"))
+    for h in handlers:
+        h.addFilter(RedactingFilter())
+    return handlers
+
+
 def setup_logging(
     level: str = "INFO",
     json_output: bool = False,
     log_file: Optional[str] = None,
 ) -> None:
     log_level = getattr(logging, level.upper(), logging.INFO)
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
-
-    if log_file:
-        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    handlers = build_handlers(log_file)
 
     fmt = "%(asctime)s %(levelname)-8s %(name)s  %(message)s"
     logging.basicConfig(level=log_level, handlers=handlers, format=fmt, force=True)

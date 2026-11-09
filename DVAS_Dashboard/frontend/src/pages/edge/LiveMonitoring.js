@@ -2,7 +2,8 @@ import React, { useState, useEffect } from 'react';
 import AppShell from '@/components/layout/AppShell';
 import { Camera, Radio, Film, Activity, Layers } from 'lucide-react';
 import { AreaChart, Area, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
-import { authFetch, getAuthToken } from '@/lib/api';
+import { getAuthToken } from '@/lib/api';
+import { useEdgeLive } from "@/lib/edgeLive";
 
 export default function LiveMonitoring() {
   const [metrics, setMetrics] = useState({ fps: 0, connected: false, buffer_fill_pct: 0, frames_total: 0, frames_selected: 0 });
@@ -10,16 +11,16 @@ export default function LiveMonitoring() {
   const [fpsHistory, setFpsHistory] = useState(() => Array.from({length: 30}, (_, i) => ({ time: i, value: 0 })));
   const [bufferHistory, setBufferHistory] = useState(() => Array.from({length: 30}, (_, i) => ({ time: i, value: 0 })));
 
+  const { getSnapshot } = useEdgeLive();
+
   useEffect(() => {
     let tick = 0;
-    const poll = async () => {
+    const poll = () => {
       try {
-        const [statusResp, missionResp] = await Promise.all([
-          authFetch('/edge-api/api/edge/status'),
-          authFetch('/edge-api/api/edge/mission/active'),
-        ]);
-        const status = await statusResp.json();
-        const missionData = await missionResp.json();
+        const snap = getSnapshot();
+        if (!snap) return;
+        const status = snap.status;
+        const missionData = snap.mission;
         setMetrics(status);
         if (missionData.active) {
           setMission(missionData);
@@ -37,7 +38,7 @@ export default function LiveMonitoring() {
     poll();
     const interval = setInterval(poll, 2000);
     return () => clearInterval(interval);
-  }, []);
+  }, [getSnapshot]);
 
   const token = getAuthToken();
   const streamUrl = token ? `/edge-api/stream/live?token=${encodeURIComponent(token)}` : '/edge-api/stream/live';

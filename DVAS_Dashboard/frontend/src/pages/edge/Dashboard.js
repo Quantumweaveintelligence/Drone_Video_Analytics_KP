@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import AppShell from "@/components/layout/AppShell";
 import { AreaChart, Area, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
 import { authFetch } from "@/lib/api";
+import { useEdgeLive } from "@/lib/edgeLive";
 
 export default function Dashboard() {
   const [recentMissions, setRecentMissions] = useState([]);
@@ -39,18 +40,17 @@ export default function Dashboard() {
     return () => clearInterval(timer);
   }, [activeMission?.start_time]);
 
+  const { getSnapshot } = useEdgeLive();
+
   useEffect(() => {
     let tick = 0;
-    const poll = async () => {
+    const poll = () => {
       try {
-        const [statusResp, telResp, missionResp] = await Promise.all([
-          authFetch('/edge-api/api/edge/status'),
-          authFetch('/edge-api/api/edge/telemetry'),
-          authFetch('/edge-api/api/edge/mission/active'),
-        ]);
-        const status = await statusResp.json();
-        const tel = await telResp.json();
-        const missionData = await missionResp.json();
+        const snap = getSnapshot();
+        if (!snap) return;
+        const status = snap.status;
+        const tel = snap.telemetry;
+        const missionData = snap.mission;
         
         setEdgeStatus(status);
         setTelemetry(tel);
@@ -70,7 +70,7 @@ export default function Dashboard() {
     poll();
     const interval = setInterval(poll, 2000);
     return () => clearInterval(interval);
-  }, []);
+  }, [getSnapshot]);
 
   useEffect(() => {
     const fetchRecent = async () => {

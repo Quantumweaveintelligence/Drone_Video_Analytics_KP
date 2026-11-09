@@ -6,6 +6,7 @@ import 'leaflet/dist/leaflet.css';
 import { AreaChart, Area, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
 import { Compass, MapPin, Radio, Play, Pause, ShieldAlert, Undo2, Trash2, Check, Pencil, Lock } from 'lucide-react';
 import { authFetch } from '@/lib/api';
+import { useEdgeLive } from "@/lib/edgeLive";
 
 // Fix Leaflet's default icon path issues in React
 delete L.Icon.Default.prototype._getIconUrl;
@@ -72,16 +73,16 @@ export default function GpsTelemetry() {
     }))
   );
 
-  // Sync active mission, telemetry, and server send state
+  const { getSnapshot } = useEdgeLive();
+
+  // Sync active mission, telemetry, and server send state (from the shared snapshot)
   useEffect(() => {
-    const timer = setInterval(async () => {
+    const timer = setInterval(() => {
       try {
-        const [telResp, missionResp] = await Promise.all([
-          authFetch('/edge-api/api/edge/telemetry'),
-          authFetch('/edge-api/api/edge/mission/active')
-        ]);
-        const tel = await telResp.json();
-        const missionData = await missionResp.json();
+        const snap = getSnapshot();
+        if (!snap) return;
+        const tel = snap.telemetry;
+        const missionData = snap.mission;
 
         if (missionData.active) {
           setMission(missionData);
@@ -142,7 +143,7 @@ export default function GpsTelemetry() {
       }
     }, 1000);
     return () => clearInterval(timer);
-  }, []);
+  }, [getSnapshot]);
 
   // Fetch existing geofence on mount or when active mission changes
   useEffect(() => {

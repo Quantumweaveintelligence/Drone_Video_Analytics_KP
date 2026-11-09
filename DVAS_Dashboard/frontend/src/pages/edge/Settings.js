@@ -32,9 +32,7 @@ export default function Settings() {
   // Settings state
   const [settings, setSettings] = useState({
     transmission: {
-      ingest_url: 'http://10.253.110.250:8000/ingest/frame',
-      mission_start_url: 'http://10.253.110.250:8000/ingest/mission/start',
-      mission_end_url: 'http://10.253.110.250:8000/ingest/mission/end',
+      ingest_base_url: '',
       bypass_target_fps: 10,
       jpeg_quality: 80,
       max_resolution: '1080p',
@@ -91,7 +89,11 @@ export default function Settings() {
         setSettings(prev => ({
           ...prev,
           ...data,
-          transmission: { ...prev.transmission, ...(data.transmission || {}) },
+          transmission: {
+            ...prev.transmission,
+            ...(data.transmission || {}),
+            ingest_base_url: data.transmission?.ingest_base_url || data.transmission?.ingest_url || '',
+          },
           storage: { ...prev.storage, ...(data.storage || {}) },
           operator_preferences: { ...prev.operator_preferences, ...(data.operator_preferences || {}) }
         }));
@@ -182,6 +184,9 @@ export default function Settings() {
           localStorage.setItem('dvas_default_squadron', settings.operator_preferences.default_squadron);
         }
         fetchDiskUsage();
+      } else if (resp.status === 422) {
+        const err = await resp.json().catch(() => ({}));
+        showToast(typeof err.detail === 'string' ? err.detail : 'Invalid settings value.', 'error');
       } else {
         showToast('Failed to save settings. Please check server logs.', 'error');
       }
@@ -195,9 +200,7 @@ export default function Settings() {
   const handleResetDefaults = () => {
     setSettings({
       transmission: {
-        ingest_url: 'http://10.253.110.250:8000/ingest/frame',
-        mission_start_url: 'http://10.253.110.250:8000/ingest/mission/start',
-        mission_end_url: 'http://10.253.110.250:8000/ingest/mission/end',
+        ingest_base_url: settings.transmission.ingest_base_url,   // reset never clears the server address
         bypass_target_fps: 10,
         jpeg_quality: 80,
         max_resolution: '1080p',
@@ -223,7 +226,7 @@ export default function Settings() {
       const resp = await authFetch('/edge-api/api/edge/transmission/test-connection', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: settings.transmission.ingest_url }),
+        body: JSON.stringify({ url: settings.transmission.ingest_base_url }),
       });
       if (resp.ok) {
         const data = await resp.json();
@@ -339,18 +342,18 @@ export default function Settings() {
               <div className="space-y-4">
                 <div>
                   <label className="block text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
-                    Ingest Frame Target URL
+                    Ingest Server URL (RunPod)
                   </label>
                   <div className="flex gap-2">
                     <input
                       type="text"
-                      value={settings.transmission.ingest_url}
+                      value={settings.transmission.ingest_base_url}
                       onChange={e => setSettings({
                         ...settings,
-                        transmission: { ...settings.transmission, ingest_url: e.target.value }
+                        transmission: { ...settings.transmission, ingest_base_url: e.target.value }
                       })}
                       className="flex-1 bg-slate-950 border border-slate-700 focus:border-sky-500 outline-none px-3 py-2 text-xs font-mono text-slate-200 rounded"
-                      placeholder="http://10.253.110.250:8000/ingest/frame"
+                      placeholder="https://<pod>-80.proxy.runpod.net"
                     />
                     <button
                       onClick={handleTestConnection}
@@ -362,7 +365,7 @@ export default function Settings() {
                     </button>
                   </div>
                   <p className="text-[10px] text-slate-500 mt-1">
-                    Central GPU ingestion server URL where frames are posted via HTTP multipart.
+                    Server address only. Frames, missions, login and live video all use it. Applies from the next mission.
                   </p>
                 </div>
 

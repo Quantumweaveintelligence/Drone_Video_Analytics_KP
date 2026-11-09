@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import AppShell from '@/components/layout/AppShell';
 import { Target, Play, Trash, Trash2, XCircle, CheckCircle, Cpu } from 'lucide-react';
 import { authFetch, getAuthToken } from '@/lib/api';
+import { useEdgeLive } from "@/lib/edgeLive";
 
 export default function MissionControl() {
   const [activeMission, setActiveMission] = useState(null);
@@ -421,11 +422,13 @@ export default function MissionControl() {
     activeMissionRef.current = activeMission;
   }, [activeMission]);
 
+  const { getSnapshot } = useEdgeLive();
+
   useEffect(() => {
-    const poll = async () => {
+    const poll = () => {
       try {
-        const resp = await authFetch('/edge-api/api/edge/mission/active');
-        const data = await resp.json();
+        const data = getSnapshot()?.mission;
+        if (!data) return;            // not connected yet: never treat as "no mission"
         if (data.active) {
           setServerSend(data.server_send_enabled || false);
           setPipelineEnabled(data.pipeline_enabled !== undefined ? data.pipeline_enabled : true);
@@ -459,7 +462,7 @@ export default function MissionControl() {
     poll();
     const interval = setInterval(poll, 3000);
     return () => clearInterval(interval);
-  }, []);
+  }, [getSnapshot]);
 
   const handleToggleServerSend = async () => {
     try {

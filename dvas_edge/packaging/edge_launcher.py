@@ -10,45 +10,76 @@ Binds 127.0.0.1:8765 (with dynamic port fallback) and provides:
 
 This reproduces exactly what the dashboard nginx does today on a single
 origin, so the React code needs NO URL changes.
+
+Runs without a console window (pythonw.exe). Logs go to rotating files in
+%LOCALAPPDATA%\\DVAS_Edge\\logs. A tray icon offers Open / Logs / Restart / Quit.
+Start with --console (python.exe) to also see logs in a terminal for support.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import pathlib
 import socket
-import subprocess
 import sys
 import threading
 import webbrowser
+
+# ── Paths & imports from the edge package ─────────────────────────────────────
+APP_DIR  = pathlib.Path(__file__).resolve().parent
+# Edge package root: next to this file in dist/, one level up in the source tree (packaging/)
+EDGE_ROOT = next((r for r in (APP_DIR, APP_DIR.parent) if (r / "edge_api_server.py").is_file()), APP_DIR)
+if str(EDGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(EDGE_ROOT))
 
 import httpx
 import uvicorn
 import websockets
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-# ── Paths & Config ────────────────────────────────────────────────────────────
-APP_DIR  = pathlib.Path(__file__).resolve().parent
+from src.launcher import credentials
+from src.launcher.supervisor import CoreSupervisor
+from src.utils.logger import build_handlers
+
 DATA_DIR = pathlib.Path(os.environ.get("LOCALAPPDATA", str(APP_DIR))) / "DVAS_Edge"
+LOG_DIR  = DATA_DIR / "logs"
+CONFIG_DIR = DATA_DIR / "config"
+ENV_FILE = CONFIG_DIR / "edge.env"
+SECRETS_FILE = CONFIG_DIR / "secrets.dpapi"
 
 # Load edge.env from the data directory
-_env_file = DATA_DIR / "config" / "edge.env"
-if _env_file.exists():
-    load_dotenv(_env_file)
+if ENV_FILE.exists():
+    load_dotenv(ENV_FILE)
 
 CLOUD    = os.environ.get("DVAS_CLOUD_URL", "http://localhost:3000").rstrip("/")
 CORE     = "http://127.0.0.1:8766"
 STATIC   = APP_DIR / "static"
+
+log = logging.getLogger("launcher")
 
 # Hop-by-hop headers that must NOT be forwarded
 HOP = {
     "host", "content-length", "connection", "keep-alive",
     "transfer-encoding", "upgrade", "te", "trailer",
 }
+# Never forwarded from the browser: the core's shutdown secret belongs to this launcher only
+BLOCKED_REQUEST_HEADERS = HOP | {"x-launcher-secret"}
 METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+
+def setup_launcher_logging() -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=build_handlers(str(LOG_DIR / "launcher.log")),
+        format="%(asctime)s %(levelname)-8s %(name)s  %(message)s",
+        force=True,
+    )
+
 
 # ── Port & Instance Helpers ───────────────────────────────────────────────────
 def is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
@@ -75,15 +106,15 @@ def is_dvas_edge_running(port: int) -> bool:
             resp = check_client.get(f"http://127.0.0.1:{port}/edge-launcher/health")
             if resp.status_code == 200 and resp.json().get("app") == "DVAS_Edge_Launcher":
                 return True
-    except Exception:
-        pass
+    except (httpx.HTTPError, ValueError) as exc:   # nothing / something else on the port
+        log.debug("instance_probe_failed: %s", exc)
     try:
         with httpx.Client(timeout=1.0) as check_client:
             resp = check_client.get(f"http://127.0.0.1:{port}/")
             if resp.status_code == 200 and ("DVAS" in resp.text or "Drone Video Analytics" in resp.text):
                 return True
-    except Exception:
-        pass
+    except (httpx.HTTPError, ValueError) as exc:   # nothing / something else on the port
+        log.debug("instance_probe_failed: %s", exc)
     return False
 
 
@@ -102,7 +133,7 @@ async def _proxy(request: Request, target: str) -> StreamingResponse:
     url = target + (f"?{request.url.query}" if request.url.query else "")
     headers = [
         (k, v) for k, v in request.headers.items()
-        if k.lower() not in HOP
+        if k.lower() not in BLOCKED_REQUEST_HEADERS
     ]
     upstream = await client.send(
         client.build_request(
@@ -135,14 +166,25 @@ async def _proxy(request: Request, target: str) -> StreamingResponse:
 @app.get("/edge-launcher/health")
 async def launcher_health():
     """Health & single-instance check endpoint."""
-    return {"status": "ok", "app": "DVAS_Edge_Launcher", "version": "1.0.0"}
+    supervisor = getattr(app.state, "supervisor", None)
+    return {
+        "status": "ok",
+        "app": "DVAS_Edge_Launcher",
+        "version": "2.0.0",
+        "core": supervisor.state if supervisor else "unknown",
+    }
 
 
 @app.api_route("/edge-api/{path:path}", methods=METHODS)
 async def edge_core(path: str, request: Request):
     """Proxy to the local edge core on the dynamically assigned core port."""
+    if path.lstrip("/").lower().startswith("internal"):
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
     target_core = getattr(request.app.state, "core_url", CORE)
-    return await _proxy(request, f"{target_core}/{path}")
+    try:
+        return await _proxy(request, f"{target_core}/{path}")
+    except httpx.ConnectError:
+        return JSONResponse({"detail": "Edge core is starting or unavailable"}, status_code=503)
 
 
 @app.websocket("/api/ws")
@@ -181,8 +223,8 @@ async def ws_proxy(ws: WebSocket):
             )
             for t in pending:
                 t.cancel()
-    except Exception:
-        pass  # WebSocket closed or cloud unreachable
+    except Exception as exc:
+        log.info("cloud_ws_closed: %s", type(exc).__name__)
 
 
 @app.api_route("/api/{path:path}", methods=METHODS)
@@ -200,34 +242,78 @@ async def spa(path: str):
     return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-store"})
 
 
+# ── Tray icon ─────────────────────────────────────────────────────────────────
+def _open_folder(path: pathlib.Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    os.startfile(str(path))  # noqa: S606 - opens Explorer on our own log folder
+
+
+def run_tray(ui_url: str, supervisor: CoreSupervisor, server: uvicorn.Server) -> bool:
+    """Blocking tray loop on the main thread. Returns False when no tray is available."""
+    try:
+        import pystray
+        from PIL import Image
+    except ImportError as exc:
+        log.warning("tray_unavailable: %s", exc)
+        return False
+
+    icon_file = STATIC / "favicon.ico"
+    image = Image.open(icon_file) if icon_file.exists() else Image.new("RGB", (64, 64), (16, 64, 128))
+
+    def quit_app(icon, _item):
+        log.info("quit_requested_from_tray")
+        icon.title = "DVAS Edge - stopping..."
+        supervisor.stop()
+        server.should_exit = True
+        icon.stop()
+
+    def restart_core(_icon, _item):
+        log.info("core_restart_requested_from_tray")
+        threading.Thread(target=supervisor.restart, name="CoreRestart", daemon=True).start()
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Open DVAS Edge", lambda _i, _m: webbrowser.open(ui_url), default=True),
+        pystray.MenuItem("Open logs folder", lambda _i, _m: _open_folder(LOG_DIR)),
+        pystray.MenuItem("Restart edge core", restart_core),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Quit DVAS Edge", quit_app),
+    )
+    icon = pystray.Icon("DVAS_Edge", image, "DVAS Edge Operator", menu)
+
+    def on_state(state: str) -> None:
+        icon.title = f"DVAS Edge Operator - core {state}"
+        if state == "failed":
+            icon.notify("The edge core keeps stopping. Open the logs folder and contact support.", "DVAS Edge")
+
+    supervisor.set_state_listener(on_state)
+    icon.run()
+    return True
+
+
 # ── Main: start edge core subprocess + gateway ───────────────────────────────
 def main():
     global CORE
 
+    setup_launcher_logging()
+    console_mode = "--console" in sys.argv
     preferred_ui_port   = int(os.environ.get("DVAS_PORT", os.environ.get("EDGE_GATEWAY_PORT", "8765")))
     preferred_core_port = int(os.environ.get("DVAS_CORE_PORT", os.environ.get("EDGE_CORE_PORT", "8766")))
 
     # 1. Single Instance Check: Is DVAS Edge already running?
     if is_port_in_use(preferred_ui_port):
         if is_dvas_edge_running(preferred_ui_port):
-            print("=" * 60)
-            print("  DVAS Edge Operator is already running!")
-            print(f"  Focusing existing session: http://localhost:{preferred_ui_port}")
-            print("=" * 60)
+            log.info("already_running; focusing http://localhost:%s", preferred_ui_port)
             webbrowser.open(f"http://localhost:{preferred_ui_port}")
             sys.exit(0)
-        else:
-            print(f"[!] Port {preferred_ui_port} is occupied by another application.")
-            ui_port = find_free_port(preferred_ui_port + 1)
-            print(f"[+] Reassigned UI Gateway to free port: {ui_port}")
+        ui_port = find_free_port(preferred_ui_port + 1)
+        log.warning("ui_port_busy port=%s; using %s", preferred_ui_port, ui_port)
     else:
         ui_port = preferred_ui_port
 
     # 2. Check Core Port
     if is_port_in_use(preferred_core_port) or preferred_core_port == ui_port:
-        print(f"[!] Core port {preferred_core_port} is unavailable.")
         core_port = find_free_port(max(preferred_core_port + 1, ui_port + 1))
-        print(f"[+] Reassigned Edge Core to free port: {core_port}")
+        log.warning("core_port_busy port=%s; using %s", preferred_core_port, core_port)
     else:
         core_port = preferred_core_port
 
@@ -235,47 +321,52 @@ def main():
     app.state.core_url = CORE
 
     # Ensure data directories exist
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    (DATA_DIR / "config").mkdir(parents=True, exist_ok=True)
-    (DATA_DIR / "data").mkdir(parents=True, exist_ok=True)
-    (DATA_DIR / "data" / "logs").mkdir(parents=True, exist_ok=True)
+    for d in (CONFIG_DIR, DATA_DIR / "data", LOG_DIR):
+        d.mkdir(parents=True, exist_ok=True)
 
-    # Environment for the edge core subprocess
-    env = {
-        **os.environ,
-        "EDGE_HOST": "127.0.0.1",
-        "EDGE_PORT": str(core_port),
-        "DVAS_EDGE_DATA_DIR": str(DATA_DIR / "data"),
-    }
-
-    # Start edge_api_server.py as a subprocess
-    # stdin=PIPE kept open → avoids the Uvicorn EOF shutdown when no console
-    core = subprocess.Popen(
-        [sys.executable, str(APP_DIR / "edge_api_server.py")],
-        cwd=str(APP_DIR),
-        env=env,
-        stdin=subprocess.PIPE,
-    )
-
+    # 3. Secrets: plain text in edge.env -> DPAPI store, then into this process env
     try:
-        # Auto-open the browser after a short delay
-        if os.environ.get("DVAS_OPEN_BROWSER", "1") == "1":
-            threading.Timer(2.0, lambda: webbrowser.open(f"http://localhost:{ui_port}")).start()
+        credentials.migrate(ENV_FILE, SECRETS_FILE)
+        credentials.apply(SECRETS_FILE)
+    except OSError as exc:
+        log.error("credential_store_unavailable: %s", exc)
 
-        print("=" * 60)
-        print("  DVAS Edge Operator")
-        print(f"  UI:    http://localhost:{ui_port}")
-        print(f"  Core:  {CORE}")
-        print(f"  Cloud: {CLOUD}")
-        print("=" * 60)
+    # 4. Edge core, supervised, without a console window
+    supervisor = CoreSupervisor(
+        cmd=[sys.executable, str(EDGE_ROOT / "edge_api_server.py")],
+        cwd=EDGE_ROOT,
+        env={
+            **os.environ,
+            "EDGE_HOST": "127.0.0.1",
+            "EDGE_PORT": str(core_port),
+            "DVAS_EDGE_DATA_DIR": str(DATA_DIR / "data"),
+            "LOGGING__LOG_FILE": str(LOG_DIR / "core.log"),
+        },
+        core_url=CORE,
+        stderr_log=LOG_DIR / "core-stderr.log",
+    )
+    app.state.supervisor = supervisor
+    supervisor.start()
 
-        uvicorn.run(app, host="127.0.0.1", port=ui_port, log_level="info")
+    ui_url = f"http://localhost:{ui_port}"
+    log.info("dvas_edge_started ui=%s core=%s cloud=%s logs=%s", ui_url, CORE, CLOUD, LOG_DIR)
+    if os.environ.get("DVAS_OPEN_BROWSER", "1") == "1":
+        threading.Timer(2.0, lambda: webbrowser.open(ui_url)).start()
+
+    # 5. Gateway (log_config=None: no console streams under pythonw)
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=ui_port, log_config=None))
+    try:
+        if console_mode:
+            server.run()
+        else:
+            gateway = threading.Thread(target=server.run, name="Gateway", daemon=True)
+            gateway.start()
+            if not run_tray(ui_url, supervisor, server):
+                gateway.join()
+            gateway.join(timeout=10)
     finally:
-        core.terminate()
-        try:
-            core.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            core.kill()
+        supervisor.stop()
+        log.info("dvas_edge_stopped")
 
 
 if __name__ == "__main__":

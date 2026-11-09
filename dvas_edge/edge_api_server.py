@@ -7,7 +7,7 @@ and MJPEG video streaming for the Dashboard frontend.
 
 Usage:
     python edge_api_server.py
-    # Server starts on http://0.0.0.0:8765
+    # Server starts on http://127.0.0.1:8765 (EDGE_HOST / EDGE_PORT override)
 """
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ import ntpath
 import time
 import datetime
 import asyncio
+import contextlib
 import threading
 import queue
 import collections
@@ -82,23 +83,7 @@ def emit_system_log(source: str, level: str, message: str, metric: str = ""):
     }
     SYSTEM_LOGS_DEQUE.appendleft(entry)
 
-# Pre-seed realistic initial operational engine events
-_init_events = [
-    ("stream-mgr", "INFO", "RTMP connected to rtmp://10.253.110.250:1935/live/stream", "ONLINE"),
-    ("stream-mgr", "INFO", "Encoding metrics verified: 1920x1080 @ 30 FPS, Bitrate: 4500 kbps, Codec: H.264", "1080p@30FPS"),
-    ("stream-mgr", "INFO", "Stream health nominal; 0 frames dropped; uplink latency: 18ms", "0 drops / 18ms"),
-    ("buffer-svc", "INFO", "Local ring buffer 68% full (12.4 GB / 18 GB slab storage)", "68% (12.4 GB)"),
-    ("buffer-svc", "INFO", "Overwrite cycle #42 completed; pinned evidence clips preserved in secure vault", "Cycle #42"),
-    ("telemetry", "INFO", "GPS Lock 3D acquired (14 satellites, HDOP: 0.8)", "14 SATS (3D)"),
-    ("telemetry", "INFO", "Flight telemetry nominal: Battery: 78%, Speed: 12.4 m/s, Altitude: 45.2 m AGL", "78% Bat / 45.2m"),
-    ("telemetry", "INFO", "Control input active; RC Operator authenticated: Govind", "Operator: Govind"),
-    ("ingest", "INFO", "WebSocket telemetry sync active: Connected to ws://10.253.110.250:8000/ws/status", "WS CONNECTED"),
-    ("ingest", "INFO", "Frame queue ACK received from central dvas_ingest node", "ACK OK"),
-    ("system", "INFO", "Jetson / Edge device health nominal: CPU: 42%, GPU: 65%, Temp: 54°C", "CPU 42% / 54°C"),
-    ("system", "INFO", "/data partition health: 52% used (94 GB available space)", "52% (94 GB free)"),
-]
-for _s, _l, _m, _met in _init_events:
-    emit_system_log(_s, _l, _m, _met)
+emit_system_log("system", "INFO", "Edge core started")
 
 # ── Persistent Edge Settings ──────────────────────────────────────────────────
 _EDGE_DATA_DIR = Path(os.getenv("DVAS_EDGE_DATA_DIR", "/data"))
@@ -106,9 +91,7 @@ SETTINGS_FILE_PATH = _EDGE_DATA_DIR / "edge_settings.json"
 
 DEFAULT_SETTINGS = {
     "transmission": {
-        "ingest_url": os.getenv("INGEST__URL", "http://drone_nginx/ingest/frame"),
-        "mission_start_url": os.getenv("INGEST__MISSION_START_URL", "http://drone_nginx/ingest/mission/start"),
-        "mission_end_url": os.getenv("INGEST__MISSION_END_URL", "http://drone_nginx/ingest/mission/end"),
+        "ingest_base_url": os.getenv("INGEST__BASE_URL", os.getenv("INGEST__URL", "")),
         "bypass_target_fps": 30,
         "jpeg_quality": 80,
         "max_resolution": "1080p",
@@ -199,17 +182,10 @@ def _system_metrics_collector():
             t_str = datetime.datetime.now().strftime("%H:%M:%S")
             SYSTEM_HISTORY_DEQUE.append({"time": t_str, "cpu": c, "gpu": g, "memory": m})
 
-            # Emit live engine status periodic heartbeats every 6-10 seconds
+            # Periodic health line from real readings only (every ~6 s)
             if loop_count % 3 == 0:
-                emit_system_log("system", "INFO", f"Jetson / Edge device health: CPU: {c}%, GPU: {g}%, Temp: 54°C", metric=f"CPU {c}%")
-            if loop_count % 4 == 0:
-                emit_system_log("ingest", "INFO", "Frame queue ACK received from central dvas_ingest node", metric="ACK OK")
-            if loop_count % 6 == 0:
-                emit_system_log("telemetry", "INFO", f"Flight telemetry nominal: Battery: 78%, Speed: 12.4 m/s, Altitude: 45.2 m AGL", metric="14 SATS")
-            if loop_count % 8 == 0:
-                emit_system_log("buffer-svc", "INFO", "Local ring buffer health: 68% full (12.4 GB / 18 GB); pinned clips preserved", metric="68%")
-            if loop_count % 10 == 0:
-                emit_system_log("stream-mgr", "INFO", "Encoding stream: 1920x1080 @ 30 FPS, Bitrate: 4500 kbps, Codec: H.264", metric="30 FPS")
+                gpu_part = f", GPU: {g}%" if _GPU_AVAILABLE else ""
+                emit_system_log("system", "INFO", f"Edge device health: CPU: {c}%, Memory: {m}%{gpu_part}", metric=f"CPU {c}%")
 
         except Exception:
             pass
@@ -228,6 +204,7 @@ from src.cognitive_frame_selector.selected_frame import SelectedFrame
 from ingest.edge_sender import IngestClient
 from ingest.offline_buffer import OfflineBuffer
 from ingest.seq_store import SeqStore
+from ingest.endpoints import IngestEndpoints, InvalidIngestURL, normalize_base
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +423,22 @@ class EdgeSenderThread(threading.Thread):
         self._buffer.commit(frame_id)
         self._consecutive_failures = 0
         self._rtt_ema = 0.8 * self._rtt_ema + 0.2 * (time.monotonic() - t0)
+
+
+def _ingest_endpoints() -> Optional[IngestEndpoints]:
+    """Endpoints from the operator's ingest URL (Settings), else from edge.env."""
+    t = settings_manager.get_all().get("transmission", {})
+    url = t.get("ingest_base_url") or t.get("ingest_url")   # ingest_url: settings saved by v1
+    if url:
+        try:
+            return IngestEndpoints.from_base(url)
+        except InvalidIngestURL as exc:
+            log.error(f"configured_ingest_url_invalid: {exc}")
+    return IngestEndpoints.from_env()
+
+
+def _tls_verify() -> bool:
+    return os.getenv("INGEST__TLS_VERIFY", "true").lower() == "true"
 
 
 _LINK_DOWN_AFTER = 3
@@ -779,6 +772,7 @@ class PipelineManager:
                 session_token=effective_token,
                 token_expiry=effective_expiry,
                 laptop_id=laptop_id,
+                endpoints=_ingest_endpoints(),
             )
             self.sender_thread = EdgeSenderThread(
                 client=client,
@@ -1113,7 +1107,14 @@ def get_jwks():
 
 pipeline = PipelineManager()
 
-app = FastAPI(title="DVAS Edge Control API")
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    yield
+    # Shutdown: end a running mission and wait for the sender (blocking, so in a thread)
+    await asyncio.to_thread(_end_mission_on_shutdown)
+
+
+app = FastAPI(title="DVAS Edge Control API", lifespan=_lifespan)
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -1423,6 +1424,10 @@ def toggle_pipeline(req: TogglePipelineRequest, auth: dict = Depends(verify_edge
 
 @app.get("/api/edge/mission/active")
 def get_active_mission(auth: dict = Depends(verify_edge_auth)):
+    return _active_mission_view()
+
+
+def _active_mission_view() -> dict:
     if pipeline.active_mission:
         return {
             "active": True,
@@ -1482,6 +1487,12 @@ def get_edge_settings(auth: dict = Depends(verify_edge_auth)):
 @app.post("/api/edge/settings")
 def update_edge_settings(req: UpdateSettingsRequest, auth: dict = Depends(verify_edge_auth)):
     payload = req.model_dump(exclude_unset=True)
+    transmission = payload.get("transmission") or {}
+    if "ingest_base_url" in transmission:
+        try:
+            transmission["ingest_base_url"] = normalize_base(transmission["ingest_base_url"])
+        except InvalidIngestURL as exc:
+            raise HTTPException(status_code=422, detail=f"Ingest server URL: {exc}")
     updated = settings_manager.update(payload)
     log.info("edge_settings_updated", settings=updated)
     emit_system_log("system", "INFO", "Operator updated edge system configuration", metric="CONFIG")
@@ -1571,14 +1582,19 @@ def purge_temp_files(auth: dict = Depends(verify_edge_auth)):
 @app.post("/api/edge/transmission/test-connection")
 async def test_transmission_connection(req: TestConnectionRequest, auth: dict = Depends(verify_edge_auth)):
     curr_settings = settings_manager.get_all()
-    target_url = req.url or curr_settings.get("transmission", {}).get("ingest_url", "http://drone_nginx/ingest/frame")
-    import urllib.parse
-    parsed = urllib.parse.urlparse(target_url)
-    base_url = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else target_url
-    
+    try:
+        endpoints = IngestEndpoints.from_base(req.url) if req.url else _ingest_endpoints()
+    except InvalidIngestURL as exc:
+        raise HTTPException(status_code=422, detail=f"Ingest server URL: {exc}")
+    if endpoints is None:
+        raise HTTPException(status_code=422, detail="Ingest server URL is not configured")
+    target_url = endpoints.frame
+    base_url = endpoints.base
+
+
     start_time = time.time()
     try:
-        async with httpx.AsyncClient(timeout=3.0, verify=False) as client:
+        async with httpx.AsyncClient(timeout=3.0, verify=_tls_verify()) as client:
             r = await client.get(base_url)
             latency_ms = round((time.time() - start_time) * 1000, 1)
             return {
@@ -1967,6 +1983,10 @@ def get_telemetry(request: Request, auth: dict = Depends(verify_edge_auth)):
 
 @app.get("/api/edge/analytics")
 def get_analytics(auth: dict = Depends(verify_edge_auth)):
+    return _analytics_view()
+
+
+def _analytics_view() -> dict:
     if not pipeline._running:
         return {"active": False}
     
@@ -2119,37 +2139,152 @@ async def stream_live(request: Request, auth: dict = Depends(verify_edge_auth)):
 # ---------------------------------------------------------------------------
 # Ingest Server Proxy
 # ---------------------------------------------------------------------------
-INGEST_BASE_URL = os.getenv("INGEST__URL", os.getenv("INGEST_URL", "https://4nrza3dukc231h-80.proxy.runpod.net/ingest")).replace("/frame", "")
+_DRONE_ID_RE = re.compile(r"^[A-Z0-9_\-]{3,30}$")
 
-@app.get("/api/ingest-server/status")
-async def proxy_ingest_status(auth: dict = Depends(verify_edge_auth)):
-    tls_verify = os.getenv("INGEST__TLS_VERIFY", "true").lower() == "true"
-    async with httpx.AsyncClient(timeout=2.0, verify=tls_verify) as client:
+
+async def _ingest_get(path: str) -> dict:
+    endpoints = _ingest_endpoints()
+    if endpoints is None:
+        return {}
+    async with httpx.AsyncClient(timeout=2.0, verify=_tls_verify()) as client:
         try:
-            resp = await client.get(f"{INGEST_BASE_URL}/status")
+            resp = await client.get(f"{endpoints.base}/ingest{path}")
             if resp.status_code == 200:
                 return resp.json()
         except Exception as e:
-            log.warning(f"Failed to fetch ingest status: {e}")
+            log.warning(f"Failed to fetch ingest {path}: {e}")
     return {}
+
+
+@app.get("/api/ingest-server/status")
+async def proxy_ingest_status(auth: dict = Depends(verify_edge_auth)):
+    return await _ingest_get("/status")
 
 
 @app.get("/api/ingest-server/status/{drone_id}")
 async def proxy_ingest_drone_status(drone_id: str, auth: dict = Depends(verify_edge_auth)):
-    tls_verify = os.getenv("INGEST__TLS_VERIFY", "true").lower() == "true"
-    async with httpx.AsyncClient(timeout=2.0, verify=tls_verify) as client:
-        try:
-            resp = await client.get(f"{INGEST_BASE_URL}/status/{drone_id}")
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception as e:
-            log.warning(f"Failed to fetch ingest drone status for {drone_id}: {e}")
-    return {}
+    if not _DRONE_ID_RE.match(drone_id):
+        raise HTTPException(status_code=422, detail="Invalid drone id")
+    return await _ingest_get(f"/status/{drone_id}")
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Live snapshot for the edge UI: one cached object instead of many polls
+# ---------------------------------------------------------------------------
+_SNAPSHOT_TTL_S = 0.5
+_SSE_INTERVAL_S = 1.0
+_SSE_KEEPALIVE_S = 15.0
+_SSE_MAX_CLIENTS = 8
+_snapshot_lock = threading.Lock()
+_snapshot_cache: dict = {"t": 0.0, "data": None}
+_sse_clients = 0
+
+
+def _uplink_view() -> dict:
+    sender = pipeline.sender_thread
+    if sender is None:
+        return {"active": False}
+    return {
+        "active": True,
+        "rtt_ms": round(getattr(sender, "_rtt_ema", 0.0) * 1000, 1),
+        "consecutive_failures": getattr(sender, "_consecutive_failures", 0),
+        "buffer": sender.buffer_stats(),
+    }
+
+
+def build_snapshot() -> dict:
+    """Everything the live edge pages show, built at most every _SNAPSHOT_TTL_S."""
+    with _snapshot_lock:
+        now = time.monotonic()
+        if _snapshot_cache["data"] is None or now - _snapshot_cache["t"] >= _SNAPSHOT_TTL_S:
+            _snapshot_cache["data"] = {
+                "status": pipeline.get_status(),
+                "telemetry": pipeline.get_telemetry(),
+                "mission": _active_mission_view(),
+                "analytics": _analytics_view(),
+                "uplink": _uplink_view(),
+            }
+            _snapshot_cache["t"] = now
+        return _snapshot_cache["data"]
+
+
+@app.get("/api/edge/snapshot")
+def get_snapshot(auth: dict = Depends(verify_edge_auth)):
+    return build_snapshot()
+
+
+@app.get("/api/edge/events")
+async def stream_events(request: Request, auth: dict = Depends(verify_edge_auth)):
+    """Server-Sent Events: the snapshot when it changes (at most once per second)."""
+    if _sse_clients >= _SSE_MAX_CLIENTS:
+        raise HTTPException(status_code=429, detail="Too many live connections")
+
+    async def events():
+        global _sse_clients
+        _sse_clients += 1          # counted only once streaming starts, so finally always pairs it
+        last_body, last_sent = None, 0.0
+        try:
+            while not await request.is_disconnected():
+                body = json.dumps(await asyncio.to_thread(build_snapshot), default=str, separators=(",", ":"))
+                now = time.monotonic()
+                if body != last_body:
+                    yield f"event: snapshot\ndata: {body}\n\n"
+                    last_body, last_sent = body, now
+                elif now - last_sent >= _SSE_KEEPALIVE_S:
+                    yield ": keepalive\n\n"
+                    last_sent = now
+                await asyncio.sleep(_SSE_INTERVAL_S)
+        finally:
+            _sse_clients -= 1
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown (launcher Quit / restart, Ctrl+C in a debug console)
+# ---------------------------------------------------------------------------
+_LAUNCHER_SECRET = os.getenv("DVAS_LAUNCHER_SECRET", "")
+_SHUTDOWN_DRAIN_S = 15.0
+
+
+def _end_mission_on_shutdown() -> None:
+    """End a running mission so the sender spills unsent frames to disk and tells ingest."""
+    sender = pipeline.sender_thread
+    if pipeline._running:
+        log.info("shutdown_ending_active_mission")
+        pipeline.end_mission()
+    if sender is not None:
+        sender.join(timeout=_SHUTDOWN_DRAIN_S)
+        if sender.is_alive():
+            log.warning("shutdown_sender_did_not_finish", timeout_s=_SHUTDOWN_DRAIN_S)
+
+
+@app.post("/internal/shutdown", include_in_schema=False)
+def internal_shutdown(request: Request, x_launcher_secret: Optional[str] = Header(None)):
+    """Called by the launcher only: loopback client and the per-launch secret it generated."""
+    import hmac
+    client_ip = request.client.host if request.client else ""
+    if (not _LAUNCHER_SECRET or client_ip not in ("127.0.0.1", "::1")
+            or not hmac.compare_digest(x_launcher_secret or "", _LAUNCHER_SECRET)):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    server = getattr(app.state, "uvicorn_server", None)
+    if server is None:
+        raise HTTPException(status_code=503, detail="Server handle unavailable")
+    server.should_exit = True
+    return {"status": "shutting_down"}
+
+
 if __name__ == "__main__":
-    _host = os.getenv("EDGE_HOST", "0.0.0.0")
+    _host = os.getenv("EDGE_HOST", "127.0.0.1")
     _port = int(os.getenv("EDGE_PORT", "8765"))
-    uvicorn.run(app, host=_host, port=_port)
+    # log_config=None: Uvicorn's default config writes to sys.stderr, which is None under
+    # pythonw (no console) and made startup fail. Its loggers now go to our file handlers.
+    _server = uvicorn.Server(uvicorn.Config(app, host=_host, port=_port, log_config=None))
+    app.state.uvicorn_server = _server
+    _server.run()
 

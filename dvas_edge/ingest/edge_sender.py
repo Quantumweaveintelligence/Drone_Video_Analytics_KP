@@ -23,10 +23,13 @@ import json
 import logging
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
 import httpx
+
+from ingest.endpoints import IngestEndpoints
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # LAN demo: direct HTTP to ingest server (no VPN / no TLS)
@@ -56,10 +59,10 @@ def get_laptop_name() -> str:
 
 LAPTOP_ID = get_laptop_name()
 
-INGEST_URL  = os.getenv("INGEST__URL", os.getenv("INGEST_URL",  "http://10.123.225.251/ingest/frame"))
-TOKEN_URL   = os.getenv("INGEST__TOKEN_URL", os.getenv("TOKEN_URL",   "http://10.123.225.251:8080/realms/kerala-police-drone/protocol/openid-connect/token"))
+INGEST_URL  = os.getenv("INGEST__URL", os.getenv("INGEST_URL", ""))   # legacy override (main.py)
+TOKEN_URL   = os.getenv("INGEST__TOKEN_URL", os.getenv("TOKEN_URL", ""))   # legacy override (main.py)
 CLIENT_ID   = os.getenv("KC_CLIENT_ID",  "drone-ingest-client")
-CLIENT_SEC  = os.getenv("INGEST__CLIENT_SECRET", os.getenv("KC_CLIENT_SEC", "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn"))
+CLIENT_SEC  = os.getenv("INGEST__CLIENT_SECRET", os.getenv("KC_CLIENT_SEC", ""))
 
 # INGEST__USERNAME: if not explicitly configured, automatically defaults to Windows Computer Name
 _env_user   = os.getenv("INGEST__USERNAME", os.getenv("EDGE_USERNAME", "")).strip()
@@ -107,6 +110,14 @@ def _iso_utc(epoch_s: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(total_ms // 1000)) + f".{total_ms % 1000:03d}Z"
 
 
+def _legacy_endpoints() -> Optional[IngestEndpoints]:
+    """Endpoints from INGEST__BASE_URL / INGEST__URL, honouring main.py's module overrides."""
+    if INGEST_URL:
+        ep = IngestEndpoints.from_base(INGEST_URL)
+        return replace(ep, token=TOKEN_URL) if TOKEN_URL else ep
+    return IngestEndpoints.from_env()
+
+
 class IngestClient:
     """
     Authenticated HTTP client for the drone ingest server.
@@ -126,7 +137,9 @@ class IngestClient:
         session_token: Optional[str] = None,
         token_expiry:  float = 0.0,
         laptop_id:     Optional[str] = None,
+        endpoints:     Optional[IngestEndpoints] = None,
     ) -> None:
+        self.endpoints = endpoints or _legacy_endpoints()
         if drone_id:
             import re
             cleaned_drone = re.sub(r"[^A-Z0-9_\-]", "-", str(drone_id).upper())
@@ -169,7 +182,7 @@ class IngestClient:
         """
         async with httpx.AsyncClient(timeout=10.0, verify=_tls_param()) as client:
             resp = await client.post(
-                TOKEN_URL,
+                self._ep().token,
                 data={
                     "client_id":     CLIENT_ID,
                     "client_secret": CLIENT_SEC,
@@ -233,6 +246,11 @@ class IngestClient:
             self._http_client = None
 
     # ── Frame upload ──────────────────────────────────────────────────────────
+
+    def _ep(self) -> IngestEndpoints:
+        if self.endpoints is None:
+            raise RuntimeError("Ingest server URL is not configured (Settings > Ingest server URL)")
+        return self.endpoints
 
     def _frame_identity(self, seq: Optional[int], capture_ts: Optional[float]) -> tuple:
         """Use the capture-time identity given by the caller.
@@ -301,7 +319,7 @@ class IngestClient:
             try:
                 client = await self._get_client()
                 resp = await client.post(
-                    INGEST_URL,
+                    self._ep().frame,
                     headers={"Authorization": f"Bearer {token}"},
                     files={"frame": ("frame.jpg", frame_bytes, "image/jpeg")},
                     data={"metadata_json": json.dumps(meta)},
@@ -420,7 +438,7 @@ class IngestClient:
             try:
                 client = await self._get_client()
                 resp = await client.post(
-                    INGEST_URL,
+                    self._ep().frame,
                     headers={"Authorization": f"Bearer {token}"},
                     files={"frame": ("frame.jpg", frame_bytes, "image/jpeg")},
                     data={"metadata_json": json.dumps(meta)},
@@ -470,10 +488,7 @@ class IngestClient:
         geofence:     Optional[dict] = None,
     ) -> None:
         """Register mission start with the ingest server, optionally including geofence."""
-        mission_start_url = os.getenv(
-            "INGEST__MISSION_START_URL",
-            os.getenv("MISSION_START_URL", "http://10.123.225.251/ingest/mission/start")
-        )
+        mission_start_url = self._ep().mission_start
         token = await self.get_token()
         payload = {
             "drone_id":          self.drone_id,
@@ -500,11 +515,7 @@ class IngestClient:
 
     async def send_geofence_update(self, geofence: dict) -> None:
         """Send mid-flight updated geofence to the ingest server."""
-        base_url = os.getenv(
-            "INGEST__MISSION_START_URL",
-            os.getenv("MISSION_START_URL", "http://10.123.225.251/ingest/mission/start")
-        )
-        geofence_url = base_url.replace("/start", "/geofence")
+        geofence_url = self._ep().mission_geofence
         token = await self.get_token()
         payload = {
             "drone_id":   self.drone_id,
@@ -522,10 +533,7 @@ class IngestClient:
 
     async def end_mission(self) -> None:
         """Register mission end with the ingest server."""
-        mission_end_url = os.getenv(
-            "INGEST__MISSION_END_URL",
-            os.getenv("MISSION_END_URL", "http://10.123.225.251/ingest/mission/end")
-        )
+        mission_end_url = self._ep().mission_end
         token = await self.get_token()
         client = await self._get_client()
         resp = await client.post(

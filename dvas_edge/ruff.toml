@@ -1,0 +1,30 @@
+# Lint config for the v2 edge work. Scope is limited to files written or rewritten in v2,
+# so existing code is not flagged by a tool it was never checked with.
+# Run: ruff check   (from dvas_edge/)
+target-version = "py311"
+include = [
+    "ingest/seq_store.py",
+    "ingest/offline_buffer.py",
+    "ingest/endpoints.py",
+    "src/utils/dpapi.py",
+    "src/utils/logger.py",
+    "src/launcher/*.py",
+    "packaging/edge_launcher.py",
+    "tests/test_seq_reservation.py",
+    "tests/test_offline_buffer_caps.py",
+    "tests/test_edge_sender_order.py",
+    "tests/test_endpoints.py",
+    "tests/test_logging_and_credentials.py",
+    "tests/test_supervisor.py",
+    "tests/test_api_v2.py",
+]
+
+[lint]
+# pyflakes, bugbear, bandit-style security rules, syntax errors
+select = ["E9", "F", "B", "S"]
+# S101 assert (tests), S311 random for jitter only, S603 subprocess with argument lists (no shell)
+ignore = ["S101", "S311", "S603"]
+
+[lint.per-file-ignores]
+# Fake credentials and a system tool (tasklist) used only inside tests
+"tests/*" = ["S105", "S106", "S607"]

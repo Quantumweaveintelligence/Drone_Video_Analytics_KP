@@ -121,11 +121,13 @@ Write-Host "  Cleaned __pycache__"
 Copy-Item (Join-Path $ScriptDir "edge_launcher.py") -Destination $DistDir
 Write-Host "  Copied edge_launcher.py"
 
-# Step 5: Copy launchers
-Write-Host "[5/7] Creating launchers..." -ForegroundColor Yellow
-Copy-Item (Join-Path $ScriptDir "Start_DVAS_Edge.bat") -Destination $DistDir
-Copy-Item (Join-Path $ScriptDir "Start_DVAS_Edge.vbs") -Destination $DistDir
-Write-Host "  Copied Start_DVAS_Edge.bat + .vbs"
+# Step 5: Launchers
+# The installer shortcuts start python_runtime\pythonw.exe edge_launcher.py directly
+# (no console window); the "support console" shortcut uses python.exe --console.
+Write-Host "[5/7] Launchers: shortcuts point at pythonw.exe (no .bat/.vbs needed)" -ForegroundColor Yellow
+if (-not (Test-Path (Join-Path $DistDir "python_runtime\pythonw.exe"))) {
+    throw "python_runtime\pythonw.exe missing from the embedded runtime"
+}
 
 # Step 6: Build frontend (optional)
 if ($SkipFrontend) {

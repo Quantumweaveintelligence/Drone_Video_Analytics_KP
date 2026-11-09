@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import AppShell from '@/components/layout/AppShell';
 import { AreaChart, Area, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
 import { Clock, Scan, Activity, Database, AlertCircle } from 'lucide-react';
-import { authFetch } from '@/lib/api';
+import { useEdgeLive } from "@/lib/edgeLive";
 
 // Reusable SVG Donut Gauge
 const DonutGauge = ({ value, label, max = 100, isPercentage = false, color = "#3b82f6", size = "normal" }) => {
@@ -50,27 +50,15 @@ export default function BufferAndChange() {
   });
   const [mission, setMission] = useState(null);
 
+  const { getSnapshot } = useEdgeLive();
+
   useEffect(() => {
     let mounted = true;
-    const poll = async () => {
-      try {
-        const [analyticsResp, missionResp] = await Promise.all([
-          authFetch('/edge-api/api/edge/analytics'),
-          authFetch('/edge-api/api/edge/mission/active')
-        ]);
-
-        if (analyticsResp.ok && mounted) {
-          const json = await analyticsResp.json();
-          setData(json);
-        }
-
-        if (missionResp.ok && mounted) {
-          const mJson = await missionResp.json();
-          setMission(mJson.active ? mJson : null);
-        }
-      } catch (err) {
-        // Ignore fetch errors during polling
-      }
+    const poll = () => {
+      const snap = getSnapshot();
+      if (!snap || !mounted) return;
+      setData(snap.analytics);
+      setMission(snap.mission?.active ? snap.mission : null);
     };
 
     poll();
@@ -79,7 +67,7 @@ export default function BufferAndChange() {
       mounted = false;
       clearInterval(interval);
     };
-  }, []);
+  }, [getSnapshot]);
 
   const isActive = data.active && mission !== null;
 

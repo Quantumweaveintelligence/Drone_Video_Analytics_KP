@@ -2,26 +2,29 @@
 ; DVAS Edge Operator — Inno Setup Installer Script
 ; ============================================================
 ; Compile with:
-;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" dvas_edge_installer.iss
-;
-; Or with build-time secrets:
-;   ISCC.exe /DClientSecret=xxx /DEdgeApiKey=yyy dvas_edge_installer.iss
+;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DClientSecret=xxx /DEdgeApiKey=yyy ^
+;       [/DIngestPassword=zzz] [/DDefaultIngestUrl=https://<pod>-80.proxy.runpod.net] dvas_edge_installer.iss
+; ClientSecret and EdgeApiKey are required (the build stops without them).
 ; ============================================================
 
 #define AppName      "Kerala Police DVAS Edge Operator"
 #define AppVersion   "1.0.0"
 #define AppPublisher "Kerala Police — Drone Video Analytics"
-#define AppExeName   "Start_DVAS_Edge.vbs"
+#define AppExeName   "edge_launcher.py"
 
-; Build-time parameters (pass via /D on command line)
+; Build-time parameters (pass via /D on command line). There are no defaults:
+; a secret compiled into the installer would ship to every laptop.
 #ifndef ClientSecret
-  #define ClientSecret "yNa0AfA0mToUmhQHSiM2vjAyYud6NSMn"
+  #error ClientSecret not set. Build with: ISCC.exe /DClientSecret=... /DEdgeApiKey=... dvas_edge_installer.iss
 #endif
 #ifndef EdgeApiKey
-  #define EdgeApiKey "test-key-123"
+  #error EdgeApiKey not set. Build with: ISCC.exe /DClientSecret=... /DEdgeApiKey=... dvas_edge_installer.iss
 #endif
 #ifndef IngestPassword
   #define IngestPassword ""
+#endif
+#ifndef DefaultIngestUrl
+  #define DefaultIngestUrl ""
 #endif
 
 [Setup]
@@ -53,19 +56,20 @@ Source: "dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createal
 ; Data directories (persist across upgrades)
 Name: "{localappdata}\DVAS_Edge\config"
 Name: "{localappdata}\DVAS_Edge\data"
-Name: "{localappdata}\DVAS_Edge\data\logs"
+Name: "{localappdata}\DVAS_Edge\logs"
 Name: "{localappdata}\DVAS_Edge\data\buffer_storage"
 
 [Icons]
-; Desktop shortcut
-Name: "{autodesktop}\DVAS Edge Operator"; Filename: "wscript.exe"; Parameters: """{app}\Start_DVAS_Edge.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\static\favicon.ico"; Comment: "Launch DVAS Edge Operator"
+; Desktop shortcut (no console window: pythonw.exe; logs go to %LOCALAPPDATA%\DVAS_Edge\logs)
+Name: "{autodesktop}\DVAS Edge Operator"; Filename: "{app}\python_runtime\pythonw.exe"; Parameters: """{app}\edge_launcher.py"""; WorkingDir: "{app}"; IconFilename: "{app}\static\favicon.ico"; Comment: "Launch DVAS Edge Operator"
 ; Start menu shortcuts
-Name: "{autoprograms}\DVAS Edge\DVAS Edge Operator"; Filename: "wscript.exe"; Parameters: """{app}\Start_DVAS_Edge.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\static\favicon.ico"
+Name: "{autoprograms}\DVAS Edge\DVAS Edge Operator"; Filename: "{app}\python_runtime\pythonw.exe"; Parameters: """{app}\edge_launcher.py"""; WorkingDir: "{app}"; IconFilename: "{app}\static\favicon.ico"
+Name: "{autoprograms}\DVAS Edge\DVAS Edge (support console)"; Filename: "{app}\python_runtime\python.exe"; Parameters: """{app}\edge_launcher.py"" --console"; WorkingDir: "{app}"; IconFilename: "{app}\static\favicon.ico"; Comment: "Same app with a console window showing live logs"
 Name: "{autoprograms}\DVAS Edge\Change Ingest URL"; Filename: "notepad.exe"; Parameters: """{localappdata}\DVAS_Edge\config\edge.env"""
-Name: "{autoprograms}\DVAS Edge\View Logs"; Filename: "{localappdata}\DVAS_Edge\data\logs"
+Name: "{autoprograms}\DVAS Edge\View Logs"; Filename: "{localappdata}\DVAS_Edge\logs"
 
 [Run]
-Filename: "wscript.exe"; Parameters: """{app}\Start_DVAS_Edge.vbs"""; Description: "Launch DVAS Edge now"; Flags: postinstall shellexec skipifsilent nowait
+Filename: "{app}\python_runtime\pythonw.exe"; Parameters: """{app}\edge_launcher.py"""; WorkingDir: "{app}"; Description: "Launch DVAS Edge now"; Flags: postinstall skipifsilent nowait
 
 [UninstallDelete]
 ; Clean up Python bytecode on uninstall (but NOT the data directory)
@@ -73,6 +77,8 @@ Type: filesandordirs; Name: "{app}\__pycache__"
 Type: filesandordirs; Name: "{app}\src\__pycache__"
 Type: filesandordirs; Name: "{app}\ingest\__pycache__"
 Type: filesandordirs; Name: "{app}\config\__pycache__"
+Type: filesandordirs; Name: "{app}\src\launcher\__pycache__"
+Type: filesandordirs; Name: "{app}\src\utils\__pycache__"
 
 [Code]
 var
@@ -85,9 +91,9 @@ begin
     'DVAS Ingest Server',
     'Ingest server address',
     'Verify or edit the DVAS Ingest Server URL for this operator laptop.'#13#10 +
-    'The cloud ingest endpoint is pre-configured below by default:');
+    'Enter the RunPod / ingest server address, e.g. https://<pod>-80.proxy.runpod.net');
   IngestPage.Add('Ingest Server URL:', False);
-  IngestPage.Values[0] := 'https://g03m12pg2h741j-80.proxy.runpod.net/ingest';
+  IngestPage.Values[0] := '{#DefaultIngestUrl}';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -96,7 +102,6 @@ var
   Lines: TStringList;
   RawUrl: string;
   CloudBase: string;
-  IngestBase: string;
   LowerUrl: string;
 begin
   if CurStep = ssPostInstall then
@@ -107,18 +112,15 @@ begin
     while (Length(RawUrl) > 0) and (RawUrl[Length(RawUrl)] = '/') do
       RawUrl := Copy(RawUrl, 1, Length(RawUrl) - 1);
 
+    { Accept https://host, https://host/ingest or https://host/ingest/frame: keep the host part }
     LowerUrl := Lowercase(RawUrl);
-    { If user entered URL ending with /ingest, split into CloudBase and IngestBase }
+    if (Length(LowerUrl) >= 6) and (Copy(LowerUrl, Length(LowerUrl) - 5, 6) = '/frame') then
+      RawUrl := Copy(RawUrl, 1, Length(RawUrl) - 6);
+    LowerUrl := Lowercase(RawUrl);
     if (Length(LowerUrl) >= 7) and (Copy(LowerUrl, Length(LowerUrl) - 6, 7) = '/ingest') then
-    begin
-      IngestBase := RawUrl;
-      CloudBase := Copy(RawUrl, 1, Length(RawUrl) - 7);
-    end
-    else
-    begin
-      CloudBase := RawUrl;
-      IngestBase := RawUrl + '/ingest';
-    end;
+      RawUrl := Copy(RawUrl, 1, Length(RawUrl) - 7);
+    CloudBase := RawUrl;
+    LowerUrl := Lowercase(RawUrl);
 
     Lines := TStringList.Create;
     try
@@ -126,11 +128,11 @@ begin
       Lines.Add('# Generated by installer on ' + GetDateTimeString('yyyy-mm-dd', #0, #0));
       Lines.Add('');
       Lines.Add('DVAS_CLOUD_URL=' + CloudBase);
-      Lines.Add('INGEST__URL=' + IngestBase + '/frame');
-      Lines.Add('INGEST__MISSION_START_URL=' + IngestBase + '/mission/start');
-      Lines.Add('INGEST__MISSION_END_URL=' + IngestBase + '/mission/end');
-      Lines.Add('INGEST__TOKEN_URL=' + CloudBase + '/realms/kerala-police-drone/protocol/openid-connect/token');
+      Lines.Add('# Ingest server (RunPod) URL. Frame, mission, token and video endpoints are derived from it.');
+      Lines.Add('# It can also be changed in the app: Settings > Ingest server URL.');
+      Lines.Add('INGEST__BASE_URL=' + CloudBase);
       Lines.Add('INGEST__CLIENT_ID=drone-ingest-client');
+      Lines.Add('# Secrets below are moved to an encrypted store (Windows DPAPI) on first start.');
       Lines.Add('INGEST__CLIENT_SECRET={#ClientSecret}');
       Lines.Add('# INGEST__USERNAME auto-detected from Windows computer name');
       Lines.Add('INGEST__PASSWORD={#IngestPassword}');

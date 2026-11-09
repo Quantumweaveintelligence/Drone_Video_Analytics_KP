@@ -219,7 +219,7 @@ class OfflineBuffer:
     def _lowest_disk_row(self, excluded: set) -> Optional[tuple]:
         if excluded:
             marks = ",".join("?" * len(excluded))
-            sql = ("SELECT rowid, id, kind, telemetry_json, frame_path FROM frames "
+            sql = ("SELECT rowid, id, kind, telemetry_json, frame_path FROM frames "  # noqa: S608 - only "?" marks are formatted in
                    f"WHERE mission_id = ? AND id NOT IN ({marks}) ORDER BY seq LIMIT 1")
             return self._conn.execute(sql, (self.mission_id, *excluded)).fetchone()
         return self._conn.execute(
@@ -341,7 +341,7 @@ class OfflineBuffer:
             return
         with self._lock:
             marks = ",".join("?" * len(ids))
-            self._write(f"DELETE FROM events WHERE id IN ({marks})", tuple(ids))
+            self._write(f"DELETE FROM events WHERE id IN ({marks})", tuple(ids))  # noqa: S608 - only "?" marks
             self._maybe_commit(force=True)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
