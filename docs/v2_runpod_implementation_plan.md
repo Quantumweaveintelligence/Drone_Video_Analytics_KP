@@ -546,8 +546,14 @@ Every step is measured on the pod before and after, with the stage split (A4) an
   - e2e, one 4K drone: **analytics 20 fps sustained, 0.1–0.7 s behind live, 400 / 400 frames,
     wall time 22 s for a 20 s clip** (was 8–10 fps and 26 s behind).
 - Next gain seen in the profile: Ultralytics copies the 28 GPU tiles back to the host for
-  `orig_img` (≈19 ms device→host per round on the face stream). Calling the model with our own
-  pre/post-processing (or TensorRT, item 3) removes it — headroom for more drones.
+  `orig_img` (≈19 ms device→host per round on the face stream).
+  **Done (`PERSON_FACE_DIRECT=1`):** the GPU tiles go through the predictor's own network and
+  NMS with the same settings, boxes clipped as its `scale_boxes()` does. Verified in the
+  production image (Ultralytics 8.3.253): identical faces to `predict()` and to the CPU-cut path.
+- Found while testing: `yolov8n-face.pt` needs `omegaconf`, missing from the image — Ultralytics
+  pip-installed it at model load. Added to `requirements/ai.txt`.
+- `bench_person.py` now uses a synthetic frame with real people/faces, so its FP16 face check
+  compares detections (it compared 0 with 0).
 
 1. **Vehicle → ANPR shared detections** (`DVAS_SHARED_DETS=1`).
    - Vehicle's HUD packet already carries the visdrone boxes and its track ids. It adds the raw
@@ -612,6 +618,18 @@ Every step is measured on the pod before and after, with the stage split (A4) an
    - `tools/bench_capacity.py` replays a recorded TS into N simulated drones through the
      video-gateway, with a chosen service set, and reports per-service fps and lag. Record the
      table (drones × service set → fps) here.
+   - **Status (2026-11-10): `tools/bench_capacity.py` added.** N `send_ts` senders at once
+     (30 fps H.264, 8 Mbps at 4K / 4 Mbps at 1080p), straight to ingest (nginx allows 4 uplinks
+     per token); samples every 5 s each drone's analytics fps and lag behind live, the service
+     with the largest backlog, and GPU use. Ingest caps uplinks at `DVAS_MAX_LIVE_STREAMS` (8).
+
+     | Drones × resolution | Analytics fps per drone | Max behind live | Slowest service |
+     |---|---|---|---|
+     | 1 × 4K (e2e, 2026-11-10) | 20 | 0.7 s | — |
+     | 2 × 4K | _to measure_ | | |
+     | 4 × 4K | _to measure_ | | |
+     | 4 × 1080p | _to measure_ | | |
+     | 8 × 1080p | _to measure_ | | |
    - Gateway governor: when an enabled service stays below `DVAS_ANALYTICS_FPS` for 30 s, the
      dashboard shows **Degraded: <service> 14 fps** on the drone's tile and the Models page.
    - Do not silently drop frames.

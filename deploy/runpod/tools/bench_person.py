@@ -98,8 +98,18 @@ def main():
     if jpeg is None:
         img = np.random.randint(0, 255, (2160, 3840, 3), np.uint8)
         img = cv2.GaussianBlur(img, (9, 9), 0)
+        # People and faces at several sizes (Ultralytics' sample photos), so the FP16 face
+        # check below compares real detections, not 0 vs 0
+        assets = os.path.join(os.path.dirname(__import__("ultralytics").__file__), "assets")
+        z, b = cv2.imread(os.path.join(assets, "zidane.jpg")), cv2.imread(os.path.join(assets, "bus.jpg"))
+        if z is not None and b is not None:
+            img[100:820, 200:1480] = z
+            img[900:1440, 1500:2460] = cv2.resize(z, (960, 540))
+            img[1000:2080, 2700:3510] = b
+            img[300:570, 2500:2980] = cv2.resize(z, (480, 270))
+            img[1600:1960, 600:1240] = cv2.resize(z, (640, 360))
         jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()
-        print("using a synthetic 3840x2160 frame"
+        print("using a synthetic 3840x2160 frame with sample people"
               + (f" — no frames found for {a.drone} (is it the drone that is streaming?)" if a.drone else ""))
 
     print("\n== stages (median / worst of", a.frames, "frames, ms)")
@@ -114,12 +124,13 @@ def main():
     print("person predict        %8.1f / %.1f" % timed(lambda: an.tracker.predict_batch({"bench": frame}, **kw), a.frames))
     print("person predict+track  %8.1f / %.1f" % timed(lambda: an.tracker.track_batch({"bench": frame}, **kw), a.frames))
     # v2 R4: before (tiles cut on the CPU, faces after persons) and after (GPU tiles, parallel)
-    gpu_tiles, parallel = pa.FACE_GPU_TILES, pa.FACE_PARALLEL
-    for flag in (False, True):
-        pa.FACE_GPU_TILES = flag
-        print("face tiles, %s     %8.1f / %.1f" % ("GPU cut" if flag else "CPU cut", *timed(
+    gpu_tiles, parallel, direct = pa.FACE_GPU_TILES, pa.FACE_PARALLEL, pa.FACE_DIRECT
+    for label, g, d in (("CPU cut       ", False, False), ("GPU cut       ", True, False),
+                        ("GPU cut+direct", True, True)):
+        pa.FACE_GPU_TILES, pa.FACE_DIRECT = g, d
+        print("face tiles, %s %8.1f / %.1f" % (label, *timed(
             lambda: pa.detect_faces_on_tiles(an.face_model, frame, device=an.device), a.frames)))
-    pa.FACE_GPU_TILES = gpu_tiles
+    pa.FACE_GPU_TILES, pa.FACE_DIRECT = gpu_tiles, direct
     for flag in (False, True):
         pa.FACE_PARALLEL = flag
         print("analyze_batch, %s %8.1f / %.1f" % ("parallel" if flag else "in turn ", *timed(

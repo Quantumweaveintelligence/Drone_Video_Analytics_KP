@@ -19,6 +19,13 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
+try:                                                    # Ultralytics >= 8.3.1xx
+    from ultralytics.utils.nms import non_max_suppression as _yolo_nms
+except ImportError:
+    from ultralytics.utils.ops import non_max_suppression as _yolo_nms
+import inspect as _inspect
+_NMS_KW = set(_inspect.signature(_yolo_nms).parameters)
+
 from shared import gpu_profile
 from shared.batch_tracker import BatchTracker
 
@@ -45,6 +52,9 @@ TILE_IMG_SIZE    = FACE_TILE
 #   runs, instead of after it (a round costs max(person, face) rather than the sum).
 FACE_GPU_TILES   = os.getenv("PERSON_FACE_GPU_TILES", "1") != "0"
 FACE_PARALLEL    = os.getenv("PERSON_FACE_PARALLEL", "1") != "0"
+# DIRECT: GPU tiles go straight through the model and Ultralytics' own NMS. predict() would
+#   copy every tile back to the host only to read its shape (~19 ms per 4K frame on the pod).
+FACE_DIRECT      = os.getenv("PERSON_FACE_DIRECT", "1") != "0"
 # After a CUDA failure the analyzer runs on the CPU; it retries the GPU after this long
 GPU_RETRY_S      = _env_int("PERSON_GPU_RETRY_S", 60, 10, 3600)
 
@@ -137,6 +147,30 @@ def face_tiles(h_img: int, w_img: int, tile: int = FACE_TILE,
             for y in starts(h_img) for x in starts(w_img)]
 
 
+def _tile_dets_direct(model: YOLO, crops: torch.Tensor, tile: int):
+    """Face boxes per tile as (n, 6) tensors (x1, y1, x2, y2, conf, cls) in tile pixels — the
+    same as model.predict() on these tiles: the predictor's own network and NMS with the same
+    settings, and boxes clipped to the tile as its scale_boxes() does (the letterbox is the
+    identity at tile == imgsz). None when the predictor is not set up for this input yet."""
+    p = getattr(model, "predictor", None)
+    m = getattr(p, "model", None)
+    if not FACE_DIRECT or m is None:
+        return None
+    try:
+        weights = next(m.parameters())
+    except StopIteration:
+        return None
+    if weights.device != crops.device or bool(getattr(m, "fp16", False)) != (crops.dtype == torch.float16):
+        return None
+    kw = {"max_det": p.args.max_det, "nc": 0, "end2end": getattr(m, "end2end", False)}
+    with torch.inference_mode():
+        dets = _yolo_nms(m(crops), CONF_FACE, p.args.iou, None, True,
+                         **{k: v for k, v in kw.items() if k in _NMS_KW})
+        for d in dets:
+            d[:, :4] = d[:, :4].clamp(0, tile)
+    return dets
+
+
 def detect_faces_on_tiles(
     model: YOLO,
     frame: np.ndarray,
@@ -166,15 +200,18 @@ def detect_faces_on_tiles(
             crops = (crops.half() if half else crops.float()) / 255
         else:
             crops = [frame[y1:y2, x1:x2] for (x1, y1, x2, y2) in part]
-        results = model.predict(
-            crops, device=device, imgsz=tile,
-            conf=CONF_FACE, verbose=False, agnostic_nms=True, half=half,
-        )
-        for (x1, y1, _, _), res in zip(part, results):
-            if res.boxes is None or len(res.boxes) == 0:
+        dets = _tile_dets_direct(model, crops, tile) if src is not None else None
+        if dets is None:
+            results = model.predict(
+                crops, device=device, imgsz=tile,
+                conf=CONF_FACE, verbose=False, agnostic_nms=True, half=half,
+            )
+            dets = [res.boxes.data if res.boxes is not None else torch.zeros((0, 6)) for res in results]
+        for (x1, y1, _, _), d in zip(part, dets):
+            if len(d) == 0:
                 continue
-            xyxy = res.boxes.xyxy.cpu().numpy()
-            confs = res.boxes.conf.cpu().numpy()
+            d = d.float().cpu().numpy()
+            xyxy, confs = d[:, :4], d[:, 4]
             for (bx1, by1, bx2, by2), conf in zip(xyxy, confs):
                 gx1 = int(bx1 + x1); gy1 = int(by1 + y1)
                 gx2 = int(bx2 + x1); gy2 = int(by2 + y1)
