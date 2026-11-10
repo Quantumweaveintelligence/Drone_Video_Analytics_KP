@@ -128,6 +128,10 @@ async def stream(args) -> int:
         ready = json.loads(await ws.recv())
         print("server:", ready)
         if ready.get("type") != "ready":
+            if not args.no_start and not args.no_end:     # do not leave the test mission running
+                r = httpx.post(f"{base}/ingest/mission/end", headers=hdr, timeout=20, verify=not args.insecure,
+                               json={"drone_id": args.drone, "mission_id": args.mission})
+                print("mission/end", r.status_code, r.text[:200])
             return 1
         seq = int(ready.get("last_seq") or 0) + 1
 
