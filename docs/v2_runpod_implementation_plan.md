@@ -541,9 +541,13 @@ Every step is measured on the pod before and after, with the stage split (A4) an
     costs max(person, face), not the sum.
 - Verified locally: identical faces (coordinates, confidences) in FP16 and FP32, and identical
   tracker ids, boxes and face links, sequential vs parallel.
-- To measure on the pod: `bench_person.py` prints both paths (`face tiles, CPU/GPU cut`,
-  `analyze_batch, in turn/parallel`). If a round is still over 50 ms, TensorRT for the face model
-  (item 3) is next.
+- **Measured on the pod (image `20261110-f9a30a8`, RTX PRO 6000):**
+  - face tiles: 34 ms (CPU cut) → 29 ms (GPU cut); person round: 60 ms (in turn) → 50.6 ms (parallel);
+  - e2e, one 4K drone: **analytics 20 fps sustained, 0.1–0.7 s behind live, 400 / 400 frames,
+    wall time 22 s for a 20 s clip** (was 8–10 fps and 26 s behind).
+- Next gain seen in the profile: Ultralytics copies the 28 GPU tiles back to the host for
+  `orig_img` (≈19 ms device→host per round on the face stream). Calling the model with our own
+  pre/post-processing (or TensorRT, item 3) removes it — headroom for more drones.
 
 1. **Vehicle → ANPR shared detections** (`DVAS_SHARED_DETS=1`).
    - Vehicle's HUD packet already carries the visdrone boxes and its track ids. It adds the raw
