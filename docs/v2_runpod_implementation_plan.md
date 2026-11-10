@@ -1,0 +1,601 @@
+# DVAS RunPod v2 — Implementation plan (cloud, branch `runpod-v1`)
+
+*Version 2, 2026-11-10 (adds R-F11–R-F13 queueing findings, the disk-backed analytics feed, the
+decisions below, and the delivery stages in §0). Version 1, 2026-11-09. Owner: RunPod developer. Companion document: `v2_edge_implementation_plan.md`
+(edge developer). §3 (the uplink contract) is identical in both documents; change it in both or in
+neither. This plan builds on `analytics_pipeline_improvement_plan.md` (Phases 1, 2a and 2 are done;
+Phase 3 items are folded into R4 below). Its §3 evidence rules and §4 accuracy guard apply here
+unchanged.*
+
+**Goal of v2:**
+- **Live view:** every drone's feed plays in the dashboard at the source rate (25–30 fps), through
+  the RunPod HTTP proxy.
+- **Analytics:** every enabled service runs at **≥ 20 fps per drone**.
+- **Overlays:** boxes, labels and geofences are drawn in the browser, not burned into JPEGs on the
+  server.
+
+This is not a full overhaul. The work is limited to:
+
+1. continuous video: WebSocket uplink from the edge, then WS-fMP4 (MSE) to the browser through
+   go2rtc;
+2. removing the HTTP JPEG polling and the server-side draw → re-encode for live viewing;
+3. the redundant YOLO inference and the CPU thread contention;
+4. the other changes without which 20 fps is not reachable or evidence would suffer.
+
+## 0. Decisions (2026-11-10) and delivery
+
+| Topic | Decision |
+|---|---|
+| Analytics falling behind the stream | **No loss, disk-backed.** The video-gateway feeds analytics from the recording on disk and keeps only a small window in Valkey. A lagging service delays its results ("Person 40 s behind live") but never loses frames. No service skips ahead. |
+| Analytics resolution | **Source resolution.** No downscale (`DVAS_ANALYTICS_MAX_WIDTH=0`). 4K stays 4K for face tiles and plates. Person at 4K reaches 20 fps only after R4. |
+| Recording | **On, kept 7 days** (`DVAS_RECORD_RETENTION_DAYS=7`), except segments linked to legal-hold evidence. Stops with an alert at 90 % of the volume. |
+| Delivery | **Stages, each pushed to branch `runpod-v2` and checked on the pod before the next:** Stage 1 = R0 spike script + R1 + R2; Stage 2 = R3; Stage 3 = R4 + R5. |
+
+Out of scope for v2:
+- a single multi-head backbone (needs retraining);
+- GB/T 28181;
+- MQTT gimbal control;
+- VLM search / pgvector;
+- 3D GIS FOV footprints;
+- the edge code (the edge team owns it; see the companion plan).
+
+---
+
+## 1. What the platform does today (verified on `runpod-v1` @ `bd66902`)
+
+| # | Finding | Where | Effect |
+|---|---|---|---|
+| R-F1 | **Frames arrive as one HTTPS POST per JPEG.** The edge allows 5 in flight; a POST round trip from Kerala to the pod is 350–750 ms. | edge `edge_api_server.py:460`; `dvas_ingest/ingest/api/main.py` `ingest_frame` | Ceiling ≈ **7–14 frames/s reach the pod**. The analyzers can never see 20 fps from Kerala on this path. |
+| R-F2 | **The edge stamps `frame_seq` / `capture_ts` at send time, not at capture.** Retried frames look newer than they are. | edge `ingest/edge_sender.py:365, :386` | The Phase 1 re-order window cannot repair the order. Fixed on the edge side (edge plan E1). The video uplink removes this path altogether. |
+| R-F3 | **Multi-Drone Grid and Tactical Map tiles poll raw JPEGs** every 700–800 ms. The analytics pages poll raw feeds every 1.5 s, and crowd polls its annotated view. | `MultiDroneView.js:236`, `TacticalMapPage.js:27`, `CrowdAnalytics.js:222-228`, raw feeds in Traffic / Person / Vessel | About 1 fps on the command views. A full-resolution JPEG per poll goes through the proxy. |
+| R-F4 | **Annotated views are MJPEG streams** (`shared/annotated_hub.py`, `useLiveFeed.js`). They are smooth, but every analyzer draws on the frame, resizes and JPEG-encodes **every processed frame, whether or not anyone is watching.** | `AnnotatedHub.put_frame`; `cv2.imencode` in person / vehicle / ANPR / vessel / anomaly `main.py` | About 10–15 ms of CPU per frame per service. Overlays are fixed pixels: they cannot be toggled, hovered or clicked, and they cannot be combined across services in one view. |
+| R-F5 | **Each enabled service JPEG-decodes the same frame** (4K: 31.8 ms on the pod). The decode is in a prefetch thread since Phase 2, but the CPU is still spent N times. | `shared/frame_sampler.py` `decode_frame` / `next_decoded` | With 5–6 services at 20 fps per drone, that is several CPU cores of the 27-vCPU quota spent on decoding. |
+| R-F6 | **Vehicle and ANPR run the identical detector** (`visdrone.pt`) on the identical frames, each with its own tracker. | `vehicle/main.py:57`, `anpr/main.py:60` | One full YOLO pass plus one tracker per frame is pure duplication. |
+| R-F7 | **The other detectors are different models:** person `yolov8m`; intrusion `geotrax_hbb_yolov8s_1920`; vessel `yolov8s` (SeaDrone); anomaly `visdrone-yolov11x` + `yolo11n`. | `*/main.py` model paths | The blueprint's "6× the same backbone" is true only for vehicle/ANPR. The others need retraining to share a backbone, which is out of scope. |
+| R-F8 | **Person at 4K needs ≈ 85 ms per frame** (bench on the L40S: decode 31.8 ms, predict 14, predict+track 39, face tiles 46.5). The GPU and CPU stages run one after another. | `tools/bench_person.py` output, 2026-11-07 | About 12 fps at 4K. This is the service furthest from 20 fps. |
+| R-F9 | **Thread budgets are uniform:** `OMP_NUM_THREADS = DVAS_CPUS / 8` for every process, whatever its load. | `deploy/runpod/bin/dvas-init.sh:79-89` | Light services hold threads that heavy ones (person, ANPR OCR, anomaly) need. Oversubscription shows up when all of them run. |
+| R-F10 | **No continuous recording of the source video.** Evidence is the JPEG frames the edge chose to send. | — | When analytics move to server-decoded frames (R1), the original stream must be kept, for Section 65B. |
+| R-F11 | **Unread frames are trimmed when analytics lag.** Every `XADD` uses `MAXLEN ~ QUEUE_MAX_LENGTH` (2000), or a quarter of it while Valkey memory is above 85 %. Trimming ignores consumer groups, so a service more than ≈ 100 s behind at 20 fps (≈ 25 s when memory is tight) loses the oldest frames it has not read. They are never analysed; the sampler only counts them as `skipped` from `frame_seq` gaps. The GPU governor makes this likely: under GPU pressure it caps services down to 5 fps while input stays at 20. | `ingest/api/queue_manager.py` `publish_frame` (`maxlen`), `_memory_tight`; `shared/frame_sampler.py` header; `gateway/governor.py` | Silent frame loss under load. This contradicts "every frame is analysed" (evidence rule 1) exactly when the system is busiest. |
+| R-F12 | **Frames are acknowledged when read, not when analysed.** `_next_ordered` XACKs entries as soon as they arrive. They then wait in the in-memory re-order buffer (up to 16 per drone) and the decode prefetch. | `shared/frame_sampler.py` `_next_ordered` | If a service restarts or crashes, those frames are no longer pending, so they are never re-read: they are lost. The "re-read own pending list" path on start never sees them. |
+| R-F13 | **Valkey holds the whole backlog as JPEGs.** 2000 entries × 1–1.5 MB at 4K ≈ 2–3 GB per drone, against the 8 GB cap. | `etc/valkey.conf`, `QUEUE_MAX_LENGTH` | Two or three 4K drones with a lagging service push Valkey into the memory guard, which shortens the queue (R-F11) for every drone. |
+
+The pod's network has no UDP and only port 80 is exposed over HTTP (Cloudflare limit: 100 s idle).
+So the transport is **WebSocket over port 80** in both directions. WebRTC is offered only for LAN or
+on-prem installs (R2.6).
+
+Items from the blueprint that are **already done**:
+- `DELETE /api/evidence/{id}` requires `senior_officer` and respects legal hold (`routers/alerts.py:507`).
+- Frames are stored as raw bytes in Valkey; `jpeg_b64` is written only with `QUEUE_WRITE_JPEG_B64`.
+- Analytics pages already stream MJPEG rather than polling (`useLiveFeed`).
+- The edge `EDGE_API_KEY` fallback has been removed.
+
+---
+
+## 2. Target design
+
+```
+edge ──wss /ingest/video/ws (H.264 MPEG-TS + per-frame meta, §3)──►  video-gateway (new, dvas_ingest)
+                                                                       │  ├─ TS bytes ─► go2rtc (RTSP publish, 127.0.0.1) ─► browsers: wss /live/api/ws (MSE, 25–30 fps)
+                                                                       │  └─ TS bytes + meta ─► recorder: 10 s segments + meta.jsonl on /workspace, SHA-256 chain (evidence)
+                                                                       │                          │
+                                                                       │        decoder tails the recording (PyAV, CPU or NVDEC), at the pace analytics consume:
+                                                                       │        sample to DVAS_ANALYTICS_FPS (20) ─► JPEG ─► XADD mission:frames:{sid}
+                                                                       │        (same fields as today + telemetry from meta.jsonl), only while the
+                                                                       │        stream's unconsumed window < DVAS_VIDEO_WINDOW_FRAMES (≈ 5 s)
+analyzers (unchanged inputs) ── per-frame results ──► XADD mission:hud:{sid} ──► backend WS /api/hud/ws ──► <HudCanvas> over <LiveVideo>
+vehicle ── detections (visdrone) ──► mission:hud:{sid} ──► ANPR reads them instead of running visdrone again
+```
+
+- **Analyzers keep their input contract.** They still read `mission:frames:{sid}`, ordered, with the
+  same fields. Sampler, ordering, persist gates, evidence rules and Phase 2a stream keys are all
+  untouched. The only difference is where frames come from: the video-gateway instead of
+  `/ingest/frame`.
+- **`/ingest/frame` stays**, for older edges and the edge's JPEG fallback.
+- **The video-gateway** writes the same frame entries the JPEG path writes. Downstream nothing
+  knows which transport delivered a frame, except a `source=h264` field.
+- **Backlog lives on disk, not in Valkey (decision §0).**
+  - Live video and recording run at the edge's pace.
+  - The analytics feed runs at the pace of the slowest enabled service: the decoder pauses while
+    the Valkey window is full and continues from the recording when there is room.
+  - A lag of minutes costs disk (already written for evidence), never frames. Valkey holds ≈ 5 s per
+    mission (≈ 150 MB at 4K), so the memory guard (R-F11, R-F13) is no longer reached by video
+    missions.
+  - How far behind live each service is shows on the Models page and on the drone's tile.
+  - Overlays from a service that is more than 2 s behind are not drawn on the live video (R3); the
+    tile says "Person 40 s behind live".
+
+---
+
+## 3. Uplink contract v1 (shared with the edge plan — keep identical)
+
+**Endpoint:** `wss://<host>/ingest/video/ws?drone_id=<id>&mission_id=<id>`
+- RunPod example: `wss://<pod>-80.proxy.runpod.net/ingest/video/ws`. On a LAN install, plain `ws://`.
+- The `Authorization: Bearer <operator token>` header carries the same token used for `/ingest/frame` today.
+- Prerequisite: `POST /ingest/mission/start` has succeeded, as today. The server applies the Phase 2a
+  rule: only the operator who started the mission may stream to it, and the mission must be `live`.
+
+**Edge → server, first message (text):**
+```json
+{"type":"hello","v":1,"drone_id":"DRN-012","mission_id":"MSN-…","laptop_id":"…",
+ "codec":"h264","container":"mpegts","width":1920,"height":1080,"fps":29.97,
+ "source":"rtsp|file|usb","next_seq":1}
+```
+- `next_seq` is the sequence number of the first frame this connection will carry.
+- After a reconnect it continues the mission's numbering; it never restarts at 1 within a mission.
+
+**Server → edge, reply (text):**
+- On success:
+  ```json
+  {"type":"ready","v":1,"analytics_fps":20,"max_kbps":12000,"last_seq":0}
+  ```
+  `last_seq` is the highest sequence the server already has for this mission (used on resume).
+- On refusal:
+  ```json
+  {"type":"error","code":"…","detail":"…"}
+  ```
+  followed by a close with the code from the table below.
+
+**Edge → server, during the stream:**
+- **Binary messages:** MPEG-TS bytes (a multiple of 188 bytes, ≤ 256 KiB per message), in order.
+  - Video PTS must be monotonic within a connection.
+  - Every connection starts with a keyframe preceded by SPS/PPS.
+- **Text `meta`:** one per video frame, sent *before* the binary chunk that carries that frame.
+  - Messages may be batched as `{"type":"meta_batch","items":[…]}`, at most 10 per batch and at most 200 ms old.
+  ```json
+  {"type":"meta","seq":1234,"pts_ms":41233.4,"capture_ts":1762671000.123,"key":false,
+   "change_score":0.12,
+   "tel":{"latitude":8.52,"longitude":76.93,"altitude_m":85.0,"abs_alt":120.1,"speed_mps":4.2,
+          "battery_pct":71,"gb_yaw":142.5,"gb_pitch":-35.0,"gb_roll":0.0,"focal_len":24.0,
+          "dzoom_ratio":1.0}}
+  ```
+  - `seq`: per-mission frame counter **assigned at capture**.
+  - `pts_ms`: the PTS of that frame in the TS stream, in milliseconds.
+  - `capture_ts`: wall clock, epoch seconds, **taken at capture**.
+  - `tel`: the same field names as today's `/ingest/frame` metadata; missing values are `null`.
+- **Text `bye`:** `{"type":"bye","last_seq":N}` before `POST /ingest/mission/end`.
+- **Pings:** WebSocket ping every 15 s (the RunPod/Cloudflare path drops connections idle for 100 s).
+
+**Server → edge, during the stream (text, about every 2 s):**
+```json
+{"type":"stats","rx_fps":29.9,"rx_kbps":5200,"decoded_fps":29.9,"analytics_fps":20.0,
+ "analytics_lag_frames":3,"last_seq":1234}
+```
+The server may also send a congestion hint, `{"type":"slow_down","max_kbps":4000}`.
+
+**Codec rules:**
+- H.264 (AVC), Baseline/Main/High, up to 3840×2160, up to 60 fps.
+- Keyframe interval ≤ 2 s (1 s recommended).
+- When transcoding: no B-frames, `-tune zerolatency`.
+- HEVC is not accepted by the server: the edge transcodes it to H.264.
+
+**Close codes:**
+
+| Code | Meaning | Edge action |
+|---|---|---|
+| `1000` | Normal close | — |
+| `4401` | Token invalid or expired | Refresh the token, reconnect |
+| `4403` | Not the mission owner | Stop and show an error |
+| `4409` | Mission not live | Call `mission/start`, or stop |
+| `4413` | Over `max_kbps` | Transcode lower, reconnect |
+| `4415` | Codec not supported | Transcode, reconnect |
+| `1011` | Server error | Back off 0.5 → 1 → 2 → 4 → 8 s, then reconnect |
+
+If the upgrade returns HTTP 404 (an old server) or fails 5 times in a row, switch to the JPEG
+fallback and keep retrying the WebSocket every 60 s.
+
+---
+
+## 4. Phases
+
+Each phase is one image release:
+1. `build_image.sh`
+2. `push_ghcr.sh`
+3. set the image **on the pod**
+4. restart
+5. add a row to `RELEASES.md`
+
+Every behaviour sits behind an env flag, so it can be switched off on the pod without a rebuild.
+
+### Phase R0 — Spike on the pod (2 days, no production change)
+
+Answer these questions before any design detail is fixed. Write the answers here.
+
+1. **go2rtc through the RunPod proxy.**
+   - Run go2rtc (pinned release, SHA-256 verified) on `127.0.0.1:1984` / `:8554`.
+   - Publish a test TS with `ffmpeg -re -i test.ts -c copy -f rtsp rtsp://127.0.0.1:8554/t`.
+   - Proxy `/live/` through nginx and play `wss://<pod>-80.proxy.runpod.net/live/api/ws?src=t` in
+     Chrome, Edge and Firefox.
+   - Measure glass-to-glass latency with a burnt-in clock, from Kerala.
+   - Check whether the fMP4 `baseMediaDecodeTime` keeps the source PTS. This decides the HUD sync
+     method in R3.
+2. **Decode in the image.**
+   - Is NVDEC usable? Check `ffmpeg -hwaccels`, `ls /usr/lib/x86_64-linux-gnu/libnvcuvid*`, and
+     `NVIDIA_DRIVER_CAPABILITIES` (it needs `video`).
+   - Does the PyAV wheel decode H.264 with threads?
+   - CPU cost per 1080p30 / 4K30 stream for CPU decode (H.264 decode costs far less than JPEG
+     decode; NVDEC is optional).
+3. **JPEG encode for the analytics frames:** `cv2.imencode` at 1920 and 3840 px, compared with
+   nvJPEG (`torchvision.io.encode_jpeg` on CUDA).
+4. **Size of `/dev/shm`** on the pod: `df -h /dev/shm`. This is only needed for the optional R5.4.
+5. **WebSocket uplink through Cloudflare** with a 10 Mbps TS for 30 minutes: does it disconnect, and
+   what is the throughput ceiling?
+
+**Done when:** each answer is recorded with numbers, and the HUD sync method and decode path are
+chosen.
+
+### Phase R1 — Video ingest: video-gateway, go2rtc, recording (6–8 days)
+
+New service `dvas_ingest/video_gateway/` (FastAPI + asyncio). It is a supervisord program
+`video-gateway` on `127.0.0.1:8092`. It reuses `ingest/api/queue_manager.py` (Phase 2a registry,
+`publish_frame`) and `ingest/api/auth.py`.
+
+1. **WebSocket endpoint** `/ingest/video/ws` (§3).
+   - **Auth:** the same token validation as `/ingest/frame`, and the Phase 2a ownership rule (the
+     mission must be `live` and started by this `sub`).
+   - **Limits:** one connection per mission (a newer one replaces the older one, with close code
+     1000); `DVAS_VIDEO_MAX_KBPS` (default 12000) → 4413; `DVAS_MAX_LIVE_STREAMS` (default 8) →
+     close 1013.
+   - Validate `drone_id` and `mission_id` with the same pattern as ingest (D7).
+2. **Relay to go2rtc.**
+   - Per mission, one `ffmpeg -f mpegts -i pipe:0 -c copy -f rtsp rtsp://127.0.0.1:8554/{sid}`
+     subprocess.
+   - It restarts on exit. Its stderr goes to `/var/log/dvas/video-gateway.log`, rate-limited.
+   - go2rtc stream name = Phase 2a `sid`.
+3. **Recorder** (`DVAS_RECORD_VIDEO=1`; it is also the analytics feed, §2).
+   - The TS bytes are written as-is into segments of about 10 s, rotated at the next keyframe:
+     `/workspace/dvas/recordings/{sid}/seg-000001.ts`, `seg-000002.ts`, …
+   - Each segment has a `seg-NNNNNN.meta.jsonl`: every `meta` message as received, plus `rx_ts`
+     (server clock).
+   - When a segment closes, a line goes to `manifest.jsonl`: `sha256`, the previous line's hash
+     (a chain), `seq` range, `capture_ts` range, bytes.
+   - Progress is kept in Valkey `mission:video:{sid}` (hash): `status` (receiving | ended),
+     `segments`, `last_seq_rx`.
+   - At mission end the manifest's last hash is written to the audit log as a
+     `video_recording_sealed` event, through the existing backend audit API.
+   - **Retention:** `DVAS_RECORD_RETENTION_DAYS=7`. Purge runs in `backup-loop.sh`. It skips:
+     - any mission whose analytics have not finished (`decoder_done` not set);
+     - anything linked to evidence under legal hold.
+   - **Disk:** at 90 % of `DVAS_VOLUME_GB`, new missions are refused with close 1013 and an
+     alert; running missions continue.
+   - **Why it is critical:** analytics frames are now decoded on the server, so the original stream
+     is what proves them (65B). It is also the backlog store for the no-loss policy.
+4. **Decoder: the recording → analytics frames, at the analytics' pace.**
+   - **Input.** One decoder thread per mission reads the segments in order through a tailing
+     reader:
+     - at the end of the newest segment it waits while `status=receiving`;
+     - EOF comes after the last segment once `status=ended`.
+     - `av.open(reader, format="mpegts")` on CPU, or NVDEC if R0 chose it.
+   - **Decoding and sampling.** Every frame is decoded (P-frames depend on earlier ones). Sampling
+     happens after decode: keep a frame when `floor(t × DVAS_ANALYTICS_FPS)` advances. Default 20;
+     the source rate if lower.
+   - **Meta join.** Meta comes from the segment's `meta.jsonl`, joined by `pts_ms` (± half a frame;
+     fall back to `seq` order).
+     - Fields from meta: `frame_sequence` / `frame_seq` = meta `seq`, `capture_ts`, the telemetry
+       fields, `change_score`.
+     - Added fields: `source="h264"`, `rx_ts_ms` (when the server received the frame).
+   - **Resolution: source** (`DVAS_ANALYTICS_MAX_WIDTH=0`; a value > 0 caps the width). JPEG q90 via
+     `cv2.imencode` (nvJPEG if it wins in R0). The frame is XADDed through
+     `QueueManager.publish_frame`: same stream key, same fields.
+   - **Flow control (no loss).**
+     - Before each XADD, the decoder reads the stream's unconsumed frames: for each *active*
+       consumer group (the same rule as the drain check, `QUEUE_READER_IDLE_S`), `lag + pending`.
+     - At ≥ `DVAS_VIDEO_WINDOW_FRAMES` (default 100 ≈ 5 s at 20 fps) it waits (50 ms polls). The
+       recording keeps growing; nothing is dropped.
+     - The stream's `MAXLEN` for video missions is 4 × the window. It is a safety bound only and is
+       never reached while flow control works.
+     - With no active group (no service enabled), the decoder keeps live pace and the window is
+       trimmed, as today: a service enabled later starts at the current window.
+   - **Restart-safe.**
+     - Every 20 published frames the decoder stores `decoder_seg` and `decoder_seq` in
+       `mission:video:{sid}`.
+     - After a restart it reopens `decoder_seg` (segments start at a keyframe) and skips frames with
+       `seq ≤ decoder_seq`.
+   - **End of mission.**
+     - When the decoder reaches EOF it sets `decoder_done=1`.
+     - The ingest drain check (`is_fully_consumed`) additionally requires `decoder_done` for a
+       mission that has a video record. A mission stays `draining` until its analytics have seen
+       every frame. Its stream is not purged early.
+   - **Live position.** The decoder publishes `behind_live_s` (`rx_ts` of the newest received frame
+     minus `rx_ts` of the last published one) for `stats`, the Models page and `dvas-ctl lag`.
+4a. **Queue integrity fixes** (all transports; R-F11, R-F12).
+   - **Acknowledge after analysis.** The sampler XACKs a frame when the service asks for the next
+     round. By then the service has finished it, because loops are sequential per drone; the
+     prefetch path never acknowledges.
+     - Frames in the re-order buffer and the prefetch stay pending, so a restart re-reads them (at
+       most one duplicate frame per drone after a crash: at-least-once).
+     - Test: kill a service mid-stream and restart it → no `seq` missing in its results.
+   - **Lag measured on the server clock.** `lag_ms` uses `rx_ts_ms` when present (video). For the
+     JPEG path it uses `ts` as today, so a backlog read from disk is not reported as "live".
+   - **Legacy JPEG path, overflow made visible.**
+     - When a group's unread count passes 80 % of `MAXLEN`, ingest logs a warning and publishes a
+       `queue_overflow_risk` event. The Models page shows it.
+     - Frames trimmed unread are counted per mission as **Dropped (queue full)**, separate from
+       `skipped`. This path cannot be made lossless without a disk store; the video path is the
+       fix.
+   - **Governor.** With the video path, a lower cap only adds delay. The status shows the resulting
+     `behind_live_s` per service, so the operator sees the cost of the cap.
+5. **`stats` to the edge** every 2 s (§3). The values come from the gateway's counters and the
+   sampler snapshot (analytics fps, lag). `analytics_lag_frames` is the unconsumed window plus the
+   frames not yet decoded from disk.
+6. **nginx.**
+   - `location /ingest/video/ws`: proxy to `video-gateway`, `proxy_http_version 1.1`,
+     Upgrade/Connection headers, `proxy_read_timeout 3600s`, `proxy_buffering off`,
+     `client_body_buffer_size` small. No per-request rate limit (it is one long connection); use a
+     `limit_conn` per token of 2.
+   - `location /live/`: go2rtc, described in R2.
+7. **Image changes.**
+   - go2rtc binary (pinned version + SHA-256), `/etc/dvas/go2rtc.yaml`.
+   - go2rtc settings: API on `127.0.0.1:1984` only; the RTSP listener on `127.0.0.1:8554` only; no
+     `exec`/`echo` sources defined; WebRTC disabled on RunPod.
+   - Add `av` to `requirements/ai.txt`, or to the ingest venv.
+   - supervisord programs `go2rtc` and `video-gateway`.
+   - `dvas-ctl lag` shows the video streams.
+8. **Tests:**
+   - `dvas_ingest/tests/test_video_gateway.py`, using a synthetic TS made with ffmpeg testsrc with
+     known PTS and meta:
+     - every sampled frame is XADDed in order, with the right `seq` and telemetry;
+     - flow control: with a consumer that stops reading, the decoder pauses at the window, nothing
+       is trimmed, and after the consumer resumes every `seq` arrives;
+     - restart of the decoder mid-mission resumes without a gap or a duplicate `seq`;
+     - the drain waits for `decoder_done`;
+     - auth refusals give the right close codes;
+     - reconnect resumes `seq`;
+     - the recorder hash chain verifies;
+     - a replacing connection closes the old one.
+   - The existing ingest tests still pass.
+
+**Done when:**
+- with the edge's E2 build (or `tools/send_ts.py`) streaming a 4K DJI file, the analytics stream
+  receives 20 fps of source-resolution frames with correct telemetry, for 30 minutes;
+- with a service deliberately capped to 5 fps for 5 minutes, it then catches up and has analysed
+  every `seq` (Lost = 0, Dropped = 0), while the live video never stalled;
+- recordings play in VLC and their hashes verify;
+- `/ingest/frame` keeps working for an old edge;
+- `DVAS_VIDEO_INGEST=0` closes the endpoint (404).
+
+### Phase R2 — Live video in the dashboard (3–4 days)
+
+1. **Backend** — new `routers/live.py`:
+   - `GET /api/live/ticket?drone_id=`
+     - Applies the same jurisdiction check as `ingest_proxy.py` `/frame/{drone_id}/latest`.
+     - Resolves the drone's active mission `sid`.
+     - Returns `{src, ticket}`. The ticket is an HMAC over (`sub`, `src`, expiry 60 s).
+   - `GET /api/live/authorize` — for nginx `auth_request`. Validates the ticket against `src` from
+     `X-Original-URI`.
+2. **nginx `/live/`.**
+   - Only `location = /live/api/ws` is proxied to go2rtc (WebSocket upgrade, 3600 s timeout).
+   - It is guarded by `auth_request /api/live/authorize`.
+   - Every other go2rtc path returns 404. The go2rtc API can add stream sources, so it must never
+     be reachable from outside.
+3. **Frontend player.**
+   - `components/LiveVideo.js`: an MSE player over `wss://…/live/api/ws?src=&ticket=`. Vendor
+     go2rtc's MIT `video-rtc.js` MSE part, or write a minimal player.
+   - Keep latency low: if the buffer lags the live edge by more than 1.5 s, jump to the live edge.
+   - Reconnect with a new ticket.
+   - After 3 failures, fall back to the current JPEG poller.
+4. **Replace the pollers:**
+   - `MultiDroneView.js` `useDroneFeed`;
+   - `TacticalMapPage.js` tiles;
+   - the raw-feed panes of the Traffic / Person / Vessel / Crowd analytics pages.
+   Offline drones keep the Phase 1 A5 behaviour (placeholder, no polling).
+5. **Grid bandwidth.**
+   - Nine tiles × 5 Mbps is too much for many control-room links.
+   - Option, enabled with `DVAS_LIVE_SUBSTREAM=1`: the gateway publishes `{sid}_sub` (640 px,
+     800 kbps, `h264_nvenc` if R0 confirmed NVENC, else `libx264 ultrafast`).
+   - Grid tiles use `_sub`; a maximised tile uses the main stream.
+6. **WebRTC (LAN / on-prem only):** enable go2rtc WebRTC with a configured TCP port. Not used on
+   RunPod.
+
+**Done when:**
+- Multi-Drone Grid and Tactical Map show the live feed at the source fps;
+- glass-to-glass p95 ≤ 1.5 s from Kerala (R0 method);
+- with the flag off, the old pollers return;
+- an expired or foreign ticket is refused (403) and does not reveal whether the stream exists.
+
+### Phase R3 — Overlays in the browser; stop re-encoding for live view (5–6 days)
+
+1. **Per-frame results bus** — `shared/hud.py`.
+   - `publish(service, drone_id, frame_fields, w, h, objects, overlays)` →
+     `XADD mission:hud:{sid} MAXLEN ~600`. The packet:
+     ```json
+     {"service":"vehicle","seq":1234,"pts_ms":41233.4,"capture_ts":1762671000.12,"w":1920,"h":1080,
+      "objects":[{"id":"17","cls":"car","bbox":[0.41,0.51,0.45,0.63],"conf":0.91,
+                  "label":"KL-01-AB-1234","color":"#10B981","layer":"anpr","alert":false}],
+      "overlays":{"geofence":[[0.21,0.29],[0.67,0.27],[0.73,0.82],[0.16,0.85]],"count":42}}
+     ```
+   - Coordinates are normalised to the analysed frame. At most 300 objects.
+   - Each analyzer calls it once per frame, where it calls `hub.put_frame` today:
+     - person (person boxes, face boxes, watchlist labels);
+     - vehicle;
+     - ANPR (plates);
+     - intrusion (geofence polygon in pixels, PIP state per track);
+     - vessel;
+     - anomaly (alert boxes, vectors);
+     - crowd (count, and a small density PNG at ≤ 2 Hz as `overlays.heatmap`).
+   - With `DVAS_HUD=1` (default on in v2).
+2. **Backend WebSocket** — `WS /api/hud/ws?drone_id=&services=`.
+   - Same ticket/jurisdiction check as R2.
+   - XREAD on the drone's active `mission:hud:{sid}`.
+   - Per-service rate ≤ 20 Hz to each client; a 1 s send timeout; slow clients are dropped (the
+     lesson from D4).
+   - Heartbeat every 20 s.
+3. **Frontend.**
+   - `hooks/useHudStream.js`.
+   - `components/HudCanvas.js` — the blueprint's `TacticalHudCanvas` is the starting point, with
+     these fixes:
+     - map coordinates through the video's **letterboxed** content box (`object-fit: contain`), not
+       the element box;
+     - redraw on `requestVideoFrameCallback`;
+     - DPR-aware;
+     - layer toggles per service;
+     - click → target details (track id, Re-ID / plate history link).
+   - **Sync** uses the method chosen in R0:
+     - (a) if fMP4 keeps the source PTS: draw the packet whose `pts_ms` matches the frame's
+       `mediaTime`;
+     - (b) otherwise: hold the video behind the live edge by the measured analytics latency (MSE
+       lets the player sit behind the live edge), and match by `capture_ts`;
+     - (c) last resort: the latest packet, with boxes moved along each track's velocity.
+     - Target skew ≤ 150 ms p95, shown in a debug overlay.
+   - Analytics pages and the Multi-Drone view use `LiveVideo` + `HudCanvas` when video is
+     available, otherwise MJPEG.
+   - A **"frame-exact view"** toggle keeps the MJPEG annotated stream for review and evidence
+     checks.
+4. **Lazy annotated rendering** (`DVAS_LIVE_LAZY_ANNOTATE=1`).
+   - `AnnotatedHub` gets `put_lazy(drone_id, render_fn)`: draw + resize + encode run only while at
+     least one MJPEG subscriber is connected, or `/annotated/latest` was requested within the last
+     5 s.
+   - **Audit each call site first.** Where the annotated JPEG also goes into an alert or evidence
+     record, it is still rendered on that frame. Evidence rule: alert-moment images are never
+     skipped.
+   - Expected saving: about 10–15 ms of CPU per frame per service.
+5. **Tests:**
+   - HUD packets from a recorded clip match the MJPEG overlay boxes (same frame, IoU ≥ 0.99);
+   - lazy mode renders on alert frames;
+   - the backend WebSocket drops a stalled client without delaying the others.
+
+**Done when:**
+- the Multi-Drone view shows the live video with person + vehicle + ANPR + geofence layers
+  together, toggleable, at the source fps;
+- the CPU per analyzer drops by the measured render cost when nobody watches MJPEG;
+- the §3 evidence rules tests still pass.
+
+### Phase R4 — Remove redundant inference and CPU contention; reach 20 fps (6–8 days)
+
+Every step is measured on the pod before and after, with the stage split (A4) and `bench_person.py`.
+
+1. **Vehicle → ANPR shared detections** (`DVAS_SHARED_DETS=1`).
+   - Vehicle's HUD packet already carries the visdrone boxes and its track ids. It adds the raw
+     detection fields ANPR needs: `xyxy` in pixels, `conf`, `cls`.
+   - Vehicle publishes at the lower of the two services' confidence thresholds; each service applies
+     its own threshold.
+   - **ANPR**, for frame `seq`, reads vehicle's packet from `mission:hud:{sid}`. It waits at most
+     `DVAS_DETS_WAIT_MS` (150 ms) and runs the plate stage on those boxes, using vehicle's track ids.
+   - If vehicle is not running (heartbeat key missing) or the packet times out, ANPR runs
+     `visdrone.pt` itself, exactly as today. No frame goes without detection.
+   - **Accuracy guard:** same weights, same frame, same image size → identical detections. Verify
+     the image-size and NMS settings match, and test that on a clip the plate reads are equal before
+     and after.
+   - **Saves** one YOLO pass and one tracker (with GMC) per frame whenever both services run.
+2. **GPU/CPU stage pipelining** (`DVAS_STAGE_PIPELINE=1`), in the ordered services.
+   - Frame N+1's model call (GPU stage) overlaps frame N's tracker update, post-processing and
+     persist (CPU stage).
+   - The tracker still consumes frames strictly in order (a 1-deep queue between the stages), so
+     ordering, Late/Lost and the evidence rules are unchanged.
+   - Throughput becomes max(stage) instead of the sum. Person at 4K: ≈ 85 ms → ≈ 60 ms (estimate).
+3. **TensorRT FP16** (Phase 3 B7; `DVAS_TRT=1`).
+   - Engines are built on the pod, cached in `/workspace/dvas/engines/<sm>-<trt>/`, keyed by GPU,
+     driver, TensorRT and model hash.
+   - On a build failure, fall back to `.pt`.
+   - Order: person and face first (the face tile batch is the largest single cost), then
+     visdrone, then the anomaly primary model.
+   - The face model ships only if face recall is unchanged (accuracy guard).
+4. **Per-service thread budgets** (replaces the uniform `DVAS_CPUS/8`).
+   - `dvas-init.sh` computes `DVAS_THREADS_<SVC>` from `DVAS_CPUS` with weights:
+     - person 3
+     - ANPR 2 (OCR)
+     - anomaly 2
+     - vehicle 1.5
+     - intrusion 1
+     - vessel 1
+     - crowd 0.5
+     - video-gateway 1 per active stream
+   - The sum is ≤ `DVAS_CPUS`. supervisord passes it per program.
+   - Each service applies it to `torch.set_num_threads`, `cv2.setNumThreads`, onnxruntime
+     `intra_op_num_threads` and Paddle `cpu_threads`.
+   - Any value can be overridden per service through env.
+5. **Multi-frame catch-up** (Phase 3 B6): when a drone has a backlog, process up to K consecutive
+   frames per round as one GPU batch; the tracker is still updated in frame order.
+6. **ANPR OCR on the GPU** (Phase 3 B4). This needs the plate test set; it ships only if correct
+   plate reads ≥ today's.
+7. **Optional, measured:** CUDA MPS (`nvidia-cuda-mps-control -d` in the container) to let the
+   kernels of the 7 processes overlap. Keep it only if total fps rises and nothing becomes unstable
+   in a 2-hour run.
+8. **Mission presets** in the dashboard: Traffic = vehicle + ANPR; Crowd event = crowd + person +
+   anomaly; Perimeter = intrusion + person; Coast = vessel. Only enabled services read the stream.
+   This is the cheapest way to stay at 20 fps with several drones.
+
+**Done when**, on the L40S:
+- with 2 drones at 1080p and vehicle + ANPR + person + intrusion enabled, every service holds ≥ 20
+  fps for 30 minutes, lag ≤ 1 s, and the stage split shows the GPU as the largest share;
+- with 1 drone at 4K (source resolution, the default), person holds ≥ 20 fps. If it does not, the
+  gap is recorded here; frames are still not lost (they wait on disk), they are only analysed later.
+
+### Phase R5 — Other critical items (3–4 days)
+
+1. **Capacity and admission.**
+   - `tools/bench_capacity.py` replays a recorded TS into N simulated drones through the
+     video-gateway, with a chosen service set, and reports per-service fps and lag. Record the
+     table (drones × service set → fps) here.
+   - Gateway governor: when an enabled service stays below `DVAS_ANALYTICS_FPS` for 30 s, the
+     dashboard shows **Degraded: <service> 14 fps** on the drone's tile and the Models page.
+   - Do not silently drop frames.
+2. **End-to-end latency metrics.**
+   - `capture_ts` → `rx_ts` (uplink), → analysed (sampler), → HUD sent (backend).
+   - p50/p95 on the Models page and in Prometheus.
+3. **Disk guard covers recordings.**
+   - `backup-loop.sh` writes `/run/dvas/disk_guard.json`; this is the blueprint's F2.
+   - Recording stops with an alert at 90 % of `DVAS_VOLUME_GB`, never deleting evidence.
+   - The Ingest dashboard shows a banner.
+4. **Optional — shared-memory frame bus** (`DVAS_FRAME_BUS=shm`).
+   - Do this only if, after R1–R4, JPEG decode is still a top-2 stage.
+   - The video-gateway writes decoded frames into a per-mission ring in `/dev/shm` (size from R0).
+     The XADD then carries the slot and generation instead of a JPEG.
+   - Analyzers map the slot read-only. Alert / evidence JPEGs are encoded from it on demand.
+   - A frame whose slot was reused before every group read it is published again as JPEG. The
+     evidence rule (every frame analysed) holds.
+   - Memory: 1080p BGR is 6.2 MB per frame, so a 10 s ring at 20 fps is ≈ 1.2 GB per drone. This is
+     why it is optional.
+
+---
+
+## 5. Flags summary
+
+| Flag | Default (v2) | Phase |
+|---|---|---|
+| `DVAS_VIDEO_INGEST` | 1 | R1 |
+| `DVAS_ANALYTICS_FPS` | 20 | R1 |
+| `DVAS_ANALYTICS_MAX_WIDTH` | 0 = source resolution | R1 |
+| `DVAS_VIDEO_WINDOW_FRAMES` | 100 (≈ 5 s at 20 fps) | R1 |
+| `DVAS_VIDEO_MAX_KBPS` / `DVAS_MAX_LIVE_STREAMS` | 12000 / 8 | R1 |
+| `DVAS_RECORD_VIDEO` / `DVAS_RECORD_RETENTION_DAYS` | 1 / 7 | R1 |
+| `DVAS_LIVE_SUBSTREAM` | 0 | R2 |
+| `DVAS_HUD` / `DVAS_LIVE_LAZY_ANNOTATE` | 1 / 1 | R3 |
+| `DVAS_SHARED_DETS` / `DVAS_DETS_WAIT_MS` | 1 / 150 | R4 |
+| `DVAS_STAGE_PIPELINE` | 1 | R4 |
+| `DVAS_TRT` | 0 → 1 per model after the guard | R4 |
+| `DVAS_THREADS_<SVC>` | computed | R4 |
+| `DVAS_FRAME_BUS` | `jpeg` | R5 |
+
+## 6. v2 acceptance (all on the pod, from Kerala)
+
+| Check | Target |
+|---|---|
+| Live video per drone (grid and single view) | source fps (25–30), glass-to-glass p95 ≤ 1.5 s |
+| Analytics per enabled service per drone | ≥ 20 fps for 30 min, `behind_live_s` ≤ 1 (2 drones, R4 service set, 1080p sources; 4K per R4) |
+| No loss under lag | a service capped to 5 fps for 5 min catches up with Lost = 0 and Dropped = 0 |
+| HUD skew | ≤ 150 ms p95 (or the documented R0 fallback) |
+| Frame order / identity | Late = 0, Lost = 0, `seq` without duplicates across a reconnect |
+| Evidence | §3 rules tests pass; every alert has its crop + source frame; recording hash chain verifies |
+| Fallback | Old edge on `/ingest/frame` works; every flag off → v1 behaviour |
+
+## 7. Coordination with the edge developer
+
+| RunPod step | Needs from edge | Edge phase |
+|---|---|---|
+| R0–R1 testing | A TS + meta sender. Until E2 is ready, use `tools/send_ts.py` (ffmpeg + a websocket client, synthetic meta). | E2 |
+| R1 release | E1 (correct `seq` / `capture_ts`) for the JPEG fallback | E1 |
+| R2–R5 | — | — |
+
+- Agree on the §3 contract **before** either side codes against it.
+- Any change to it bumps `"v"`. The server accepts v1 for the whole v2 release.
+
+## 8. Risks
+
+| Risk | Mitigation |
+|---|---|
+| Cloudflare / RunPod proxy throttles long WebSockets or caps throughput | R0 measures it. The uplink adapts with `slow_down`. The JPEG path remains as a fallback. |
+| go2rtc timestamps don't allow exact HUD sync | R0 decides; methods (b) and (c) in R3. The frame-exact MJPEG view stays. |
+| NVDEC/NVENC not exposed in the container | CPU H.264 decode is cheap. The sub-stream uses libx264 `ultrafast`, or stays off. |
+| go2rtc API exposure (it can add stream sources) | localhost only; nginx exposes only `/live/api/ws` behind `auth_request`. |
+| Person at 4K stays under 20 fps | No frame loss (disk-backed); results run behind live and the tile says so. TRT and pipelining continue; mission presets reduce load. |
+| Recording disk fills (≈ 7–9 GB per 4K drone-hour) | 7-day retention, refusal of new missions at 90 % with an alert, never deleting un-analysed or legal-hold recordings. |
