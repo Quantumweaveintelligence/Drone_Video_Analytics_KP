@@ -113,8 +113,19 @@ def main():
     kw = an._track_kwargs()
     print("person predict        %8.1f / %.1f" % timed(lambda: an.tracker.predict_batch({"bench": frame}, **kw), a.frames))
     print("person predict+track  %8.1f / %.1f" % timed(lambda: an.tracker.track_batch({"bench": frame}, **kw), a.frames))
-    print("face tiles (batched)  %8.1f / %.1f" % timed(lambda: pa.detect_faces_on_tiles(an.face_model, frame, device=an.device), a.frames))
-    print("full analyze_batch    %8.1f / %.1f" % timed(lambda: an.analyze_batch({"bench": frame}, save_crops=True), a.frames))
+    # v2 R4: before (tiles cut on the CPU, faces after persons) and after (GPU tiles, parallel)
+    gpu_tiles, parallel = pa.FACE_GPU_TILES, pa.FACE_PARALLEL
+    for flag in (False, True):
+        pa.FACE_GPU_TILES = flag
+        print("face tiles, %s     %8.1f / %.1f" % ("GPU cut" if flag else "CPU cut", *timed(
+            lambda: pa.detect_faces_on_tiles(an.face_model, frame, device=an.device), a.frames)))
+    pa.FACE_GPU_TILES = gpu_tiles
+    for flag in (False, True):
+        pa.FACE_PARALLEL = flag
+        print("analyze_batch, %s %8.1f / %.1f" % ("parallel" if flag else "in turn ", *timed(
+            lambda: an.analyze_batch({"bench": frame}, save_crops=True), a.frames)))
+    pa.FACE_PARALLEL = parallel
+    print("   (a round must stay under 50 ms for 20 fps)")
     print("device after run:", an.device_info())
 
     # C3: FP16 vs FP32 face recall on this GPU (plan Phase 1 item 7)

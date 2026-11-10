@@ -29,7 +29,21 @@ This is not a full overhaul. The work is limited to:
 | Analytics falling behind the stream | **No loss, disk-backed.** The video-gateway feeds analytics from the recording on disk and keeps only a small window in Valkey. A lagging service delays its results ("Person 40 s behind live") but never loses frames. No service skips ahead. |
 | Analytics resolution | **Source resolution.** No downscale (`DVAS_ANALYTICS_MAX_WIDTH=0`). 4K stays 4K for face tiles and plates. Person at 4K reaches 20 fps only after R4. |
 | Recording | **On, kept 7 days** (`DVAS_RECORD_RETENTION_DAYS=7`), except segments linked to legal-hold evidence. Stops with an alert at 90 % of the volume. |
-| Delivery | **Stages, each pushed to branch `runpod-v2` and checked on the pod before the next:** Stage 1 = R0 spike script + R1 + R2; Stage 2 = R3; Stage 3 = R4 + R5. |
+| Delivery | **Stages, each pushed to branch `runpod-v2` and checked on the pod before the next:** Stage 1 = R0 spike script + R1 + R2; Stage 2 = R3; Stage 3 = R4 + R5. **Reordered after the Stage 1 pod check: Stage 3 (speed) before Stage 2 (overlays)** — overlays on analytics 20 s+ behind live are of little use. |
+
+### Stage 1 on the pod (2026-11-10, RTX PRO 6000 Blackwell)
+
+| Check | Result |
+|---|---|
+| Uplink (`send_ts`, 4K H.264 at 8 Mbps, 60 s) | 30 fps received, no disconnects |
+| No-loss queue | 400 / 400 frames analysed; when analytics lagged, the decoder slowed to match and the backlog waited on disk |
+| Disk guard | Works; it first refused video because MooseFS `du` counts allocated blocks (165 GB for ~16 GB of MinIO data). Volume wiped and set to 100 GB |
+| Bitrate cap | Works: an uncapped test clip (~25 Mbps) was cut with 4413; the test clip is now capped at 8 Mbps |
+| Live video in the browser | **Bug, fixed in `bf57b82`**: the backend's service token has no DVAS role, so `/ingest/video/live` answered 403 and tiles fell back to JPEG. Re-check on the pod pending |
+| Analytics at 4K | **8–10 fps steady**, lag grew to 26 s per minute of flight. `dvas-ctl lag`: only `person-group` had pending frames — person + 28 face tiles per 4K frame sets the pace for every service |
+| CPU decode 4K / nvJPEG 4K | 146–164 fps / 0.3–0.7 ms — not a bottleneck |
+
+Follow-ups: make the disk guard measure apparent size (not MooseFS blocks).
 
 ### Status (2026-11-10): Stage 1 implemented on `runpod-v2`, not yet on the pod
 
@@ -519,6 +533,17 @@ New service `dvas_ingest/video_gateway/` (FastAPI + asyncio). It is a supervisor
 ### Phase R4 — Remove redundant inference and CPU contention; reach 20 fps (6–8 days)
 
 Every step is measured on the pod before and after, with the stage split (A4) and `bench_person.py`.
+
+**Status (2026-11-10):** started with person, the measured bottleneck.
+- Done (`PERSON_FACE_GPU_TILES=1`, `PERSON_FACE_PARALLEL=1`, both on by default):
+  - face tiles are cut on the GPU from one upload of the frame, not as 28 CPU crops;
+  - face tiles run on their own CUDA stream while person detection + tracking runs, so a round
+    costs max(person, face), not the sum.
+- Verified locally: identical faces (coordinates, confidences) in FP16 and FP32, and identical
+  tracker ids, boxes and face links, sequential vs parallel.
+- To measure on the pod: `bench_person.py` prints both paths (`face tiles, CPU/GPU cut`,
+  `analyze_batch, in turn/parallel`). If a round is still over 50 ms, TensorRT for the face model
+  (item 3) is next.
 
 1. **Vehicle → ANPR shared detections** (`DVAS_SHARED_DETS=1`).
    - Vehicle's HUD packet already carries the visdrone boxes and its track ids. It adds the raw

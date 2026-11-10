@@ -10,6 +10,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -37,6 +38,13 @@ FACE_TILE        = _env_int("PERSON_FACE_TILE", 640, 320, 1280)
 FACE_TILE_OVERLAP = _env_int("PERSON_FACE_TILE_OVERLAP", 96, 0, 320)
 FACE_TILE_BATCH  = _env_int("PERSON_FACE_TILE_BATCH", 32, 1, 128)
 TILE_IMG_SIZE    = FACE_TILE
+# v2 R4 (no change to what is detected — same pixels, same model, same thresholds):
+# GPU_TILES: the frame is uploaded once and the tiles are cut on the GPU, instead of 28
+#   numpy crops letterboxed and stacked on the CPU (identity letterbox at tile == imgsz).
+# PARALLEL: face tiles run on their own CUDA stream while person detection + tracking
+#   runs, instead of after it (a round costs max(person, face) rather than the sum).
+FACE_GPU_TILES   = os.getenv("PERSON_FACE_GPU_TILES", "1") != "0"
+FACE_PARALLEL    = os.getenv("PERSON_FACE_PARALLEL", "1") != "0"
 # After a CUDA failure the analyzer runs on the CPU; it retries the GPU after this long
 GPU_RETRY_S      = _env_int("PERSON_GPU_RETRY_S", 60, 10, 3600)
 
@@ -142,10 +150,22 @@ def detect_faces_on_tiles(
     h_img, w_img = frame.shape[:2]
     windows = face_tiles(h_img, w_img, tile, overlap)
     all_boxes, all_confidences = [], []
+    src = None
+    if (FACE_GPU_TILES and device != "cpu" and tile % 32 == 0
+            and all(x2 - x1 == tile and y2 - y1 == tile for (x1, y1, x2, y2) in windows)):
+        src = torch.from_numpy(np.ascontiguousarray(frame)).to(
+            f"cuda:{device}" if isinstance(device, int) else device)
 
     for i in range(0, len(windows), FACE_TILE_BATCH):
         part = windows[i:i + FACE_TILE_BATCH]
-        crops = [frame[y1:y2, x1:x2] for (x1, y1, x2, y2) in part]
+        if src is not None:
+            # BCHW RGB in 0..1, converted exactly as Ultralytics does for numpy input
+            # (uint8 → half/float, then / 255); tensors skip its letterbox and BGR flip.
+            crops = torch.stack([src[y1:y2, x1:x2] for (x1, y1, x2, y2) in part])
+            crops = crops.flip(-1).permute(0, 3, 1, 2).contiguous()
+            crops = (crops.half() if half else crops.float()) / 255
+        else:
+            crops = [frame[y1:y2, x1:x2] for (x1, y1, x2, y2) in part]
         results = model.predict(
             crops, device=device, imgsz=tile,
             conf=CONF_FACE, verbose=False, agnostic_nms=True, half=half,
@@ -215,6 +235,9 @@ class PersonFaceAnalyzer:
         log.info("PersonFaceAnalyzer device: %s, person imgsz %d, face tiles %d px (overlap %d)",
                  self.device, self.imgsz, FACE_TILE, FACE_TILE_OVERLAP)
         self.tracker: Optional[BatchTracker] = None
+        # Face tiles of a round run here, on their own CUDA stream, during person tracking
+        self._face_pool = ThreadPoolExecutor(1, thread_name_prefix="person-face")
+        self._face_stream = torch.cuda.Stream() if self.device != "cpu" else None
 
         try:
             self.person_model = YOLO(person_model_path)
@@ -259,6 +282,15 @@ class PersonFaceAnalyzer:
         """Native-resolution tiled face detection, serialised on the face model."""
         with self.face_lock:
             return detect_faces_on_tiles(self.face_model, frame_bgr, device=self.device)
+
+    def _faces_timed(self, frame_bgr) -> Tuple[List[Tuple[int, int, int, int, float]], float]:
+        t = time.perf_counter()
+        if self._face_stream is not None and self.device != "cpu":
+            with torch.cuda.stream(self._face_stream):
+                boxes = self.detect_faces(frame_bgr)      # .cpu() of the results syncs the stream
+        else:
+            boxes = self.detect_faces(frame_bgr)
+        return boxes, (time.perf_counter() - t) * 1000
 
     def detect_faces_direct(self, img_bgr, conf: float = 0.15) -> List[Tuple[int, int, int, int, float]]:
         """Whole-image face detection (enrolment fallback), serialised on the face model."""
@@ -342,6 +374,9 @@ class PersonFaceAnalyzer:
         self._maybe_back_to_gpu()
         t0 = time.perf_counter()
         tracked: Dict[str, object] = {}
+        face_jobs: Dict[str, Future] = {}
+        if FACE_PARALLEL and self.face_model and self.device != "cpu":
+            face_jobs = {d: self._face_pool.submit(self._faces_timed, fr) for d, fr in frames.items()}
 
         # ── Person detection + tracking (batched across drones) ─────────────
         if self.person_model and self.tracker:
@@ -360,7 +395,7 @@ class PersonFaceAnalyzer:
         person_ms = (time.perf_counter() - t0) * 1000 / max(1, len(frames))
 
         return {
-            d: self._postprocess(d, frame, tracked.get(d), save_crops, person_ms)
+            d: self._postprocess(d, frame, tracked.get(d), save_crops, person_ms, face_jobs.get(d))
             for d, frame in frames.items()
         }
 
@@ -376,7 +411,8 @@ class PersonFaceAnalyzer:
             "model_ms":     round(model_ms, 1),
         }
 
-    def _postprocess(self, drone_id, frame_bgr, result, save_crops, person_ms) -> dict:
+    def _postprocess(self, drone_id, frame_bgr, result, save_crops, person_ms,
+                     face_job: Optional[Future] = None) -> dict:
         """Per-drone part: person boxes from the batched result, face tiles, linking."""
         t0 = time.perf_counter()
         self._frame_count += 1
@@ -417,9 +453,8 @@ class PersonFaceAnalyzer:
         # ── Face detection (tile-based) ───────────────────────────────────────
         if self.face_model:
             try:
-                tf = time.perf_counter()
-                face_boxes = self.detect_faces(frame_bgr)
-                face_ms = (time.perf_counter() - tf) * 1000
+                # started with the person call (parallel), else run here
+                face_boxes, face_ms = face_job.result() if face_job else self._faces_timed(frame_bgr)
                 for (x1, y1, x2, y2, conf) in face_boxes:
                     face_bbox = _bbox_dict(x1, y1, x2, y2)
 
