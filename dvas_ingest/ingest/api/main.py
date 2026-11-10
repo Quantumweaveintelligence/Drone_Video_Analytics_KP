@@ -1509,9 +1509,10 @@ async def _video_finish(ws: WebSocket, conn: Optional[_VideoConn], rec, relay) -
 
 @app.get("/ingest/video/live/{drone_id}", summary="Live video of a drone's current mission (internal)",
          tags=["Video"])
-async def video_live_info(drone_id: str, claims: dict = Depends(validate_token_flexible)) -> dict:
+async def video_live_info(drone_id: str) -> dict:
     """go2rtc stream slot and state of the drone's current mission video — for the dashboard
-    backend (service token). 404 when the drone is not streaming video now."""
+    backend. No JWT, like /ingest/status: ingest listens on 127.0.0.1 and nginx refuses this
+    path from outside (the backend's service token has no DVAS role). 404: no video now."""
     if _qm is None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Queue unavailable")
     sid = _drone_active_sid.get(drone_id) or await _qm.drone_active_sid(drone_id)
@@ -1526,7 +1527,7 @@ async def video_live_info(drone_id: str, claims: dict = Depends(validate_token_f
 
 @app.get("/ingest/video/slot/{slot}", summary="Which mission a live stream slot carries (internal)",
          tags=["Video"])
-async def video_slot_owner(slot: str, claims: dict = Depends(validate_token_flexible)) -> dict:
+async def video_slot_owner(slot: str) -> dict:                # internal, like video_live_info
     if slot not in LIVE_SLOTS:
         raise HTTPException(404, "Unknown slot")
     raw = await _qm._client.get(f"live:slot:{slot}")

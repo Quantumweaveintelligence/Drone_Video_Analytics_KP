@@ -371,6 +371,9 @@ def test_live_relay_gets_a_slot_and_the_stream_from_a_keyframe(client, valkey, c
         info = client.get(f"/ingest/video/live/{DRONE}", headers=H()).json()
         assert info["src"] == "live01" and info["width"] == 320
         assert client.get("/ingest/video/slot/live01", headers=H()).json()["drone_id"] == DRONE
+        # the dashboard backend calls these with a role-less service token: no JWT needed
+        assert client.get(f"/ingest/video/live/{DRONE}").json()["src"] == "live01"
+        assert client.get("/ingest/video/slot/live01").json()["drone_id"] == DRONE
         send_clip(ws, clips["plain"])
         msg = ws.receive()
         while msg.get("type") != "websocket.close":
