@@ -551,7 +551,8 @@ Every step is measured on the pod before and after, with the stage split (A4) an
   NMS with the same settings, boxes clipped as its `scale_boxes()` does. Verified in the
   production image (Ultralytics 8.3.253): identical faces to `predict()` and to the CPU-cut path.
 - Found while testing: `yolov8n-face.pt` needs `omegaconf`, missing from the image — Ultralytics
-  pip-installed it at model load. Added to `requirements/ai.txt`.
+  pip-installed it at model load. Installed in its own Dockerfile layer (so the venv layer stays
+  cached); move into `requirements/ai.txt` at the next full venv rebuild.
 - `bench_person.py` now uses a synthetic frame with real people/faces, so its FP16 face check
   compares detections (it compared 0 with 0).
 

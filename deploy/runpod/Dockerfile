@@ -158,6 +158,12 @@ RUN curl -fsSL -o /usr/local/bin/go2rtc \
     chmod 755 /usr/local/bin/go2rtc && /usr/local/bin/go2rtc -version && \
     /opt/venvs/ai/bin/python -c "import av, cv2, redis; print('video-decoder deps: av', av.__version__, 'cv2', cv2.__version__)"
 
+# yolov8n-face.pt was pickled with omegaconf objects; without the package Ultralytics pip-installs
+# it at model load (internet, untracked version). Its own small layer so the venv layer above
+# stays cached; move it into requirements/ai.txt at the next full venv rebuild.
+RUN /opt/venvs/ai/bin/python -m pip install --no-cache-dir "omegaconf>=2.3,<2.5" && \
+    /opt/venvs/ai/bin/python -c "import omegaconf; print('omegaconf', omegaconf.__version__)"
+
 # Application code (weights excluded by Dockerfile.dockerignore)
 COPY dvas_analytics/             /opt/dvas/dvas_analytics/
 COPY dvas_ingest/ingest/api/     /opt/dvas/dvas_ingest/ingest/api/
