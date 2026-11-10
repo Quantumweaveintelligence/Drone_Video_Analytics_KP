@@ -93,6 +93,8 @@ import weakref
 
 # ── Queue manager (Redis Streams) ─────────────────────────────────────────────
 import queue_manager as _qmod
+import video_relay
+import video_store
 from queue_manager import (
     get_queue_manager,
     legacy_stream_key,
@@ -493,6 +495,7 @@ async def _start_mission_registry(req: MissionStartRequest, claims: dict) -> dic
         for other, oi in others:
             if oi.get("status") == "live":
                 await _qm.set_mission_draining(other)
+                await _video_mission_stopped(other)
                 _start_mission_drain(other, req.drone_id, oi.get("mission_id") or other)
                 superseded.append(oi.get("mission_id") or other)
                 log.info("mission_superseded drone=%s old=%s new=%s",
@@ -539,6 +542,11 @@ async def _try_finalize_mission(sid: str, min_age_s: float, idle_s: float) -> Op
             return None
         if now - getattr(_qm, "_last_publish", {}).get(key, 0.0) < idle_s:
             return None
+        if sid in _video_conns:
+            return None                                 # still receiving video
+        vdone = await _qm._client.hget(video_store.video_key(sid), "decoder_done")
+        if vdone is not None and vdone not in (b"1", "1"):
+            return None                                 # the decoder has not fed every frame yet
         existed = bool(await _qm._client.exists(key))
         if existed and not await _qm.is_fully_consumed(key):
             return None
@@ -812,6 +820,10 @@ async def lifespan(app: FastAPI):
                 await _restore_mission_registry()
             except Exception as e:
                 log.warning(f"Failed to restore the mission registry from Valkey: {e}")
+            try:
+                await _video_restore()
+            except Exception as e:
+                log.warning(f"Failed to restore video ingest state: {e}")
 
     except Exception as exc:
         log.error("startup_redis_connect_failed", extra={"error": str(exc)})
@@ -1120,6 +1132,484 @@ async def ingest_frame(
         queue_name     = queue_name,
         message_id     = msg_id,
     )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# VIDEO UPLINK (RunPod v2 plan R1) — H.264 MPEG-TS over WebSocket
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# The edge streams the whole video plus one `meta` message per frame (contract: v2 plan §3).
+# This process only receives: it records the bytes (video_store), relays them to go2rtc for
+# live viewing (video_relay), and keeps the drone's live telemetry/status current. Frames for
+# the analytics are decoded from the recording by the separate video-decoder process, at
+# the pace the analytics consume (no frame is lost when they fall behind).
+
+VIDEO_INGEST = os.getenv("DVAS_VIDEO_INGEST", "1").lower() in ("1", "true", "yes")
+VIDEO_MAX_KBPS = max(500, int(os.getenv("DVAS_VIDEO_MAX_KBPS", "12000") or 12000))
+VIDEO_MAX_STREAMS = max(1, int(os.getenv("DVAS_MAX_LIVE_STREAMS", "8") or 8))
+VIDEO_MAX_MSG = 256 * 1024
+VIDEO_HELLO_TIMEOUT_S = 10.0
+VIDEO_STATS_EVERY_S = 2.0
+VIDEO_LIVE_UPDATE_S = 0.5          # drone telemetry / dashboard events at most this often
+_VIDEO_TEL_KEYS = ("latitude", "longitude", "altitude_m", "abs_alt", "speed_mps", "battery_pct",
+                   "heading_deg", "gb_yaw", "gb_pitch", "gb_roll", "focal_len", "dzoom_ratio")
+_VIDEO_TEL_RANGE = {"latitude": (-90.0, 90.0), "longitude": (-180.0, 180.0),
+                    "altitude_m": (0.0, 10000.0), "battery_pct": (0.0, 100.0), "speed_mps": (0.0, 500.0)}
+
+
+class _VideoClose(Exception):
+    def __init__(self, code: int, error: str, detail: str = ""):
+        super().__init__(f"{code} {error}")
+        self.code, self.error, self.detail = code, error, detail
+
+
+class _VideoConn:
+    """One edge connection streaming one mission's video."""
+
+    def __init__(self, ws: WebSocket, sid: str, drone_id: str, mission_id: str):
+        self.ws, self.sid, self.drone_id, self.mission_id = ws, sid, drone_id, mission_id
+        self.closed = asyncio.Event()
+        self.close_code: Optional[int] = None
+        self.frames = 0
+        self.bytes = 0
+        self.dup = 0
+        self.last_seq = 0
+        self.live_slot: Optional[str] = None       # go2rtc stream this mission is relayed to
+        self.pending_meta: Optional[dict] = None   # newest frame meta not yet in the live state
+        self.win_frames = 0
+        self.win_bytes = 0
+        self._win: list = []                   # (t, bytes) for the bitrate window
+        self._over = 0
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        self.close_code = code
+        try:
+            await self.ws.close(code=code, reason=reason[:120])
+        except Exception:
+            pass
+
+    def note_bytes(self, n: int, now: float) -> Optional[float]:
+        """Add received bytes; every 5 s returns the window's kbps (else None)."""
+        self._win.append((now, n))
+        if now - self._win[0][0] < 5.0:
+            return None
+        span = max(1e-3, now - self._win[0][0])
+        kbps = sum(b for _, b in self._win) * 8 / 1000 / span
+        self._win = []
+        return kbps
+
+
+_video_conns: dict[str, _VideoConn] = {}      # sid → open connection
+
+# go2rtc accepts pushes only into streams declared in its config (etc/go2rtc.yaml): a fixed
+# pool of slots, mapped to missions in Valkey (live:slot:<name> = sid) while they stream.
+LIVE_SLOTS = [f"live{n:02d}" for n in range(1, 17)]
+_DEL_IF_EQUAL = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0"
+
+
+async def _live_slot_acquire(sid: str) -> Optional[str]:
+    client = _qm._client
+    for name in LIVE_SLOTS:
+        cur = await client.get(f"live:slot:{name}")
+        if cur is not None and (cur.decode() if isinstance(cur, bytes) else cur) == sid:
+            return name
+    for name in LIVE_SLOTS[:max(1, min(len(LIVE_SLOTS), VIDEO_MAX_STREAMS))]:
+        if await client.set(f"live:slot:{name}", sid, nx=True):
+            return name
+    return None
+
+
+async def _live_slot_release(sid: str, name: Optional[str]) -> None:
+    if name:
+        try:
+            await _qm._client.eval(_DEL_IF_EQUAL, 1, f"live:slot:{name}", sid)
+            await _qm._client.hdel(video_store.video_key(sid), "live_slot")
+        except Exception as exc:
+            log.debug("live slot release failed (%s %s): %s", sid, name, exc)
+
+
+def _clean_meta(m: dict) -> Optional[dict]:
+    """A frame meta from the edge, validated (None when unusable)."""
+    try:
+        seq = int(m["seq"])
+        pts = float(m["pts_ms"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if seq < 1 or seq > 10**12:
+        return None
+    out = {"seq": seq, "pts_ms": round(pts, 3), "key": bool(m.get("key"))}
+    cap = _f(m.get("capture_ts"), 0.0)
+    out["capture_ts"] = cap if 1e9 < cap < 1e10 else None
+    try:
+        out["change_score"] = max(0.0, min(1.0, float(m.get("change_score") or 0.0)))
+    except (TypeError, ValueError):
+        out["change_score"] = 0.0
+    tel_in = m.get("tel") if isinstance(m.get("tel"), dict) else {}
+    tel = {}
+    for k in _VIDEO_TEL_KEYS:
+        v = tel_in.get(k)
+        if v is None:
+            continue
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            continue
+        if v != v:                                   # NaN
+            continue
+        lo, hi = _VIDEO_TEL_RANGE.get(k, (-1e7, 1e7))
+        tel[k] = max(lo, min(hi, v))
+    if "gps_lock" in tel_in and isinstance(tel_in.get("gps_lock"), bool):
+        tel["gps_lock"] = tel_in["gps_lock"]
+    out["tel"] = tel
+    return out
+
+
+def _video_live_update(conn: _VideoConn, meta: dict, claims: dict, n_bytes: int) -> None:
+    """Drone telemetry, ingest stats and dashboard events from the newest frame meta
+    (the same state /ingest/frame keeps current for JPEG uploads)."""
+    drone_id, mission_id = conn.drone_id, conn.mission_id
+    if _drone_active_sid.get(drone_id, conn.sid) != conn.sid:
+        return
+    tel = meta["tel"]
+    ts_iso = _iso(meta["capture_ts"] or time.time())
+    active_m = _active_missions.get(drone_id, {})
+    lat, lon = tel.get("latitude"), tel.get("longitude")
+    _latest_metadata[drone_id] = {
+        **_latest_metadata.get(drone_id, {}),
+        "drone_id": drone_id, "mission_id": mission_id,
+        "mission_name": active_m.get("mission_name"),
+        "operator": active_m.get("operator", extract_username(claims)),
+        "location": active_m.get("location"),
+        **{k: tel.get(k) for k in _VIDEO_TEL_KEYS},
+        "change_score": meta["change_score"], "frame_sequence": meta["seq"], "timestamp": ts_iso,
+        "last_seen": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+        "gps_lock": tel.get("gps_lock") if "gps_lock" in tel else (
+            lat is not None and lon is not None and (lat != 0.0 or lon != 0.0)),
+        "transport": "h264_ws",
+    }
+    frame_events.offer(drone_id, {
+        "event": "frame_queued", "drone_id": drone_id, "mission_id": mission_id,
+        "frame_sequence": meta["seq"], "change_score": meta["change_score"], "timestamp": ts_iso,
+        "bytes": n_bytes, "latency_ms": 0.0, "latitude": lat, "longitude": lon,
+        "altitude_m": tel.get("altitude_m"), "battery_pct": tel.get("battery_pct"),
+        "speed_mps": tel.get("speed_mps"), "transport": "h264_ws",
+    })
+
+
+async def _video_hash(sid: str) -> dict:
+    raw = await _qm._client.hgetall(video_store.video_key(sid))
+    return {(k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
+            for k, v in (raw or {}).items()}
+
+
+async def _video_stats(conn: _VideoConn, rx_frames: int, rx_bytes: int, span: float) -> dict:
+    h = await _video_hash(conn.sid)
+    last_rx = int(_f(h.get("last_seq_rx"), 0))
+    try:
+        window = max((await _qm.unread_frames(mission_stream_key(conn.sid))).values() or [0])
+    except Exception:
+        window = 0
+    pub_fps = round(_f(h.get("pub_fps"), 0.0), 1)
+    behind = _f(h.get("behind_live_s"), 0.0)
+    return {"type": "stats", "rx_fps": round(rx_frames / span, 1) if span > 0 else 0.0,
+            "rx_kbps": round(rx_bytes * 8 / 1000 / span) if span > 0 else 0,
+            "decoded_fps": pub_fps, "analytics_fps": pub_fps,
+            "analytics_lag_frames": int(window + behind * _video_analytics_fps()),
+            "behind_live_s": round(behind, 1),
+            "last_seq": last_rx}
+
+
+async def _video_mission_stopped(sid: str) -> None:
+    """The mission stopped taking frames (mission/end, superseded, purged): close its video
+    connection. The decoder finishes the recording, then the drain can complete."""
+    conn = _video_conns.get(sid)
+    if conn is not None:
+        await conn.close(1000, "mission ended")
+
+
+async def _video_restore() -> None:
+    """After a restart no connection is open: receiving → paused, live slots free."""
+    for key in await _scan_keys("live:slot:*"):
+        await _qm._client.delete(key)
+    for key in await _scan_keys("mission:video:*"):
+        try:
+            await _qm._client.hdel(key, "live_slot")
+        except Exception:
+            pass
+        try:
+            if (await _qm._client.hget(key, "status")) in (b"receiving", "receiving"):
+                await _qm._client.hset(key, "status", "paused")
+        except Exception as exc:
+            log.warning("video state restore failed for %s: %s", key, exc)
+
+
+async def _video_handshake(ws: WebSocket, drone_id: str, mission_id: str):
+    """Auth, hello, mission ownership and limits. Returns (claims, sid, hello)."""
+    auth_h = ws.headers.get("authorization") or ""
+    if not auth_h.lower().startswith("bearer "):
+        raise _VideoClose(4401, "unauthorized", "Authorization: Bearer <token> required")
+    try:
+        claims = await validate_token_string(auth_h.split(" ", 1)[1].strip())
+    except HTTPException as exc:
+        raise _VideoClose(4401 if exc.status_code == 401 else 4403, "unauthorized", str(exc.detail))
+    try:
+        from models import check_drone_id, check_mission_id   # noqa: PLC0415
+        check_drone_id(drone_id)
+        check_mission_id(mission_id)
+    except ValueError as exc:
+        raise _VideoClose(1008, "bad_request", str(exc))
+    try:
+        raw = await asyncio.wait_for(ws.receive_text(), VIDEO_HELLO_TIMEOUT_S)
+        hello = json.loads(raw)
+    except asyncio.TimeoutError:
+        raise _VideoClose(1008, "bad_request", "hello expected first")
+    except (ValueError, KeyError, RuntimeError):
+        raise _VideoClose(1008, "bad_request", "hello must be a JSON text message")
+    if not isinstance(hello, dict) or hello.get("type") != "hello" or hello.get("v") != 1:
+        raise _VideoClose(1008, "bad_request", "expected {\"type\":\"hello\",\"v\":1,...}")
+    if hello.get("drone_id") != drone_id or hello.get("mission_id") != mission_id:
+        raise _VideoClose(1008, "bad_request", "hello drone_id / mission_id differ from the URL")
+    if str(hello.get("codec", "")).lower() != "h264":
+        raise _VideoClose(4415, "unsupported_codec", "only H.264 is accepted")
+    if str(hello.get("container", "")).lower() != "mpegts":
+        raise _VideoClose(4415, "unsupported_codec", "only MPEG-TS is accepted")
+    w, h, fps = int(_f(hello.get("width"))), int(_f(hello.get("height"))), _f(hello.get("fps"))
+    if not (16 <= w <= 7680 and 16 <= h <= 4320 and 1 <= fps <= 120):
+        raise _VideoClose(1008, "bad_request", "width/height/fps out of range")
+    try:
+        sid, idx = await _check_frame_mission(drone_id, mission_id, claims)
+    except HTTPException as exc:
+        err = exc.detail.get("error", "") if isinstance(exc.detail, dict) else ""
+        if exc.status_code == 403:
+            raise _VideoClose(4403, err or "forbidden", str(exc.detail))
+        if exc.status_code == 409:
+            raise _VideoClose(4409, err or "mission_not_live", str(exc.detail))
+        raise _VideoClose(1011, "server_error", "queue unavailable")
+    if idx.get("status") != "live":
+        raise _VideoClose(4409, "mission_not_live", f"mission {mission_id!r} is {idx.get('status')}")
+    ok, free_gb, free_pct = video_store.disk_ok()
+    if not ok:
+        log.error("video_refused_disk_low sid=%s free_gb=%s free_pct=%s", sid, free_gb, free_pct)
+        raise _VideoClose(1013, "disk_full", f"recording disk low ({free_gb} GB, {free_pct} % free)")
+    others = [s for s in _video_conns if s != sid]
+    if len(others) >= VIDEO_MAX_STREAMS:
+        raise _VideoClose(1013, "too_many_streams", f"{VIDEO_MAX_STREAMS} live streams already")
+    return claims, sid, hello
+
+
+if VIDEO_INGEST:
+    @app.websocket("/ingest/video/ws")
+    async def ingest_video_ws(ws: WebSocket, drone_id: str = "", mission_id: str = "") -> None:
+        """Continuous H.264 (MPEG-TS) uplink of one mission — contract in v2 plan §3."""
+        await ws.accept()
+        conn: Optional[_VideoConn] = None
+        rec = relay = None
+        try:
+            claims, sid, hello = await _video_handshake(ws, drone_id, mission_id)
+            old = _video_conns.get(sid)
+            if old is not None:                         # a newer connection replaces the older
+                await old.close(1000, "replaced by a newer connection")
+                try:
+                    await asyncio.wait_for(old.closed.wait(), 5.0)
+                except asyncio.TimeoutError:
+                    raise _VideoClose(1013, "busy", "previous connection still closing")
+            conn = _VideoConn(ws, sid, drone_id, mission_id)
+            _video_conns[sid] = conn
+            vkey = video_store.video_key(sid)
+            h = await _video_hash(sid)
+            conn_no = int(_f(h.get("conn"), 0)) + 1
+            conn.last_seq = int(_f(h.get("last_seq_rx"), 0))
+            rec = await asyncio.to_thread(video_store.SegmentRecorder, sid, conn_no)
+            conn.live_slot = await _live_slot_acquire(sid) if video_relay.ENABLED else None
+            relay = video_relay.Relay(conn.live_slot) if conn.live_slot else None
+            await _qm._client.hset(vkey, mapping={
+                "status": "receiving", "conn": conn_no, "drone_id": drone_id, "mission_id": mission_id,
+                "width": int(_f(hello.get("width"))), "height": int(_f(hello.get("height"))),
+                "fps": _f(hello.get("fps")), "codec": "h264", "decoder_done": 0,
+                **({"live_slot": conn.live_slot} if conn.live_slot else {}),
+                **({} if h.get("started_at") else {"started_at": repr(time.time())})})
+            await _qm._client.persist(vkey)
+            await ws.send_text(json.dumps({"type": "ready", "v": 1, "analytics_fps": _video_analytics_fps(),
+                                           "max_kbps": VIDEO_MAX_KBPS, "last_seq": conn.last_seq}))
+            log.info("video_connected drone=%s mission=%s conn=%d %sx%s@%s last_seq=%d",
+                     drone_id, mission_id, conn_no, hello.get("width"), hello.get("height"),
+                     hello.get("fps"), conn.last_seq)
+            await _video_receive_loop(conn, claims, rec, relay, vkey)
+        except _VideoClose as exc:
+            log.warning("video_refused drone=%s mission=%s code=%d %s %s",
+                        drone_id, mission_id, exc.code, exc.error, exc.detail)
+            try:
+                await ws.send_text(json.dumps({"type": "error", "code": exc.error, "detail": exc.detail}))
+            except Exception:
+                pass
+            try:
+                await ws.close(code=exc.code, reason=exc.error[:120])
+            except Exception:
+                pass
+        except WebSocketDisconnect:
+            pass
+        except Exception as exc:
+            log.error("video_connection_error drone=%s mission=%s: %s", drone_id, mission_id, exc)
+            try:
+                await ws.close(code=1011)
+            except Exception:
+                pass
+        finally:
+            # In its own task: a cancelled handler (client gone, shutdown) still seals the
+            # recording and frees the mission for the next connection.
+            done = asyncio.ensure_future(_video_finish(ws, conn, rec, relay))
+            try:
+                await asyncio.shield(done)
+            except BaseException:
+                pass
+
+
+async def _video_finish(ws: WebSocket, conn: Optional[_VideoConn], rec, relay) -> None:
+    try:
+        if conn is not None and rec is not None:
+            try:
+                await _qm._client.hset(video_store.video_key(conn.sid), mapping={
+                    "last_seq_rx": conn.last_seq, "rx_ts_last": repr(time.time()),
+                    "bytes": rec.total_bytes})
+            except Exception:
+                pass
+        if rec is not None:
+            try:
+                await asyncio.to_thread(rec.close)
+            except Exception as exc:
+                log.error("video recording close failed sid=%s: %s", conn.sid if conn else "?", exc)
+        if relay is not None:
+            await relay.close()
+        if conn is not None:
+            await _live_slot_release(conn.sid, conn.live_slot)
+            try:
+                await _qm._client.hset(video_store.video_key(conn.sid), "status",
+                                       "ended" if conn.close_code == -1 else "paused")
+            except Exception:
+                pass
+            log.info("video_disconnected drone=%s mission=%s frames=%d bytes=%d dup=%d",
+                     conn.drone_id, conn.mission_id, conn.frames, conn.bytes, conn.dup)
+    finally:
+        if conn is not None:
+            if _video_conns.get(conn.sid) is conn:
+                _video_conns.pop(conn.sid, None)
+            conn.closed.set()
+            if conn.close_code == -1:                  # after `bye`: closed once the recording is sealed
+                try:
+                    await ws.close(code=1000)
+                except Exception:
+                    pass
+
+
+def _video_analytics_fps() -> float:
+    try:
+        return max(1.0, min(60.0, float(os.getenv("DVAS_ANALYTICS_FPS", "20"))))
+    except ValueError:
+        return 20.0
+
+
+async def _video_receive_loop(conn: _VideoConn, claims: dict, rec, relay, vkey: str) -> None:
+    ticker = asyncio.create_task(_video_ticker(conn, claims, rec, vkey))
+    try:
+        await _video_receive(conn, claims, rec, relay, vkey)
+    finally:
+        ticker.cancel()
+        try:
+            await ticker
+        except BaseException:
+            pass
+        if conn.pending_meta is not None:
+            _video_live_update(conn, conn.pending_meta, claims, conn.win_bytes)
+
+
+async def _video_ticker(conn: _VideoConn, claims: dict, rec, vkey: str) -> None:
+    """Every VIDEO_LIVE_UPDATE_S: drone live state and receive progress; every
+    VIDEO_STATS_EVERY_S: a `stats` message to the edge — also while it sends nothing."""
+    win_start = last_stats = time.monotonic()
+    saved_seq = None
+    while True:
+        await asyncio.sleep(VIDEO_LIVE_UPDATE_S)
+        now = time.monotonic()
+        try:
+            if conn.pending_meta is not None:
+                _video_live_update(conn, conn.pending_meta, claims, conn.win_bytes)
+                conn.pending_meta = None
+            if saved_seq != conn.last_seq:
+                await _qm._client.hset(vkey, mapping={
+                    "last_seq_rx": conn.last_seq, "rx_ts_last": repr(time.time()),
+                    "cur_seg": rec.idx or 0, "bytes": rec.total_bytes})
+                saved_seq = conn.last_seq
+            if now - last_stats >= VIDEO_STATS_EVERY_S:
+                stats = await _video_stats(conn, conn.win_frames, conn.win_bytes, now - win_start)
+                conn.win_frames = conn.win_bytes = 0
+                win_start = last_stats = now
+                await conn.ws.send_text(json.dumps(stats))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.debug("video ticker %s: %s", conn.sid, exc)
+
+
+async def _video_receive(conn: _VideoConn, claims: dict, rec, relay, vkey: str) -> None:
+    ws = conn.ws
+    next_key = False                  # the next binary chunk starts a keyframe
+    bytes_since_meta = 0
+    while True:
+        msg = await ws.receive()
+        if msg.get("type") == "websocket.disconnect":
+            return
+        data = msg.get("bytes")
+        if data is not None:
+            if len(data) > VIDEO_MAX_MSG or len(data) % 188:
+                raise _VideoClose(1009 if len(data) > VIDEO_MAX_MSG else 1003, "bad_chunk",
+                                  "binary messages carry whole TS packets, at most 256 KiB")
+            rec.data(data)
+            if relay is not None:
+                await relay.feed(data, next_key)
+            next_key = False
+            conn.bytes += len(data)
+            conn.win_bytes += len(data)
+            bytes_since_meta += len(data)
+            kbps = conn.note_bytes(len(data), time.monotonic())
+            if kbps is not None:
+                conn._over = conn._over + 1 if kbps > VIDEO_MAX_KBPS * 1.25 else 0
+                if conn._over >= 2:
+                    raise _VideoClose(4413, "over_bitrate", f"{kbps:.0f} kbps > {VIDEO_MAX_KBPS}")
+            continue
+        try:
+            doc = json.loads(msg.get("text") or "")
+        except ValueError:
+            raise _VideoClose(1003, "bad_message", "text messages must be JSON")
+        kind = doc.get("type") if isinstance(doc, dict) else None
+        items = (doc.get("items") or []) if kind == "meta_batch" else [doc] if kind == "meta" else []
+        if kind == "bye":
+            conn.close_code = -1                       # clean end: no more data for this mission
+            await _qm._client.hset(vkey, "status", "ended")
+            return
+        if kind not in ("meta", "meta_batch") or not isinstance(items, list) or len(items) > 10:
+            continue                                   # unknown / malformed: ignored
+        for raw in items:
+            m = _clean_meta(raw) if isinstance(raw, dict) else None
+            if m is None:
+                continue
+            rx = time.time()
+            if m["key"]:
+                next_key = True
+                await asyncio.to_thread(rec.meta, m, rx)   # may close a segment (fsync)
+            else:
+                rec.meta(m, rx)
+            if m["seq"] <= conn.last_seq:
+                conn.dup += 1                          # resent after a reconnect: kept in the recording
+                continue
+            conn.last_seq = m["seq"]
+            conn.frames += 1
+            conn.win_frames += 1
+            conn.pending_meta = m
+            _record_frame(conn.drone_id, bytes_since_meta, conn.mission_id)
+            FRAMES_RECEIVED.labels(drone_id=conn.drone_id, status="video").inc()
+            FRAMES_BYTES.labels(drone_id=conn.drone_id).inc(bytes_since_meta)
+            frame_log.record(conn.drone_id, conn.mission_id, bytes_since_meta, 0.0, m["seq"])
+            bytes_since_meta = 0
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1779,6 +2269,7 @@ async def _mission_end_registry(req: MissionEndRequest, claims: dict, ts: str) -
         if state in LIVE_STATES:
             await _qm.set_mission_draining(sid)
             state = "draining"
+    await _video_mission_stopped(sid)
     if state == "draining" and sid not in _mission_drain_tasks:
         _start_mission_drain(sid, req.drone_id, req.mission_id)
 
@@ -2227,6 +2718,7 @@ async def _purge_drone_missions(drone_id: str) -> list:
             if idx and idx.get("drone_id") not in (None, "", drone_id):
                 continue                     # not this drone's mission (stale pointer)
             await _qm.finalize_mission(sid, drone_id, purged=True)
+        await _video_mission_stopped(sid)        # the decoder sees purged_at and stops
         purged.append((idx or {}).get("mission_id") or sid)
     await client.delete(f"drone:missions:{drone_id}", f"drone:active_mission:{drone_id}")
     return purged

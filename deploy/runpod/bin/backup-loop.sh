@@ -47,6 +47,11 @@ disk_guard() {
     pct="$(df --output=pcent /workspace 2>/dev/null | tail -1 | tr -dc '0-9')"
   fi
   [ -n "$pct" ] || return 0
+  # Read by ingest before it accepts a video stream (v2 R1: recordings stop at 90 %)
+  mkdir -p /run/dvas
+  printf '{"pct": %s, "used_kb": %s, "volume_gb": "%s", "at": %s}\n' \
+    "$pct" "${used_kb:-0}" "${DVAS_VOLUME_GB:-}" "$(date +%s)" > /run/dvas/disk_guard.json.tmp \
+    && mv /run/dvas/disk_guard.json.tmp /run/dvas/disk_guard.json
   if [ "$pct" -ge "$DISK_WARN_PCT" ]; then
     log "WARNING: /workspace is ${pct}% full (threshold ${DISK_WARN_PCT}%) — check MinIO retention and old backups"
   fi

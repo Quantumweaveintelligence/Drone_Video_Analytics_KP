@@ -31,11 +31,22 @@ case "$cmd" in
       who=""; [ "$sid" != "$key" ] && who="  drone $(valkey-cli -h 127.0.0.1 HGET "mission:index:$sid" drone_id) · $(valkey-cli -h 127.0.0.1 HGET "mission:index:$sid" status)"
       echo "== $key  (length $(valkey-cli -h 127.0.0.1 XLEN "$key"))$who"
       valkey-cli -h 127.0.0.1 XINFO GROUPS "$key" | paste - - | awk '{printf "   %s\n", $0}'
+      if [ "$sid" != "$key" ] && [ "$(valkey-cli -h 127.0.0.1 EXISTS "mission:video:$sid")" = 1 ]; then
+        echo "   video: $(valkey-cli -h 127.0.0.1 HMGET "mission:video:$sid" status decoder_done behind_live_s pub_fps live_slot \
+          | paste -sd' ' | awk '{printf "status=%s decoded_all=%s behind_live_s=%s analytics_fps=%s live_slot=%s", $1,$2,$3,$4,$5}')"
+      fi
+    done
+    # video missions still being decoded after their frame stream was purged / not yet created
+    for vkey in $(valkey-cli -h 127.0.0.1 --scan --pattern 'mission:video:*'); do
+      sid=${vkey#mission:video:}
+      [ "$(valkey-cli -h 127.0.0.1 EXISTS "mission:frames:$sid")" = 1 ] && continue
+      echo "== $vkey  $(valkey-cli -h 127.0.0.1 HMGET "$vkey" status decoder_done behind_live_s | paste -sd' ')"
     done ;;
   disk)
     df -h / 2>/dev/null
+    [ -r /run/dvas/disk_guard.json ] && echo "disk guard: $(cat /run/dvas/disk_guard.json)"
     echo "network volume used: $(du -sh /workspace 2>/dev/null | cut -f1) of ${DVAS_VOLUME_GB:-?} GB (df /workspace shows the whole RunPod cluster)"
-    du -sh "$VOL"/{pg,minio,backups,engines} /var/lib/postgresql/dvas 2>/dev/null || true ;;
+    du -sh "$VOL"/{pg,minio,backups,engines,recordings} /var/lib/postgresql/dvas 2>/dev/null || true ;;
   backup-now) "$BIN/backup-loop.sh" --once ;;
   *) sed -n '2,11p' "$0"; exit 2 ;;
 esac

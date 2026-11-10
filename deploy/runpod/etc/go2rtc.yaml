@@ -1,0 +1,39 @@
+# ════════════════════════════════════════════════════════════════════════════
+# go2rtc — live video for the dashboard (RunPod v2 plan R1/R2)
+# Ingest (video_relay.py) pushes each mission's H.264 over RTSP into one of the fixed
+# stream slots below (the slot ↔ mission map lives in Valkey, live:slot:<name>); browsers
+# play it through nginx /live/api/ws (MSE over WebSocket, behind auth_request).
+# go2rtc only accepts pushes to streams that exist, so the slots are declared here and the
+# API never needs to create streams: it is bound to localhost and limited to /api/ws.
+# ════════════════════════════════════════════════════════════════════════════
+api:
+  listen: "127.0.0.1:1984"
+  origin: ""
+  allow_paths: [/api/ws]
+
+rtsp:
+  listen: "127.0.0.1:8554"
+
+webrtc:
+  listen: ""          # no UDP on RunPod; WebRTC only for LAN / on-prem installs (plan R2.6)
+
+log:
+  level: info
+
+streams:
+  live01:
+  live02:
+  live03:
+  live04:
+  live05:
+  live06:
+  live07:
+  live08:
+  live09:
+  live10:
+  live11:
+  live12:
+  live13:
+  live14:
+  live15:
+  live16:

@@ -461,6 +461,10 @@ async def _stream_loop():
                 await asyncio.shield(pending)   # a stream stop must not cut a round half-written
             except Exception:
                 pass
+        try:
+            await _sampler.done()           # the last round is finished: acknowledge it
+        except Exception:
+            pass
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────

@@ -9,6 +9,8 @@ can never mix frames, and a drone's next mission never continues the last one's 
   mission:index:{sid}             HASH drone_id, mission_id, operator_sub, status, started_at, ended_at
   drone:missions:{drone_id}       ZSET sid → started_at (missions whose stream still exists)
   drone:active_mission:{drone_id} sid of the drone's newest mission
+  mission:video:{sid}             HASH of a video mission (v2): decoder_done=1 once every
+                                  recorded frame was fed to the stream
 
 Analytics keep the drone id as their key (trackers, stats, results); this module maps a
 drone to its streams. Legacy `drone:frames:{drone_id}` streams (written before the upgrade,
@@ -64,6 +66,10 @@ def index_key(sid: str) -> str:
     return f"mission:index:{sid}"
 
 
+def video_key(sid: str) -> str:
+    return f"mission:video:{sid}"
+
+
 def _s(v) -> str:
     return v.decode("utf-8", errors="replace") if isinstance(v, bytes) else str(v)
 
@@ -85,8 +91,8 @@ async def drone_streams(client, drone_id: str, mode: Optional[str] = None) -> Li
 
 
 async def is_live(client, key: str, now: Optional[float] = None) -> bool:
-    """A mission stream that may still receive frames: status live, or draining for less
-    than SWITCH_AFTER_S. Legacy streams count as live in drone mode (written forever) and
+    """A mission stream that may still receive frames: status live, a video mission whose
+    decoder is not done, or draining for less than SWITCH_AFTER_S. Legacy streams count as live in drone mode (written forever) and
     as finished in mission mode (ingest no longer writes them)."""
     sid = sid_of_key(key)
     if sid is None:
@@ -94,6 +100,11 @@ async def is_live(client, key: str, now: Optional[float] = None) -> bool:
     status, ended_at = await client.hmget(index_key(sid), ["status", "ended_at"])
     status = _s(status) if status is not None else ""
     if status == "live":
+        return True
+    # A video mission (v2 R1) is fed from its recording at the analytics' pace, possibly
+    # long after the mission ended: it takes frames until its decoder is done.
+    done = await client.hget(video_key(sid), "decoder_done")
+    if done is not None and _s(done) != "1" and status != "ended":
         return True
     if status != "draining":
         return False

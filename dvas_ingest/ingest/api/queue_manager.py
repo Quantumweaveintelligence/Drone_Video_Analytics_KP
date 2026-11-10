@@ -275,8 +275,14 @@ class QueueManager:
     async def _last_id(self, stream_key: str, ref: str):
         """Id of the newest entry: from our own XADDs (no round trip), else XINFO STREAM."""
         cached = getattr(self, "_last_entry", {}).get(ref)
-        if cached:
-            return _parse_id(cached)
+        # The video decoder (another process) XADDs to mission streams and records its
+        # newest id in mission:video:{sid}; take the newer of the two.
+        sid = sid_of_key(stream_key)
+        video_last = await self._client.hget(f"mission:video:{sid}", "last_entry_id") if sid else None
+        ids = [i for i in (_parse_id(cached) if cached else None,
+                           _parse_id(_s(video_last)) if video_last else None) if i is not None]
+        if ids:
+            return max(ids)
         info = await self._client.xinfo_stream(stream_key)
         return _parse_id(info.get("last-generated-id"))
 
@@ -418,6 +424,7 @@ class QueueManager:
         frame_bytes: bytes,
         metadata:   Dict[str, Any],
         stream_key: Optional[str] = None,
+        maxlen:     Optional[int] = None,
     ) -> str:
         """
         Publish a frame to the per-drone Redis Stream, or to `stream_key` (a mission stream,
@@ -456,11 +463,17 @@ class QueueManager:
 
         if stream_key:
             fields["mission_id"] = str(metadata.get("mission_id") or "")
+        # Video uplink (v2 R1): frames decoded from the recording carry when the server
+        # received them, so analytics lag is measured from there, not from the XADD.
+        if metadata.get("rx_ts_ms") is not None:
+            fields["rx_ts_ms"] = str(int(metadata["rx_ts_ms"]))
+            fields["source"] = str(metadata.get("source") or "h264")
 
         if QUEUE_WRITE_JPEG_B64:
             fields["jpeg_b64"] = base64.b64encode(frame_bytes).decode("ascii")
 
-        maxlen = QUEUE_MAX_LEN if not await self._memory_tight() else max(10, QUEUE_MAX_LEN // 4)
+        if maxlen is None:
+            maxlen = QUEUE_MAX_LEN if not await self._memory_tight() else max(10, QUEUE_MAX_LEN // 4)
         entry_id: str = await self._client.xadd(
             key,
             fields,

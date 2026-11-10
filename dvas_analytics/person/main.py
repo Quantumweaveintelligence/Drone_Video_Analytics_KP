@@ -932,6 +932,10 @@ async def _stream_loop():
             except Exception:
                 pass
         try:
+            await _sampler.done()           # the last round is finished: acknowledge it
+        except Exception:
+            pass
+        try:
             await _flush_ended_tracks(force=True)
         except Exception as exc:
             log.warning("Person final writes at stream stop failed: %s", exc)

@@ -148,6 +148,16 @@ RUN set -e; PY="$(cat /opt/dvas-python)"; \
   /opt/venvs/ai/bin/python -c "import torch;assert torch.__version__.startswith('2.8'), torch.__version__;print('torch', torch.__version__, 'cuda', torch.version.cuda)"; \
   /opt/venvs/ai/bin/python -c "import onnxruntime as o;print('onnxruntime providers', o.get_available_providers())"
 
+# go2rtc (v2 R1/R2): live video for the dashboard — pinned release, SHA-256 verified
+# (digest from the GitHub release asset). After the venvs so their layers stay cached.
+ARG GO2RTC_VERSION=v1.9.14
+ARG GO2RTC_SHA256=32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6
+RUN curl -fsSL -o /usr/local/bin/go2rtc \
+      "https://github.com/AlexxIT/go2rtc/releases/download/${GO2RTC_VERSION}/go2rtc_linux_amd64" && \
+    echo "${GO2RTC_SHA256}  /usr/local/bin/go2rtc" | sha256sum -c - && \
+    chmod 755 /usr/local/bin/go2rtc && /usr/local/bin/go2rtc -version && \
+    /opt/venvs/ai/bin/python -c "import av, cv2, redis; print('video-decoder deps: av', av.__version__, 'cv2', cv2.__version__)"
+
 # Application code (weights excluded by Dockerfile.dockerignore)
 COPY dvas_analytics/             /opt/dvas/dvas_analytics/
 COPY dvas_ingest/ingest/api/     /opt/dvas/dvas_ingest/ingest/api/

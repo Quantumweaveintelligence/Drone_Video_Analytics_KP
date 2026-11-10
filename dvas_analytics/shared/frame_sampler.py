@@ -10,7 +10,12 @@ XREADGROUP per drone:
     in order, one per drone per round. If the GPU falls behind the backlog stays
     in the queue and is worked off — also after the edge stops streaming. Frames
     are lost only when the queue overflows (MAXLEN); they are counted as `skipped`
-    from gaps in `frame_seq`.
+    from gaps in `frame_seq`. (Video missions never overflow: the video decoder feeds
+    a small window and waits for the slowest active service — v2 plan R1.)
+  * Acknowledged after analysis (v2 R1 4a): a frame is XACKed when the service asks for
+    its next round, i.e. once it has finished with it. Frames waiting in the re-order
+    buffer or the prefetched round stay pending, so a restart re-reads them (at most one
+    frame per drone is analysed twice after a crash).
   * mode="newest" (crowd): only the newest entry per drone is analysed; older ones
     are XACKed unread and counted as `skipped`.
   * A per-drone rate cap (the governor's `dvas:fps_cap:<service>`, else
@@ -284,6 +289,9 @@ class FrameSampler:
         self._last_cap_read = 0.0
         self._batch_sizes: Deque[int] = deque(maxlen=50)
         self._pel_done: set = set()          # stream keys whose own pending entries were re-read
+        self._pel_pos: Dict[str, str] = {}   # stream key → last pending id re-read (restart)
+        self._returned: List[Tuple[str, str]] = []   # (stream, id) handed out last round: ack next round
+        self._ack_now: Dict[str, List[str]] = {}     # entries finished without analysis (trimmed, dropped)
         self._last_seq: Dict[str, int] = {}  # last analysed frame_seq per drone (gap = lost)
         self._held: Dict[str, List[tuple]] = {}   # drone → [(seq, arrived_mono, fields)] re-order buffer
         self._gaps: Dict[str, set] = {}           # drone → seqs counted as lost (a late arrival refunds)
@@ -347,7 +355,7 @@ class FrameSampler:
                 log.info("[%s] %s: %s finished — reading %s with fresh trackers",
                          self.service, d, old, key)
                 self._last_seq.pop(d, None)
-                self._held.pop(d, None)
+                self._drop_held(d)
                 self._gaps.pop(d, None)
                 self._reset_state(d)
 
@@ -413,10 +421,49 @@ class FrameSampler:
 
     # ── Reading ───────────────────────────────────────────────────────────────
     async def next_round(self, drones: List[str]) -> Dict[str, dict]:
-        """Newest due frame per drone: {drone_id: fields}. Empty dict when none.
+        """Next due frame per drone: {drone_id: fields}. Empty dict when none.
 
-        Older entries read in the same round are XACKed and counted as skipped.
+        Ordered mode: the frames handed out by the previous call are acknowledged now (the
+        service has finished them). Newest mode: older entries read in the same round are
+        XACKed and counted as skipped.
         """
+        await self._ack_returned()
+        out = await self._round(drones)
+        self._remember(out.values())
+        return out
+
+    async def done(self) -> None:
+        """The service stopped reading: acknowledge the frames it has finished."""
+        await self._ack_returned()
+
+    def _remember(self, fields_list) -> None:
+        self._returned = [(f["_stream"], f["entry_id"]) for f in fields_list
+                          if isinstance(f, dict) and f.get("_stream") and f.get("entry_id")]
+
+    def _finished(self, fields: dict) -> None:
+        """A read entry that will not be handed out (dropped, undecodable): ack it."""
+        key, eid = fields.get("_stream"), fields.get("entry_id")
+        if key and eid:
+            self._ack_now.setdefault(key, []).append(eid)
+
+    async def _ack_returned(self) -> None:
+        todo, self._returned = self._returned, []
+        for key, eid in todo:
+            self._ack_now.setdefault(key, []).append(eid)
+        await self._flush_acks()
+
+    async def _flush_acks(self) -> None:
+        if not self._ack_now:
+            return
+        todo, self._ack_now = self._ack_now, {}
+        client = self._redis()
+        for key, ids in todo.items():
+            try:
+                await client.xack(key, self.group, *ids)
+            except Exception as exc:                # stream purged (NOGROUP): nothing to ack
+                log.debug("[%s] xack on %s failed: %s", self.service, key, exc)
+
+    async def _round(self, drones: List[str]) -> Dict[str, dict]:
         await self._refresh_cap()
         self._reset_idle()
         if not drones:
@@ -497,16 +544,21 @@ class FrameSampler:
         stream stop (the sampler lives as long as the process) and is returned first on
         the next start, so no frame is skipped.
         """
+        await self._ack_returned()
         task, self._prefetch = self._prefetch, None
         got = await task if task is not None else await self._read_decoded(list(drones))
+        self._remember(f for f, _img in got.values())
         self._prefetch = asyncio.create_task(self._read_decoded(list(drones)))
         return got
 
     async def _read_decoded(self, drones: List[str]) -> Dict[str, Tuple[dict, object]]:
-        frames = await self.next_round(drones)
+        frames = await self._round(drones)
         if not frames:
             return {}
         imgs = await asyncio.gather(*(asyncio.to_thread(_decode_quietly, f) for f in frames.values()))
+        for f, img in zip(frames.values(), imgs):
+            if img is None:
+                self._finished(f)                # undecodable: never handed out, so ack it
         return {d: (f, img) for (d, f), img in zip(frames.items(), imgs) if img is not None}
 
     async def _next_ordered(self, client, due: List[str]) -> Dict[str, dict]:
@@ -521,8 +573,10 @@ class FrameSampler:
         ready_now = any(self._ready(d, now) is not None for d in due)
         keys = {d: self._key(d) for d in due}
         by_key = {k: d for d, k in keys.items()}
-        streams = {k: ("0" if k not in self._pel_done else ">") for k in by_key}
-        if any(v == "0" for v in streams.values()) or ready_now:
+        await self._flush_acks()
+        # own pending entries first (after a restart), continuing after the last one re-read
+        streams = {k: (self._pel_pos.get(k, "0") if k not in self._pel_done else ">") for k in by_key}
+        if any(v != ">" for v in streams.values()) or ready_now:
             block = None
         else:
             wait = self._hold_wait(due, now)
@@ -535,6 +589,8 @@ class FrameSampler:
             if "NOGROUP" in str(exc):
                 self._groups_ok.difference_update(by_key)
                 self._pel_done.difference_update(by_key)
+                for k in by_key:
+                    self._pel_pos.pop(k, None)
                 return {}
             raise
         got = {}
@@ -545,17 +601,20 @@ class FrameSampler:
         now = self._clock()
         for d in due:
             entries = got.get(d) or []
-            if streams[keys[d]] == "0" and not entries:
-                self._pel_done.add(keys[d])     # own pending list is empty: switch to new entries
-            ids = [_s(e[0]) for e in entries]
-            if ids:
-                await client.xack(keys[d], self.group, *ids)
+            if streams[keys[d]] != ">":
+                if not entries:
+                    self._pel_done.add(keys[d])     # own pending list re-read: switch to new entries
+                    self._pel_pos.pop(keys[d], None)
+                else:
+                    self._pel_pos[keys[d]] = _s(entries[-1][0])
             st = self.stats.setdefault(d, DroneStats())
             for eid, raw in entries:
                 if raw is None or not raw:      # pending id whose entry was trimmed away
+                    self._ack_now.setdefault(keys[d], []).append(_s(eid))
                     continue
                 st.received.append(now)
                 fields = decode_fields(raw, d, _s(eid))
+                fields["_stream"] = keys[d]
                 self._held.setdefault(d, []).append((_seq_of(fields), now, fields))
 
         out: Dict[str, dict] = {}
@@ -564,7 +623,8 @@ class FrameSampler:
             if fields is None:
                 continue
             st = self.stats[d]
-            ts_ms = fields.get("ts")
+            # video frames: from when the server received them (they may wait on disk first)
+            ts_ms = fields.get("rx_ts_ms") or fields.get("ts")
             try:
                 st.lag_ms = max(0.0, time.time() * 1000 - float(ts_ms)) if ts_ms else None
             except ValueError:
@@ -629,6 +689,7 @@ class FrameSampler:
             if seq is None:
                 return fields
             if last is not None and seq == last:
+                self._finished(fields)
                 continue                        # duplicate upload (edge retried after success)
             if last is not None and seq < last and last - seq <= SEQ_RESET:
                 # Arrived after a newer frame was analysed
@@ -638,6 +699,7 @@ class FrameSampler:
                     gaps.discard(seq)
                     st.skipped = max(0, st.skipped - 1)
                 if self.late_policy == "skip":
+                    self._finished(fields)
                     continue
                 fields["_late"] = "1"
                 return fields
@@ -707,9 +769,13 @@ class FrameSampler:
         self._cands.pop(drone_id, None)
         self._resolved_at.pop(drone_id, None)
         self._last_seq.pop(drone_id, None)
-        self._held.pop(drone_id, None)
+        self._drop_held(drone_id)
         self._gaps.pop(drone_id, None)
         self.cap.forget(drone_id)
+
+    def _drop_held(self, drone_id: str) -> None:
+        for _seq, _at, fields in self._held.pop(drone_id, None) or []:
+            self._finished(fields)
 
     def snapshot(self) -> dict:
         from shared import gpu_profile  # noqa: PLC0415
