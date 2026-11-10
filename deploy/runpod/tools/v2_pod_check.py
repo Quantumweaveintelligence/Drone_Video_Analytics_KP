@@ -134,6 +134,8 @@ def e2e(tmp: str, token: str, url: str) -> None:
     clip = os.path.join(tmp, "e2e.mp4")
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=3840x2160:rate=30",
                     "-t", "20", "-c:v", "libx264", "-preset", "veryfast", "-g", "30", "-bf", "0",
+                    # a drone camera's 4K rate; testsrc2 uncapped is ~25 Mbps (> the 12 Mbps uplink cap → 4413)
+                    "-b:v", "8M", "-maxrate", "10M", "-bufsize", "10M",
                     "-pix_fmt", "yuv420p", clip], check=True)
     mission = f"MSN-V2CHECK-{int(time.time())}"
     tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "send_ts.py")

@@ -136,32 +136,40 @@ async def stream(args) -> int:
         seq = int(ready.get("last_seq") or 0) + 1
 
         async def show():
-            async for msg in ws:
-                if isinstance(msg, str):
-                    print("server:", msg)
+            try:
+                async for msg in ws:
+                    if isinstance(msg, str):
+                        print("server:", msg)
+            except websockets.ConnectionClosed as exc:
+                print("server closed:", exc)
         printer = asyncio.create_task(show())
         start = time.monotonic()
         offset = 0.0
-        for _ in range(max(1, args.loop)):
-            last = 0.0
-            for meta, data, t in ts_chunks(args.file, args.transcode, first_seq=seq):
-                if meta is not None:
-                    wait = start + offset + t - time.monotonic()
-                    if wait > 0:
-                        await asyncio.sleep(wait)
-                    await ws.send(json.dumps(meta))
-                    seq = meta["seq"] + 1
-                    last = t
-                for i in range(0, len(data), 188 * 1300):
-                    await ws.send(data[i:i + 188 * 1300])
-            offset += last + 1.0 / fps
-        await ws.send(json.dumps({"type": "bye", "last_seq": seq - 1}))
+        rc = 0
+        try:
+            for _ in range(max(1, args.loop)):
+                last = 0.0
+                for meta, data, t in ts_chunks(args.file, args.transcode, first_seq=seq):
+                    if meta is not None:
+                        wait = start + offset + t - time.monotonic()
+                        if wait > 0:
+                            await asyncio.sleep(wait)
+                        await ws.send(json.dumps(meta))
+                        seq = meta["seq"] + 1
+                        last = t
+                    for i in range(0, len(data), 188 * 1300):
+                        await ws.send(data[i:i + 188 * 1300])
+                offset += last + 1.0 / fps
+            await ws.send(json.dumps({"type": "bye", "last_seq": seq - 1}))
+        except websockets.ConnectionClosed as exc:  # refused mid-stream: still end the test mission below
+            print("stream stopped:", exc)
+            rc = 1
         printer.cancel()
     if not args.no_end:
         r = httpx.post(f"{base}/ingest/mission/end", headers=hdr, timeout=20, verify=not args.insecure,
                        json={"drone_id": args.drone, "mission_id": args.mission})
         print("mission/end", r.status_code, r.text[:200])
-    return 0
+    return rc
 
 
 def main() -> int:
