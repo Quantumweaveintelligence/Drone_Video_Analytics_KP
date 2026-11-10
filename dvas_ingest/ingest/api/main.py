@@ -1204,6 +1204,9 @@ _video_conns: dict[str, _VideoConn] = {}      # sid → open connection
 # go2rtc accepts pushes only into streams declared in its config (etc/go2rtc.yaml): a fixed
 # pool of slots, mapped to missions in Valkey (live:slot:<name> = sid) while they stream.
 LIVE_SLOTS = [f"live{n:02d}" for n in range(1, 17)]
+# A freed slot is not reused for this long: nginx closes a viewer's socket after 30 s without
+# video, so no viewer of the last mission can still be attached when another mission gets it.
+LIVE_SLOT_COOLDOWN_S = 90
 _DEL_IF_EQUAL = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0"
 
 
@@ -1213,7 +1216,9 @@ async def _live_slot_acquire(sid: str) -> Optional[str]:
         cur = await client.get(f"live:slot:{name}")
         if cur is not None and (cur.decode() if isinstance(cur, bytes) else cur) == sid:
             return name
-    for name in LIVE_SLOTS[:max(1, min(len(LIVE_SLOTS), VIDEO_MAX_STREAMS))]:
+    for name in LIVE_SLOTS:
+        if await client.exists(f"live:cooldown:{name}"):
+            continue          # viewers of its last mission may still be attached (≤ nginx idle timeout)
         if await client.set(f"live:slot:{name}", sid, nx=True):
             return name
     return None
@@ -1222,7 +1227,8 @@ async def _live_slot_acquire(sid: str) -> Optional[str]:
 async def _live_slot_release(sid: str, name: Optional[str]) -> None:
     if name:
         try:
-            await _qm._client.eval(_DEL_IF_EQUAL, 1, f"live:slot:{name}", sid)
+            if await _qm._client.eval(_DEL_IF_EQUAL, 1, f"live:slot:{name}", sid):
+                await _qm._client.set(f"live:cooldown:{name}", sid, ex=LIVE_SLOT_COOLDOWN_S)
             await _qm._client.hdel(video_store.video_key(sid), "live_slot")
         except Exception as exc:
             log.debug("live slot release failed (%s %s): %s", sid, name, exc)
@@ -1499,6 +1505,36 @@ async def _video_finish(ws: WebSocket, conn: Optional[_VideoConn], rec, relay) -
                     await ws.close(code=1000)
                 except Exception:
                     pass
+
+
+@app.get("/ingest/video/live/{drone_id}", summary="Live video of a drone's current mission (internal)",
+         tags=["Video"])
+async def video_live_info(drone_id: str, claims: dict = Depends(validate_token_flexible)) -> dict:
+    """go2rtc stream slot and state of the drone's current mission video — for the dashboard
+    backend (service token). 404 when the drone is not streaming video now."""
+    if _qm is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Queue unavailable")
+    sid = _drone_active_sid.get(drone_id) or await _qm.drone_active_sid(drone_id)
+    h = await _video_hash(sid) if sid else {}
+    slot = h.get("live_slot")
+    if not slot or h.get("status") != "receiving" or sid not in _video_conns:
+        raise HTTPException(404, "No live video for this drone")
+    return {"drone_id": drone_id, "mission_id": h.get("mission_id"), "sid": sid, "src": slot,
+            "width": int(_f(h.get("width"))), "height": int(_f(h.get("height"))), "fps": _f(h.get("fps")),
+            "analytics_fps": _f(h.get("pub_fps")), "behind_live_s": _f(h.get("behind_live_s"))}
+
+
+@app.get("/ingest/video/slot/{slot}", summary="Which mission a live stream slot carries (internal)",
+         tags=["Video"])
+async def video_slot_owner(slot: str, claims: dict = Depends(validate_token_flexible)) -> dict:
+    if slot not in LIVE_SLOTS:
+        raise HTTPException(404, "Unknown slot")
+    raw = await _qm._client.get(f"live:slot:{slot}")
+    sid = (raw.decode() if isinstance(raw, bytes) else raw) if raw else None
+    h = await _video_hash(sid) if sid else {}
+    if not sid or not h.get("drone_id"):
+        raise HTTPException(404, "Slot is free")
+    return {"src": slot, "sid": sid, "drone_id": h.get("drone_id"), "mission_id": h.get("mission_id")}
 
 
 def _video_analytics_fps() -> float:

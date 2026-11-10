@@ -30,7 +30,7 @@ from services.retention import start_retention_job
 from services.report_jobs import start_report_worker
 from ingest_proxy import ingest_api
 
-from routers import admin, auth, drones, alerts, audit, analytics, edge, infra, ws, incidents, reports, push, cases, downloads
+from routers import admin, auth, drones, alerts, audit, analytics, edge, infra, ws, incidents, reports, push, cases, downloads, live
 
 # ---------- App ----------
 logging.basicConfig(level=logging.INFO)
@@ -131,6 +131,7 @@ app.include_router(ingest_api)
 app.include_router(incidents.router)
 app.include_router(reports.router)
 app.include_router(push.router)
+app.include_router(live.router)
 
 # ---------- CORS ----------
 cors_origins = [o.strip() for o in CORS_ORIGINS if o.strip() and o.strip() != "*"]

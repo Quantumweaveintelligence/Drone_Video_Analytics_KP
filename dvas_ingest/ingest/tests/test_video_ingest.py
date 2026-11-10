@@ -368,12 +368,18 @@ def test_live_relay_gets_a_slot_and_the_stream_from_a_keyframe(client, valkey, c
         assert json.loads(ws.receive_text())["type"] == "ready"
         seen_slot.append(s(valkey.get("live:slot:live01")))
         assert vhash(valkey)["live_slot"] == "live01"
+        info = client.get(f"/ingest/video/live/{DRONE}", headers=H()).json()
+        assert info["src"] == "live01" and info["width"] == 320
+        assert client.get("/ingest/video/slot/live01", headers=H()).json()["drone_id"] == DRONE
         send_clip(ws, clips["plain"])
         msg = ws.receive()
         while msg.get("type") != "websocket.close":
             msg = ws.receive()
     assert seen_slot == [SID]
     assert valkey.get("live:slot:live01") is None and "live_slot" not in vhash(valkey)   # freed
+    assert client.get(f"/ingest/video/live/{DRONE}", headers=H()).status_code == 404
+    assert client.get("/ingest/video/slot/live01", headers=H()).status_code == 404
+    assert valkey.ttl("live:cooldown:live01") > 60           # not handed to another mission yet
     time.sleep(0.2)
     relayed = out.read_bytes()
     recorded = b"".join(vs.seg_path(SID, i).read_bytes() for i in vs.segments(SID))

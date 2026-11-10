@@ -117,7 +117,11 @@ async def stream(args) -> int:
     ws_url = base.replace("https://", "wss://").replace("http://", "ws://") + \
         f"/ingest/video/ws?drone_id={args.drone}&mission_id={args.mission}"
     seq = 1
-    async with websockets.connect(ws_url, additional_headers=hdr, max_size=None, ping_interval=15) as ws:
+    try:
+        conn = websockets.connect(ws_url, additional_headers=hdr, max_size=None, ping_interval=15)
+    except TypeError:                                   # websockets < 13
+        conn = websockets.connect(ws_url, extra_headers=hdr, max_size=None, ping_interval=15)
+    async with conn as ws:
         await ws.send(json.dumps({"type": "hello", "v": 1, "drone_id": args.drone, "mission_id": args.mission,
                                   "laptop_id": "send_ts", "codec": "h264", "container": "mpegts",
                                   "width": w, "height": h, "fps": fps, "source": "file", "next_seq": seq}))

@@ -109,7 +109,10 @@ source (RTSP / MP4 / USB)
           "battery_pct":71,"gb_yaw":142.5,"gb_pitch":-35.0,"gb_roll":0.0,"focal_len":24.0,
           "dzoom_ratio":1.0}}
   ```
-  - `seq`: per-mission frame counter **assigned at capture**.
+  - `seq`: per-mission frame counter **assigned at capture**. It may follow packet (decode)
+    order when the source has B-frames. It never repeats for different frames, and continues
+    across reconnects. The server orders frames by PTS and numbers the analytics frames itself;
+    `seq` is kept as `edge_seq` and used to drop frames re-sent after a reconnect.
   - `pts_ms`: the PTS of that frame in the TS stream, in milliseconds.
   - `capture_ts`: wall clock, epoch seconds, **taken at capture**.
   - `tel`: the same field names as today's `/ingest/frame` metadata; missing values are `null`.
@@ -140,8 +143,10 @@ The server may also send a congestion hint, `{"type":"slow_down","max_kbps":4000
 | `4413` | Over `max_kbps` | Transcode lower, reconnect |
 | `4415` | Codec not supported | Transcode, reconnect |
 | `1011` | Server error | Back off 0.5 → 1 → 2 → 4 → 8 s, then reconnect |
+| `1013` | Server busy: recording disk full, too many live streams, previous connection still closing | Wait 30 s, reconnect; keep the JPEG fallback meanwhile |
+| `1003` / `1008` / `1009` | Malformed message, bad hello, chunk over 256 KiB or not whole TS packets | Fix the sender (bug); do not retry in a loop |
 
-If the upgrade returns HTTP 404 (an old server) or fails 5 times in a row, switch to the JPEG
+If the upgrade is refused (HTTP 403/404: an old server, or `DVAS_VIDEO_INGEST=0`) or fails 5 times in a row, switch to the JPEG
 fallback and keep retrying the WebSocket every 60 s.
 
 ---

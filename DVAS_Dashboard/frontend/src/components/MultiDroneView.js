@@ -51,6 +51,7 @@ import {
 
 import { useActiveStreams, framesLeft } from "@/hooks/useActiveStreams";
 import { useJpegPoller } from "@/hooks/useJpegPoller";
+import { useLiveVideo } from "@/hooks/useLiveVideo";
 import {
   useCrowdReadings,
   usePersonCount,
@@ -247,8 +248,12 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge, can
   const isOtherSelected = hasSelection && !isSelected;
   const left = framesLeft(drone);
 
-  const { blobUrl, hasFrame, feedDead, notFound } = useDroneFeed(drone.id, !isLive);
+  // v2: continuous H.264 when the edge streams video; the JPEG feed only while it does not
+  const live = useLiveVideo(drone.id, isLive);
+  const { blobUrl, hasFrame, feedDead, notFound } = useDroneFeed(drone.id, !isLive || live.playing);
   const noAccess = notFound === "no_access";
+  const hasPicture = live.playing || hasFrame;
+  const feedDown = !live.playing && feedDead;
 
   const borderColor = isDegraded
     ? "border-amber-500/40"
@@ -303,8 +308,18 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge, can
           <div key={i} className={`absolute w-4 h-4 ${cls} ${isDegraded ? "border-amber-400/60" : isOffline ? "border-red-400/60" : "border-teal-400/60"}`} />
         ))}
 
-        {/* Live JPEG feed or placeholder */}
-        {isLive && hasFrame && blobUrl ? (
+        {/* Live video (v2), else the JPEG feed, else a placeholder */}
+        {isLive && (
+          <video
+            ref={live.videoRef}
+            muted
+            autoPlay
+            playsInline
+            className="absolute inset-0 w-full h-full object-cover"
+            style={{ opacity: live.playing ? (isDegraded ? 0.8 : 0.95) : 0 }}
+          />
+        )}
+        {isLive && live.playing ? null : isLive && hasFrame && blobUrl ? (
           <img
             src={blobUrl}
             alt={`Live feed ${drone.id}`}
@@ -325,7 +340,7 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge, can
                 <WifiOff size={22} className="text-slate-400/60" />
                 <span className="mono text-[10px] text-slate-400/80">NO ACCESS</span>
               </div>
-            ) : isOffline || feedDead ? (
+            ) : isOffline || feedDown ? (
               <div className="flex flex-col items-center gap-2">
                 <WifiOff size={22} className="text-red-400/60" />
                 <span className="mono text-[10px] text-red-400/60">FEED OFFLINE</span>
@@ -396,10 +411,10 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge, can
                 <Trash2 size={9} /> Purge
               </button>
             )}
-            {hasFrame && !feedDead && !isOffline && (
+            {hasPicture && !feedDown && !isOffline && (
               <span className="w-2 h-2 rounded-full bg-teal-400" style={{ animation: "pulse 1.2s infinite" }} />
             )}
-            <StatusPill status={isDraining ? "draining" : isOffline || feedDead ? "offline" : drone.status} />
+            <StatusPill status={isDraining ? "draining" : isOffline || feedDown ? "offline" : drone.status} />
           </div>
           {isDraining && (
             <span className="text-[10px] bg-amber-900/60 text-amber-300 px-2 py-0.5 rounded-full flex items-center gap-1 font-bold">

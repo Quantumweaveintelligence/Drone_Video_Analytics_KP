@@ -4,6 +4,7 @@ import { useI18n } from "@/context/I18nContext";
 import LiveMap from "@/components/LiveMap";
 import { useActiveStreams, framesLeft } from "@/hooks/useActiveStreams";
 import { useJpegPoller } from "@/hooks/useJpegPoller";
+import { useLiveVideo } from "@/hooks/useLiveVideo";
 import { API } from "@/lib/api";
 import {
   MapPin,
@@ -23,21 +24,26 @@ function MiniStreamCell({ drone }) {
   const isOffline = !isLive && !isDraining;
   const left = framesLeft(drone);
 
-  const url = isLive ? `${API}/ingest-server/frame/${encodeURIComponent(drone.id)}/latest` : null;
-  const { blobUrl, hasFrame, feedDead, notFound } = useJpegPoller(url, 800, isLive, { notFoundRetryMs: TILE_404_RETRY_MS });
+  // v2: continuous H.264 when the edge streams video; the JPEG feed only while it does not
+  const live = useLiveVideo(drone.id, isLive);
+  const pollJpeg = isLive && !live.playing;
+  const url = pollJpeg ? `${API}/ingest-server/frame/${encodeURIComponent(drone.id)}/latest` : null;
+  const { blobUrl, hasFrame, feedDead, notFound } = useJpegPoller(url, 800, pollJpeg, { notFoundRetryMs: TILE_404_RETRY_MS });
   const noAccess = notFound === "no_access";
+  const hasPicture = live.playing || hasFrame;
+  const feedDown = !live.playing && feedDead;
   const [lastSeen, setLastSeen] = useState(null);
 
   useEffect(() => {
-    if (hasFrame) setLastSeen(new Date());
-  }, [hasFrame, blobUrl]);
+    if (hasPicture) setLastSeen(new Date());
+  }, [hasPicture, blobUrl]);
 
-  const statusColor = isDraining ? "#fbbf24" : isOffline || feedDead ? "#ef4444" : isDegraded ? "#f59e0b" : "#10b981";
+  const statusColor = isDraining ? "#fbbf24" : isOffline || feedDown ? "#ef4444" : isDegraded ? "#f59e0b" : "#10b981";
   const borderColor = isDraining || isDegraded
     ? "border-amber-500/40"
-    : isOffline || feedDead
+    : isOffline || feedDown
     ? "border-red-500/30"
-    : hasFrame
+    : hasPicture
     ? "border-teal-500/40"
     : "border-slate-700/60";
 
@@ -69,7 +75,17 @@ function MiniStreamCell({ drone }) {
           }}
         />
 
-        {isLive && hasFrame && blobUrl ? (
+        {isLive && (
+          <video
+            ref={live.videoRef}
+            muted
+            autoPlay
+            playsInline
+            className="absolute inset-0 w-full h-full object-cover"
+            style={{ opacity: live.playing ? (isDegraded ? 0.75 : 0.92) : 0 }}
+          />
+        )}
+        {isLive && live.playing ? null : isLive && hasFrame && blobUrl ? (
           <img
             src={blobUrl}
             alt={`Feed ${drone.id}`}
@@ -89,7 +105,7 @@ function MiniStreamCell({ drone }) {
               >
                 NO ACCESS
               </div>
-            ) : isOffline || feedDead ? (
+            ) : isOffline || feedDown ? (
               <div className="mono text-[9px] text-red-400 bg-black/70 px-2 py-1 rounded border border-red-500/30">
                 FEED OFFLINE
               </div>
@@ -125,7 +141,7 @@ function MiniStreamCell({ drone }) {
 
         <div className="absolute top-1.5 right-1.5 z-20 flex flex-col items-end gap-1">
           <div className="flex items-center gap-1">
-            {hasFrame && !feedDead && (
+            {hasPicture && !feedDown && (
               <span
                 className="w-1.5 h-1.5 rounded-full"
                 style={{ background: isDraining ? "#fbbf24" : "#10b981", animation: "pulse 1.2s infinite" }}
@@ -139,7 +155,7 @@ function MiniStreamCell({ drone }) {
                 border: `1px solid ${statusColor}30`,
               }}
             >
-              {isDraining ? "DRAINING" : isOffline || feedDead ? "OFFLINE" : isDegraded ? "DEGRADED" : "LIVE"}
+              {isDraining ? "DRAINING" : isOffline || feedDown ? "OFFLINE" : isDegraded ? "DEGRADED" : "LIVE"}
             </span>
           </div>
         </div>

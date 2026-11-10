@@ -31,6 +31,47 @@ This is not a full overhaul. The work is limited to:
 | Recording | **On, kept 7 days** (`DVAS_RECORD_RETENTION_DAYS=7`), except segments linked to legal-hold evidence. Stops with an alert at 90 % of the volume. |
 | Delivery | **Stages, each pushed to branch `runpod-v2` and checked on the pod before the next:** Stage 1 = R0 spike script + R1 + R2; Stage 2 = R3; Stage 3 = R4 + R5. |
 
+### Status (2026-11-10): Stage 1 implemented on `runpod-v2`, not yet on the pod
+
+Built:
+- **R1** — `/ingest/video/ws` (`dvas_ingest/ingest/api/main.py`).
+- **R1** — recording and SHA-256 chain manifest (`video_store.py`).
+- **R1** — live relay (`video_relay.py`).
+- **R1** — `video-decoder` process (`video_decoder.py`, runs in the ai venv: no new Python packages).
+- **R1** — ack-after-analysis in the sampler (and `done()` at each analyzer's stream stop).
+- **R1** — video-aware `is_live`.
+- **R1** — the drain waits for `decoder_done`.
+- **R1** — disk guard file.
+- **R1** — `dvas-ctl lag` video lines.
+- **R2** — go2rtc v1.9.14 (SHA-256 pinned) with 16 slots, `/live/api/ws` behind `auth_request`.
+- **R2** — `routers/live.py`.
+- **R2** — `useLiveVideo` on the Multi-Drone Grid and Tactical Map tiles.
+- **Tools** — `tools/send_ts.py` (edge stand-in) and `tools/v2_pod_check.py` (R0 measurements on the pod).
+
+Tests:
+- ingest: 65, incl. 12 video tests — recording, flow control, restart resume, reconnect, B-frames,
+  drain gating, relay slot, disk guard;
+- analytics shared: 63, incl. 5 ack tests;
+- backend: `test_live_video.py`;
+- frontend: builds.
+
+Differences from the plan text above, found while building:
+- the edge's `seq` follows decode order with B-frames, so the decoder orders by PTS and numbers
+  frames itself (`edge_seq` kept);
+- go2rtc needs pre-declared stream slots, so the R2 tickets were replaced by session-cookie
+  auth plus the slot's current drone;
+- `df /workspace` shows the RunPod storage cluster, so recordings are refused using the backup
+  loop's du-based disk guard (`DVAS_VOLUME_GB`).
+
+Not verified (needs the pod):
+- go2rtc's handling of the empty slot entries in its config;
+- MSE playback through Cloudflare;
+- latency from Kerala;
+- decode / JPEG speed at 4K;
+- the 30 s player idle timeout in practice.
+
+`v2_pod_check.py` covers these.
+
 Out of scope for v2:
 - a single multi-head backbone (needs retraining);
 - GB/T 28181;
@@ -148,7 +189,10 @@ vehicle ── detections (visdrone) ──► mission:hud:{sid} ──► ANPR 
           "battery_pct":71,"gb_yaw":142.5,"gb_pitch":-35.0,"gb_roll":0.0,"focal_len":24.0,
           "dzoom_ratio":1.0}}
   ```
-  - `seq`: per-mission frame counter **assigned at capture**.
+  - `seq`: per-mission frame counter **assigned at capture**. It may follow packet (decode)
+    order when the source has B-frames. It never repeats for different frames, and continues
+    across reconnects. The server orders frames by PTS and numbers the analytics frames itself;
+    `seq` is kept as `edge_seq` and used to drop frames re-sent after a reconnect.
   - `pts_ms`: the PTS of that frame in the TS stream, in milliseconds.
   - `capture_ts`: wall clock, epoch seconds, **taken at capture**.
   - `tel`: the same field names as today's `/ingest/frame` metadata; missing values are `null`.
@@ -179,8 +223,10 @@ The server may also send a congestion hint, `{"type":"slow_down","max_kbps":4000
 | `4413` | Over `max_kbps` | Transcode lower, reconnect |
 | `4415` | Codec not supported | Transcode, reconnect |
 | `1011` | Server error | Back off 0.5 → 1 → 2 → 4 → 8 s, then reconnect |
+| `1013` | Server busy: recording disk full, too many live streams, previous connection still closing | Wait 30 s, reconnect; keep the JPEG fallback meanwhile |
+| `1003` / `1008` / `1009` | Malformed message, bad hello, chunk over 256 KiB or not whole TS packets | Fix the sender (bug); do not retry in a loop |
 
-If the upgrade returns HTTP 404 (an old server) or fails 5 times in a row, switch to the JPEG
+If the upgrade is refused (HTTP 403/404: an old server, or `DVAS_VIDEO_INGEST=0`) or fails 5 times in a row, switch to the JPEG
 fallback and keep retrying the WebSocket every 60 s.
 
 ---
@@ -355,42 +401,53 @@ New service `dvas_ingest/video_gateway/` (FastAPI + asyncio). It is a supervisor
 
 ### Phase R2 — Live video in the dashboard (3–4 days)
 
-1. **Backend** — new `routers/live.py`:
-   - `GET /api/live/ticket?drone_id=`
-     - Applies the same jurisdiction check as `ingest_proxy.py` `/frame/{drone_id}/latest`.
-     - Resolves the drone's active mission `sid`.
-     - Returns `{src, ticket}`. The ticket is an HMAC over (`sub`, `src`, expiry 60 s).
-   - `GET /api/live/authorize` — for nginx `auth_request`. Validates the ticket against `src` from
-     `X-Original-URI`.
-2. **nginx `/live/`.**
-   - Only `location = /live/api/ws` is proxied to go2rtc (WebSocket upgrade, 3600 s timeout).
-   - It is guarded by `auth_request /api/live/authorize`.
-   - Every other go2rtc path returns 404. The go2rtc API can add stream sources, so it must never
-     be reachable from outside.
-3. **Frontend player.**
-   - `components/LiveVideo.js`: an MSE player over `wss://…/live/api/ws?src=&ticket=`. Vendor
-     go2rtc's MIT `video-rtc.js` MSE part, or write a minimal player.
-   - Keep latency low: if the buffer lags the live edge by more than 1.5 s, jump to the live edge.
-   - Reconnect with a new ticket.
-   - After 3 failures, fall back to the current JPEG poller.
-4. **Replace the pollers:**
+1. **Stream slots.** go2rtc accepts pushes only into streams declared in its config, and its
+   API can add stream sources. So the API stays locked (`allow_paths: [/api/ws]`, localhost
+   only), and `etc/go2rtc.yaml` declares 16 slots, `live01` … `live16`.
+   - Ingest assigns a slot per streaming mission: `live:slot:<name>` = sid (SET NX), also stored
+     as `live_slot` in `mission:video:{sid}`.
+   - It frees the slot when the connection ends, followed by a 90 s cool-down.
+2. **Backend** — new `routers/live.py`. No tickets: the dashboard's WebSockets already
+   authenticate with the httpOnly session cookie (`?token=` on the edge app), and nginx's
+   `auth_request` forwards it.
+   - `GET /api/live/drone/{drone_id}`: same access check as `/frame/{drone_id}/latest`. Returns
+     `{src: <slot>, ws_path: /live/api/ws?src=<slot>, width, height, fps, analytics_fps,
+     behind_live_s}`, or 404 when the drone sends no video. It reads ingest's internal
+     `/ingest/video/live/{drone}`.
+   - `GET /api/live/authorize` (nginx `auth_request`): the user, plus the drone whose mission the
+     slot carries *at this moment* (ingest `/ingest/video/slot/{slot}`), plus the operator /
+     jurisdiction rule → 204, else 401 / 403.
+3. **nginx.**
+   - Only `location = /live/api/ws` is proxied to go2rtc; every other `/live/` path returns 404.
+   - The player socket closes after **30 s without video**. With the 90 s slot cool-down, no
+     viewer of a finished mission is still attached when the slot carries another drone.
+   - `/ingest/video/live|slot` are internal (404 from outside).
+4. **Frontend player** — `hooks/useLiveVideo.js`. A minimal MSE client for go2rtc's protocol:
+   - sends `{"type":"mse","value":<codecs>}`, appends fMP4 into a SourceBuffer;
+   - jumps to the live edge when more than 1.5 s behind; keeps 10 s of buffer;
+   - reconnects when no data arrives for 8 s;
+   - falls back to the JPEG poller while unavailable, and re-checks every 15 s;
+   - uses `ManagedMediaSource` on iOS 17.1+.
+5. **Replace the pollers** (the JPEG poll runs only while no video plays):
    - `MultiDroneView.js` `useDroneFeed`;
-   - `TacticalMapPage.js` tiles;
-   - the raw-feed panes of the Traffic / Person / Vessel / Crowd analytics pages.
+   - `TacticalMapPage.js` tiles.
+   - The raw-feed panes of the analytics pages move to Stage 2 (R3), where those pages switch to
+     video + browser overlays.
    Offline drones keep the Phase 1 A5 behaviour (placeholder, no polling).
-5. **Grid bandwidth.**
+6. **Grid bandwidth** (not in Stage 1; after the R0 numbers).
    - Nine tiles × 5 Mbps is too much for many control-room links.
    - Option, enabled with `DVAS_LIVE_SUBSTREAM=1`: the gateway publishes `{sid}_sub` (640 px,
      800 kbps, `h264_nvenc` if R0 confirmed NVENC, else `libx264 ultrafast`).
    - Grid tiles use `_sub`; a maximised tile uses the main stream.
-6. **WebRTC (LAN / on-prem only):** enable go2rtc WebRTC with a configured TCP port. Not used on
+7. **WebRTC (LAN / on-prem only):** enable go2rtc WebRTC with a configured TCP port. Not used on
    RunPod.
 
 **Done when:**
 - Multi-Drone Grid and Tactical Map show the live feed at the source fps;
 - glass-to-glass p95 ≤ 1.5 s from Kerala (R0 method);
 - with the flag off, the old pollers return;
-- an expired or foreign ticket is refused (403) and does not reveal whether the stream exists.
+- a user outside the drone's access, or a free slot, is refused (403) and learns nothing about the
+  stream.
 
 ### Phase R3 — Overlays in the browser; stop re-encoding for live view (5–6 days)
 
