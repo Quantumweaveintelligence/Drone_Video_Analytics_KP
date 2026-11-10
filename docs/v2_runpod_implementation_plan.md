@@ -682,6 +682,7 @@ Every step is measured on the pod before and after, with the stage split (A4) an
 | Frame order / identity | Late = 0, Lost = 0, `seq` without duplicates across a reconnect |
 | Evidence | §3 rules tests pass; every alert has its crop + source frame; recording hash chain verifies |
 | Fallback | Old edge on `/ingest/frame` works; every flag off → v1 behaviour |
+| Real edge (`edge-exe-v2`) | The §7 real-edge requirement passes: 30 fps received, live tile plays, analytics ≥ 20 fps, for a 4K and a 1080p camera |
 
 ## 7. Coordination with the edge developer
 
@@ -693,6 +694,32 @@ Every step is measured on the pod before and after, with the stage split (A4) an
 
 - Agree on the §3 contract **before** either side codes against it.
 - Any change to it bumps `"v"`. The server accepts v1 for the whole v2 release.
+
+### Requirement: stream test with the real edge application (added 2026-11-10)
+
+The edge developer's uplink is on branch `edge-exe-v2` (`dvas_edge/ingest/video_uplink.py`,
+commit `44e504f` and later). A read-only review against §3 found it follows the contract (hello,
+Bearer auth, `meta` before its TS bytes, `bye`, close-code handling). It also found four risks
+that must be cleared before v2 is accepted with a real drone.
+
+| # | Risk | Effect if not handled | Owner and action | Test |
+|---|---|---|---|---|
+| E-1 | The edge sends each frame's TS bytes as **one** WebSocket message; a 4K H.264 keyframe is often > 256 KiB | Server closes with **1009 `bad_chunk`**; the edge reconnects, resends from the same keyframe, and loops — no live video | **Edge:** split each frame's bytes into messages of ≤ 256 KiB (multiples of 188), as §3 says. **RunPod:** make the limit configurable (`DVAS_VIDEO_MAX_MSG_KB`, default 256) so a field test is not blocked meanwhile | No `bad_chunk` in `/var/log/dvas/ingest.log` during a 4K stream |
+| E-2 | The edge forwards the camera stream as is (copy mode); a real 4K camera can exceed 15 Mbps (1.25 × `DVAS_VIDEO_MAX_KBPS`) | Server closes with **4413 `over_bitrate`** after 10 s | **RunPod:** set `DVAS_VIDEO_MAX_KBPS` from the cameras' measured bitrate (for the first test 40000). **Edge:** the transcoding ladder (later release) | No `over_bitrate` in the ingest log; `rx_kbps` in `stats` matches the camera |
+| E-3 | This edge release forwards only H.264; HEVC sources stay on the JPEG fallback | No live video for HEVC cameras (analytics still works via JPEG) | **Edge:** HEVC → H.264 transcoding (ladder). **Ops:** set the drone camera / RTMP output to H.264 for now | Edge log has no `video_uplink_codec_unsupported`; `codec=h264` in `mission:video:{sid}` |
+| E-4 | The 2026-11-10 database wipe removed drone registrations and assignments | `mission/start` or the uplink is refused (403 / 4403) | **Ops:** register the edge's drone ID and assign it to the operator account the edge logs in with | `mission/start` 201; `ready` received |
+
+**Test procedure** (pod on image `20261110-7125f0c` or later):
+1. While the edge streams, in the pod:
+   `watch -n 2 'for k in $(valkey-cli --scan --pattern "mission:video:*"); do echo "$k"; valkey-cli HMGET "$k" status width height fps codec last_seq_rx live_slot | paste -sd" "; done; tail -3 /var/log/dvas/ingest.log'`
+2. Pass when:
+   - `status=receiving`, `fps` 30 (or 29.97), `codec=h264`, `live_slot` set;
+   - `last_seq_rx` rises by ≈ 30 per second;
+   - the ingest log has no `bad_chunk` and no `over_bitrate`;
+   - the drone's Multi-Drone Grid tile plays smooth video (DevTools → WS `/live/api/ws`: 101, binary frames);
+   - `dvas-ctl lag` shows analytics ≈ 20 fps and ≤ 1 s behind live.
+3. Repeat with a 4K and a 1080p camera, and once across a network drop (the edge resends from the
+   last keyframe; no duplicate `seq`, Lost = 0).
 
 ## 8. Risks
 
