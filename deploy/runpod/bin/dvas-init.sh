@@ -47,6 +47,15 @@ export ANALYTICS_REPORT_DATABASE_URL="postgresql://dvas_report_ro:${DVAS_REPORT_
 export REDIS_URL="redis://127.0.0.1:6379/0" MINIO_ENDPOINT="127.0.0.1:9000" MINIO_SECURE=false MINIO_PUBLIC_URL=""
 export KEYCLOAK_URL="http://127.0.0.1:8080" KC_REALM=kerala-police-drone KC_CLIENT_ID=drone-ingest-client
 export CORS_ORIGINS="${PUBLIC_BASE_URL},http://localhost:8765" ALLOWED_ORIGINS="${PUBLIC_BASE_URL},http://localhost:8765"
+# Live player sockets: nginx accepts these page origins (etc/nginx.conf $live_origin_listed)
+{
+  echo "# written by dvas-init.sh at $(date -Is) from ALLOWED_ORIGINS"
+  IFS=',' read -ra _origins <<< "$ALLOWED_ORIGINS"
+  for o in "${_origins[@]}"; do
+    o="${o%/}"
+    if [[ "$o" =~ ^https?://[A-Za-z0-9.:_-]+$ ]]; then printf '"%s" 1;\n' "$o"; fi
+  done
+} > /etc/dvas/live_origins.map
 export ANALYTICS_GATEWAY_URL=http://127.0.0.1:8100 \
        CROWD_ANALYTICS_URL=http://127.0.0.1:8101 PERSON_ANALYTICS_URL=http://127.0.0.1:8102 \
        VEHICLE_ANALYTICS_URL=http://127.0.0.1:8103 ANPR_ANALYTICS_URL=http://127.0.0.1:8104 \

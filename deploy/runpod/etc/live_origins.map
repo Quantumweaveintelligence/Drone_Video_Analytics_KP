@@ -1,0 +1,3 @@
+# Origins allowed to open live player sockets (/live/api/ws), besides same-host pages.
+# Rewritten at every start by dvas-init.sh from ALLOWED_ORIGINS (PUBLIC_BASE_URL, …):
+#   "https://<pod>-80.proxy.runpod.net" 1;
