@@ -26,7 +26,7 @@ This is not a full overhaul. The work is limited to:
 
 | Topic | Decision |
 |---|---|
-| Analytics falling behind the stream | **No loss, disk-backed.** The video-gateway feeds analytics from the recording on disk and keeps only a small window in Valkey. A lagging service delays its results ("Person 40 s behind live") but never loses frames. No service skips ahead. |
+| Analytics falling behind the stream | **Superseded 2026-11-11 for overload (R6):** normal load — every frame for person / face, ANPR, intrusion, anomaly; latest frame for crowd and vessel; over 1.5 s behind — shed (drop-oldest, marked gaps, cadence step-down). The recording keeps every frame. *(Was: no loss, disk-backed; the video-gateway feeds analytics from the recording and keeps a small window in Valkey — still how the feed works under normal load.)* |
 | Analytics resolution | **Source resolution.** No downscale (`DVAS_ANALYTICS_MAX_WIDTH=0`). 4K stays 4K for face tiles and plates. Person at 4K reaches 20 fps only after R4. |
 | Recording | **On, kept 7 days** (`DVAS_RECORD_RETENTION_DAYS=7`), except segments linked to legal-hold evidence. Stops with an alert at 90 % of the volume. |
 | Delivery | **Stages, each pushed to branch `runpod-v2` and checked on the pod before the next:** Stage 1 = R0 spike script + R1 + R2; Stage 2 = R3; Stage 3 = R4 + R5. **Reordered after the Stage 1 pod check: Stage 3 (speed) before Stage 2 (overlays)** — overlays on analytics 20 s+ behind live are of little use. |
@@ -701,7 +701,7 @@ Every step is measured on the pod before and after, with the stage split (A4) an
 
 ---
 
-### Phase R6 — Live-first options from the "30 fps reference architecture" review (2026-11-11)
+### Phase R6 — Live-first analytics: feed modes, overload shedding (from the "30 fps reference architecture" review, 2026-11-11)
 
 **Source:** a description of how tier-1 platforms keep a 30 fps wall (lossy latest-frame AI
 queue, detection at 5–10 Hz with tracking in between, browser-side interpolation, zero-copy
@@ -714,56 +714,106 @@ Frigate (detects at ~5 fps on the latest frame, records separately).
 |---|---|---|
 | Never block video delivery for AI | Done (R1/R2): go2rtc serves the edge's H.264 straight to browsers; analytics read a separate feed from the recording. Live view does not wait for any analyzer. | **Already done** |
 | Lightweight JSON overlays, not re-encoded JPEGs | Planned (R3 HUD bus + `HudCanvas`); MJPEG annotated views still exist. | **Adopt — R3** (unchanged) |
-| Browser interpolation of boxes (rAF, 60 fps) | R3 sync method (c) was a "last resort". | **Adopt as the default render loop in R3**: draw on `requestVideoFrameCallback`, place each box by its packet's `pts_ms` / `capture_ts`, and between packets move it along the track's velocity (lerp). Packets older than 2 s are not drawn. |
-| AI queue capped at 1, drop stale frames | **Opposite by decision (§0):** no loss, disk-backed backlog; every frame analysed (evidence rule 1). | **Do not replace.** See R6.1 for what can be adopted without losing evidence. |
-| Detector at 5–10 Hz, tracker bridges the rest | Every analytics frame (20 fps) gets full detection. | **Per service, opt-in, after an accuracy check** — R6.2. |
-| Zero-copy NVDEC → GPU memory | CPU H.264 decode → JPEG → Valkey → each service CPU-decodes the JPEG (27 ms at 4K) → GPU. | **Partly** — R6.3 (GPU JPEG decode now; shared GPU frames only if still needed). |
+| Browser interpolation of boxes (rAF, 60 fps) | R3 sync method (c) was a "last resort". | **Adopt as the default render loop in R3**: draw on `requestVideoFrameCallback`, place each box by its packet's `pts_ms` / `capture_ts`, and between packets move it along the track's velocity (lerp). Packets older than 1.5 s are not drawn (R6.4). |
+| AI queue capped at 1, drop stale frames | No loss, disk-backed backlog; every frame analysed. | **Adopt where it fits (decided):** latest-frame for crowd and vessel always (R6.1); drop-oldest for every service only under overload (R6.3). Critical services keep every frame under normal load. |
+| Detector at 5–10 Hz, tracker bridges the rest | Every analytics frame (20 fps) gets full detection. | **Only as the overload step-down** (R6.3 level 3); no fixed lower rate (decided). |
+| Zero-copy NVDEC → GPU memory | CPU H.264 decode → JPEG → Valkey → each service CPU-decodes the JPEG (27 ms at 4K) → GPU. | **Partly** — R6.6 (GPU JPEG decode now; shared GPU frames only if still needed). |
 
-**Why the lossy queue is not the default here:** with the person/face speed-up, 4 drones at 4K and
-4 at 1080p hold 20 fps with **zero backlog** (R5 table) — the head-of-line lag the lossy queue
-cures does not occur at today's load. Making it the default would break: evidence rule 1
-(every frame analysed) and the 65B chain (alert ↔ analysed source frame); the frame order and
-Late / Lost counters; ANPR (fewer looks at each plate); face watchlist (fewer chances per face);
-the intrusion state machine and anomaly rules, which count **consecutive frames**
-(`intrusion/state_machine.py` `confirm_inside_frames`) — a lower or irregular frame rate changes
-when an alarm fires.
+**Why the critical services do not drop frames all the time:** at today's measured load (4 × 4K,
+20 fps, backlog 0, R5 table) nothing lags, and dropping by default would cost: ANPR (fewer looks
+at each plate), the face watchlist (fewer chances per face), Late / Lost accounting, and the
+intrusion / anomaly rules, which count **consecutive frames** (`intrusion/state_machine.py`
+`confirm_inside_frames`) — hence R6.5 (thresholds in seconds) before any frame is ever skipped.
 
-#### R6.1 Live-first under overload, with backfill (`DVAS_LIVE_FIRST=0`, opt-in)
-- Today, an overloaded service falls behind live and catches up later (no loss, delayed alerts).
-- Option: when a service is more than `DVAS_LIVE_FIRST_MAX_LAG_S` (e.g. 5 s) behind, it jumps to
-  the newest frame (fresh overlays and alerts for the operator), and the skipped range is
-  queued for a **backfill** pass from the recording at low priority, with its own tracker
-  instance. Every frame is still analysed eventually; backfill alerts are marked `late`.
-- Cost: tracks are split at the jump (a person keeps one Re-ID identity, but the tracker id
-  changes); backfill uses GPU time when the system is idle.
-- Only worth building if real missions show sustained lag (none at today's measured load).
+#### Decisions (2026-11-11, operator answers) — supersede the "no loss" row of §0 for overload
 
-#### R6.2 Asymmetric detection per service (`DVAS_DETECT_HZ_<SVC>`, default = every frame)
-- On frames between detections the service runs only the tracker's Kalman prediction (≈ 1 ms)
-  and publishes predicted boxes, flagged `predicted`; alerts, crops and evidence come only from
-  frames with real detections.
-- Candidates (to be confirmed with the accuracy guard on a recorded clip): **crowd** 2–5 Hz
-  (a density count, no identities); **vessel** 10 Hz. **Not** candidates without new tests:
-  person/face (watchlist), ANPR (plate reads), intrusion and anomaly (frame-count rules —
-  their thresholds would have to become time-based first).
-- Gain: GPU time for more drones (the 20-drone target), not live-view smoothness.
+| Topic | Decision |
+|---|---|
+| Services that run on the **latest frame only** | **crowd** (density + heatmap) and **vessel**. They never queue and never hold the feed back. |
+| Services that analyse **every frame** under normal load | **person / face, ANPR, intrusion, anomaly** (and vehicle, which feeds ANPR). |
+| **No analytics service selected** | No analytics queue at all: the decoder does not decode or publish frames; only live view and recording run. |
+| **Overload** (a service more than **1.5 s** behind live) | **Shed, don't queue:** drop to the newest frame (drop-oldest), mark the gap, step the detector cadence down with tracker prediction in between, skip secondary models unless a priority event is in progress, and show the state. Live video is never affected. |
+| Fixed lower detection rate per service | **None for now** — only the dynamic step-down under overload. |
+| Intrusion / anomaly thresholds | **Converted from frame counts to seconds**, so alarm timing does not change with the analytics rate. |
 
-#### R6.3 Cheaper frame hand-off to the GPU
-1. **GPU JPEG decode** in the sampler (`torchvision.io.decode_jpeg(device="cuda")`, nvJPEG):
-   0.3 ms instead of 27 ms of CPU per 4K frame per service, same pixels. Services that need a
-   numpy frame copy it back (~2–3 ms). Identical-output test against `cv2.imdecode`.
-2. **NVDEC** in `video-decoder` when the pod exposes the `video` driver capability (the same
-   switch NVENC needs for the grid sub-stream).
-3. Shared GPU frames between processes (CUDA IPC or one perception process) only if 1–2 leave
-   decode as a top cost — this is the R5.4 shared-memory bus, done on the GPU side.
+**What this keeps and what it changes:**
+- **Kept:** live video at the source rate (independent of analytics); the recording on disk with
+  every frame and its SHA-256 chain — the Section 65B source evidence is complete whatever
+  analytics shed; telemetry for every frame (ingest updates the drone's live position from each
+  `meta`, independent of analytics); evidence rules for frames that **are** analysed (alerts,
+  plate reads, face crops, alert-moment frames are never throttled once a detection exists).
+- **Changed:** under overload some frames are not analysed by the critical services. An alert
+  whose only frames fall in a shed range is missed in real time. Every shed range is recorded
+  (service, mission, `seq` range, reason) in the audit log as `analytics_shed`, so coverage gaps
+  are explicit and defensible; a later **backfill** pass from the recording can analyse them
+  (R6.7, optional).
+- At today's measured load (4 × 4K, 20 fps, backlog 0) no shedding happens; this is the overload
+  behaviour for 20 drones and for spikes.
 
-#### Decisions needed (2026-11-11)
-1. Is "every frame analysed" mandatory for **all** services, or may some (crowd density, heatmap)
-   run on the latest frame only?
-2. Under overload: keep "fall behind, never lose" (today), or "live-first + backfill" (R6.1)?
-3. Asymmetric detection (R6.2): which services may run their detector below 20 Hz?
-4. May intrusion / anomaly thresholds change from frame counts to seconds (needed for R6.2 and
-   to keep alarm timing stable if the analytics rate ever changes)?
+#### R6.1 Feed modes per service (`DVAS_FEED_MODE_<SVC>` = `every` | `latest`)
+- Defaults: `latest` for crowd and vessel; `every` for person, vehicle, ANPR, intrusion, anomaly.
+- `latest`: the sampler reads the newest entry per drone (`XREVRANGE … COUNT 1`) each round, with
+  no consumer group, so it never adds to the decoder's flow control window. Frames in between are
+  not analysed by design (counted as `sampled_out`, not as lost).
+- `every`: today's consumer-group path (ordered, ack after analysis) plus R6.3 shedding.
+
+#### R6.2 No services selected → no analytics feed
+- The decoder decodes and publishes only while at least one service is enabled for the drone
+  (an active consumer group, or a `latest` reader's heartbeat). Otherwise it only follows the
+  recording position, so CPU is not spent on frames nobody reads.
+- When a service is enabled mid-mission it starts at the live position (no backlog from before).
+
+#### R6.3 Overload shedding for `every` services (`DVAS_SHED_AFTER_S=1.5`)
+Measured on the server clock (`rx_ts_ms` of the frame being read vs. now), with hysteresis:
+enter a level when behind > threshold, leave it after ≤ 0.5 s behind for 10 s.
+1. **Level 1 — shed secondary stages** (> 1.5 s): skip person whole-body Re-ID embeddings, face
+   Re-ID clustering, face crop enhancement, anomaly secondary-model passes. **Kept even then:**
+   detection, tracking, ArcFace watchlist matching on detected faces, plate OCR, alert
+   generation — the primary police functions. A priority event in progress (open alert, watchlist
+   hit) keeps the secondary stages on for that drone.
+2. **Level 2 — drop-oldest** (still > 1.5 s after level 1 for 3 s, or > 3 s): the sampler XACKs
+   every pending entry older than the newest one and continues from the newest (no growing PEL).
+   The skipped `seq` range is recorded (`analytics_shed` audit event, `frames_shed` counter) and
+   the next frame carries `gap=true`: trackers do not read the jump as a velocity spike — tracks
+   whose age exceeds the gap are retired and Re-ID re-links identities.
+3. **Level 3 — detector cadence step-down**: detect every 2nd, then every 4th frame; between
+   detections the tracker's Kalman prediction moves the boxes (published as `predicted`).
+   Alerts, crops and evidence come only from frames with real detections.
+- The decoder's flow-control window applies only while no group is shedding; with shedding the
+  feed runs at live pace and the stream's small `MAXLEN` acts as the leaky bucket.
+- Valkey memory stays bounded (≈ 5 s per mission) in every case.
+
+#### R6.4 Dashboard: smooth degradation
+- Tile and Models page show the service state: `LIVE`, `DEGRADED` (level 1), `SHEDDING` (level
+  2/3, with frames shed), `DRAINING`.
+- The HUD (R3) draws no packet older than 1.5 s against the live video; between packets boxes
+  move by track velocity (rAF interpolation) — no stale boxes over current video.
+
+#### R6.5 Thresholds in seconds
+- Intrusion `confirm_inside_frames` / `confirm_outside_frames` → `INTRUSION_CONFIRM_S` (default
+  = today's frames ÷ 20 fps, so behaviour at 20 fps is unchanged); dwell / loiter timers already
+  in seconds stay. Anomaly frame-count rules (running, fall, loitering hysteresis) likewise, using
+  `capture_ts` deltas. Tests: the same alerts at 20 fps as before; correct timing at 10 / 5 fps
+  and across a `gap=true`.
+
+#### R6.6 Cheaper frame hand-off to the GPU
+1. **GPU JPEG decode** in the sampler (`torchvision.io.decode_jpeg(device="cuda")`): 0.3 ms
+   instead of 27 ms CPU per 4K frame per service; identical-output test against `cv2.imdecode`.
+2. **NVDEC** in `video-decoder` when the pod exposes the `video` driver capability.
+3. Shared GPU frames between processes only if 1–2 leave decode as a top cost (R5.4 on the GPU).
+
+#### R6.7 Optional — backfill of shed ranges (`DVAS_BACKFILL=0`)
+- When the system is idle, analyse the recorded `analytics_shed` ranges from the recording with a
+  separate tracker; results marked `late`. Off by default; enable if missed coverage matters.
+
+**Tests (R6):** a service held at 5 fps enters level 1 → 2 → 3 within seconds, its PEL stays
+small, every shed range is in the audit log, and it returns to `LIVE` after the load ends; a
+`latest` service never delays the feed; with no service enabled the decoder publishes nothing;
+intrusion / anomaly alerts fire at the same times at 20 fps as before; live video fps unchanged.
+
+**Done when:** with load beyond capacity (e.g. 8 × 4K, all services), every `every` service stays
+within ~1.5–3 s of live, shed ranges are marked, live video stays at the source rate, and the
+recording is complete.
 
 ## 5. Flags summary
 
@@ -782,9 +832,11 @@ when an alarm fires.
 | `DVAS_TRT` | 0 → 1 per model after the guard | R4 |
 | `DVAS_THREADS_<SVC>` | computed | R4 |
 | `DVAS_FRAME_BUS` | `jpeg` | R5 |
-| `DVAS_LIVE_FIRST` / `DVAS_LIVE_FIRST_MAX_LAG_S` | 0 / 5 | R6 (decision pending) |
-| `DVAS_DETECT_HZ_<SVC>` | every frame | R6 (decision pending) |
+| `DVAS_FEED_MODE_<SVC>` | `latest` for crowd, vessel; `every` for the others | R6 |
+| `DVAS_SHED_AFTER_S` | 1.5 | R6 |
+| `INTRUSION_CONFIRM_S` (replaces frame counts) | today's frames ÷ 20 | R6 |
 | `DVAS_GPU_JPEG_DECODE` | 0 → 1 after the identical-output test | R6 |
+| `DVAS_BACKFILL` | 0 | R6 |
 
 ## 6. v2 acceptance (all on the pod, from Kerala)
 
@@ -792,7 +844,7 @@ when an alarm fires.
 |---|---|
 | Live video per drone (grid and single view) | source fps (25–30), glass-to-glass p95 ≤ 1.5 s |
 | Analytics per enabled service per drone | ≥ 20 fps for 30 min, `behind_live_s` ≤ 1 (2 drones, R4 service set, 1080p sources; 4K per R4) |
-| No loss under lag | a service capped to 5 fps for 5 min catches up with Lost = 0 and Dropped = 0 |
+| Overload (R6) | a service capped to 5 fps sheds within ~1.5–3 s of live, every shed range is in the audit log, it returns to LIVE after the load ends; the recording is complete |
 | HUD skew | ≤ 150 ms p95 (or the documented R0 fallback) |
 | Frame order / identity | Late = 0, Lost = 0, `seq` without duplicates across a reconnect |
 | Evidence | §3 rules tests pass; every alert has its crop + source frame; recording hash chain verifies |
