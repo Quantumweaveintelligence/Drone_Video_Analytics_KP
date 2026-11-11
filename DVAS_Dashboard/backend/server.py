@@ -81,6 +81,12 @@ async def _start_sync():
     start_audit_sync_service()
 
 @app.on_event("startup")
+async def _start_analytics_shed_audit():
+    # v2 R6.3: analytics shed ranges → audit log
+    from services.analytics_shed import start_analytics_shed_audit
+    start_analytics_shed_audit()
+
+@app.on_event("startup")
 async def _start_evidence_sync():
     start_evidence_sync()
 

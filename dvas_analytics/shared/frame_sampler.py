@@ -20,6 +20,14 @@ XREADGROUP per drone:
     older ones are XACKed unread and counted as `skipped`. The video decoder never waits
     for a newest-mode service. DVAS_FEED_MODE_<SERVICE>=latest|every overrides a service's
     mode (latest = newest, every = ordered).
+  * Overload shedding (v2 R6.3, ordered mode): when a drone's frames are more than
+    DVAS_SHED_AFTER_S (1.5 s) behind live, the service sheds instead of queueing —
+    level 1: `shed_secondary(drone)` is True (services skip secondary stages unless a
+    priority event is marked); level 2: drop-oldest, the backlog is acknowledged unread and
+    analysis continues from the newest frame (`_gap` marks the jump; over 1 s the drone's
+    trackers restart); level 3: only every 2nd, then 4th frame is analysed. Back down one
+    level after 10 s at <= 0.5 s behind. Every shed range goes to the Valkey stream
+    `dvas:analytics_shed` (written to the audit log by the dashboard backend).
   * A per-drone rate cap (the governor's `dvas:fps_cap:<service>`, else
     DVAS_FPS_MAX) keeps one service from taking the whole GPU.
   * Live stats (input fps, analysed fps, skipped, inference ms, lag) are
@@ -56,6 +64,14 @@ STATS_KEY = "dvas:svc_stats:{service}"
 CAP_KEY = "dvas:fps_cap:{service}"
 STATS_TTL_S = 10
 STATS_EVERY_S = 2.0
+# v2 R6.3 overload shedding (0 = off)
+SHED_AFTER_S = max(0.0, float(os.getenv("DVAS_SHED_AFTER_S", "1.5") or 0))
+SHED_JUMP_AFTER_S = 3.0        # level 1 this long (or > 2 × SHED_AFTER_S behind) → drop-oldest
+SHED_RECOVER_S = 0.5           # at most this far behind …
+SHED_RECOVER_HOLD_S = 10.0     # … for this long → one level down
+SHED_TRACK_RESET_S = 1.0       # a jump over more time than this restarts the drone's trackers
+SHED_LOG_KEY = "dvas:analytics_shed"
+SHED_LOG_MAXLEN = 10000
 CAP_REFRESH_S = 2.0
 READ_CHUNK = 32
 # Re-ordering (plan D1): the edge uploads several frames at once and retries failures, so
@@ -230,6 +246,20 @@ class RateCap:
 
 
 @dataclass
+class ShedState:
+    """Overload state of one drone in one service (v2 R6.3)."""
+    level: int = 0                       # 0 live, 1 secondary stages off, 2 drop-oldest, 3 cadence
+    level_since: float = 0.0
+    ok_since: Optional[float] = None
+    last_jump: float = -1e9
+    jumps: Deque[float] = field(default_factory=deque)
+    cadence: int = 1                     # analyse every Nth frame (level 3)
+    frames_shed: int = 0
+    pending: Optional[dict] = None       # cadence-shed range not yet logged
+    priority_until: float = 0.0
+
+
+@dataclass
 class DroneStats:
     processed: Deque[float] = field(default_factory=deque)   # monotonic ts of analysed frames
     received: Deque[float] = field(default_factory=deque)    # monotonic ts of every entry read
@@ -306,6 +336,7 @@ class FrameSampler:
         self.on_idle: List[Callable[[str], None]] = []
         self._queued: Dict[str, Optional[int]] = {}
         self._prefetch: Optional[asyncio.Task] = None   # the next round, read + decoded (B2)
+        self._shed: Dict[str, ShedState] = {}
         # Set by the service: {"device": "cuda"|"cpu", "cpu_fallback": bool, "cpu_reason": str, ...}
         self.device_info: Optional[dict] = None
 
@@ -626,6 +657,10 @@ class FrameSampler:
             fields = self._release(d, now)
             if fields is None:
                 continue
+            if self.mode == "ordered" and SHED_AFTER_S > 0:
+                fields = await self._shed_check(client, d, fields)
+                if fields is None:
+                    continue
             st = self.stats[d]
             # video frames: from when the server received them (they may wait on disk first)
             ts_ms = fields.get("rx_ts_ms") or fields.get("ts")
@@ -729,6 +764,132 @@ class FrameSampler:
             except Exception:
                 self._queued[d] = None
 
+    # ── Overload shedding (v2 R6.3) ──────────────────────────────────────────
+    @staticmethod
+    def _behind_s(fields: dict) -> Optional[float]:
+        ts_ms = fields.get("rx_ts_ms") or fields.get("ts")
+        try:
+            t = float(ts_ms) / 1000.0 if ts_ms else 0.0
+        except (TypeError, ValueError):
+            return None
+        return max(0.0, time.time() - t) if t > 0 else None      # 0 / missing: unknown, not "behind"
+
+    def shed_level(self, drone_id: str) -> int:
+        s = self._shed.get(drone_id)
+        return s.level if s else 0
+
+    def mark_priority(self, drone_id: str, seconds: float = 30.0) -> None:
+        """A priority event (alert, watchlist hit) for this drone: secondary stages stay on."""
+        s = self._shed.setdefault(drone_id, ShedState())
+        s.priority_until = max(s.priority_until, self._clock() + seconds)
+
+    def shed_secondary(self, drone_id: str) -> bool:
+        """True while the service should skip its secondary stages for this drone."""
+        s = self._shed.get(drone_id)
+        return bool(s and s.level >= 1 and self._clock() >= s.priority_until)
+
+    def _set_level(self, d: str, s: ShedState, level: int, behind: float) -> None:
+        if level != s.level:
+            log.warning("[%s] %s: %.1f s behind live — shedding level %d → %d%s", self.service, d,
+                        behind, s.level, level, f" (every {s.cadence}th frame)" if s.cadence > 1 else "")
+        s.level, s.level_since = level, self._clock()
+
+    async def _shed_log(self, client, rec: dict) -> None:
+        try:
+            await client.xadd(SHED_LOG_KEY, {k: str(v) for k, v in rec.items()},
+                              maxlen=SHED_LOG_MAXLEN, approximate=True)
+        except Exception as exc:
+            log.debug("[%s] shed log failed: %s", self.service, exc)
+
+    async def _flush_cadence(self, client, d: str, s: ShedState) -> None:
+        if s.pending:
+            await self._shed_log(client, s.pending)
+            s.pending = None
+
+    async def _shed_check(self, client, d: str, fields: dict) -> Optional[dict]:
+        behind = self._behind_s(fields)
+        if behind is None:
+            return fields
+        s = self._shed.setdefault(d, ShedState())
+        now = self._clock()
+        if behind > SHED_AFTER_S:
+            s.ok_since = None
+            if s.level == 0:
+                self._set_level(d, s, 1, behind)
+            elif ((s.level == 1 and (now - s.level_since >= SHED_JUMP_AFTER_S or behind > 2 * SHED_AFTER_S))
+                  or (s.level >= 2 and now - s.last_jump >= SHED_JUMP_AFTER_S)):
+                fields = await self._shed_jump(client, d, s, fields, behind)
+                if fields is None:
+                    return None
+                while s.jumps and now - s.jumps[0] > 20.0:
+                    s.jumps.popleft()
+                if len(s.jumps) >= 2 and s.cadence < 4:        # jumping again and again: step down
+                    s.cadence *= 2
+                    s.jumps.clear()
+                    self._set_level(d, s, 3, behind)
+        elif behind <= SHED_RECOVER_S and s.level:
+            if s.ok_since is None:
+                s.ok_since = now
+            elif now - s.ok_since >= SHED_RECOVER_HOLD_S:
+                if s.cadence > 1:
+                    s.cadence //= 2
+                new = 3 if s.cadence > 1 else s.level - 1            # 3 → 2 → 1 → 0
+                await self._flush_cadence(client, d, s)
+                self._set_level(d, s, new, behind)
+                s.ok_since = now
+        else:
+            s.ok_since = None
+        if s.cadence > 1:
+            seq = _seq_of(fields)
+            if seq is not None and seq % s.cadence:
+                self._finished(fields)                       # analysed later never: shed (logged)
+                s.frames_shed += 1
+                p = s.pending or {"service": self.service, "drone_id": d, "stream": fields.get("_stream", ""),
+                                  "reason": "cadence", "from_seq": seq, "to_seq": seq, "frames": 0,
+                                  "behind_s": round(behind, 2), "at": round(time.time(), 3)}
+                p["to_seq"], p["frames"] = seq, p["frames"] + 1
+                s.pending = p
+                if p["frames"] >= 200:
+                    await self._flush_cadence(client, d, s)
+                return None
+        elif s.pending:
+            await self._flush_cadence(client, d, s)
+        if s.level:
+            fields["_shed_level"] = str(s.level)
+        return fields
+
+    async def _shed_jump(self, client, d: str, s: ShedState, fields: dict, behind: float) -> Optional[dict]:
+        """Drop-oldest: acknowledge the backlog unread and continue from the newest frame."""
+        key = fields.get("_stream") or self._key(d)
+        for _seq, _at, f in self._held.pop(d, []):
+            self._finished(f)
+        self._finished(fields)
+        latest = await self._jump_to_newest(client, d)
+        if not latest:
+            return None
+        eid, raw = latest
+        new = decode_fields(raw, d, _s(eid))
+        new["_stream"] = key
+        old_seq, new_seq = _seq_of(fields), _seq_of(new)
+        n = (new_seq - old_seq) if (old_seq is not None and new_seq is not None) else 0
+        if new_seq is not None:
+            self._last_seq[d] = new_seq
+        s.frames_shed += max(0, n)
+        s.last_jump = self._clock()
+        s.jumps.append(s.last_jump)
+        if s.level < 2:
+            self._set_level(d, s, 2, behind)
+        new["_gap"] = "1"
+        rec = {"service": self.service, "drone_id": d, "stream": key, "reason": "drop_oldest",
+               "from_seq": old_seq if old_seq is not None else "", "to_seq": (new_seq - 1) if new_seq else "",
+               "frames": max(0, n), "behind_s": round(behind, 2), "at": round(time.time(), 3)}
+        await self._shed_log(client, rec)
+        log.warning("[%s] %s: %.1f s behind — dropped %d frames (seq %s..%s), continuing from the newest",
+                    self.service, d, behind, max(0, n), rec["from_seq"], rec["to_seq"])
+        if behind > SHED_TRACK_RESET_S:
+            self._reset_state(d)                         # tracks restart; Re-ID re-links identities
+        return new
+
     async def _jump_to_newest(self, client, drone_id: str):
         """Move the group's last-delivered id to the newest entry and return that entry."""
         key = self._key(drone_id)
@@ -799,6 +960,9 @@ class FrameSampler:
                 "lag_ms": None if st.lag_ms is None else round(st.lag_ms),
                 "queued": self._queued.get(d),
                 "late": st.late,
+                "shed_level": self._shed[d].level if d in self._shed else 0,
+                "frames_shed": self._shed[d].frames_shed if d in self._shed else 0,
+                "cadence": self._shed[d].cadence if d in self._shed else 1,
                 "stages": {**{k: round(v, 1) for k, v in st.stages.items()},
                            **({"model": round(st.infer_ms, 1)} if st.infer_ms is not None else {}),
                            **({"total": round(st.total_ms, 1)} if st.total_ms is not None else {})},

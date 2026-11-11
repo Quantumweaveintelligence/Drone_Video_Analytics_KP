@@ -584,6 +584,7 @@ async def _persist_person_frame(
             if match:
                 tid = face.get("tracker_id")
                 recognition_results[tid] = match
+                _sampler.mark_priority(drone_id)    # watchlist hit: nothing is shed for this drone (R6.3)
 
                 # Deduplication-gated alert pipeline
                 if alert_deduplicator and alert_deduplicator.should_alert(match.watchlist_id):
@@ -740,7 +741,9 @@ async def _persist_person_frame(
 
     # Periodic re-ID clustering for both Persons and Faces
     # Re-ID clustering on a timer, per mission (was every 50 frames over every embedding)
-    if time.monotonic() - _reid_last_run >= cfg.REID_CLUSTER_EVERY_S:
+    # v2 R6.3 level 1: Re-ID clustering (a batch pass, no evidence written) waits while this
+    # drone's frames are being shed; detection, recognition, crops and embeddings never do
+    if time.monotonic() - _reid_last_run >= cfg.REID_CLUSTER_EVERY_S and not _sampler.shed_secondary(drone_id):
         _reid_last_run = time.monotonic()
         asyncio.create_task(_safe_task(_run_person_reid_clustering(), "Person Re-ID Clustering"))
         asyncio.create_task(_safe_task(_run_reid_clustering(), "Face Re-ID Clustering"))

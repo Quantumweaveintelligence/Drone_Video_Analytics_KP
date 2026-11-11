@@ -163,6 +163,10 @@ RUN curl -fsSL -o /usr/local/bin/go2rtc \
 # stays cached; move it into requirements/ai.txt at the next full venv rebuild.
 RUN /opt/venvs/ai/bin/python -m pip install --no-cache-dir "omegaconf>=2.3,<2.5" && \
     /opt/venvs/ai/bin/python -c "import omegaconf; print('omegaconf', omegaconf.__version__)"
+# The dashboard backend reads the analytics shed log from Valkey (v2 R6.3); same small-layer
+# reason as above — move into requirements/backend.txt at the next full venv rebuild.
+RUN /opt/venvs/backend/bin/python -m pip install --no-cache-dir "redis[hiredis]==5.0.8" && \
+    /opt/venvs/backend/bin/python -c "import redis; print('backend redis', redis.__version__)"
 
 # Application code (weights excluded by Dockerfile.dockerignore)
 COPY dvas_analytics/             /opt/dvas/dvas_analytics/
