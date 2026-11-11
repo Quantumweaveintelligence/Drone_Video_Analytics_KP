@@ -8,9 +8,22 @@
  * Extensions (/live/api/ws?src=<slot>, go2rtc's MSE protocol). nginx lets the socket open
  * only for a logged-in user who may see the drone (session cookie; ?token= on the edge app).
  *
- * state: "off" (not enabled) | "connecting" | "playing" | "unavailable" (the drone sends
- * no video — older edge on JPEG uploads — or MSE is missing: callers keep their JPEG view).
- * Lookups are retried every 15 s while unavailable; a stalled or closed socket reconnects.
+ * options.sub: play the 720p grid sub-stream (<slot>_sub) instead of the source — what grid
+ * tiles use, so several tiles fit a control-room link and a laptop's decoder. The lookup is
+ * repeated every 20 s while it plays: that keeps the server's transcode running.
+ *
+ * Staying live without visible skips (R2 hardening): a little behind the live edge the player
+ * speeds up slightly (up to 1.25×) instead of seeking; it seeks only when far behind. A short
+ * reconnect keeps the last frame on screen ("reconnecting" counts as playing) instead of
+ * falling back to JPEG.
+ *
+ * state: "off" (not enabled) | "connecting" | "playing" | "reconnecting" | "unavailable" (the
+ * drone sends no video — older edge on JPEG uploads — or MSE is missing: callers keep their
+ * JPEG view). Lookups are retried every 15 s while unavailable.
+ *
+ * stats (only with the debug switch: localStorage dvas.liveDebug = "1", or ?livedebug=1):
+ * rendered fps, dropped frames, seconds behind the live edge, received kbps, reconnects,
+ * seeks, playback rate — the numbers that tell network, decoder and player problems apart.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -19,13 +32,26 @@ import { API, authFetch, getAuthToken } from "@/lib/api";
 const CODECS = ["avc1.640029", "avc1.64002A", "avc1.640033", "avc1.42E01E", "avc1.4D401F",
                 "hvc1.1.6.L153.B0", "mp4a.40.2", "mp4a.40.5", "flac", "opus"];
 const LOOKUP_RETRY_MS = 15000;
+const SUB_REFRESH_MS = 20000;    // repeat the ?sub=1 lookup while playing (server keeps 45 s)
 const RECONNECT_MS = [1000, 2000, 4000, 8000];
 const STALL_MS = 8000;           // no video data for this long → reconnect
-const MAX_LAG_S = 1.5;           // behind the newest buffered frame by more → jump to it
+const RECONNECT_GRACE_MS = 10000; // keep the last frame this long before showing "connecting"
+const TARGET_LAG_S = 0.5;        // where the playhead sits behind the newest buffered frame
+const SEEK_LAG_S = 5;            // further behind than this → seek (a visible skip) instead of speeding up
+const MAX_RATE = 1.25;
 const KEEP_S = 10;               // buffered seconds kept behind the playhead
 
 function MediaSourceClass() {
   return window.ManagedMediaSource || window.MediaSource || null;
+}
+
+export function liveDebugEnabled() {
+  try {
+    return new URLSearchParams(window.location.search).get("livedebug") === "1"
+      || window.localStorage.getItem("dvas.liveDebug") === "1";
+  } catch {
+    return false;
+  }
 }
 
 export function liveWsUrl(path) {
@@ -47,10 +73,12 @@ function supportedCodecs(MS) {
   }).join(",");
 }
 
-export function useLiveVideo(droneId, enabled = true) {
+export function useLiveVideo(droneId, enabled = true, options = {}) {
+  const sub = !!options.sub;
   const videoRef = useRef(null);
   const [state, setState] = useState("off");
   const [info, setInfo] = useState(null);
+  const [stats, setStats] = useState(null);
 
   useEffect(() => {
     if (!enabled || !droneId) {
@@ -63,6 +91,7 @@ export function useLiveVideo(droneId, enabled = true) {
       setState("unavailable");
       return undefined;
     }
+    const debug = liveDebugEnabled();
     let cancelled = false;
     let ws = null;
     let ms = null;
@@ -71,16 +100,22 @@ export function useLiveVideo(droneId, enabled = true) {
     let queue = [];
     let timer = null;
     let watchdog = null;
+    let refresher = null;
+    let graceTimer = null;
     let lastData = 0;
     let failures = 0;
     let everPlayed = false;
+    let currentPath = null;
+    const counters = { bytes: 0, reconnects: 0, seeks: 0 };
+    let sample = null;                                // previous stats sample
 
     const later = (fn, ms_) => {
       clearTimeout(timer);
       timer = setTimeout(() => { if (!cancelled) fn(); }, ms_);
     };
 
-    const teardown = () => {
+    // keepFrame: leave the last decoded frame on screen (a reconnect, not a stop)
+    const teardown = (keepFrame = false) => {
       clearInterval(watchdog);
       watchdog = null;
       if (ws) {
@@ -95,7 +130,7 @@ export function useLiveVideo(droneId, enabled = true) {
       }
       ms = null;
       const v = videoRef.current;
-      if (v) {
+      if (v && !keepFrame) {
         v.removeAttribute("src");
         try { v.load(); } catch { /* ignore */ }
       }
@@ -128,6 +163,15 @@ export function useLiveVideo(droneId, enabled = true) {
       }
     };
 
+    const behindLive = () => {
+      const v = videoRef.current;
+      try {
+        return v && sb && sb.buffered.length ? sb.buffered.end(sb.buffered.length - 1) - v.currentTime : 0;
+      } catch {
+        return 0;                                    // buffered can throw while the source closes
+      }
+    };
+
     const keepLive = () => {
       const v = videoRef.current;
       if (!v || !sb) return;
@@ -135,31 +179,65 @@ export function useLiveVideo(droneId, enabled = true) {
         reconnect();
         return;
       }
-      try {
-        if (sb.buffered.length) {
-          const end = sb.buffered.end(sb.buffered.length - 1);
-          if (end - v.currentTime > MAX_LAG_S) v.currentTime = Math.max(0, end - 0.3);
-        }
-      } catch { /* buffered can throw while the source closes */ }
+      const lag = behindLive();
+      if (lag > SEEK_LAG_S) {
+        try { v.currentTime = Math.max(0, v.currentTime + lag - TARGET_LAG_S); counters.seeks += 1; } catch { /* ignore */ }
+        v.playbackRate = 1;
+      } else if (lag > TARGET_LAG_S + 0.3) {
+        // drift back to the live edge: faster the further behind, never a jump
+        v.playbackRate = Math.min(MAX_RATE, 1 + (lag - TARGET_LAG_S) * 0.15);
+      } else if (v.playbackRate !== 1 && lag <= TARGET_LAG_S) {
+        v.playbackRate = 1;
+      }
       if (v.paused) v.play().catch(() => {});
+      if (debug) {
+        const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
+        const now = performance.now();
+        if (q && sample) {
+          const dt = (now - sample.t) / 1000;
+          setStats({
+            fps: Math.round(((q.totalVideoFrames - sample.frames) / dt) * 10) / 10,
+            dropped: q.droppedVideoFrames,
+            behind: Math.round(lag * 100) / 100,
+            kbps: Math.round(((counters.bytes - sample.bytes) * 8) / dt / 1000),
+            reconnects: counters.reconnects,
+            seeks: counters.seeks,
+            rate: Math.round(v.playbackRate * 100) / 100,
+            res: `${v.videoWidth}x${v.videoHeight}`,
+          });
+        }
+        if (q) sample = { t: now, frames: q.totalVideoFrames, bytes: counters.bytes };
+      }
     };
 
     function reconnect() {
-      teardown();
+      const keep = everPlayed;
+      teardown(keep);
       if (cancelled) return;
       failures += 1;
+      counters.reconnects += 1;
       if (!everPlayed && failures >= 3) {
         setState("unavailable");
         failures = 0;
         later(lookup, LOOKUP_RETRY_MS * 2);
         return;
       }
-      setState("connecting");
+      if (keep) {
+        // keep showing the last frame for a while; only then let the caller fall back to JPEG
+        setState((s) => (s === "playing" ? "reconnecting" : s));
+        clearTimeout(graceTimer);
+        graceTimer = setTimeout(() => {
+          if (!cancelled) setState((s) => (s === "reconnecting" ? "connecting" : s));
+        }, RECONNECT_GRACE_MS);
+      } else {
+        setState("connecting");
+      }
       later(lookup, RECONNECT_MS[Math.min(failures - 1, RECONNECT_MS.length - 1)]);
     }
 
     const connect = (wsPath) => {
-      teardown();
+      teardown(everPlayed);
+      currentPath = wsPath;
       ws = new WebSocket(liveWsUrl(wsPath));
       ws.binaryType = "arraybuffer";
       lastData = Date.now();
@@ -190,6 +268,7 @@ export function useLiveVideo(droneId, enabled = true) {
           return;
         }
         lastData = Date.now();
+        counters.bytes += ev.data.byteLength;
         queue.push(ev.data);
         pump();
       };
@@ -198,32 +277,48 @@ export function useLiveVideo(droneId, enabled = true) {
       watchdog = setInterval(keepLive, 1000);
     };
 
+    const lookupUrl = () => `${API}/live/drone/${encodeURIComponent(droneId)}${sub ? "?sub=1" : ""}`;
+
     async function lookup() {
       if (cancelled) return;
       try {
-        const res = await authFetch(`${API}/live/drone/${encodeURIComponent(droneId)}`);
+        const res = await authFetch(lookupUrl());
         if (cancelled) return;
         if (!res.ok) {
-          setState("unavailable");
+          setState((s) => (s === "reconnecting" ? s : "unavailable"));
           later(lookup, LOOKUP_RETRY_MS);
           return;
         }
         const data = await res.json();
         if (cancelled) return;
         setInfo(data);
-        setState((s) => (s === "playing" ? s : "connecting"));
+        setState((s) => (s === "playing" || s === "reconnecting" ? s : "connecting"));
         connect(data.ws_path);
       } catch {
         if (!cancelled) {
-          setState("unavailable");
+          setState((s) => (s === "reconnecting" ? s : "unavailable"));
           later(lookup, LOOKUP_RETRY_MS);
         }
       }
     }
 
+    // ?sub=1 keeps the server's transcode alive; a changed slot (new mission) reconnects
+    if (sub) {
+      refresher = setInterval(async () => {
+        if (cancelled || !ws) return;
+        try {
+          const res = await authFetch(lookupUrl());
+          if (!res.ok || cancelled) return;
+          const data = await res.json();
+          if (!cancelled && data.ws_path && data.ws_path !== currentPath) connect(data.ws_path);
+        } catch { /* the watchdog handles a dead stream */ }
+      }, SUB_REFRESH_MS);
+    }
+
     const onPlaying = () => {
       everPlayed = true;
       failures = 0;
+      clearTimeout(graceTimer);
       setState("playing");
     };
     const v = videoRef.current;
@@ -234,10 +329,13 @@ export function useLiveVideo(droneId, enabled = true) {
     return () => {
       cancelled = true;
       clearTimeout(timer);
+      clearTimeout(graceTimer);
+      clearInterval(refresher);
       v?.removeEventListener("playing", onPlaying);
       teardown();
     };
-  }, [droneId, enabled]);
+  }, [droneId, enabled, sub]);
 
-  return { videoRef, state, info, playing: state === "playing" };
+  const playing = state === "playing" || state === "reconnecting";
+  return { videoRef, state, info, playing, stats };
 }

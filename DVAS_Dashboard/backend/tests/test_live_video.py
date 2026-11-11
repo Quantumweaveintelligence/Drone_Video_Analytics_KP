@@ -13,7 +13,8 @@ from routers import live
 
 USERS = {"tok-op": {"id": "u1", "role": "drone_operator"},
          "tok-cro": {"id": "u2", "role": "control_room_officer"}}
-SLOTS = {"live03": {"src": "live03", "sid": "MSN-1", "drone_id": "DRN-1", "mission_id": "MSN-1"}}
+SLOTS = {"live03": {"src": "live03", "sid": "MSN-1", "drone_id": "DRN-1", "mission_id": "MSN-1"},
+         "live03_sub": {"src": "live03_sub", "sid": "MSN-1", "drone_id": "DRN-1", "mission_id": "MSN-1"}}
 ALLOWED = {("u1", "DRN-1")}
 
 
@@ -30,8 +31,10 @@ def client(monkeypatch):
             if slot not in SLOTS:
                 raise HTTPException(404, "Slot is free")
             return SLOTS[slot]
-        if path == "/ingest/video/live/DRN-1":
-            return {"src": "live03", "mission_id": "MSN-1", "width": 3840, "height": 2160, "fps": 30.0,
+        if path in ("/ingest/video/live/DRN-1", "/ingest/video/live/DRN-1?sub=1"):
+            sub = path.endswith("?sub=1")
+            return {"src": "live03_sub" if sub else "live03", "main_src": "live03", "sub": sub,
+                    "mission_id": "MSN-1", "width": 3840, "height": 2160, "fps": 30.0,
                     "analytics_fps": 20.0, "behind_live_s": 0.4}
         raise HTTPException(404, "No live video for this drone")
 
@@ -71,6 +74,9 @@ def test_authorize_allows_only_the_slots_current_drone_for_permitted_users(clien
     assert auth(client, "/live/api/ws?src=../api/streams", "tok-op") == 403
     assert auth(client, "/live/api/streams?src=live03", "tok-op") == 403   # only the player socket
     assert auth(client, "/live/api/ws?src=live03&token=tok-op") == 204     # edge app: ?token=
+    assert auth(client, "/live/api/ws?src=live03_sub", "tok-op") == 204    # grid sub-stream
+    assert auth(client, "/live/api/ws?src=live03_sub", "tok-cro") == 403
+    assert auth(client, "/live/api/ws?src=live03_hd", "tok-op") == 403
 
 
 def test_drone_lookup_returns_the_player_path(client):
@@ -79,3 +85,10 @@ def test_drone_lookup_returns_the_player_path(client):
     assert r.status_code == 200
     assert r.json()["ws_path"] == "/live/api/ws?src=live03" and r.json()["width"] == 3840
     assert client.get("/api/live/drone/DRN-2").status_code == 404
+
+
+def test_grid_tiles_get_the_sub_stream(client):
+    client.cookies.set("dvas_access_token", "tok-op")
+    r = client.get("/api/live/drone/DRN-1?sub=1").json()
+    assert r["ws_path"] == "/live/api/ws?src=live03_sub" and r["sub"] is True
+    assert client.get("/api/live/drone/DRN-1").json()["sub"] is False

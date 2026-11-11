@@ -6,7 +6,10 @@ The edge streams H.264 to ingest, which relays it into one of go2rtc's stream sl
 `/live/api/ws?src=<slot>` (MSE over WebSocket); nginx asks `/api/live/authorize` first
 (auth_request) on every connection.
 
-  GET /api/live/drone/{drone_id}   which slot carries the drone's video now (404: none)
+  GET /api/live/drone/{drone_id}   which slot carries the drone's video now (404: none);
+                                   ?sub=1 asks for the 720p grid sub-stream (liveNN_sub) — the
+                                   player repeats the call while it plays, which keeps the
+                                   transcode running
   GET /api/live/authorize          for nginx only: the user (session cookie, or ?token= for
                                    the edge app, like other WebSockets) may see the drone
                                    whose mission the slot carries at this moment
@@ -26,14 +29,15 @@ from ingest_proxy import _any_user, _check_drone_access, _proxy_get
 logger = logging.getLogger("dvas")
 router = APIRouter(prefix="/api/live", tags=["Live video"])
 
-_SLOT_RE = re.compile(r"^live\d{2}$")
+_SLOT_RE = re.compile(r"^live\d{2}(_sub)?$")
 
 
 @router.get("/drone/{drone_id}")
-async def live_drone(drone_id: str, user: dict = Depends(_any_user)):
+async def live_drone(drone_id: str, sub: bool = False, user: dict = Depends(_any_user)):
     await _check_drone_access(drone_id, user)
     try:
-        info = await _proxy_get(f"/ingest/video/live/{quote(drone_id, safe='')}", timeout=3.0)
+        info = await _proxy_get(f"/ingest/video/live/{quote(drone_id, safe='')}{'?sub=1' if sub else ''}",
+                                timeout=3.0)
     except HTTPException as exc:
         if exc.status_code == 404:
             raise HTTPException(404, "No live video for this drone")
@@ -46,6 +50,7 @@ async def live_drone(drone_id: str, user: dict = Depends(_any_user)):
         "mission_id": info.get("mission_id"),
         "src": src,
         "ws_path": f"/live/api/ws?src={src}",
+        "sub": bool(info.get("sub")),
         "width": info.get("width"), "height": info.get("height"), "fps": info.get("fps"),
         "analytics_fps": info.get("analytics_fps"), "behind_live_s": info.get("behind_live_s"),
     }

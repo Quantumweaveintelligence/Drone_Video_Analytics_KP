@@ -1207,6 +1207,9 @@ LIVE_SLOTS = [f"live{n:02d}" for n in range(1, 17)]
 # A freed slot is not reused for this long: nginx closes a viewer's socket after 30 s without
 # video, so no viewer of the last mission can still be attached when another mission gets it.
 LIVE_SLOT_COOLDOWN_S = 90
+# A grid tile asks for the 720p sub-stream through /ingest/video/live?sub=1 and repeats the ask
+# while it plays; the relay transcodes only while this key exists.
+LIVE_SUB_WANT_S = 45
 _DEL_IF_EQUAL = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0"
 
 
@@ -1427,7 +1430,9 @@ if VIDEO_INGEST:
             conn.last_seq = int(_f(h.get("last_seq_rx"), 0))
             rec = await asyncio.to_thread(video_store.SegmentRecorder, sid, conn_no)
             conn.live_slot = await _live_slot_acquire(sid) if video_relay.ENABLED else None
-            relay = video_relay.Relay(conn.live_slot) if conn.live_slot else None
+            relay = video_relay.LiveRelay(
+                conn.live_slot, want_sub=lambda slot=conn.live_slot: _qm._client.exists(f"live:sub_want:{slot}"),
+            ) if conn.live_slot else None
             await _qm._client.hset(vkey, mapping={
                 "status": "receiving", "conn": conn_no, "drone_id": drone_id, "mission_id": mission_id,
                 "width": int(_f(hello.get("width"))), "height": int(_f(hello.get("height"))),
@@ -1509,7 +1514,7 @@ async def _video_finish(ws: WebSocket, conn: Optional[_VideoConn], rec, relay) -
 
 @app.get("/ingest/video/live/{drone_id}", summary="Live video of a drone's current mission (internal)",
          tags=["Video"])
-async def video_live_info(drone_id: str) -> dict:
+async def video_live_info(drone_id: str, sub: int = 0) -> dict:
     """go2rtc stream slot and state of the drone's current mission video — for the dashboard
     backend. No JWT, like /ingest/status: ingest listens on 127.0.0.1 and nginx refuses this
     path from outside (the backend's service token has no DVAS role). 404: no video now."""
@@ -1520,7 +1525,12 @@ async def video_live_info(drone_id: str) -> dict:
     slot = h.get("live_slot")
     if not slot or h.get("status") != "receiving" or sid not in _video_conns:
         raise HTTPException(404, "No live video for this drone")
-    return {"drone_id": drone_id, "mission_id": h.get("mission_id"), "sid": sid, "src": slot,
+    src = slot
+    if sub and video_relay.SUBSTREAM:
+        await _qm._client.set(f"live:sub_want:{slot}", sid, ex=LIVE_SUB_WANT_S)
+        src = f"{slot}_sub"
+    return {"drone_id": drone_id, "mission_id": h.get("mission_id"), "sid": sid, "src": src, "main_src": slot,
+            "sub": src != slot,
             "width": int(_f(h.get("width"))), "height": int(_f(h.get("height"))), "fps": _f(h.get("fps")),
             "analytics_fps": _f(h.get("pub_fps")), "behind_live_s": _f(h.get("behind_live_s"))}
 
@@ -1528,9 +1538,10 @@ async def video_live_info(drone_id: str) -> dict:
 @app.get("/ingest/video/slot/{slot}", summary="Which mission a live stream slot carries (internal)",
          tags=["Video"])
 async def video_slot_owner(slot: str) -> dict:                # internal, like video_live_info
-    if slot not in LIVE_SLOTS:
+    base = slot[:-4] if slot.endswith("_sub") else slot          # liveNN_sub belongs to liveNN's mission
+    if base not in LIVE_SLOTS:
         raise HTTPException(404, "Unknown slot")
-    raw = await _qm._client.get(f"live:slot:{slot}")
+    raw = await _qm._client.get(f"live:slot:{base}")
     sid = (raw.decode() if isinstance(raw, bytes) else raw) if raw else None
     h = await _video_hash(sid) if sid else {}
     if not sid or not h.get("drone_id"):

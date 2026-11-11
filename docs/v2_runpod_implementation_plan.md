@@ -485,6 +485,26 @@ New service `dvas_ingest/video_gateway/` (FastAPI + asyncio). It is a supervisor
      seeking; seek only when > 5 s behind. Keep the last video frame on screen during a short
      reconnect instead of switching to JPEG.
   4. **Glass-to-glass latency** with a burnt-in clock (R0 item 1, still open).
+- **Built (2026-11-11), items 1–3:**
+  - `useLiveVideo`: catch-up by `playbackRate` (≤ 1.25×, target 0.5 s behind the newest buffered
+    frame), seek only when > 5 s behind; a reconnect keeps the last frame for up to 10 s
+    (`reconnecting` counts as playing) before the tile falls back to JPEG; `stats` for the
+    diagnostics badge (`components/LiveVideoStats.js`, switch: `localStorage dvas.liveDebug = "1"`
+    or `?livedebug=1`): rendered fps, dropped, behind, kbps, reconnects, seeks, rate.
+  - Grid sub-stream: `video_relay.LiveRelay` runs a second ffmpeg into go2rtc slot `liveNN_sub`
+    (16 twins declared in `go2rtc.yaml`) only while `live:sub_want:<slot>` exists. The grid's
+    `GET /api/live/drone/{id}?sub=1` sets it (45 s) and the player repeats the call every 20 s.
+    Multi-Drone Grid tiles use it except the selected tile; Tactical Map tiles always.
+    `/api/live/authorize` accepts `liveNN_sub` for the drone of `liveNN`. go2rtc's own `ffmpeg:`
+    source was not usable: it needs ffmpeg ≥ 5, the image has 4.4.
+  - Measured in the production image: encoder auto-detect picks `h264_nvenc` where NVENC is
+    exposed; 4K → 720p sub-stream plays at **29.9 fps, 0 dropped, ≈ 1.4 Mbps** (source 8 Mbps).
+    `libx264` fallback: ≈ 0.8 CPU core per watched drone (2× real time).
+  - Tests: ingest 66 (new: the sub-stream starts only when asked, both outputs start at a
+    keyframe, `_sub` slot ownership); backend 110 (new: sub lookup and authorize).
+  - On the pod: check whether NVENC is exposed — `grep "sub-stream encoder" /var/log/dvas/ingest.log`
+    after a grid tile opens. If it says `libx264`, add `video` to `NVIDIA_DRIVER_CAPABILITIES`
+    in the template (`compute,utility,video`).
 
 ### Phase R3 — Overlays in the browser; stop re-encoding for live view (5–6 days)
 
@@ -691,7 +711,7 @@ Every step is measured on the pod before and after, with the stage split (A4) an
 | `DVAS_VIDEO_WINDOW_FRAMES` | 100 (≈ 5 s at 20 fps) | R1 |
 | `DVAS_VIDEO_MAX_KBPS` / `DVAS_MAX_LIVE_STREAMS` | 12000 / 8 | R1 |
 | `DVAS_RECORD_VIDEO` / `DVAS_RECORD_RETENTION_DAYS` | 1 / 7 | R1 |
-| `DVAS_LIVE_SUBSTREAM` | 0 | R2 |
+| `DVAS_LIVE_SUBSTREAM` / `DVAS_LIVE_SUB_ENCODER` | 1 / auto (nvenc → libx264) | R2 |
 | `DVAS_HUD` / `DVAS_LIVE_LAZY_ANNOTATE` | 1 / 1 | R3 |
 | `DVAS_SHARED_DETS` / `DVAS_DETS_WAIT_MS` | 1 / 150 | R4 |
 | `DVAS_STAGE_PIPELINE` | 1 | R4 |

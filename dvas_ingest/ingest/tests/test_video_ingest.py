@@ -391,6 +391,39 @@ def test_live_relay_gets_a_slot_and_the_stream_from_a_keyframe(client, valkey, c
         assert sum(1 for _ in c.decode(c.streams.video[0])) == 120
 
 
+def test_grid_substream_runs_only_while_asked_for(client, valkey, clips, tmp_path, monkeypatch):
+    # fake ffmpeg: writes its stdin to a file named after the go2rtc stream it pushes to
+    fake = tmp_path / "fake_ffmpeg.sh"
+    fake.write_text(f"#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\ncat > '{tmp_path}'/\"$(basename \"$last\")\"\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(main.video_relay, "ENABLED", True)
+    monkeypatch.setattr(main.video_relay, "SUBSTREAM", True)
+    monkeypatch.setattr(main.video_relay, "FFMPEG", str(fake))
+    monkeypatch.setattr(main.video_relay, "_sub_encoder", "libx264")
+    assert start(client, DRONE, MISSION).status_code < 300
+
+    with client.websocket_connect(ws_url(), headers={"authorization": "Bearer sub:op-a"}) as ws:
+        ws.send_text(hello())
+        assert json.loads(ws.receive_text())["type"] == "ready"
+        plain = client.get(f"/ingest/video/live/{DRONE}").json()
+        assert plain["src"] == "live01" and plain["sub"] is False
+        assert valkey.get("live:sub_want:live01") is None            # nobody asked: no transcode
+        info = client.get(f"/ingest/video/live/{DRONE}?sub=1").json()
+        assert info["src"] == "live01_sub" and info["main_src"] == "live01" and info["sub"] is True
+        assert 0 < valkey.ttl("live:sub_want:live01") <= main.LIVE_SUB_WANT_S
+        assert client.get("/ingest/video/slot/live01_sub").json()["drone_id"] == DRONE   # authorize path
+        send_clip(ws, clips["plain"])
+        msg = ws.receive()
+        while msg.get("type") != "websocket.close":
+            msg = ws.receive()
+    time.sleep(0.2)
+    main_bytes = (tmp_path / "live01").read_bytes()
+    sub_bytes = (tmp_path / "live01_sub").read_bytes()
+    assert main_bytes[:1] == b"\x47" and sub_bytes[:1] == b"\x47"   # both fed from a keyframe
+    assert len(sub_bytes) == len(main_bytes)                           # same input; ffmpeg re-encodes
+    assert client.get("/ingest/video/slot/live09_sub").status_code == 404
+
+
 def test_full_volume_refuses_new_video(client, valkey, tmp_path, monkeypatch):
     guard = tmp_path / "disk_guard.json"
     guard.write_text(json.dumps({"pct": 93, "used_kb": 1, "volume_gb": "100", "at": time.time()}))

@@ -25,7 +25,7 @@ function MiniStreamCell({ drone }) {
   const left = framesLeft(drone);
 
   // v2: continuous H.264 when the edge streams video; the JPEG feed only while it does not
-  const live = useLiveVideo(drone.id, isLive);
+  const live = useLiveVideo(drone.id, isLive, { sub: true });     // small tile: 720p sub-stream
   const pollJpeg = isLive && !live.playing;
   const url = pollJpeg ? `${API}/ingest-server/frame/${encodeURIComponent(drone.id)}/latest` : null;
   const { blobUrl, hasFrame, feedDead, notFound } = useJpegPoller(url, 800, pollJpeg, { notFoundRetryMs: TILE_404_RETRY_MS });

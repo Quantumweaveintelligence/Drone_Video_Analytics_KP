@@ -5,6 +5,7 @@
 # play it through nginx /live/api/ws (MSE over WebSocket, behind auth_request).
 # go2rtc only accepts pushes to streams that exist, so the slots are declared here and the
 # API never needs to create streams: it is bound to localhost and limited to /api/ws.
+# Each slot has a liveNN_sub twin for the grid's 720p sub-stream.
 # ════════════════════════════════════════════════════════════════════════════
 api:
   listen: "127.0.0.1:1984"
@@ -37,3 +38,20 @@ streams:
   live14:
   live15:
   live16:
+  # 720p grid sub-streams, pushed by ingest only while a grid tile watches (video_relay.LiveRelay)
+  live01_sub:
+  live02_sub:
+  live03_sub:
+  live04_sub:
+  live05_sub:
+  live06_sub:
+  live07_sub:
+  live08_sub:
+  live09_sub:
+  live10_sub:
+  live11_sub:
+  live12_sub:
+  live13_sub:
+  live14_sub:
+  live15_sub:
+  live16_sub:

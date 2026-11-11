@@ -52,6 +52,7 @@ import {
 import { useActiveStreams, framesLeft } from "@/hooks/useActiveStreams";
 import { useJpegPoller } from "@/hooks/useJpegPoller";
 import { useLiveVideo } from "@/hooks/useLiveVideo";
+import LiveVideoStats from "@/components/LiveVideoStats";
 import {
   useCrowdReadings,
   usePersonCount,
@@ -248,8 +249,9 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge, can
   const isOtherSelected = hasSelection && !isSelected;
   const left = framesLeft(drone);
 
-  // v2: continuous H.264 when the edge streams video; the JPEG feed only while it does not
-  const live = useLiveVideo(drone.id, isLive);
+  // v2: continuous H.264 when the edge streams video; the JPEG feed only while it does not.
+  // Grid tiles play the 720p sub-stream; the selected tile plays the source.
+  const live = useLiveVideo(drone.id, isLive, { sub: !isSelected });
   const { blobUrl, hasFrame, feedDead, notFound } = useDroneFeed(drone.id, !isLive || live.playing);
   const noAccess = notFound === "no_access";
   const hasPicture = live.playing || hasFrame;
@@ -319,6 +321,7 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge, can
             style={{ opacity: live.playing ? (isDegraded ? 0.8 : 0.95) : 0 }}
           />
         )}
+        {isLive && live.playing && <LiveVideoStats stats={live.stats} sub={live.info?.sub} />}
         {isLive && live.playing ? null : isLive && hasFrame && blobUrl ? (
           <img
             src={blobUrl}

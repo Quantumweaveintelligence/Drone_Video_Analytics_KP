@@ -6,6 +6,11 @@ One ffmpeg per mission copies the stream (no re-encode) into go2rtc's RTSP liste
 127.0.0.1; browsers watch it through nginx /live/api/ws (MSE). The relay is for live
 viewing only: when ffmpeg is slow or gone, bytes are dropped up to the next keyframe and
 the process is restarted. The recording and the analytics never depend on it.
+
+Grid sub-stream (plan R2 hardening, DVAS_LIVE_SUBSTREAM=1): while a dashboard grid tile asks
+for it (Valkey key live:sub_want:<slot>, refreshed by the viewer), a second ffmpeg re-encodes
+the stream to 720p ~1.5 Mbps into go2rtc slot <slot>_sub — h264_nvenc when the pod exposes
+NVENC, else libx264 ultrafast. Nobody watching a grid tile → no transcode.
 """
 from __future__ import annotations
 
@@ -13,20 +18,57 @@ import asyncio
 import logging
 import os
 import time
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 log = logging.getLogger(__name__)
 
 ENABLED = os.getenv("DVAS_VIDEO_RELAY", "1").lower() in ("1", "true", "yes")
 RTSP_BASE = os.getenv("DVAS_GO2RTC_RTSP", "rtsp://127.0.0.1:8554").rstrip("/")
 FFMPEG = os.getenv("DVAS_FFMPEG", "ffmpeg")
+SUBSTREAM = os.getenv("DVAS_LIVE_SUBSTREAM", "1").lower() in ("1", "true", "yes")
+SUB_HEIGHT = int(os.getenv("DVAS_LIVE_SUB_HEIGHT", "720") or 720)
+SUB_KBPS = int(os.getenv("DVAS_LIVE_SUB_KBPS", "1500") or 1500)
+SUB_CHECK_S = 2.0                   # how often the relay re-reads whether anyone wants the sub-stream
 MAX_BUFFER = 4 * 1024 * 1024        # bytes waiting for ffmpeg before the relay skips to a keyframe
 RESTART_MIN_S = 2.0
 
 
+def _encoder_args(encoder: str) -> list:
+    rate = [f"-b:v", f"{SUB_KBPS}k", "-maxrate", f"{SUB_KBPS * 4 // 3}k", "-bufsize", f"{SUB_KBPS * 2 // 3}k",
+            "-g", "30", "-bf", "0"]
+    if encoder == "h264_nvenc":
+        return ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-rc", "cbr", *rate]
+    return ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-pix_fmt", "yuv420p",
+            "-threads", "2", *rate]
+
+
+_sub_encoder: Optional[str] = None
+
+
+async def sub_encoder() -> str:
+    """h264_nvenc if it encodes on this machine (the pod must expose NVENC), else libx264."""
+    global _sub_encoder
+    if _sub_encoder is None:
+        want = os.getenv("DVAS_LIVE_SUB_ENCODER", "auto")
+        _sub_encoder = want if want in ("h264_nvenc", "libx264") else "libx264"
+        if want == "auto":
+            try:
+                p = await asyncio.create_subprocess_exec(
+                    FFMPEG, "-hide_banner", "-v", "error", "-f", "lavfi", "-i",
+                    "testsrc2=size=1280x720:rate=30", "-t", "0.5", *_encoder_args("h264_nvenc"), "-f", "null", "-",
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                if await asyncio.wait_for(p.wait(), 15) == 0:
+                    _sub_encoder = "h264_nvenc"
+            except Exception:
+                pass
+        log.info("video relay: grid sub-stream encoder %s (%dp, %d kbps)", _sub_encoder, SUB_HEIGHT, SUB_KBPS)
+    return _sub_encoder
+
+
 class Relay:
-    def __init__(self, stream_name: str):
+    def __init__(self, stream_name: str, transcode: bool = False):
         self.name = stream_name
+        self.transcode = transcode
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._started_at = 0.0
         self._wait_key = True             # (re)start only at a keyframe
@@ -35,10 +77,12 @@ class Relay:
 
     async def _spawn(self) -> None:
         self._started_at = time.monotonic()
+        codec = (["-vf", f"scale=-2:{SUB_HEIGHT}", *_encoder_args(await sub_encoder())]
+                 if self.transcode else ["-c", "copy"])
         self._proc = await asyncio.create_subprocess_exec(
             FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin",
             "-fflags", "+genpts+nobuffer", "-f", "mpegts", "-i", "pipe:0",
-            "-map", "0:v:0", "-c", "copy", "-f", "rtsp", "-rtsp_transport", "tcp",
+            "-map", "0:v:0", *codec, "-f", "rtsp", "-rtsp_transport", "tcp",
             f"{RTSP_BASE}/{self.name}",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL)
@@ -93,3 +137,41 @@ class Relay:
                 p.kill()
             except ProcessLookupError:
                 pass
+
+
+class LiveRelay:
+    """A mission's live outputs: the copied stream (always) and the 720p grid sub-stream
+    (only while want_sub() says a viewer wants it)."""
+
+    def __init__(self, slot: str, want_sub: Optional[Callable[[], Awaitable[bool]]] = None):
+        self.slot = slot
+        self.main = Relay(slot)
+        self.sub: Optional[Relay] = None
+        self._want = want_sub if SUBSTREAM else None
+        self._next_check = 0.0
+        self._sub_on = False
+
+    async def feed(self, chunk: bytes, starts_key: bool) -> None:
+        await self.main.feed(chunk, starts_key)
+        if self._want is None:
+            return
+        now = time.monotonic()
+        if now >= self._next_check:
+            self._next_check = now + SUB_CHECK_S
+            try:
+                self._sub_on = bool(await self._want())
+            except Exception:
+                self._sub_on = False
+            if not self._sub_on and self.sub is not None:
+                await self.sub.close()
+                self.sub = None
+        if self._sub_on:
+            if self.sub is None:
+                self.sub = Relay(f"{self.slot}_sub", transcode=True)
+            await self.sub.feed(chunk, starts_key)
+
+    async def close(self) -> None:
+        await self.main.close()
+        if self.sub is not None:
+            await self.sub.close()
+            self.sub = None
