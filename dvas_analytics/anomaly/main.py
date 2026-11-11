@@ -395,6 +395,21 @@ async def _persist_round(items: list) -> None:
         _sampler.record(drone_id, infer_ms=detect_ms, total_ms=t_elapsed * 1000)
 
 
+def _frame_time(analyzer, f: dict) -> float:
+    """Seconds since the drone's first frame, in capture time (v2 R6.5): the behaviour rules
+    measure the scene, not when a frame happened to be processed. Without capture_ts: processing
+    time, as before."""
+    try:
+        cap = float(f.get("capture_ts") or 0)
+    except (TypeError, ValueError):
+        cap = 0.0
+    if cap <= 0:
+        return time.time() - analyzer.start_time
+    if analyzer.cap_t0 is None or cap < analyzer.cap_t0 - 3600:
+        analyzer.cap_t0 = cap - (time.time() - analyzer.start_time)   # continue the drone's timeline
+    return max(1e-3, cap - analyzer.cap_t0)
+
+
 async def _stream_loop():
     active_drones: List[str] = []
     log.info("Anomaly stream loop started (dynamic stream discovery mode, GPU %s)",
@@ -434,7 +449,7 @@ async def _stream_loop():
                     f, frame = decoded[drone_id]
                     metadata_dict, mission_id = _frame_metadata(drone_id, f)
                     analyzer = _get_or_create_analyzer(drone_id)
-                    items.append((analyzer, frame, metadata_dict, time.time() - analyzer.start_time))
+                    items.append((analyzer, frame, metadata_dict, _frame_time(analyzer, f)))
                     meta.append((drone_id, f, analyzer, datetime.now(timezone.utc), mission_id))
 
                 # Camera motion per drone, one batched detector pass, then per-drone pipeline

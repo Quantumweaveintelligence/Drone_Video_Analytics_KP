@@ -169,6 +169,7 @@ class TrackState:
     # Hysteresis & Alert Cooldown Tracking
     is_alert_active: bool = False
     alert_clearing_counter: int = 0
+    alert_clearing_since: Optional[float] = None   # capture time the confidence first dropped
     last_alerted_level: Optional[SuspicionLevel] = None
 
     # Temporal Entity Timeline

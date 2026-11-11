@@ -977,22 +977,30 @@ class SuspiciousEventRulesEngine:
         if track.is_alert_active:
             # While active, maintain alert as long as alert_confidence >= hysteresis_maintain (0.70)
             if track.alert_confidence < self.hysteresis_maintain:
+                # v2 R6.5: clear after the confidence stayed low for clear_frames at 20 fps worth of
+                # capture time ((N - 1) / 20 s) — the same as N frames at 20 fps, at any rate
                 track.alert_clearing_counter += 1
-                if track.alert_clearing_counter >= self.hysteresis_clear_frames:
+                if track.alert_clearing_since is None:
+                    track.alert_clearing_since = timestamp
+                clear_s = max(0.0, (self.hysteresis_clear_frames - 1) / 20.0)
+                if timestamp - track.alert_clearing_since >= clear_s - 0.025:
                     track.is_alert_active = False
                     track.alert_clearing_counter = 0
+                    track.alert_clearing_since = None
                     return False, "Alert cleared by hysteresis (confidence dropped below maintain threshold)", meta
                 else:
                     # Still in grace period, maintain alert
                     pass
             else:
                 track.alert_clearing_counter = 0
+                track.alert_clearing_since = None
         else:
             # Enter alert only if event_confidence >= 0.85 and alert_confidence >= 0.85
             if track.event_confidence < self.hysteresis_enter or track.alert_confidence < self.hysteresis_enter:
                 return False, f"Confidence below alert entry threshold (event={track.event_confidence:.2f}, alert={track.alert_confidence:.2f} < {self.hysteresis_enter})", meta
             track.is_alert_active = True
             track.alert_clearing_counter = 0
+            track.alert_clearing_since = None
 
         # --- Gate 7: Cooldown Gate with Escalation Bypass ---
         in_cooldown = (timestamp - track.last_alert_time) < self.cooldown_seconds

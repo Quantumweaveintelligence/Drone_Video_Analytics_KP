@@ -435,6 +435,12 @@ async def _persist_monitor(item: dict, results, annotator: IntrusionAnnotator) -
     gm, sm, ic, ts = item["gm"], item["sm"], item["ic"], item["ts"]
     ts_s = ts.timestamp()
     frame_seq = _frames_processed
+    # The state machine runs on capture time (v2 R6.5): confirmations and dwell measure the
+    # scene, not when this frame happened to be processed (lag, catch-up, shedding).
+    try:
+        cap_s = float(f.get("capture_ts") or 0) or ts_s
+    except (TypeError, ValueError):
+        cap_s = ts_s
 
     # Update camera intrinsics if focal length or resolution changed (here, in
     # frame order, so the frame being projected uses its own intrinsics)
@@ -496,7 +502,7 @@ async def _persist_monitor(item: dict, results, annotator: IntrusionAnnotator) -
                 state, is_inside, is_boundary = sm.process_track_observation(
                     track_id=track_id,
                     lat=g_lat, lon=g_lon,
-                    timestamp_s=ts_s,
+                    timestamp_s=cap_s,
                     frame_idx=frame_seq,
                 )
                 intrusion_state = state

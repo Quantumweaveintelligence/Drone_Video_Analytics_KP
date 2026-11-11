@@ -4,12 +4,28 @@
 from enum import Enum
 import logging
 import math
+import os
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from intrusion.projection import wgs84_to_enu
 
 logger = logging.getLogger(__name__)
+
+# v2 R6.5: confirmations are measured in seconds of capture time, so alarm timing does not change
+# with the analytics frame rate (shedding, step-down). A count of N frames at the nominal rate
+# becomes (N - 1) / rate seconds — the same decision at that rate; TOLERANCE_S absorbs the jitter
+# of real frame timestamps. A gap longer than MAX_GAP_S between two observations of a track
+# restarts its streak (nothing is assumed about time nobody looked at).
+NOMINAL_FPS = 20.0
+TOLERANCE_S = 0.025
+MAX_GAP_S = 1.0
+_CONFIRM_S_ENV = os.getenv("INTRUSION_CONFIRM_S", "").strip()
+CONFIRM_S_OVERRIDE: Optional[float] = float(_CONFIRM_S_ENV) if _CONFIRM_S_ENV else None
+
+
+def frames_to_seconds(frames: int, fps: float = NOMINAL_FPS) -> float:
+    return max(0.0, (int(frames) - 1) / max(1.0, fps))
 
 
 class IntrusionState(str, Enum):
@@ -68,6 +84,8 @@ class TrackIntrusionState:
         confirm_inside_frames: int = 3,
         confirm_outside_frames: int = 3,
         min_dwell_time_s: float = 3.0,
+        confirm_inside_s: Optional[float] = None,
+        confirm_outside_s: Optional[float] = None,
     ):
         self.track_id: int = track_id
         self.current_state: IntrusionState = IntrusionState.OUTSIDE
@@ -76,7 +94,15 @@ class TrackIntrusionState:
 
         self.confirm_inside_frames: int = confirm_inside_frames
         self.confirm_outside_frames: int = confirm_outside_frames
+        # explicit seconds > INTRUSION_CONFIRM_S > the preset's frame count at 20 fps
+        self.confirm_inside_s: float = next(v for v in (confirm_inside_s, CONFIRM_S_OVERRIDE,
+                                                        frames_to_seconds(confirm_inside_frames)) if v is not None)
+        self.confirm_outside_s: float = next(v for v in (confirm_outside_s, CONFIRM_S_OVERRIDE,
+                                                         frames_to_seconds(confirm_outside_frames)) if v is not None)
         self.min_dwell_time_s: float = min_dwell_time_s
+        self._inside_since: Optional[float] = None     # capture time the current streak began
+        self._outside_since: Optional[float] = None
+        self._last_ts: Optional[float] = None
 
         self.first_seen_timestamp_s: Optional[float] = None
         self.entry_timestamp_s: Optional[float] = None
@@ -93,13 +119,27 @@ class TrackIntrusionState:
     ) -> IntrusionState:
         if self.first_seen_timestamp_s is None:
             self.first_seen_timestamp_s = timestamp_s
+        if self._last_ts is not None and timestamp_s - self._last_ts > MAX_GAP_S:
+            self._inside_since = self._outside_since = None          # unseen time: restart streaks
+            self.consecutive_inside_count = self.consecutive_outside_count = 0
+        self._last_ts = timestamp_s
 
         if is_inside:
             self.consecutive_inside_count += 1
             self.consecutive_outside_count = 0
+            if self._inside_since is None:
+                self._inside_since = timestamp_s
+            self._outside_since = None
         else:
             self.consecutive_outside_count += 1
             self.consecutive_inside_count = 0
+            if self._outside_since is None:
+                self._outside_since = timestamp_s
+            self._inside_since = None
+        inside_ok = (self._inside_since is not None
+                     and timestamp_s - self._inside_since >= self.confirm_inside_s - TOLERANCE_S)
+        outside_ok = (self._outside_since is not None
+                      and timestamp_s - self._outside_since >= self.confirm_outside_s - TOLERANCE_S)
 
         prev_state = self.current_state
 
@@ -110,27 +150,27 @@ class TrackIntrusionState:
                     self.entry_timestamp_s = timestamp_s
 
         elif self.current_state == IntrusionState.ENTERING:
-            if self.consecutive_inside_count >= self.confirm_inside_frames:
+            if inside_ok:
                 self.current_state = IntrusionState.INSIDE
-            elif self.consecutive_outside_count >= self.confirm_outside_frames:
+            elif outside_ok:
                 self.current_state = IntrusionState.OUTSIDE
                 self.entry_timestamp_s = None
 
         elif self.current_state == IntrusionState.INSIDE:
-            if self.consecutive_outside_count >= self.confirm_outside_frames:
+            if outside_ok:
                 self.current_state = IntrusionState.EXITING
             elif self.entry_timestamp_s is not None and (timestamp_s - self.entry_timestamp_s) >= self.min_dwell_time_s:
                 self.current_state = IntrusionState.DWELLING
 
         elif self.current_state == IntrusionState.DWELLING:
-            if self.consecutive_outside_count >= self.confirm_outside_frames:
+            if outside_ok:
                 self.current_state = IntrusionState.EXITING
 
         elif self.current_state == IntrusionState.EXITING:
-            if self.consecutive_outside_count >= self.confirm_outside_frames:
+            if outside_ok:
                 self.current_state = IntrusionState.EXITED
                 self.exit_timestamp_s = timestamp_s
-            elif self.consecutive_inside_count >= self.confirm_inside_frames:
+            elif inside_ok:
                 self.current_state = IntrusionState.INSIDE
 
         return self.current_state
@@ -155,9 +195,13 @@ class IntrusionStateMachine:
         confirm_inside_frames: int = 3,
         confirm_outside_frames: int = 3,
         min_dwell_time_s: float = 3.0,
+        confirm_inside_s: Optional[float] = None,
+        confirm_outside_s: Optional[float] = None,
     ):
         self.confirm_inside_frames = confirm_inside_frames
         self.confirm_outside_frames = confirm_outside_frames
+        self.confirm_inside_s = confirm_inside_s
+        self.confirm_outside_s = confirm_outside_s
         self.min_dwell_time_s = min_dwell_time_s
 
         # Use first vertex as ENU reference origin
@@ -192,6 +236,8 @@ class IntrusionStateMachine:
                 confirm_inside_frames=self.confirm_inside_frames,
                 confirm_outside_frames=self.confirm_outside_frames,
                 min_dwell_time_s=self.min_dwell_time_s,
+                confirm_inside_s=self.confirm_inside_s,
+                confirm_outside_s=self.confirm_outside_s,
             )
 
         track_state = self.track_states[track_id]

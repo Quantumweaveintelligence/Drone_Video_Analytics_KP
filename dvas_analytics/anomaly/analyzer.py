@@ -122,6 +122,10 @@ def format_time(seconds: float) -> str:
     return f"{mins:02d}:{secs:02d}.{millis:02d}"
 
 
+
+NOMINAL_FPS = 20.0       # analytics frame rate the frame-count defaults were tuned at
+MAX_FRAME_DT_S = 1.0
+
 class AnomalyAnalyzer:
     """
     Per-drone Anomaly Analyzer instance maintaining tracker, motion,
@@ -228,6 +232,12 @@ class AnomalyAnalyzer:
         # Telemetry & Performance Tracking
         self.frame_count = 0
         self.start_time = time.time()
+        # v2 R6.5: the behaviour modules integrate durations as 1 / fps per frame. They were given a
+        # fixed 30.0 while analytics frames arrive at 20 fps (timers ran at 2/3 speed); they now get
+        # the real spacing of this drone's frames in capture time, clamped to [1/60 s, 1 s] (a longer
+        # gap — shedding, a drop — counts as 1 s, never as a jump).
+        self._last_ts: Optional[float] = None
+        self.cap_t0: Optional[float] = None
         self.rolling_fps = 0.0
         self.latest_annotated_frame: Optional[np.ndarray] = None
         self.active_tracks_cache: List[Dict[str, Any]] = []
@@ -277,6 +287,9 @@ class AnomalyAnalyzer:
             t0 = time.time()
         if timestamp is None or timestamp <= 0:
             timestamp = time.time() - self.start_time
+        dt = (timestamp - self._last_ts) if self._last_ts is not None else 1.0 / NOMINAL_FPS
+        self._last_ts = timestamp
+        fps_now = 1.0 / min(MAX_FRAME_DT_S, max(1.0 / 60.0, dt))
 
         metadata = metadata or {}
         triggered_alerts = []
@@ -297,7 +310,7 @@ class AnomalyAnalyzer:
             trk.ground_history.append((ground_pos[0], ground_pos[1], timestamp))
             if len(trk.ground_history) > 120:
                 trk.ground_history.pop(0)
-            self.trajectory_analyzer.update_kinematics(trk, timestamp, fps=30.0)
+            self.trajectory_analyzer.update_kinematics(trk, timestamp, fps=fps_now)
 
         # Separate Entities by Role
         active_persons = [t for t in active_tracks if t.is_person]
@@ -308,23 +321,23 @@ class AnomalyAnalyzer:
         self.associator.update_associations(
             tracks=active_tracks,
             timestamp=timestamp,
-            fps=30.0,
+            fps=fps_now,
         )
         self.hand_associator.update_hand_associations(
             persons=active_persons,
             objects=active_objects,
             timestamp=timestamp,
-            fps=30.0,
+            fps=fps_now,
         )
 
         # Step 6: Multi-Entity Behavior Analysis
         for p in active_persons:
-            self.person_behavior_analyzer.analyze(p, timestamp, fps=30.0)
+            self.person_behavior_analyzer.analyze(p, timestamp, fps=fps_now)
             if self.trajectory_analyzer.is_repetitive_trajectory(p):
                 if EventType.LOITERING_EVENT not in p.active_events:
                     p.active_events.append(EventType.LOITERING_EVENT)
         self.interaction_analyzer.update_interactions(
-            active_persons, timestamp, fps=30.0, objects=active_objects
+            active_persons, timestamp, fps=fps_now, objects=active_objects
         )
         self.trajectory_analyzer.evaluate_crowd_flow(active_persons, timestamp)
 
@@ -332,19 +345,19 @@ class AnomalyAnalyzer:
             self.vehicle_trajectory_analyzer.analyze(v, timestamp)
             self.vehicle_circling_detector.analyze(v, timestamp)
         self.lane_traffic_analyzer.evaluate_traffic_flow(active_vehicles)
-        self.vehicle_speed_analyzer.analyze(active_vehicles, timestamp, fps=30.0)
+        self.vehicle_speed_analyzer.analyze(active_vehicles, timestamp, fps=fps_now)
         self.vehicle_interaction_analyzer.update_interactions(
             vehicles=active_vehicles,
             persons=active_persons,
             objects=active_objects,
             timestamp=timestamp,
-            fps=30.0,
+            fps=fps_now,
         )
 
         self.scene_context_engine.evaluate_context(active_tracks)
 
         for trk in active_objects:
-            self.stationarity_evaluator.evaluate(trk, timestamp, fps=30.0)
+            self.stationarity_evaluator.evaluate(trk, timestamp, fps=fps_now)
 
         # Step 7: Cognitive Suspicious Rules Engine & 4-Tier Confidences
         for trk in active_tracks:
@@ -353,7 +366,7 @@ class AnomalyAnalyzer:
                 track=trk,
                 all_tracks=active_tracks,
                 timestamp=timestamp,
-                fps=30.0,
+                fps=fps_now,
             )
 
             # Step 8: Multi-Stage Alert Gating & Evidence Capture

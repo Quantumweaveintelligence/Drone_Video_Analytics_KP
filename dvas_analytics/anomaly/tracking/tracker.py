@@ -63,6 +63,11 @@ class DroneMultiObjectTracker:
         human_classes: Optional[set] = None,
     ):
         self.max_lost_frames = max_lost_frames
+        # v2 R6.5: a track expires after max_lost_frames at 20 fps worth of capture time (1.5 s by
+        # default — what 30 misses meant at 20 fps), whatever the frame rate.
+        self.max_lost_s = max_lost_frames / 20.0
+        self.lost_since: Dict[int, float] = {}
+        self._last_ts: Optional[float] = None
         self.min_iou_thresh = min_iou_thresh
         self.max_dist_thresh = max_dist_thresh
         self.human_classes = human_classes or {"pedestrian", "people", "person"}
@@ -85,6 +90,9 @@ class DroneMultiObjectTracker:
         :param H_camera: 3x3 camera transformation matrix from frame t-1 to frame t
         :return: List of active TrackState objects
         """
+        frame_dt = (min(1.0, max(1.0 / 60.0, timestamp - self._last_ts))
+                    if self._last_ts is not None else 1.0 / 20.0)
+        self._last_ts = timestamp
         active_tracks = list(self.tracks.values())
 
         # If camera motion matrix is provided, warp existing track bounding boxes
@@ -178,6 +186,7 @@ class DroneMultiObjectTracker:
                         trk.history.pop(0)
 
                     self.lost_frames[trk.track_id] = 0
+                    self.lost_since.pop(trk.track_id, None)
                     matched_tracks.add(trk.track_id)
                     matched_dets.add(c)
 
@@ -186,12 +195,13 @@ class DroneMultiObjectTracker:
             if trk.track_id not in matched_tracks:
                 cnt = self.lost_frames.get(trk.track_id, 0) + 1
                 self.lost_frames[trk.track_id] = cnt
+                self.lost_since.setdefault(trk.track_id, timestamp)
                 trk.lost_frames = cnt
                 trk.is_matched_this_frame = False
 
                 # Extrapolate bounding box along estimated velocity vector for smooth tracking
                 if cnt <= 5 and abs(trk.velocity[0]) > 0.1 or abs(trk.velocity[1]) > 0.1:
-                    dt = 1.0 / 30.0
+                    dt = frame_dt
                     dx = trk.velocity[0] * dt
                     dy = trk.velocity[1] * dt
                     trk.bbox = [
@@ -202,10 +212,12 @@ class DroneMultiObjectTracker:
                     ]
 
         # Delete expired tracks
-        expired = [tid for tid, count in self.lost_frames.items() if count > self.max_lost_frames]
+        expired = [tid for tid, since in self.lost_since.items()
+                   if tid in self.lost_frames and timestamp - since >= self.max_lost_s - 0.025]
         for tid in expired:
             del self.tracks[tid]
             del self.lost_frames[tid]
+            self.lost_since.pop(tid, None)
 
         # Initiate new tracks for unmatched detections (with recovery check against coasting tracks)
         for d_idx, det in enumerate(detections):
@@ -233,6 +245,7 @@ class DroneMultiObjectTracker:
                             if len(trk.history) > 120:
                                 trk.history.pop(0)
                             self.lost_frames[trk.track_id] = 0
+                            self.lost_since.pop(trk.track_id, None)
                             matched_tracks.add(trk.track_id)
                             recovered = True
                             break
@@ -272,6 +285,7 @@ class DroneMultiObjectTracker:
                 new_trk.class_history = {det.class_name: det.confidence}
                 self.tracks[tid] = new_trk
                 self.lost_frames[tid] = 0
+                self.lost_since.pop(tid, None)
 
         # Post-update track deduplication: eliminate overlapping dual tracks
         track_list = list(self.tracks.values())
@@ -310,6 +324,7 @@ class DroneMultiObjectTracker:
                     del self.tracks[sid]
                 if sid in self.lost_frames:
                     del self.lost_frames[sid]
+                self.lost_since.pop(sid, None)
 
         return list(self.tracks.values())
 
