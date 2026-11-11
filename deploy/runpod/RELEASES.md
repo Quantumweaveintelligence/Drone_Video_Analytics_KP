@@ -22,3 +22,4 @@ Deploy only tags listed here; roll back by putting the previous tag into the Run
 | 2026-11-10T12:13Z | `20261110-7125f0c` | `sha256:4ce6f65088fe931cec9cf2fe22bdff36ebec129483f56e26788c48f38b951b5e` | `7125f0cb2163` | `runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04` | 23.9 GB |
 | 2026-11-11T05:15Z | `20261111-fd3db71` | `sha256:327fb9f391ef2ea10480bf11c233e1c1ebccc9e91ffe3351d78fad485a1037fc` | `fd3db716d999` | `runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04` | 23.9 GB |
 | 2026-11-11T06:07Z | `20261111-0c12fa8` | `sha256:956594f1e08820739b7111f8b9bcee20d72e32dc122538de8dac5f38329f49fa` | `0c12fa8278bd` | `runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04` | 23.9 GB |
+| 2026-11-11T06:59Z | `20261111-8584b2c` | `sha256:ad2409691428e10ea24e92de35185eb107c78b120c6aab5f09271a43d85eb955` | `8584b2c0c041` | `runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04` | 23.9 GB |
