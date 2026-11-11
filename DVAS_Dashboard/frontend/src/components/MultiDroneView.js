@@ -53,6 +53,7 @@ import { useActiveStreams, framesLeft } from "@/hooks/useActiveStreams";
 import { useJpegPoller } from "@/hooks/useJpegPoller";
 import { useLiveVideo } from "@/hooks/useLiveVideo";
 import LiveVideoStats from "@/components/LiveVideoStats";
+import { useAnalyticsStates } from "@/hooks/useAnalyticsStates";
 import {
   useCrowdReadings,
   usePersonCount,
@@ -240,7 +241,28 @@ function useDroneFeed(droneId, disabled, intervalMs = 700) {
   return useJpegPoller(url, intervalMs, !disabled, { notFoundRetryMs: FEED_404_RETRY_MS });
 }
 
-function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge, canPurge }) {
+// v2 R6.4: analytics state of a drone, next to its status (live video is never affected)
+function AnalyticsStateBadge({ info }) {
+  if (!info || info.state === "live") return null;
+  const lagging = Object.entries(info.services || {}).filter(([, v]) => v.state !== "live");
+  const title = lagging.map(([svc, v]) =>
+    `${svc}: ${v.behind_s ?? "?"} s behind live` +
+    (v.frames_shed ? `, ${v.frames_shed} frames not analysed` : "") +
+    (v.cadence > 1 ? `, every ${v.cadence}th frame` : "")).join("\n");
+  const shedding = info.state === "shedding";
+  return (
+    <span
+      className={`mono text-[9px] font-bold px-1.5 py-0.5 rounded border ${shedding
+        ? "text-red-300 border-red-500/40 bg-red-500/10" : "text-amber-300 border-amber-500/40 bg-amber-500/10"}`}
+      title={title}
+      data-testid="analytics-state"
+    >
+      {shedding ? "SHEDDING" : "DEGRADED"}
+    </span>
+  );
+}
+
+function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge, canPurge, analytics }) {
   const isDegraded = drone.status === "degraded";
   const isDraining = drone.status === "draining";
   // A5: only live tiles poll raw frames; draining and offline tiles show a placeholder
@@ -417,6 +439,7 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge, can
             {hasPicture && !feedDown && !isOffline && (
               <span className="w-2 h-2 rounded-full bg-teal-400" style={{ animation: "pulse 1.2s infinite" }} />
             )}
+            {isLive && <AnalyticsStateBadge info={analytics} />}
             <StatusPill status={isDraining ? "draining" : isOffline || feedDown ? "offline" : drone.status} />
           </div>
           {isDraining && (
@@ -1408,6 +1431,9 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
     if (ao !== bo) return ao - bo;
     return (a.id || "").localeCompare(b.id || "");
   });
+  // v2 R6.4: live / degraded / shedding per live tile
+  const analyticsStates = useAnalyticsStates(
+    drones.filter((d) => d.status === "live" || d.status === "degraded").map((d) => d.id));
 
   const events = liveAlerts && liveAlerts.length > 0
     ? liveAlerts.map((a) => ({
@@ -1494,6 +1520,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
                   onSelect={handleSelectDrone}
                   onPurge={setPurgeConfirm}
                   canPurge={canPurge}
+                  analytics={analyticsStates[d.id]}
                 />
               </div>
             );

@@ -403,7 +403,12 @@ def _performance_view(gov: dict, policy: dict, user: dict, local_gpu=None) -> di
         drones = []
         for d, st in sorted((doc.get("drones") or {}).items()):
             fps, inp = st.get("fps") or 0, st.get("input_fps") or 0
-            if svc == "crowd":
+            shed = int(st.get("shed_level") or 0)
+            if shed >= 2:
+                state = "shedding"                    # v2 R6.3: dropping the oldest frames / lower cadence
+            elif shed == 1:
+                state = "degraded"                    # secondary stages off, still every frame
+            elif svc == "crowd":
                 state = "capped"                      # 1–2 fps by design
             elif inp and inp < policy["target_min"] and fps >= 0.85 * inp:
                 state = "input_limited"
@@ -412,7 +417,8 @@ def _performance_view(gov: dict, policy: dict, user: dict, local_gpu=None) -> di
             else:
                 state = "below_target"
             drones.append({"drone_id": d, **{k: st.get(k) for k in
-                           ("fps", "input_fps", "skipped", "late", "infer_ms", "total_ms", "lag_ms", "queued", "stages")},
+                           ("fps", "input_fps", "skipped", "late", "infer_ms", "total_ms", "lag_ms", "queued", "stages",
+                            "shed_level", "frames_shed", "cadence")},
                            "state": state})
         rows.append({"service": svc, "label": labels.get(svc, svc), "governed": doc.get("governed", True),
                      "cap_fps": doc.get("cap_fps"), "avg_batch": doc.get("avg_batch"), "drones": drones,
@@ -432,6 +438,46 @@ def _performance_view(gov: dict, policy: dict, user: dict, local_gpu=None) -> di
         "gpu": profile,
         "services": rows,
     }
+
+
+_STATE_RANK = {"live": 0, "degraded": 1, "shedding": 2}
+
+
+def drone_analytics_states(gov: dict, drone_ids: List[str]) -> dict:
+    """Worst analytics state per drone across services (v2 R6.4), from the governor document:
+    live, degraded (shedding level 1) or shedding (dropping frames / lower cadence)."""
+    out = {d: {"state": "live", "services": {}} for d in drone_ids}
+    for svc, doc in ((gov or {}).get("services") or {}).items():
+        for d, st in (doc.get("drones") or {}).items():
+            if d not in out:
+                continue
+            level = int(st.get("shed_level") or 0)
+            state = "shedding" if level >= 2 else "degraded" if level == 1 else "live"
+            out[d]["services"][svc] = {
+                "state": state,
+                "behind_s": None if st.get("lag_ms") is None else round(float(st["lag_ms"]) / 1000.0, 1),
+                "frames_shed": int(st.get("frames_shed") or 0),
+                "cadence": int(st.get("cadence") or 1),
+            }
+            if _STATE_RANK[state] > _STATE_RANK[out[d]["state"]]:
+                out[d]["state"] = state
+    return out
+
+
+@router.get("/analytics/drone-states")
+async def analytics_drone_states(ids: str, user: dict = Depends(get_current_user)):
+    """Live / degraded / shedding per drone for the video tiles (v2 R6.4); only drones the user
+    may see (same check as the live video)."""
+    from ingest_proxy import _check_drone_access  # noqa: PLC0415
+    wanted = []
+    for d in [x.strip() for x in ids.split(",") if x.strip()][:64]:
+        try:
+            await _check_drone_access(d, user)
+            wanted.append(d)
+        except HTTPException:
+            continue
+    gov = await fps_policy.status()
+    return drone_analytics_states(gov if isinstance(gov, dict) and "error" not in gov else {}, wanted)
 
 
 @router.get("/models/performance")

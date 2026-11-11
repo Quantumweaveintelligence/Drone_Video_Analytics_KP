@@ -774,6 +774,24 @@ intrusion / anomaly rules, which count **consecutive frames** (`intrusion/state_
 - At today's measured load (4 × 4K, 20 fps, backlog 0) no shedding happens; this is the overload
   behaviour for 20 drones and for spikes.
 
+#### R6 status (2026-11-11): built and tested locally; not yet on the pod
+
+| Item | Built | Tests |
+|---|---|---|
+| R6.5 thresholds in seconds | intrusion confirmations = (N−1)/20 s of capture time (`INTRUSION_CONFIRM_S`), gap > 1 s restarts a streak; anomaly gets the real frame spacing (it was told 30 fps while frames come at 20 fps: duration rules ran at 2/3 speed — **now fire at their configured seconds**), lost tracks 1.5 s, alert clearing 0.45 s; both fed `capture_ts`, not processing time | same decisions as the frame counts at 20 fps (200 random patterns, ±10 ms jitter); same timing at 10 / 5 fps |
+| R6.1 feed modes | vessel on the newest frame (crowd already); `DVAS_FEED_MODE_<SVC>`; the decoder never waits for a newest-mode service | decoder test with a busy crowd group |
+| R6.2 no feed without services | decoder skips decoding while no service publishes stats; resumes at the next keyframe at live (`DVAS_DECODE_ONLY_WITH_SERVICES`) | nothing published, mission still drains |
+| R6.3 shedding | sampler levels 1–3 with recovery; `_gap` on jumps, tracker reset over 1 s; ranges → `dvas:analytics_shed` → backend writes `analytics_shed` audit rows (consumer group, ack after write). Person: Re-ID clustering waits while shed; a watchlist hit marks priority. **Not shed** (evidence rules): face super-resolution, face crops, ArcFace / ResNet embeddings, person crops | live drone untouched; level 1 → drop-oldest with logged range; cadence + recovery; audit row per range, retried on failure |
+| R6.4 states | Models page: `degraded` / `shedding` + frames shed; tiles: `DEGRADED` / `SHEDDING` badge (`GET /api/analytics/drone-states`) | backend view tests; frontend builds |
+| R6.6 GPU JPEG decode, R6.7 backfill | not started | — |
+
+Temporal votes (e.g. fall: 5 of 8 frames) stay counts of observations: at a lower rate they wait
+for the same evidence over a longer time (conservative).
+
+Found on the way (not R6): the backend's `/ws/status` listener (A5, drone offline on stream end)
+uses the role-less `dvas-admin-service` token, which ingest rejects — it has likely never
+connected on the pod; drones go offline through the slower telemetry-pump fallback.
+
 #### R6.1 Feed modes per service (`DVAS_FEED_MODE_<SVC>` = `every` | `latest`)
 - Defaults: `latest` for crowd and vessel; `every` for person, vehicle, ANPR, intrusion, anomaly.
 - `latest`: the sampler reads the newest entry per drone (`XREVRANGE … COUNT 1`) each round, with

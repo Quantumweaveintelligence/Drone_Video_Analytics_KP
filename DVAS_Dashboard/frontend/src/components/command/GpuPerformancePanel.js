@@ -20,6 +20,8 @@ const DRONE_STATE = {
   below_target:  ["below target", "text-red-400"],
   input_limited: ["input-limited", "text-amber-300"],
   capped:        ["capped (by design)", "text-slate-400"],
+  degraded:      ["degraded — secondary stages off", "text-amber-300"],
+  shedding:      ["shedding — frames not analysed", "text-red-400"],
 };
 
 // Per-frame stage split (plan A4): where each analysed frame's time goes
@@ -257,6 +259,11 @@ export default function GpuPerformancePanel() {
                   <td className="px-2 py-1.5 text-right text-slate-400">{d?.late ?? "—"}</td>
                   <td className={`px-3.5 py-1.5 ${cls}`}>
                     {lbl}
+                    {d?.frames_shed > 0 && (
+                      <span className="text-slate-400" title="Frames this service did not analyse to stay near live (v2 R6.3); they are in the recording and in the audit log">
+                        {" "}· {d.frames_shed} shed{d.cadence > 1 ? ` · every ${d.cadence}th` : ""}
+                      </span>
+                    )}
                     {d?.stages && Object.keys(d.stages).length > 0 && (
                       <div className="text-[10px] text-slate-500 whitespace-nowrap" data-testid={`stages-${s.service}-${d.drone_id}`}
                            title="Average ms per frame for each pipeline stage">
