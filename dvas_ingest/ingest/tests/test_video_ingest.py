@@ -489,3 +489,51 @@ def test_full_volume_refuses_new_video(client, valkey, tmp_path, monkeypatch):
     with client.websocket_connect(ws_url(), headers={"authorization": "Bearer sub:op-a"}) as ws:
         ws.send_text(hello())
         assert json.loads(ws.receive_text())["type"] == "ready"
+
+
+def test_mission_end_after_bye_keeps_the_video_ended():
+    """mission/end right after `bye` (while the recording is still being sealed) closes the
+    connection again; the video must stay `ended`, not turn `paused`."""
+    class WS:
+        async def close(self, code=1000, reason=""):
+            pass
+    conn = main._VideoConn(WS(), "sid", DRONE, MISSION)
+    conn.close_code = -1
+    asyncio.run(conn.close(1000, "mission ended"))
+    assert conn.close_code == -1
+    other = main._VideoConn(WS(), "sid2", DRONE, MISSION)
+    asyncio.run(other.close(1000, "mission ended"))
+    assert other.close_code == 1000
+
+
+def test_a_server_close_ends_a_receive_that_would_wait_forever():
+    """mission/end closes the connection while the handler waits in receive() and no
+    disconnect ever arrives: the wait ends, so the slot and the stream limit are freed."""
+    class WS:
+        async def receive(self):
+            await asyncio.sleep(3600)
+
+        async def close(self, code=1000, reason=""):
+            pass
+
+    async def t():
+        conn = main._VideoConn(WS(), "sid", DRONE, MISSION)
+        task = asyncio.ensure_future(main._video_receive(conn, {}, None, None, "vkey"))
+        await asyncio.sleep(0.05)
+        await conn.close(1000, "mission ended")
+        await asyncio.wait_for(task, 2.0)
+        assert conn.close_code == 1000
+
+    asyncio.run(t())
+
+
+def test_a_silent_connection_is_closed_after_the_idle_timeout(monkeypatch):
+    class WS:
+        async def receive(self):
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(main, "VIDEO_IDLE_TIMEOUT_S", 0.1)
+    conn = main._VideoConn(WS(), "sid", DRONE, MISSION)
+    with pytest.raises(main._VideoClose) as exc:
+        asyncio.run(main._video_receive(conn, {}, None, None, "vkey"))
+    assert exc.value.error == "idle"

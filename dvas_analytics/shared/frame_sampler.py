@@ -257,6 +257,7 @@ class ShedState:
     frames_shed: int = 0
     pending: Optional[dict] = None       # cadence-shed range not yet logged
     priority_until: float = 0.0
+    stream: str = ""                     # the mission stream this state belongs to
 
 
 @dataclass
@@ -811,6 +812,15 @@ class FrameSampler:
         if behind is None:
             return fields
         s = self._shed.setdefault(d, ShedState())
+        stream = fields.get("_stream", "")
+        if s.stream and stream and stream != s.stream:
+            # A new mission starts live: the last one's level and cadence do not carry over,
+            # and its unlogged cadence range is written under its own stream
+            await self._flush_cadence(client, d, s)
+            if s.level:
+                log.info("[%s] %s: new mission stream — shedding level %d → 0", self.service, d, s.level)
+            s = self._shed[d] = ShedState(priority_until=s.priority_until)
+        s.stream = stream or s.stream
         now = self._clock()
         if behind > SHED_AFTER_S:
             s.ok_since = None

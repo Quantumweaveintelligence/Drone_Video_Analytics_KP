@@ -1149,6 +1149,8 @@ VIDEO_MAX_KBPS = max(500, int(os.getenv("DVAS_VIDEO_MAX_KBPS", "12000") or 12000
 VIDEO_MAX_STREAMS = max(1, int(os.getenv("DVAS_MAX_LIVE_STREAMS", "8") or 8))
 VIDEO_MAX_MSG = 256 * 1024
 VIDEO_HELLO_TIMEOUT_S = 10.0
+VIDEO_IDLE_TIMEOUT_S = 120.0        # no message this long (pings do not count): the edge is gone; Cloudflare drops at 100 s
+VIDEO_FINISH_TIMEOUT_S = 60.0       # sealing the recording may take this long before we move on
 VIDEO_STATS_EVERY_S = 2.0
 VIDEO_LIVE_UPDATE_S = 0.5          # drone telemetry / dashboard events at most this often
 _VIDEO_TEL_KEYS = ("latitude", "longitude", "altitude_m", "abs_alt", "speed_mps", "battery_pct",
@@ -1180,13 +1182,22 @@ class _VideoConn:
         self.win_bytes = 0
         self._win: list = []                   # (t, bytes) for the bitrate window
         self._over = 0
+        self.stopping = False                  # the server closed it (mission ended, replaced)
+        self.rx: Optional[asyncio.Future] = None   # the receive in progress
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
-        self.close_code = code
+        if self.close_code != -1:              # after `bye` the mission's video stays ended
+            self.close_code = code
+        self.stopping = True
         try:
             await self.ws.close(code=code, reason=reason[:120])
         except Exception:
             pass
+        # The handler may be waiting in receive() for a message that never comes once the
+        # socket is closed from here: end that wait, so it seals the recording and frees the
+        # mission's live slot and its place in the stream limit.
+        if self.rx is not None and not self.rx.done():
+            self.rx.cancel()
 
     def note_bytes(self, n: int, now: float) -> Optional[float]:
         """Add received bytes; every 5 s returns the window's kbps (else None)."""
@@ -1476,6 +1487,9 @@ if VIDEO_INGEST:
 
 
 async def _video_finish(ws: WebSocket, conn: Optional[_VideoConn], rec, relay) -> None:
+    if conn is not None:
+        log.info("video_closing drone=%s mission=%s close_code=%s", conn.drone_id, conn.mission_id,
+                 conn.close_code)
     try:
         if conn is not None and rec is not None:
             try:
@@ -1486,7 +1500,7 @@ async def _video_finish(ws: WebSocket, conn: Optional[_VideoConn], rec, relay) -
                 pass
         if rec is not None:
             try:
-                await asyncio.to_thread(rec.close)
+                await asyncio.wait_for(asyncio.to_thread(rec.close), VIDEO_FINISH_TIMEOUT_S)
             except Exception as exc:
                 log.error("video recording close failed sid=%s: %s", conn.sid if conn else "?", exc)
         if relay is not None:
@@ -1603,7 +1617,17 @@ async def _video_receive(conn: _VideoConn, claims: dict, rec, relay, vkey: str) 
     next_key = False                  # the next binary chunk starts a keyframe
     bytes_since_meta = 0
     while True:
-        msg = await ws.receive()
+        conn.rx = asyncio.ensure_future(ws.receive())
+        try:
+            msg = await asyncio.wait_for(conn.rx, VIDEO_IDLE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            raise _VideoClose(1001, "idle", f"nothing received for {VIDEO_IDLE_TIMEOUT_S:.0f} s")
+        except asyncio.CancelledError:
+            if conn.stopping:
+                return                                 # closed by the server (conn.close)
+            raise
+        finally:
+            conn.rx = None
         if msg.get("type") == "websocket.disconnect":
             return
         data = msg.get("bytes")

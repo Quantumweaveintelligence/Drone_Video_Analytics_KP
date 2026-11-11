@@ -102,3 +102,32 @@ def test_repeated_jumps_lower_the_cadence_and_recovery_steps_back():
             await take(s)
         assert s.shed_level("D") == 0 and s._shed["D"].cadence == 1
     run(t)
+
+
+def test_a_new_mission_starts_unshed_and_the_old_cadence_range_stays_with_its_stream():
+    async def t(c):
+        await c.delete(fs.SHED_LOG_KEY)
+        key1 = await mission(c, "D", "M1")
+        clock = Clock()
+        s = sampler(c, clock=clock)
+        await frames(c, key1, range(1, 41), age_s=5.0)
+        await take(s)
+        for burst in range(3):                                   # M1 falls behind: level 3, cadence 2
+            clock.t += 3.5
+            await frames(c, key1, range(41 + burst * 40, 81 + burst * 40), age_s=5.0)
+            await take(s)
+        await frames(c, key1, range(200, 210), age_s=0.1)
+        for _ in range(4):
+            await take(s)
+        assert s.shed_level("D") == 3 and s._shed["D"].pending       # a cadence range not yet logged
+        await c.hset(fs.mission_streams.index_key(fs.mission_streams.sid_of("M1")), "status", "ended")
+        await c.delete(key1)
+        key2 = await mission(c, "D", "M2")
+        await frames(c, key2, range(1, 11), age_s=0.1)
+        got = [int((await take(s))["frame_seq"]) for _ in range(6)]
+        assert got == [1, 2, 3, 4, 5, 6]                         # every frame again
+        assert s.shed_level("D") == 0 and s._shed["D"].cadence == 1 and s._shed["D"].stream == key2
+        recs = [{k.decode(): v.decode() for k, v in e[1].items()} for e in await c.xrange(fs.SHED_LOG_KEY)]
+        cad = [r for r in recs if r["reason"] == "cadence"]
+        assert cad and all(r["stream"] == key1 and int(r["to_seq"]) >= int(r["from_seq"]) for r in cad)
+    run(t)
