@@ -465,6 +465,20 @@ New service `dvas_ingest/video_gateway/` (FastAPI + asyncio). It is a supervisor
 
 ### R2 status on the pod (2026-11-11): video plays, but looks choppy from Kerala
 
+**Root cause found (2026-11-11, later):** the tiles never played H.264. go2rtc refuses a
+WebSocket whose `Origin` differs from its `Host` (HTTP 403), and behind nginx the `Host` is
+`127.0.0.1` while the browser's `Origin` is the pod URL — so every browser player socket was
+refused (Firefox: `NS_ERROR_WEBSOCKET_CONNECTION_REFUSED` on `/live/api/ws`) and the tile kept
+showing the 0.7 s JPEG fallback: the "choppy" picture. Local tests missed it because the test
+clients sent no `Origin`. **Fix:** nginx checks the origin itself (`$live_origin_ok`: same host,
+or no `Origin` for the edge app's native client) and sends no `Origin` to go2rtc. Verified in the
+image through the real `nginx.conf`: same-site 101 with one video message per frame; another
+site 403. The analysis below (bandwidth, decode, player) still applies once video plays.
+
+Also found in the same pod run: `send_ts --loop` restarted the PTS on each pass and the decoder
+stopped analysing after the first pass (600 of 2400 frames). Fixed in `7d9b0d5` (send_ts keeps
+PTS increasing; the decoder survives a PTS restart and matches each pass to its own meta).
+
 - The tile plays the H.264 stream (the 403 fix works); the operator still sees it as choppy.
 - **Server path verified smooth** (production image, locally): relay ffmpeg → go2rtc RTSP →
   go2rtc MSE plays 1080p at **30.0 fps, 0 dropped** in go2rtc's own player, and the same
