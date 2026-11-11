@@ -463,6 +463,29 @@ New service `dvas_ingest/video_gateway/` (FastAPI + asyncio). It is a supervisor
 - a user outside the drone's access, or a free slot, is refused (403) and learns nothing about the
   stream.
 
+### R2 status on the pod (2026-11-11): video plays, but looks choppy from Kerala
+
+- The tile plays the H.264 stream (the 403 fix works); the operator still sees it as choppy.
+- **Server path verified smooth** (production image, locally): relay ffmpeg → go2rtc RTSP →
+  go2rtc MSE plays 1080p at **30.0 fps, 0 dropped** in go2rtc's own player, and the same
+  through a copy of `useLiveVideo`'s logic (0 jumps, 0 stalls).
+- So the remaining causes are between the pod and the browser — to be measured, not guessed:
+  1. **Bandwidth over the RunPod proxy (EU → Kerala):** each 4K tile is ~8 Mbps; 4 tiles ≈ 32 Mbps.
+  2. **Browser decode:** several 4K H.264 streams at once exceed many laptop GPUs' decoders.
+  3. **Player behaviour on a jittery link:** `useLiveVideo` seeks to the live edge when > 1.5 s
+     behind (a visible skip), and a reconnect swaps the tile to the 0.7 s JPEG poll until video
+     plays again.
+- **Next (R2 hardening, before R3):**
+  1. **Player diagnostics** on the tile (debug toggle): rendered fps, dropped frames, behind-live,
+     received Mbps, reconnects — so the cause is read off the screen.
+  2. **Grid sub-stream** (R2.6, `DVAS_LIVE_SUBSTREAM=1`): grid tiles play a 720p ~1.5 Mbps
+     stream; the selected / maximised tile plays the source. Transcoded with `h264_nvenc` if the
+     pod exposes NVENC (`NVIDIA_DRIVER_CAPABILITIES` needs `video`), else `libx264 ultrafast`.
+  3. **Smoother catch-up:** `playbackRate` 1.05–1.25 to drift back to the live edge instead of
+     seeking; seek only when > 5 s behind. Keep the last video frame on screen during a short
+     reconnect instead of switching to JPEG.
+  4. **Glass-to-glass latency** with a burnt-in clock (R0 item 1, still open).
+
 ### Phase R3 — Overlays in the browser; stop re-encoding for live view (5–6 days)
 
 1. **Per-frame results bus** — `shared/hud.py`.
@@ -627,10 +650,15 @@ Every step is measured on the pod before and after, with the stage split (A4) an
      | Drones × resolution | Analytics fps per drone | Max behind live | Slowest service |
      |---|---|---|---|
      | 1 × 4K (e2e, 2026-11-10) | 20 | 0.7 s | — |
-     | 2 × 4K | _to measure_ | | |
-     | 4 × 4K | _to measure_ | | |
-     | 4 × 1080p | _to measure_ | | |
+     | 2 × 4K (2026-11-11, image `7125f0c`) | 19.8–20.2 | 0.7 s | none (backlog 0) |
+     | 4 × 4K (2026-11-11) | 20.0–20.2 | 0.6 s | none (backlog 0) |
+     | 4 × 1080p (2026-11-11) | 20.0–20.2 | 0.6 s | none (backlog 0) |
      | 8 × 1080p | _to measure_ | | |
+
+     All 600 / 600 analytics frames per drone. Person bench on the same image: person round
+     36.7 ms (parallel), face tiles 12.4 ms with `PERSON_FACE_DIRECT` (45 ms via `predict()`),
+     FP16 face check 11 / 11. Synthetic clips (`testsrc2`) have few detections; real footage
+     with crowds costs more per frame — repeat with a recorded drone clip before sizing for 20 drones.
    - Gateway governor: when an enabled service stays below `DVAS_ANALYTICS_FPS` for 30 s, the
      dashboard shows **Degraded: <service> 14 fps** on the drone's tile and the Models page.
    - Do not silently drop frames.
