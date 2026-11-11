@@ -15,7 +15,11 @@ No frame is lost when the analytics fall behind (decision 2026-11-10):
     safety bound that flow control never reaches.
   * A group counts only while its consumers read (QUEUE_READER_IDLE_S) and its service
     publishes stats (dvas:svc_stats:<service>, TTL 10 s): a switched-off service does not
-    hold the others back.
+    hold the others back. Nor does a service on the latest frame (mode "newest": crowd,
+    vessel — v2 R6.1): it never makes the feed wait.
+  * No analytics service running (v2 R6.2): packets are not even decoded; the decoder only
+    follows the recording. When a service starts, decoding resumes at the next keyframe,
+    at the live position (no backlog from before).
   * Restart-safe: the resume point (segment, connection, PTS of the last published frame)
     is saved with every frame; after a restart decoding resumes one segment before it
     (segments start at a keyframe) and frames up to that PTS are skipped.
@@ -63,6 +67,9 @@ KEEP_RECORDINGS = os.getenv("DVAS_RECORD_VIDEO", "1").lower() in ("1", "true", "
 SCAN_S = 1.0
 PROGRESS_EVERY = 20
 POLL_S = 0.05
+# v2 R6.2: decode only while at least one analytics service runs (0 = always decode)
+DECODE_ONLY_WITH_SERVICES = os.getenv("DVAS_DECODE_ONLY_WITH_SERVICES", "1").lower() not in ("0", "false", "no")
+READERS_CHECK_S = 1.0
 RETENTION_EVERY_S = 3600.0
 SVC_STATS_KEY = "dvas:svc_stats:{service}"
 
@@ -305,6 +312,8 @@ class MissionDecoder(threading.Thread):
         self._resume_conn = 0
         self._resume_pts: Optional[float] = None
         self._resume_floor = 0
+        self._readers = True
+        self._readers_at = -1e9
 
     # ── state ────────────────────────────────────────────────────────────────
     def _h(self) -> dict:
@@ -405,9 +414,20 @@ class MissionDecoder(threading.Thread):
                 raise
             stream.thread_type = "AUTO"
             tb = float(stream.time_base) if stream.time_base else 1 / 90000
+            idle = False
             for packet in container.demux(stream):
                 if self.stop.is_set():
                     break
+                if DECODE_ONLY_WITH_SERVICES and not self._services_running():
+                    if not idle:
+                        log.info("decoder %s: no analytics service running — not decoding", self.sid)
+                    idle = True
+                    continue
+                if idle:
+                    if not packet.is_keyframe:
+                        continue                      # resume at a keyframe, at the live position
+                    idle, t0, bucket_last = False, None, None
+                    log.info("decoder %s: analytics service running — decoding from the live position", self.sid)
                 try:
                     decoded = packet.decode()
                 except av.error.InvalidDataError as exc:   # damaged data: go on with what decodes
@@ -491,10 +511,27 @@ class MissionDecoder(threading.Thread):
         used = 0
         for group, n in unread.items():
             svc = group[:-6] if group.endswith("-group") else group
-            if not await self.qm._client.exists(SVC_STATS_KEY.format(service=svc)):
+            raw = await self.qm._client.get(SVC_STATS_KEY.format(service=svc))
+            if not raw:
                 continue                              # service not running: does not hold the feed
+            try:
+                if json.loads(raw).get("mode") == "newest":
+                    continue                          # latest-frame service: never holds the feed
+            except (ValueError, AttributeError):
+                pass
             used = max(used, n)
         return used
+
+    def _services_running(self) -> bool:
+        """Any analytics service publishing stats (cached READERS_CHECK_S)."""
+        now = time.monotonic()
+        if now - self._readers_at >= READERS_CHECK_S:
+            self._readers_at = now
+            try:
+                self._readers = next(self.r.scan_iter(SVC_STATS_KEY.format(service="*"), count=100), None) is not None
+            except Exception:
+                self._readers = True                  # cannot tell: keep feeding
+        return self._readers
 
     async def _publish_async(self, jpeg: bytes, meta: dict, t_ms: float, edge_seq: int,
                              seg: int, rx: float) -> None:

@@ -34,6 +34,13 @@ SID = qm.mission_sid(MISSION)
 KEY = qm.mission_stream_key(SID)
 
 
+@pytest.fixture(autouse=True)
+def _decode_without_services(monkeypatch):
+    # These tests run the decoder with no analytics service publishing stats; R6.2's
+    # "decode only while a service runs" has its own test below.
+    monkeypatch.setattr(vd, "DECODE_ONLY_WITH_SERVICES", False)
+
+
 @pytest.fixture(scope="module")
 def clips(tmp_path_factory):
     if not shutil.which("ffmpeg"):
@@ -323,6 +330,30 @@ def test_switched_off_service_does_not_hold_the_feed(client, valkey, clips, monk
     valkey.xreadgroup("crowd-group", "c1", {KEY: ">"}, count=1)   # a consumer, but no stats key
     run_decoder(timeout=20)
     assert vhash(valkey)["decoder_done"] == "1"
+
+
+def test_latest_frame_service_never_holds_the_feed(client, valkey, clips, monkeypatch):
+    # crowd / vessel read the newest frame only (R6.1): a busy one must not stop the decoder
+    monkeypatch.setattr(vd, "WINDOW", 10)
+    assert start(client, DRONE, MISSION).status_code < 300
+    stream_clip(client, clips["plain"])
+    valkey.xadd(KEY, {"frame": b"x", "frame_seq": "0"})
+    valkey.xgroup_create(KEY, "crowd-group", id="$")
+    valkey.xreadgroup("crowd-group", "c1", {KEY: ">"}, count=1)   # reads, never acknowledges
+    valkey.set("dvas:svc_stats:crowd", json.dumps({"service": "crowd", "mode": "newest"}), ex=60)
+    run_decoder(timeout=20)
+    h = vhash(valkey)
+    assert h["decoder_done"] == "1" and int(h["analytics_seq"]) >= 78
+
+
+def test_nothing_is_decoded_while_no_service_runs(client, valkey, clips, monkeypatch):
+    monkeypatch.setattr(vd, "DECODE_ONLY_WITH_SERVICES", True)     # R6.2, the production default
+    assert start(client, DRONE, MISSION).status_code < 300
+    stream_clip(client, clips["plain"])
+    run_decoder(timeout=20)
+    h = vhash(valkey)
+    assert h["decoder_done"] == "1"                                 # the mission still drains
+    assert entries(valkey) == [] and int(h.get("analytics_seq") or 0) == 0
 
 
 def test_restart_resumes_without_gap_or_duplicate(client, valkey, clips):

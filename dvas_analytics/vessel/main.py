@@ -89,7 +89,9 @@ _stream_task: Optional[asyncio.Task] = None
 _stream_running = False
 _frames_processed = 0
 # Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
-_sampler = FrameSampler("vessel", "vessel-group", "vessel-analyzer", late_policy="skip")  # own tracker: late frames counted, not re-fed
+# Latest frame only (v2 R6.1, decided 2026-11-11): vessel never queues or holds the feed back.
+# Own tracker: late frames counted, not re-fed.
+_sampler = FrameSampler("vessel", "vessel-group", "vessel-analyzer", mode="newest", late_policy="skip")
 # A drone idle for DVAS_IDLE_RESET_S starts its next flight with a fresh tracker (plan A3)
 _sampler.on_idle.append(lambda d: engine.forget_drone(d) if engine is not None else None)
 # Live annotated video (MJPEG, ≤1920 px) for the dashboard

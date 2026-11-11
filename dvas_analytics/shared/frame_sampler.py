@@ -16,8 +16,10 @@ XREADGROUP per drone:
     its next round, i.e. once it has finished with it. Frames waiting in the re-order
     buffer or the prefetched round stay pending, so a restart re-reads them (at most one
     frame per drone is analysed twice after a crash).
-  * mode="newest" (crowd): only the newest entry per drone is analysed; older ones
-    are XACKed unread and counted as `skipped`.
+  * mode="newest" (crowd, vessel — v2 R6.1): only the newest entry per drone is analysed;
+    older ones are XACKed unread and counted as `skipped`. The video decoder never waits
+    for a newest-mode service. DVAS_FEED_MODE_<SERVICE>=latest|every overrides a service's
+    mode (latest = newest, every = ordered).
   * A per-drone rate cap (the governor's `dvas:fps_cap:<service>`, else
     DVAS_FPS_MAX) keeps one service from taking the whole GPU.
   * Live stats (input fps, analysed fps, skipped, inference ms, lag) are
@@ -260,6 +262,8 @@ class FrameSampler:
                  governed: bool = True, cap_fps: Optional[float] = None,
                  block_ms: int = 50, redis_factory: Optional[Callable] = None,
                  clock: Callable[[], float] = time.monotonic, stream_mode: Optional[str] = None):
+        env_mode = os.getenv(f"DVAS_FEED_MODE_{service.upper()}", "").strip().lower()
+        mode = {"latest": "newest", "newest": "newest", "every": "ordered", "ordered": "ordered"}.get(env_mode, mode)
         if mode not in ("ordered", "newest"):
             raise ValueError(f"mode must be 'ordered' or 'newest', not {mode!r}")
         if late_policy not in ("analyse", "skip"):
