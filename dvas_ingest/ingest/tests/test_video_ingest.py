@@ -91,9 +91,10 @@ def ws_url(drone=DRONE, mission=MISSION):
     return f"/ingest/video/ws?drone_id={drone}&mission_id={mission}"
 
 
-def send_clip(ws, path, first_seq=1, bye=True):
+def send_clip(ws, path, first_seq=1, bye=True, pts_offset_s=0.0):
     last = first_seq - 1
-    for meta, data, _t in ts_chunks(path, first_seq=first_seq, capture_t0=1762671000.0):
+    for meta, data, _t in ts_chunks(path, first_seq=first_seq, capture_t0=1762671000.0,
+                                    pts_offset_s=pts_offset_s):
         if meta is not None:
             ws.send_text(json.dumps(meta))
             last = meta["seq"]
@@ -268,6 +269,28 @@ def test_decoder_feeds_sampled_frames_with_their_telemetry(client, valkey, clips
     assert h["decoder_done"] == "1" and h["last_entry_id"]
 
 
+@pytest.mark.parametrize("offset", [True, False])
+def test_a_looped_clip_is_analysed_on_every_pass(client, valkey, clips, offset):
+    # send_ts --loop: the second pass continues the PTS (offset=True, as the contract wants);
+    # a sender that restarts its PTS (offset=False) must not stop the analytics feed either
+    assert start(client, DRONE, MISSION).status_code < 300
+    with client.websocket_connect(ws_url(), headers={"authorization": "Bearer sub:op-a"}) as ws:
+        ws.send_text(hello())
+        assert json.loads(ws.receive_text())["type"] == "ready"
+        last = send_clip(ws, clips["plain"], bye=False)
+        send_clip(ws, clips["plain"], first_seq=last + 1, pts_offset_s=4.1 if offset else 0.0)
+        msg = ws.receive()
+        while msg.get("type") != "websocket.close":
+            msg = ws.receive()
+    run_decoder()
+    frames = entries(valkey)
+    edge = [int(json.loads(e["metadata"])["edge_seq"]) for e in frames]
+    assert len(set(edge)) == len(edge)                           # no frame twice
+    assert max(edge) > last                                      # the second pass was analysed
+    assert len(frames) >= (158 if offset else 154)               # 2 × 80 sampled (± boundary frames)
+    assert vhash(valkey)["decoder_done"] == "1"
+
+
 def test_flow_control_waits_for_a_slow_service_and_loses_nothing(client, valkey, clips, monkeypatch):
     monkeypatch.setattr(vd, "WINDOW", 10)
     assert start(client, DRONE, MISSION).status_code < 300
@@ -307,7 +330,7 @@ def test_restart_resumes_without_gap_or_duplicate(client, valkey, clips):
     stream_clip(client, clips["plain"])
     run_decoder(stop_after=33)
     first = [int(e["frame_seq"]) for e in entries(valkey)]
-    assert 30 <= len(first) < 70 and vhash(valkey).get("decoder_done") != "1"
+    assert 30 <= len(first) < 80 and vhash(valkey).get("decoder_done") != "1"   # stopped part-way (80 in all)
     run_decoder()
     seqs = _check_frames(entries(valkey), 120)
     assert seqs[:len(first)] == first

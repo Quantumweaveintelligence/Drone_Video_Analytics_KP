@@ -40,9 +40,11 @@ class _Sink(io.RawIOBase):
 
 
 def ts_chunks(path: str, transcode: bool = False, first_seq: int = 1,
-              capture_t0: float = None) -> Iterator[Tuple[dict, bytes, float]]:
+              capture_t0: float = None, pts_offset_s: float = 0.0) -> Iterator[Tuple[dict, bytes, float]]:
     """(meta, ts_bytes, pts_s) per video frame, in send order. ts_bytes is a whole number of
-    188-byte TS packets; a keyframe's bytes start a new chunk (meta first, then bytes)."""
+    188-byte TS packets; a keyframe's bytes start a new chunk (meta first, then bytes).
+    pts_offset_s shifts every timestamp: with --loop each pass continues after the previous
+    one, because PTS must keep increasing within a connection (contract §3)."""
     import av  # noqa: PLC0415
     src = av.open(path)
     vin = src.streams.video[0]
@@ -69,6 +71,12 @@ def ts_chunks(path: str, transcode: bool = False, first_seq: int = 1,
     def emit(pkt):
         nonlocal seq, first_pts, carry
         tb = float(pkt.time_base or vout.time_base)
+        if pts_offset_s:
+            shift = round(pts_offset_s / tb)
+            if pkt.pts is not None:
+                pkt.pts += shift
+            if pkt.dts is not None:
+                pkt.dts += shift
         pts_s = (pkt.pts if pkt.pts is not None else pkt.dts) * tb
         if first_pts is None:
             first_pts = pts_s
@@ -149,7 +157,7 @@ async def stream(args) -> int:
         try:
             for _ in range(max(1, args.loop)):
                 last = 0.0
-                for meta, data, t in ts_chunks(args.file, args.transcode, first_seq=seq):
+                for meta, data, t in ts_chunks(args.file, args.transcode, first_seq=seq, pts_offset_s=offset):
                     if meta is not None:
                         wait = start + offset + t - time.monotonic()
                         if wait > 0:

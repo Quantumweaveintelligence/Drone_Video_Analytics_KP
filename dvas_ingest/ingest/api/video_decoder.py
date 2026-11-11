@@ -39,7 +39,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 import queue_manager as qm
 import video_store as vs
@@ -156,18 +156,35 @@ class TailReader:
 
 class MetaIndex:
     """Frame meta of one run, read incrementally from the segments' meta.jsonl, matched to
-    decoded frames by PTS (offset learned at the first keyframe)."""
+    decoded frames by PTS (offset learned at the first keyframe).
+
+    Epochs: a sender that restarts its PTS inside one connection (contract §3 forbids it, but
+    e.g. a muxer restart) produces the same PTS twice. Meta PTS going back more than 1 s opens a
+    new epoch here, and the decoder counts its own backward jumps the same way, so each pass is
+    matched to its own meta (its own telemetry), never to the previous pass's."""
+
+    JUMP_MS = 1000.0
 
     def __init__(self, sid: str, start_seg: int, conn: int, fps: float):
         self.sid, self.conn = sid, conn
         self._seg = start_seg
         self._pos: Dict[int, int] = {}
-        self._pts: list = []                  # sorted pts_ms
-        self._by_pts: Dict[float, dict] = {}
+        self._eps: Dict[int, Tuple[list, Dict[float, dict]]] = {0: ([], {})}   # epoch → (sorted pts, by pts)
+        self._load_epoch = 0
+        self._load_max: Optional[float] = None
+        self._epoch = 0                       # the decoder's current epoch
         self.offset: Optional[float] = None
         self._matched: Optional[float] = None
         self.tol = max(4.0, 500.0 / max(1.0, fps))
         self.missing = 0
+
+    @property
+    def _pts(self) -> list:
+        return self._eps.setdefault(self._epoch, ([], {}))[0]
+
+    @property
+    def _by_pts(self) -> Dict[float, dict]:
+        return self._eps.setdefault(self._epoch, ([], {}))[1]
 
     def _load(self) -> None:
         for idx in (self._seg, self._seg + 1, self._seg + 2):
@@ -191,10 +208,18 @@ class MetaIndex:
                     self._seg = max(self._seg, int(m.get("seg", idx)))
                     continue
                 pts = m.get("pts_ms")
-                if pts is None or pts in self._by_pts:
+                if pts is None:
+                    continue
+                if self._load_max is not None and pts < self._load_max - self.JUMP_MS:
+                    self._load_epoch += 1            # the sender restarted its PTS
+                    self._load_max = pts
+                else:
+                    self._load_max = pts if self._load_max is None else max(self._load_max, pts)
+                plist, by = self._eps.setdefault(self._load_epoch, ([], {}))
+                if pts in by:
                     continue                         # a resent frame keeps its first meta
-                self._by_pts[pts] = m
-                bisect.insort(self._pts, pts)
+                by[pts] = m
+                bisect.insort(plist, pts)
 
     def _nearest(self, target: float) -> Optional[dict]:
         i = bisect.bisect_left(self._pts, target)
@@ -215,7 +240,11 @@ class MetaIndex:
     def _lookup(self, t_ms: float) -> Optional[dict]:
         return None if self.offset is None else self._nearest(t_ms - self.offset)
 
-    def match(self, t_ms: float, is_key: bool) -> Optional[dict]:
+    def match(self, t_ms: float, is_key: bool, epoch: int = 0) -> Optional[dict]:
+        if epoch != self._epoch:                     # the decoder saw the PTS restart
+            for e in [e for e in self._eps if e < epoch]:
+                del self._eps[e]
+            self._epoch, self.offset, self._matched = epoch, None, None
         if not self._pts:
             self._load()
         if self.offset is None and is_key:
@@ -352,7 +381,8 @@ class MissionDecoder(threading.Thread):
         metas = MetaIndex(self.sid, start, conn, fps_src)
         container = None
         bucket_last = None
-        t0 = None
+        t0 = t_prev = None
+        epoch = 0
         failures = 0
         # what of this run was already published (resume) and which edge seqs are re-sends
         if conn < self._resume_conn:
@@ -388,13 +418,22 @@ class MissionDecoder(threading.Thread):
                     if frame.pts is None:
                         continue
                     t_ms = frame.pts * tb * 1000.0
-                    m = metas.match(t_ms, bool(frame.key_frame))
+                    if t_prev is not None and t_ms < t_prev - MetaIndex.JUMP_MS:
+                        epoch += 1                    # sender restarted its PTS (see MetaIndex)
+                    m = metas.match(t_ms, bool(frame.key_frame), epoch)
                     if skip_upto is not None and t_ms <= skip_upto + 0.5:
                         continue                      # published before a restart
                     if m is not None and floor and int(m["seq"]) <= floor:
                         continue                      # re-sent by the edge after a reconnect
                     if t0 is None:
                         t0 = t_ms
+                    elif t_prev is not None and t_ms < t_prev - MetaIndex.JUMP_MS:
+                        # PTS went back > 1 s inside one connection (contract §3 forbids it; e.g. a
+                        # sender restarting its muxer): sample from here instead of skipping the rest
+                        log.warning("decoder %s: PTS went back %.0f ms → %.0f ms in segment %d; "
+                                    "sampling restarts there", self.sid, t_prev, t_ms, reader.seg)
+                        t0, bucket_last = t_ms, None
+                    t_prev = t_ms
                     bucket = math.floor((t_ms - t0) / 1000.0 * ANALYTICS_FPS + 1e-6)
                     if bucket_last is not None and bucket <= bucket_last:
                         continue                      # not sampled (source faster than DVAS_ANALYTICS_FPS)
