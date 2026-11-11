@@ -18,6 +18,7 @@ from typing import Callable, Deque, Dict, Optional
 
 import av
 
+from ingest.ts_muxer import TemplateParams
 from src.buffer.packet_ring import RingPacket
 from src.video.drone_video_source import VideoFrame
 
@@ -28,7 +29,8 @@ _MAX_QUEUE = 240            # packets (~8 s at 30 fps); beyond this, skip to the
 
 
 def _open_codec(template, prefer_hw: bool):
-    name = template.codec_context.name
+    name = template.codec if isinstance(template, TemplateParams) else template.codec_context.name
+    extradata = template.extradata if isinstance(template, TemplateParams) else template.codec_context.extradata
     if prefer_hw:
         try:
             from av.codec.hwaccel import HWAccel
@@ -36,12 +38,12 @@ def _open_codec(template, prefer_hw: bool):
             for device in _HW_ORDER:
                 if device in available:
                     ctx = av.CodecContext.create(name, "r", hwaccel=HWAccel(device_type=device, allow_software_fallback=True))
-                    ctx.extradata = template.codec_context.extradata
+                    ctx.extradata = extradata
                     return ctx, device
         except (ImportError, av.FFmpegError, ValueError) as exc:
             log.warning("hw_decode_unavailable: %s", exc)
     ctx = av.CodecContext.create(name, "r")
-    ctx.extradata = template.codec_context.extradata
+    ctx.extradata = extradata
     return ctx, "software"
 
 

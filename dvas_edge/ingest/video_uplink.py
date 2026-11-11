@@ -10,8 +10,8 @@ Continuous H.264 video uplink to the ingest server over WebSocket (contract §3 
 Packets are pushed from the reader thread with push(); one asyncio thread owns the socket.
 Back-pressure: when more than BACKLOG_S of video is queued, whole GOPs are dropped (the
 view stays live; the packets remain in the PacketRing for evidence).
-Reconnect: back-off 0.5 -> 8 s with jitter; every connection restarts at the newest
-keyframe in the PacketRing and continues the mission's seq numbering.
+Reconnect: packets are replayed in sequence from the in-memory PacketRing and capped disk spool;
+the spool is retained until the server reports its durable last_seq.
 Fallback: HTTP 404 on upgrade (old server) or 5 failed connects in a row -> on_fallback(True)
 so the JPEG path takes over; the socket is retried every 60 s.
 """
@@ -22,9 +22,11 @@ import collections
 import json
 import logging
 import random
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Deque, Optional
 from urllib.parse import urlencode
 
@@ -32,17 +34,19 @@ import websockets
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
-from ingest.ts_muxer import TsMuxer
+from ingest.ts_muxer import TemplateParams, TsMuxer
+from ingest.packet_spool import PacketSpool
 from src.buffer.packet_ring import PacketRing, RingPacket
 
 log = logging.getLogger("video_uplink")
 
 CONTRACT_VERSION = 1
 BACKLOG_S = 2.0
-PING_S = 15.0
+PING_INTERVAL_S = 20.0
+PING_TIMEOUT_S = 60.0         # generous: a saturated uplink delays the pong behind queued video
 STATS_S = 2.0
 READY_TIMEOUT_S = 10.0
-FAILS_BEFORE_FALLBACK = 5
+FAILS_BEFORE_FALLBACK = 5     # consecutive connects that never reached "ready" (reset once connected)
 FALLBACK_RETRY_S = 60.0
 AUTH_REFRESH_AT = 0.8          # share of the token lifetime after which `auth` is sent
 
@@ -52,6 +56,15 @@ CLOSE_NOT_OWNER = 4403
 CLOSE_NOT_LIVE = 4409
 CLOSE_TOO_FAST = 4413
 CLOSE_CODEC = 4415
+LOG_TEXT_MAX = 200             # cap on server-supplied text in a log line
+STOP_JOIN_S = 10.0             # wait for a closing worker before a restart
+MAX_CHUNK = (256 * 1024 // 188) * 188     # 262072: largest TS-aligned binary message the server accepts
+FINAL_REFUSALS = ("not_mission_operator", "forbidden", "codec_unsupported", "unsupported_codec")
+
+
+def _clip(text: object) -> str:
+    """Server-supplied text for one log line: whitespace collapsed (no forged lines), bounded."""
+    return " ".join(str(text).split())[:LOG_TEXT_MAX]
 
 
 @dataclass
@@ -81,6 +94,8 @@ class VideoUplink:
         analytics: bool = True,
         on_fallback: Callable[[bool], None] = lambda _active: None,
         on_error: Callable[[str], None] = lambda _msg: None,
+        spool_path: Optional[Path | str] = None,
+        spool_max_bytes: int = 2 * 1024 * 1024 * 1024,
     ) -> None:
         self._url = f"{url}?{urlencode({'drone_id': drone_id, 'mission_id': mission_id})}"
         self._client = client
@@ -88,8 +103,17 @@ class VideoUplink:
         self._mission_id = mission_id
         self._laptop_id = laptop_id
         self._info = info
-        self._template = template_stream
+        # Snapshot codec params now, on the reader thread, before demux starts. The live stream must
+        # never be touched on the uplink thread (see TsMuxer docstring). `None` only in unit tests.
+        if isinstance(template_stream, TemplateParams):
+            self._template = template_stream
+        else:
+            self._template = TemplateParams.from_stream(template_stream) if template_stream is not None else None
         self._ring = ring
+        self._spool = PacketSpool(spool_path, spool_max_bytes) if spool_path is not None else None
+        self._spool_cursor = 0
+        self._spool_recording = False
+        self._spool_full_logged = False
         self._analytics = analytics
         self._on_fallback = on_fallback
         self._on_error = on_error
@@ -107,6 +131,7 @@ class VideoUplink:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._connected_ws = None
+        self._session_connected = False
 
         self.fallback_active = False
         self.clock_offset_ms = 0.0
@@ -116,6 +141,7 @@ class VideoUplink:
         self.sent_frames = 0
         self.sent_bytes = 0
         self.last_error = ""
+        self._last_sent_seq = 0
 
     # ── reader-thread side ────────────────────────────────────────────────────
 
@@ -123,12 +149,29 @@ class VideoUplink:
         """Queue one packet for sending (called for every packet, in capture order).
 
         Only while running: when stopped (Server Send OFF, or refused by the server) nothing is
-        queued; the next start resumes from the PacketRing's newest keyframe instead.
+        queued; the next start resumes from the PacketRing.
         """
         if not self._running:
             return
         with self._lock:
             self._update_rate(len(pkt.data))
+            if self._spool is not None:
+                disconnected = self._connected_ws is None
+                if disconnected and not self._spool_recording:
+                    # Preserve the current GOP from its keyframe, including packets that arrived
+                    # just before the close was detected. The source adds to the ring before push.
+                    self._spool_recording = True
+                    for buffered in self._ring.from_last_keyframe():
+                        if not self._put_spool(buffered):
+                            self.dropped_frames += 1
+                catching_up = self._spool.has_after(self._spool_cursor)
+                if catching_up:
+                    self._spool_recording = True
+                if self._spool_recording and (disconnected or catching_up):
+                    if self._put_spool(pkt):
+                        self._wake_loop()
+                        return
+                    self.dropped_frames += 1
             if self._dropping and not pkt.key:
                 self.dropped_frames += 1
                 return
@@ -142,6 +185,25 @@ class VideoUplink:
             self._queue.append(pkt)
             self._queued_bytes += len(pkt.data)
         self._wake_loop()
+
+    def _put_spool(self, pkt: RingPacket) -> bool:
+        try:
+            accepted = self._spool.put(pkt) if self._spool is not None else False
+        except (OSError, sqlite3.Error) as exc:
+            self.last_error = f"packet spool write failed: {type(exc).__name__}: {exc}"
+            if not self._spool_full_logged:
+                log.error("uplink_packet_spool_write_failed seq=%d error=%s", pkt.seq, _clip(exc))
+                self._spool_full_logged = True
+            return False
+        if not accepted:
+            self.last_error = "packet spool capacity reached"
+            if not self._spool_full_logged:
+                log.error("uplink_packet_spool_full seq=%d bytes=%d cap=%d", pkt.seq, len(pkt.data),
+                          self._spool.max_bytes)
+                self._spool_full_logged = True
+        else:
+            self._spool_full_logged = False
+        return accepted
 
     def _wake_loop(self) -> None:
         loop = self._loop
@@ -170,6 +232,7 @@ class VideoUplink:
         return self._queued_bytes / max(self._rate_bps, 1.0)
 
     def stats(self) -> dict:
+        spool = self._spool.stats() if self._spool is not None else {"packets": 0, "bytes": 0, "max_bytes": 0}
         return {
             "transport": "jpeg_http" if self.fallback_active else "h264_ws",
             "connected": self._connected_ws is not None,
@@ -180,6 +243,7 @@ class VideoUplink:
             "reconnects": self.reconnects,
             "clock_offset_ms": round(self.clock_offset_ms, 1),
             "server": self.server_stats,
+            "spool": spool,
             "last_error": self.last_error,
         }
 
@@ -189,16 +253,41 @@ class VideoUplink:
     def running(self) -> bool:
         return self._running and self._thread is not None and self._thread.is_alive()
 
+    def wait_stopped(self, timeout: float = STOP_JOIN_S) -> bool:
+        """Wait for a stopped worker to exit (it may be mid-connect or mid-close). True when none is left."""
+        old = self._thread
+        if old is not None and old.is_alive() and not self._running:
+            old.join(timeout=timeout)
+        return old is None or not old.is_alive() or self._running
+
     def start(self) -> None:
+        old = self._thread
+        if old is not None and old.is_alive():
+            # Two workers would share _loop/_wake and corrupt each other: never start a second one.
+            # Callers wait with wait_stopped() first; landing here means the old one is stuck.
+            self.last_error = "previous connection still closing"
+            log.warning("uplink_start_skipped: %s", self.last_error)
+            self._on_error(self.last_error)
+            self._set_fallback(True)                  # JPEG path carries frames meanwhile
+            return
         self._running = True
         self._thread = threading.Thread(target=self._run, name="VideoUplink", daemon=True)
         self._thread.start()
 
-    def stop(self, timeout: float = 10.0) -> None:
+    def request_stop(self) -> None:
+        """Ask the worker to close (with 1000) without waiting; `running` is False from now on."""
         self._running = False
         self._wake_loop()
+
+    def stop(self, timeout: float = 10.0) -> None:
+        self.request_stop()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+
+    def close_spool(self) -> None:
+        if self._spool is not None:
+            self._spool.close()
+            self._spool = None
 
     def _run(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -214,6 +303,7 @@ class VideoUplink:
     async def _connect_loop(self) -> None:
         failures = 0
         while self._running:
+            self._session_connected = False
             try:
                 await self._session()
                 failures = 0
@@ -226,7 +316,7 @@ class VideoUplink:
             except InvalidStatus as exc:
                 status = exc.response.status_code
                 self.last_error = f"upgrade refused: HTTP {status}"
-                failures = FAILS_BEFORE_FALLBACK if status == 404 else failures + 1
+                failures = FAILS_BEFORE_FALLBACK if status == 404 else self._count_failure(failures)
                 if status == 401:
                     await self._refresh_token(force=True)
             except ConnectionClosed as exc:
@@ -234,8 +324,8 @@ class VideoUplink:
                 if done:
                     return
             except (OSError, asyncio.TimeoutError, websockets.WebSocketException) as exc:
-                failures += 1
-                self.last_error = f"{type(exc).__name__}: {exc}"
+                failures = self._count_failure(failures)
+                self.last_error = _clip(f"{type(exc).__name__}: {exc}")
             if not self._running:
                 return
             if failures >= FAILS_BEFORE_FALLBACK:
@@ -245,10 +335,16 @@ class VideoUplink:
                 self.reconnects += 1
                 await self._sleep(min(8.0, 0.5 * 2 ** (failures - 1)) * random.uniform(0.8, 1.2))
 
+    def _count_failure(self, failures: int) -> int:
+        """A drop after a working connection is the FIRST strike, not the next: a single mid-stream
+        close must never push a long, healthy stream toward the JPEG fallback."""
+        return 1 if self._session_connected else failures + 1
+
     async def _handle_close(self, exc: ConnectionClosed, failures: int) -> tuple:
         code = exc.rcvd.code if exc.rcvd else 1006
-        reason = exc.rcvd.reason if exc.rcvd else ""
+        reason = _clip(exc.rcvd.reason) if exc.rcvd else ""
         self.last_error = f"closed {code} {reason}".strip()
+        log.warning("uplink_closed code=%s reason=%s", code, reason or "-")
         if code == 1000 and not self._running:
             return 0, True
         if code == CLOSE_NOT_OWNER:
@@ -261,16 +357,16 @@ class VideoUplink:
             try:
                 await self._client.start_mission()
             except Exception as start_exc:    # reported, then retried with back-off
-                self.last_error = f"mission/start failed: {start_exc}"
-        return failures + 1, False
+                self.last_error = _clip(f"mission/start failed: {start_exc}")
+        return self._count_failure(failures), False
 
     async def _session(self) -> None:
         token = await self._client.get_token()
         async with connect(
             self._url,
             additional_headers={"Authorization": f"Bearer {token}"},
-            ping_interval=PING_S,
-            ping_timeout=PING_S * 2,
+            ping_interval=PING_INTERVAL_S,
+            ping_timeout=PING_TIMEOUT_S,
             open_timeout=10,
             max_size=1 << 20,
         ) as ws:
@@ -290,14 +386,30 @@ class VideoUplink:
             }))
             ready = json.loads(await asyncio.wait_for(ws.recv(), READY_TIMEOUT_S))
             if ready.get("type") == "error":
-                raise UplinkStopped(f"server refused: {ready.get('code')} {ready.get('detail', '')}")
+                refusal = _clip(f"server refused: {ready.get('code')} {ready.get('detail', '')}")
+                if ready.get("code") in FINAL_REFUSALS:
+                    raise UplinkStopped(refusal)
+                raise websockets.WebSocketException(refusal)   # e.g. "busy": retried with back-off
             if ready.get("type") != "ready":
                 raise websockets.WebSocketException(f"unexpected reply {ready.get('type')!r}")
             t_recv = time.time()
             if "t_server" in ready:
                 self.clock_offset_ms = (float(ready["t_server"]) - (t_edge + t_recv) / 2) * 1000
+            if not self._running:
+                return                                # stopped meanwhile: leave the fallback to the new worker
             self._set_fallback(False)
+            self._session_connected = True             # reached "ready": a later drop resets the strike count
             self._connected_ws = ws
+            try:
+                server_last_seq = int(ready.get("last_seq", 0) or 0)
+            except (TypeError, ValueError):
+                server_last_seq = 0
+            if self._spool is not None:
+                self._spool.acknowledge(server_last_seq)
+                # Rewind to the server's durable acknowledgement after a reconnect. A prior
+                # socket.send may have returned locally before the server persisted that seq.
+                self._spool_cursor = server_last_seq
+                self._spool_recording = self._spool.has_after(self._spool_cursor)
             log.info("uplink_connected next_seq=%s server_last_seq=%s offset_ms=%.0f",
                      first.seq, ready.get("last_seq"), self.clock_offset_ms)
             try:
@@ -308,25 +420,25 @@ class VideoUplink:
     def _resume_point(self) -> Optional[RingPacket]:
         """Where a (re)connection starts sending.
 
-        After a short break: the keyframe at or before the first frame not yet sent, so nothing
-        is lost (the server ignores frames it already has). After a long break, or on the first
-        connection: the newest keyframe, so the live view does not lag behind.
+        Replay starts at the earliest keyframe still available in the ring or disk spool. Disk rows
+        beyond the ring survive longer outages and are removed only through the server's durable
+        last_seq acknowledgement.
         """
         resend: list = []
         if self._last_sent_seq:
             resend = self._ring.from_keyframe_before(self._last_sent_seq + 1)
-            if sum(len(p.data) for p in resend) > self._rate_bps * BACKLOG_S:
-                resend = []
         if not resend:
-            resend = self._ring.from_last_keyframe()
-        if not resend:
+            resend = self._ring.from_first_keyframe() if not self._last_sent_seq else self._ring.from_last_keyframe()
+        disk_first = self._spool.first_keyframe() if self._spool is not None else None
+        if not resend and disk_first is None:
             return None
         with self._lock:
-            newest_key = resend[0].seq
-            self._queue = collections.deque(resend + [p for p in self._queue if p.seq > resend[-1].seq])
+            if resend:
+                self._queue = collections.deque(resend + [p for p in self._queue if p.seq > resend[-1].seq])
             self._queued_bytes = sum(len(p.data) for p in self._queue)
             self._dropping = False
-        return self._queue[0] if self._queue and self._queue[0].seq == newest_key else None
+            queued_first = self._queue[0] if self._queue else None
+            return min((p for p in (queued_first, disk_first) if p is not None), key=lambda p: p.seq)
 
     async def _wait_for_keyframe(self) -> None:
         while self._running and not self._ring.from_last_keyframe():
@@ -351,8 +463,8 @@ class VideoUplink:
                 else:
                     ts = muxer.mux(pkt.data, pkt.pts, pkt.dts, pkt.key)
                     await ws.send(json.dumps(self._meta(pkt, muxer.rebased_ms(pkt.pts))))
-                    if ts:
-                        await ws.send(ts)
+                    for off in range(0, len(ts), MAX_CHUNK):   # contract §3.2: <= 256 KiB, multiple of 188
+                        await ws.send(ts[off:off + MAX_CHUNK])
                     self.sent_frames += 1
                     self.sent_bytes += len(ts)
                 now = time.monotonic()
@@ -371,14 +483,17 @@ class VideoUplink:
             if tail:
                 log.debug("uplink_muxer_tail_bytes=%d", len(tail))
 
-    _last_sent_seq = 0
-
     def _pop(self) -> Optional[RingPacket]:
         with self._lock:
-            if not self._queue:
+            disk_pkt = self._spool.first(self._spool_cursor) if self._spool is not None else None
+            if disk_pkt is not None and (not self._queue or disk_pkt.seq < self._queue[0].seq):
+                pkt = disk_pkt
+            elif self._queue:
+                pkt = self._queue.popleft()
+                self._queued_bytes -= len(pkt.data)
+            else:
                 return None
-            pkt = self._queue.popleft()
-            self._queued_bytes -= len(pkt.data)
+            self._spool_cursor = max(self._spool_cursor, pkt.seq)
             self._last_sent_seq = pkt.seq
             return pkt
 
@@ -405,13 +520,23 @@ class VideoUplink:
             kind = msg.get("type")
             if kind == "stats":
                 self.server_stats = msg
+                if self._spool is not None:
+                    try:
+                        ack = int(msg.get("last_seq", 0) or 0)
+                    except (TypeError, ValueError):
+                        ack = 0
+                    if ack:
+                        self._spool.acknowledge(ack)
+                        with self._lock:
+                            self._spool_cursor = max(self._spool_cursor, ack)
+                            self._spool_recording = self._spool.has_after(self._spool_cursor)
             elif kind == "slow_down":
                 log.warning("uplink_slow_down max_kbps=%s", msg.get("max_kbps"))
                 self.server_stats["slow_down_kbps"] = msg.get("max_kbps")
             elif kind == "auth_ok":
                 log.info("uplink_auth_refreshed")
             elif kind == "error":
-                self.last_error = f"{msg.get('code')}: {msg.get('detail', '')}"
+                self.last_error = _clip(f"{msg.get('code')}: {msg.get('detail', '')}")
 
     async def _maybe_refresh_auth(self, ws) -> None:
         expiry = getattr(self._client, "token_expiry", 0.0)
@@ -429,14 +554,17 @@ class VideoUplink:
         try:
             return await self._client.refresh_token(force=force)
         except Exception as exc:            # logged; the server closes with 4401 if it matters
-            self.last_error = f"token refresh failed: {exc}"
-            log.warning("uplink_token_refresh_failed: %s", exc)
+            self.last_error = _clip(f"token refresh failed: {exc}")
+            log.warning("uplink_token_refresh_failed: %s", self.last_error)
             return None
 
     def _set_fallback(self, active: bool) -> None:
         if active != self.fallback_active:
             self.fallback_active = active
-            log.warning("uplink_fallback_%s", "on (JPEG path)" if active else "off (video)")
+            if active:
+                log.warning("uplink_fallback_on (JPEG path) reason=%s", _clip(self.last_error or "-"))
+            else:
+                log.warning("uplink_fallback_off (video)")
             self._on_fallback(active)
 
     async def _sleep(self, seconds: float) -> None:

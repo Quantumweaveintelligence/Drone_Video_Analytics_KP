@@ -52,11 +52,13 @@ class FakeIngestServer:
         close_after_frames: Optional[int] = None,
         close_code: int = 1011,
         refuse_owner: bool = False,
+        close_conns: int = 1,
     ) -> None:
         self.token = token
         self.reject_404 = reject_404
         self.close_after_frames = close_after_frames
         self.close_code = close_code
+        self.close_conns = close_conns          # close mid-stream on the first N connections
         self.refuse_owner = refuse_owner
         self.rec = Recorded()
         self.last_seq = 0
@@ -134,7 +136,7 @@ class FakeIngestServer:
                     self.rec.unique_seqs.add(body["seq"])
                     self.last_seq = body["seq"]
                 frames_this_conn += 1
-                if self.close_after_frames and frames_this_conn >= self.close_after_frames and self.rec.connections == 1:
+                if self.close_after_frames and frames_this_conn >= self.close_after_frames and self.rec.connections <= self.close_conns:
                     await ws.close(self.close_code, "test close")
                     return
             elif kind == "auth":

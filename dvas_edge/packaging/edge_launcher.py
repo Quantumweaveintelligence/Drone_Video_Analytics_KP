@@ -205,7 +205,7 @@ async def launcher_health():
     return {
         "status": "ok",
         "app": "DVAS_Edge_Launcher",
-        "version": "2.0.0",
+        "version": "2.0.2",
         "core": supervisor.state if supervisor else "unknown",
     }
 

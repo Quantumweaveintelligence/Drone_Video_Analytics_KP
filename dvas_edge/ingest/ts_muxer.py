@@ -6,16 +6,45 @@ Remux H.264 packets into MPEG-TS bytes in memory (no decode, no re-encode).
 One muxer per uplink connection: every connection starts with a fresh TS stream
 (PAT/PMT, then SPS/PPS + keyframe), timestamps rebased so the first packet is 0.
 FFmpeg's mpegts muxer converts MP4-style (AVCC) packets to Annex B on its own.
+
+The muxer is built from a `TemplateParams` snapshot (codec name, extradata, size,
+time base) captured once from the source stream, never from the live stream object.
+A live `av.Stream` belongs to the reader thread's container; building a muxer from it
+on the uplink thread races libav and crashes the process (native access violation).
+The snapshot is plain data, so any number of muxers can be built from it, on any
+thread, after the source has closed.
 """
 from __future__ import annotations
 
 import io
+from dataclasses import dataclass
 from fractions import Fraction
 from typing import Optional
 
 import av
 
 TS_PACKET = 188
+
+
+@dataclass(frozen=True)
+class TemplateParams:
+    """Thread-safe snapshot of a video stream's codec parameters for remuxing."""
+    codec: str
+    extradata: bytes
+    width: int
+    height: int
+    time_base: Fraction
+
+    @classmethod
+    def from_stream(cls, stream: "av.video.stream.VideoStream") -> "TemplateParams":
+        cc = stream.codec_context
+        return cls(
+            codec=cc.name,
+            extradata=bytes(cc.extradata or b""),
+            width=cc.width,
+            height=cc.height,
+            time_base=stream.time_base or Fraction(1, 90000),
+        )
 
 
 class _Sink(io.RawIOBase):
@@ -31,10 +60,17 @@ class _Sink(io.RawIOBase):
 
 
 class TsMuxer:
-    def __init__(self, template: av.video.stream.VideoStream) -> None:
+    def __init__(self, template: TemplateParams) -> None:
         self._sink = _Sink()
         self._out = av.open(self._sink, "w", format="mpegts", options={"flush_packets": "1"})
-        self._stream = self._out.add_stream_from_template(template)
+        self._stream = self._out.add_stream(template.codec)
+        ctx = self._stream.codec_context
+        ctx.width = template.width
+        ctx.height = template.height
+        if template.extradata:
+            ctx.extradata = template.extradata       # SPS/PPS: lets FFmpeg convert AVCC -> Annex B
+        self._stream.time_base = template.time_base
+        ctx.time_base = template.time_base
         self._time_base: Fraction = template.time_base
         self._base: Optional[int] = None
 

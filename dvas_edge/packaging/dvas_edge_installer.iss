@@ -1,16 +1,13 @@
 ; ============================================================
 ; DVAS Edge Operator — Inno Setup Installer Script
 ; ============================================================
-; Compile with:
-;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DClientSecret=xxx /DEdgeApiKey=yyy ^
-;       [/DIngestPassword=zzz] [/DDefaultIngestUrl=https://<pod>-80.proxy.runpod.net] dvas_edge_installer.iss
-; ClientSecret is required (the build stops without it). Leave EdgeApiKey unset: each laptop
-; then generates its own random key on first start.
+; Build-time secrets are deliberately not accepted. Setup collects credentials, then the
+; launcher migrates them to the current user's DPAPI store on first start.
 ; ============================================================
 
 #define AppName      "Kerala Police DVAS Edge Operator"
 #ifndef AppVersion
-  #define AppVersion "2.0.0"
+  #define AppVersion "2.0.2"
 #endif
 ; Pilot builds open a console window with live logs; build with /DConsoleMode=0 to hide it.
 #ifndef ConsoleMode
@@ -26,20 +23,13 @@
 #define AppPublisher "Kerala Police — Drone Video Analytics"
 #define AppExeName   "edge_launcher.py"
 
-; Build-time parameters (pass via /D on command line). There are no defaults:
-; a secret compiled into the installer would ship to every laptop.
-#ifndef ClientSecret
-  #error ClientSecret not set. Build with: ISCC.exe /DClientSecret=... /DEdgeApiKey=... dvas_edge_installer.iss
-#endif
-#ifndef EdgeApiKey
-  ; Empty: each laptop generates its own random key on first start (stored with DPAPI)
-  #define EdgeApiKey ""
-#endif
-#ifndef IngestPassword
-  #define IngestPassword ""
-#endif
 #ifndef DefaultIngestUrl
-  #define DefaultIngestUrl ""
+  #define DefaultIngestUrl "https://qlbqcydnz8dzxu-80.proxy.runpod.net"
+#endif
+#ifdef SigningThumbprint
+  #ifndef TimestampUrl
+    #define TimestampUrl "http://timestamp.digicert.com"
+  #endif
 #endif
 
 [Setup]
@@ -59,9 +49,18 @@ DisableDirPage=auto
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\static\favicon.ico
 ArchitecturesInstallIn64BitMode=x64compatible
+#ifdef SigningThumbprint
+SignTool=DVAS
+SignedUninstaller=yes
+#endif
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
+
+#ifdef SigningThumbprint
+[SignTools]
+Name: "DVAS"; Command: "signtool.exe"; Parameters: "sign /sha1 {#SigningThumbprint} /fd SHA256 /tr {#TimestampUrl} /td SHA256 $f"
+#endif
 
 [Files]
 ; Main application distribution
@@ -105,10 +104,22 @@ begin
   IngestPage := CreateInputQueryPage(wpSelectDir,
     'DVAS Ingest Server',
     'Ingest server address',
-    'Verify or edit the DVAS Ingest Server URL for this operator laptop.'#13#10 +
-    'Enter the RunPod / ingest server address, e.g. https://<pod>-80.proxy.runpod.net');
+    'Enter the DVAS Ingest Server URL. After setup, sign in to DVAS with your operator account. The installer does not collect or store your operator password.');
   IngestPage.Add('Ingest Server URL:', False);
   IngestPage.Values[0] := '{#DefaultIngestUrl}';
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if CurPageID = IngestPage.ID then
+  begin
+    if Trim(IngestPage.Values[0]) = '' then
+    begin
+      MsgBox('Enter the Ingest Server URL.', mbError, MB_OK);
+      Result := False;
+    end
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -146,11 +157,9 @@ begin
       Lines.Add('# Ingest server (RunPod) URL. Frame, mission, token and video endpoints are derived from it.');
       Lines.Add('# It can also be changed in the app: Settings > Ingest server URL.');
       Lines.Add('INGEST__BASE_URL=' + CloudBase);
+      Lines.Add('INGEST__TOKEN_URL=' + CloudBase + '/realms/kerala-police-drone/protocol/openid-connect/token');
       Lines.Add('INGEST__CLIENT_ID=drone-ingest-client');
-      Lines.Add('# Secrets below are moved to an encrypted store (Windows DPAPI) on first start.');
-      Lines.Add('INGEST__CLIENT_SECRET={#ClientSecret}');
-      Lines.Add('# INGEST__USERNAME auto-detected from Windows computer name');
-      Lines.Add('INGEST__PASSWORD={#IngestPassword}');
+      Lines.Add('# Authenticate to ingest with the operator session after signing in to DVAS.');
       Lines.Add('INGEST__DRONE_ID=DRN-000');
       if Pos('https://', LowerUrl) = 1 then
         Lines.Add('INGEST__TLS_VERIFY=true')
@@ -160,7 +169,7 @@ begin
         Lines.Add('# Plain http accepted only because the installer was given an http:// LAN address');
         Lines.Add('DVAS_ALLOW_HTTP_INGEST=true');
       end;
-      Lines.Add('EDGE_API_KEY={#EdgeApiKey}');
+      Lines.Add('EDGE_API_KEY=');
       Lines.Add('REQUIRE_EDGE_AUTH=true');
       Lines.Add('# Local ports (auto-detects free port if busy)');
       Lines.Add('# DVAS_PORT=8765');

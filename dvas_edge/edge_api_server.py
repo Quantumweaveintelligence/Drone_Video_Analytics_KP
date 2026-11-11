@@ -33,12 +33,13 @@ import queue
 import collections
 import subprocess
 import json
+import hashlib
 import copy
 import re
 import hmac
 import math
 import random
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 # ── Third party ──────────────────────────────────────────────────────────────
 import uvicorn
@@ -100,6 +101,11 @@ DEFAULT_SETTINGS = {
         "transport": "h264_ws",        # h264_ws (continuous video) | jpeg_http (v1 path)
         "local_fps": 10,
         "local_width": 960,
+        "packet_spool_max_mb": 2048,
+        "transcode_enabled": True,
+        "video_encoder": "auto",
+        "video_max_kbps": 8000,
+        "video_max_width": 1920,
         "concurrency_semaphore": 10,
     },
     "storage": {
@@ -247,6 +253,10 @@ class ToggleIngestRequest(BaseModel):
 _QueueItem = Union[SelectedFrame, tuple, None]
 
 
+START_RETRY_MIN_S = 2.0        # ingest mission/start retry back-off (doubles up to the max)
+START_RETRY_MAX_S = 30.0
+
+
 class EdgeSenderThread(threading.Thread):
     def __init__(self, client: IngestClient, server_send_initial: bool = False, max_queue: int = 64,
                  seq_store: Optional[SeqStore] = None) -> None:
@@ -266,6 +276,13 @@ class EdgeSenderThread(threading.Thread):
         self._loop:    Optional[asyncio.AbstractEventLoop] = None
         self._running  = True
         self._mission_started = False
+        self._started_lock = threading.Lock()
+        self._on_started: list = []
+        self._send_requested = server_send_initial     # operator wants server send: keep trying mission/start
+        self._start_in_flight = False                  # single-flight guard (only touched on the sender loop)
+        self._start_task: Optional[asyncio.Task] = None
+        self._start_backoff_s = START_RETRY_MIN_S
+        self._next_start_try = 0.0
         self._server_send_initial = server_send_initial
         self._mission_name: Optional[str] = None
         self._location:     Optional[str] = None
@@ -297,6 +314,7 @@ class EdgeSenderThread(threading.Thread):
         """Triggered when SERVER SEND: ON is activated by the operator."""
         if geofence is not None:
             self._geofence = geofence
+        self._send_requested = True                  # the sender loop retries if this attempt fails
         if not self._mission_started and self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(
                 self._do_start_mission(), self._loop
@@ -306,9 +324,25 @@ class EdgeSenderThread(threading.Thread):
                 self._client.send_geofence_update(self._geofence), self._loop
             )
 
+    def on_server_send_disabled(self) -> None:
+        """SERVER SEND: OFF: stop retrying mission/start and drop waiting starts (ON adds a new one)."""
+        self._send_requested = False
+        with self._started_lock:
+            self._on_started.clear()
+
+    def when_mission_started(self, callback: Callable[[], None]) -> None:
+        """Run *callback* once ingest has accepted mission/start (at once if it already has)."""
+        with self._started_lock:
+            if not self._mission_started:
+                self._on_started.append(callback)
+                return
+        callback()
+
     async def _do_start_mission(self) -> None:
-        if self._mission_started:
+        if self._mission_started or self._start_in_flight or not self._running:
             return
+        self._start_in_flight = True
+        self._start_task = asyncio.current_task()          # cancelled before mission/end (see _async_run)
         try:
             await self._client.start_mission(
                 mission_name=self._mission_name,
@@ -316,10 +350,24 @@ class EdgeSenderThread(threading.Thread):
                 operator=self._operator,
                 geofence=self._geofence,
             )
-            self._mission_started = True
-            log.info("edge_sender_mission_started_on_ingest", extra={"mission": self._client.mission_id, "has_geofence": bool(self._geofence)})
         except Exception as e:
-            log.warning(f"edge_sender_start_mission_failed: {e}")
+            log.warning(f"edge_sender_start_mission_failed: {type(e).__name__}; retry in {self._start_backoff_s:.0f} s")
+            emit_system_log("ingest", "ERROR",
+                            f"Mission start on ingest failed ({type(e).__name__}); retrying in {self._start_backoff_s:.0f} s")
+            self._next_start_try = time.monotonic() + self._start_backoff_s
+            self._start_backoff_s = min(START_RETRY_MAX_S, self._start_backoff_s * 2)
+            return
+        finally:
+            self._start_in_flight = False
+        with self._started_lock:
+            self._mission_started = True
+            callbacks, self._on_started = self._on_started, []
+        log.info("edge_sender_mission_started_on_ingest", extra={"mission": self._client.mission_id, "has_geofence": bool(self._geofence)})
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception as exc:          # one failing listener must not block the others
+                log.warning(f"mission_started_callback_failed: {type(exc).__name__}: {exc}")
 
     def put_frame(self, frame: SelectedFrame, telemetry: dict = None, seq: Optional[int] = None) -> None:
         """Queue a SelectedFrame (from cognitive pipeline) with optional telemetry."""
@@ -369,7 +417,7 @@ class EdgeSenderThread(threading.Thread):
 
     async def _async_run(self) -> None:
         if self._server_send_initial:
-            await self._do_start_mission()
+            await asyncio.create_task(self._do_start_mission())   # own task: _start_task must not be this loop
 
         loop = asyncio.get_event_loop()
         in_flight: dict = {}          # frame_id -> asyncio.Task
@@ -377,6 +425,9 @@ class EdgeSenderThread(threading.Thread):
         self._consecutive_failures = 0
 
         while self._running:
+            if (self._send_requested and not self._mission_started and not self._start_in_flight
+                    and time.monotonic() >= self._next_start_try):
+                loop.create_task(self._do_start_mission())
             for fid in [f for f, t in in_flight.items() if t.done()]:
                 del in_flight[fid]
 
@@ -400,6 +451,10 @@ class EdgeSenderThread(threading.Thread):
 
         if in_flight:
             await asyncio.gather(*in_flight.values(), return_exceptions=True)
+        start_task = self._start_task
+        if start_task is not None and not start_task.done():
+            start_task.cancel()                     # a start must never reach ingest after the end
+            await asyncio.gather(start_task, return_exceptions=True)
         self._buffer.close()
         try:
             await self._client.end_mission()
@@ -790,6 +845,10 @@ class PipelineManager:
                     initial_play_state=self.server_send_enabled,
                     local_fps=float(tx.get("local_fps", 10)),
                     local_width=int(tx.get("local_width", 960)),
+                    transcode_enabled=bool(tx.get("transcode_enabled", True)),
+                    transcode_max_kbps=int(tx.get("video_max_kbps", 8000)),
+                    transcode_max_width=int(tx.get("video_max_width", 1920)),
+                    transcode_encoder=str(tx.get("video_encoder", "auto")),
                 )
             else:
                 self.source = RealVideoSource(
@@ -911,6 +970,7 @@ class PipelineManager:
                     pass
             if self.video_uplink is not None:
                 self.video_uplink.stop()
+                self.video_uplink.close_spool()
             if self.sender_thread is not None:
                 self.sender_thread.stop()
 
@@ -1012,10 +1072,13 @@ class PipelineManager:
                     self.source.pause()
             if enabled and self.sender_thread is not None:
                 self.sender_thread.on_server_send_enabled(self.geofence)
+            elif not enabled and self.sender_thread is not None:
+                self.sender_thread.on_server_send_disabled()
             if self.video_uplink is not None:
                 if enabled and not self.video_uplink.running:
-                    self.video_uplink.start()
+                    self._start_video_uplink()
                 elif not enabled and self.video_uplink.running:
+                    self.video_uplink.request_stop()   # at once: a quick ON must see running == False
                     threading.Thread(target=self.video_uplink.stop, daemon=True).start()   # closes with 1000
             log.info("server_send_toggled", enabled=enabled, source_active=self.source is not None)
             return self.server_send_enabled
@@ -1028,6 +1091,30 @@ class PipelineManager:
             return True
         return self.video_uplink is None or self.video_uplink.fallback_active
 
+    def _start_video_uplink(self) -> None:
+        """Open the video WebSocket only after ingest has the mission (contract §3: mission/start first)."""
+        uplink = self.video_uplink
+        if uplink is None:
+            return
+
+        def _start() -> None:
+            uplink.wait_stopped()                     # after a quick OFF -> ON; outside the lock (can take seconds)
+            # Server send may have been switched off, or the mission replaced, while mission/start ran.
+            # Under the lock, so set_server_send(False) / end_mission cannot slip between check and start.
+            with self.lock:
+                if self.server_send_enabled and self.video_uplink is uplink and not uplink.running:
+                    uplink.start()
+
+        def _start_async() -> None:
+            # Own thread: callers may hold the lock (set_server_send) or be joined by a lock holder
+            # (the source reader thread, joined by end_mission); waiting for the lock here would stall them.
+            threading.Thread(target=_start, name="UplinkStart", daemon=True).start()
+
+        if self.sender_thread is None:
+            _start_async()
+        else:
+            self.sender_thread.when_mission_started(_start_async)
+
     def _video_seq(self, frame_index: int) -> Optional[int]:
         """In h264_ws mode a decoded frame's index IS its video seq: reuse it for its JPEG."""
         return frame_index if self.transport == "h264_ws" else None
@@ -1037,26 +1124,34 @@ class PipelineManager:
         if self.video_uplink is not None:
             return                                   # reconnect of a live source: keep the uplink
         endpoints = _ingest_endpoints()
-        codec = stream.codec_context.name
+        codec = getattr(self.source, "uplink_codec", stream.codec_context.name).lower()
         if endpoints is None:
             self.uplink_note = "Ingest server URL not configured"
             return
-        if codec != "h264":
-            # Copy mode only in this release; transcoding (HEVC etc.) arrives with the ladder.
-            self.uplink_note = f"{codec} source: sending JPEG frames (video uplink needs H.264)"
-            log.warning("video_uplink_codec_unsupported", codec=codec)
+        if codec not in ("h264", "avc"):
+            self.uplink_note = f"{codec} source: H.264 encoder unavailable; using JPEG frames"
+            log.warning("video_uplink_codec_unsupported", codec=codec,
+                        bitrate=getattr(self.source, "source_bitrate", 0))
             return
+        template = getattr(self.source, "uplink_template", None) or stream
+        width = getattr(self.source, "uplink_width", 0) or stream.width
+        height = getattr(self.source, "uplink_height", 0) or stream.height
         uplink = VideoUplink(
             url=endpoints.video_ws, client=client, drone_id=drone_id, mission_id=mission_id,
-            laptop_id=laptop_id, template_stream=stream, ring=self.source.ring,
-            info=StreamInfo(codec="h264", width=stream.width, height=stream.height, fps=fps, source=source_kind),
+            laptop_id=laptop_id, template_stream=template, ring=self.source.ring,
+            info=StreamInfo(codec="h264", width=width, height=height, fps=fps, source=source_kind),
             on_error=lambda msg: emit_system_log("ingest", "ERROR", f"Video uplink stopped: {msg}"),
+            spool_path=_EDGE_DATA_DIR / "packet_spool" / f"{hashlib.sha256(mission_id.encode()).hexdigest()[:24]}.sqlite3",
+            spool_max_bytes=min(8192, max(64, int(settings_manager.get_all().get("transmission", {}).get(
+                "packet_spool_max_mb", 2048)))) * 1024 * 1024,
         )
         self.source.add_packet_listener(uplink.push)
         self.video_uplink = uplink
         if self.server_send_enabled:
-            uplink.start()
-        log.info("video_uplink_attached", url=endpoints.video_ws, width=stream.width, height=stream.height, fps=round(fps, 2))
+            self._start_video_uplink()
+        log.info("video_uplink_attached", url=endpoints.video_ws, width=width, height=height, fps=round(fps, 2),
+                 source_codec=stream.codec_context.name, source_bitrate=getattr(self.source, "source_bitrate", 0),
+                 encoder=getattr(getattr(self.source, "_transcoder", None), "encoder_name", "copy"))
 
     # ── Status / Telemetry ────────────────────────────────────────────────
 
@@ -1181,12 +1276,26 @@ class PipelineManager:
 # ---------------------------------------------------------------------------
 JWKS_CACHE = {}
 
+def _jwks_url() -> str:
+    """Use the configured public Keycloak URL to validate dashboard session tokens."""
+    token_url = os.getenv("INGEST__TOKEN_URL", "").strip()
+    if not token_url:
+        endpoints = IngestEndpoints.from_env()
+        token_url = endpoints.token if endpoints else ""
+    suffix = "/protocol/openid-connect/token"
+    if token_url.endswith(suffix):
+        return token_url[:-len("token")] + "certs"
+    return ""
+
+
 def get_jwks():
     global JWKS_CACHE
     if JWKS_CACHE:
         return JWKS_CACHE
-    token_url = os.getenv("INGEST__TOKEN_URL", "http://keycloak:8080/realms/kerala-police-drone/protocol/openid-connect/token")
-    certs_url = token_url.replace("/token", "/certs")
+    certs_url = _jwks_url()
+    if not certs_url:
+        log.error("Cannot fetch JWKS: configure INGEST__BASE_URL or INGEST__TOKEN_URL")
+        return JWKS_CACHE
     tls_verify = os.getenv("INGEST__TLS_VERIFY", "true").lower() == "true"
     try:
         import httpx
@@ -1468,12 +1577,18 @@ async def upload_srt(
 def start_mission(req: MissionStartRequest, auth: dict = Depends(verify_edge_auth)):
     token = auth.get("token") or _ACTIVE_OPERATOR_TOKEN
     expiry = auth.get("token_expiry", 0.0)
-    return pipeline.start_mission(req, session_token=token, token_expiry=expiry)
+    try:
+        return pipeline.start_mission(req, session_token=token, token_expiry=expiry)
+    finally:
+        invalidate_snapshot()
 
 
 @app.post("/api/edge/mission/end")
 def end_mission(auth: dict = Depends(verify_edge_auth)):
-    return pipeline.end_mission()
+    try:
+        return pipeline.end_mission()
+    finally:
+        invalidate_snapshot()
 
 
 @app.post("/api/edge/mission/toggle-ingest")
@@ -1692,27 +1807,53 @@ async def test_transmission_connection(req: TestConnectionRequest, auth: dict = 
         raise HTTPException(status_code=422, detail=f"Ingest server URL: {exc}")
     if endpoints is None:
         raise HTTPException(status_code=422, detail="Ingest server URL is not configured")
-    base_url = endpoints.base
+    # Checking the host root can report a false positive when a proxy serves the dashboard
+    # shell but the ingest API behind it is missing or unhealthy. Probe the frame route,
+    # which is part of both the legacy JPEG and current video clients.
+    probe_url = endpoints.frame
 
     start_time = time.time()
     try:
         async with httpx.AsyncClient(timeout=3.0, verify=_tls_verify()) as client:
-            r = await client.get(base_url)
+            r = await client.get(probe_url)
             latency_ms = round((time.time() - start_time) * 1000, 1)
+            if r.status_code in (200, 401, 403, 405, 422):
+                # 401/403 is expected without an ingest token; 405 confirms the POST-only
+                # route exists. All of these prove the ingest route answered.
+                return {
+                    "status": "online",
+                    "latency_ms": latency_ms,
+                    "http_status": r.status_code,
+                    "target": endpoints.base,
+                    "probe": "/ingest/frame",
+                    "message": "Ingest API reachable",
+                }
+            if r.status_code == 404:
+                return {
+                    "status": "unreachable",
+                    "latency_ms": latency_ms,
+                    "http_status": r.status_code,
+                    "error": "Host responded, but the ingest frame route was not found",
+                    "target": endpoints.base,
+                    "probe": "/ingest/frame",
+                }
             return {
-                "status": "online",
+                "status": "unreachable",
                 "latency_ms": latency_ms,
                 "http_status": r.status_code,
-                "target": base_url,
+                "error": f"Ingest API returned HTTP {r.status_code}",
+                "target": endpoints.base,
+                "probe": "/ingest/frame",
             }
     except httpx.HTTPError as e:
         latency_ms = round((time.time() - start_time) * 1000, 1)
-        log.warning(f"test_connection_failed target={base_url} error={type(e).__name__}")
+        log.warning(f"test_connection_failed target={endpoints.base} error={type(e).__name__}")
         return {
             "status": "unreachable",
             "latency_ms": latency_ms,
-            "error": "Server not reachable",
-            "target": base_url,
+            "error": "Ingest API not reachable",
+            "target": endpoints.base,
+            "probe": "/ingest/frame",
         }
 
 
@@ -2300,6 +2441,12 @@ def _uplink_view() -> dict:
         "video": pipeline.video_uplink.stats() if pipeline.video_uplink is not None else None,
         "decoder": pipeline.source.decoder.stats() if getattr(pipeline.source, "decoder", None) else None,
     }
+
+
+def invalidate_snapshot() -> None:
+    """Force the next snapshot to be rebuilt (a mission started or ended: old data would mislead the UI)."""
+    with _snapshot_lock:
+        _snapshot_cache["data"] = None
 
 
 def build_snapshot() -> dict:

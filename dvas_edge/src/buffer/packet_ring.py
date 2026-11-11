@@ -4,8 +4,8 @@ src/buffer/packet_ring.py
 The last N seconds of *compressed* video packets (H.264), GOP-aligned.
 
 Used for:
-- resume after a reconnect: restart the uplink at the newest keyframe, so the picture
-  comes back at once instead of waiting up to one GOP;
+- resume after a reconnect: replay from the keyframe at or before the first
+  unsent sequence, while the packet remains in the ring;
 - evidence clips: remux packets to MP4 without decoding or re-encoding (source quality);
 - native-resolution CFS stills when the decoded frame is no longer in memory.
 
@@ -69,6 +69,14 @@ class PacketRing:
         with self._lock:
             for i in range(len(self._packets) - 1, -1, -1):
                 if self._packets[i].key:
+                    return list(self._packets)[i:]
+            return []
+
+    def from_first_keyframe(self) -> List[RingPacket]:
+        """All retained packets from the oldest keyframe (used for a delayed first connect)."""
+        with self._lock:
+            for i, pkt in enumerate(self._packets):
+                if pkt.key:
                     return list(self._packets)[i:]
             return []
 

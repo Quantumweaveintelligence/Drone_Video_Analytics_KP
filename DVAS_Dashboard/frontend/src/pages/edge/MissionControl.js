@@ -4,6 +4,9 @@ import { Target, Play, Trash, Trash2, XCircle, CheckCircle, Cpu } from 'lucide-r
 import { authFetch, getAuthToken } from '@/lib/api';
 import { useEdgeLive } from "@/lib/edgeLive";
 
+// How long a just-started mission is protected from a stale "no mission" snapshot
+const UNCONFIRMED_START_GRACE_MS = 10000;
+
 export default function MissionControl() {
   const [activeMission, setActiveMission] = useState(null);
   const [serverSend, setServerSend] = useState(false);
@@ -47,6 +50,9 @@ export default function MissionControl() {
     }
     return [];
   });
+  // Missions started here that the edge has not yet reported as active (id -> start time, ms).
+  // A snapshot taken before the start must not auto-end them.
+  const unconfirmedStartsRef = React.useRef(new Map());
 
   const fetchSettings = async () => {
     try {
@@ -279,6 +285,7 @@ export default function MissionControl() {
       });
       const data = await resp.json();
       if (data.status === 'started') {
+        unconfirmedStartsRef.current.set(data.mission_id, Date.now());
         setActiveMission({
           id: data.mission_id,
           designation: data.mission_name,
@@ -430,6 +437,7 @@ export default function MissionControl() {
         const data = getSnapshot()?.mission;
         if (!data) return;            // not connected yet: never treat as "no mission"
         if (data.active) {
+          unconfirmedStartsRef.current.delete(data.mission_id);
           setServerSend(data.server_send_enabled || false);
           setPipelineEnabled(data.pipeline_enabled !== undefined ? data.pipeline_enabled : true);
           setActiveMission({
@@ -443,6 +451,12 @@ export default function MissionControl() {
             videoSourceType: data.video_source_type,
           });
         } else {
+          const pending = unconfirmedStartsRef.current;
+          const now = Date.now();
+          for (const [id, startedAt] of pending) {
+            if (now - startedAt > UNCONFIRMED_START_GRACE_MS) pending.delete(id);
+          }
+          if (pending.size > 0) return;   // snapshot may predate the start: keep the new mission
           setActiveMission(null);
           setMissionLog(logs => {
             const staleMissions = logs.filter(m => m.status === 'active');

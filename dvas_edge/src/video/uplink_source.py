@@ -19,6 +19,7 @@ from typing import Callable, List, Optional
 import av
 
 from src.buffer.packet_ring import PacketRing, RingPacket
+from src.video.h264_transcoder import H264Transcoder
 from src.video.local_decoder import LocalDecoder
 from src.video.real_video_source import _empty_telemetry, _load_telemetry, telemetry_for_frame
 
@@ -58,6 +59,10 @@ class UplinkVideoSource:
         local_width: int = 960,
         playback_speed: float = 1.0,
         ring: Optional[PacketRing] = None,
+        transcode_enabled: bool = True,
+        transcode_max_kbps: int = 8000,
+        transcode_max_width: int = 1920,
+        transcode_encoder: str = "auto",
     ) -> None:
         self.drone_id = drone_id
         self.video_source = video_source
@@ -71,6 +76,16 @@ class UplinkVideoSource:
         self._local_width = local_width
         self._speed = max(0.1, playback_speed)
         self.ring = ring or PacketRing()
+        self._transcode_enabled = transcode_enabled
+        self._transcode_max_kbps = max(250, int(transcode_max_kbps))
+        self._transcode_max_width = max(2, int(transcode_max_width))
+        self._transcode_encoder = transcode_encoder
+        self._transcoder: Optional[H264Transcoder] = None
+        self.uplink_codec = ""
+        self.uplink_width = 0
+        self.uplink_height = 0
+        self.uplink_template = None
+        self.source_bitrate = 0
         self._listeners: List[Callable[[RingPacket], None]] = []
         self.decoder: Optional[LocalDecoder] = None
 
@@ -151,11 +166,31 @@ class UplinkVideoSource:
             stream = container.streams.video[0]
             fps = float(stream.average_rate or stream.guessed_rate or 30.0)
             self.codec = stream.codec_context.name
+            self.source_bitrate = int(stream.codec_context.bit_rate or container.bit_rate or 0)
+            needs_transcode = self._transcode_enabled and (
+                self.codec.lower() not in ("h264", "avc")
+                or self.source_bitrate > self._transcode_max_kbps * 1000
+            )
+            self._transcoder = None
+            if needs_transcode:
+                try:
+                    self._transcoder = H264Transcoder(
+                        stream, self._seq, fps, self._transcode_max_kbps, self._transcode_max_width,
+                        self._transcode_encoder
+                    )
+                except (av.FFmpegError, RuntimeError, ValueError) as exc:
+                    log.error("uplink_transcode_unavailable codec=%s bitrate=%d error=%s",
+                              self.codec, self.source_bitrate, exc)
+            self.uplink_codec = "h264" if self._transcoder is not None else self.codec.lower()
+            self.uplink_width = self._transcoder.width if self._transcoder is not None else stream.width
+            self.uplink_height = self._transcoder.height if self._transcoder is not None else stream.height
+            self.uplink_template = self._transcoder.template if self._transcoder is not None else stream
             if not self._live and not self._srt:
                 self._srt = _load_telemetry(self.video_source, fps)
                 self._srt_keys = sorted(self._srt)
             if self.decoder is None:
-                self.decoder = LocalDecoder(stream, self.on_frame, self._local_fps, self._local_width)
+                decoder_template = self._transcoder.template if self._transcoder is not None else stream
+                self.decoder = LocalDecoder(decoder_template, self.on_frame, self._local_fps, self._local_width)
                 self.decoder.start()
             if self._on_stream_ready is not None:
                 self._on_stream_ready(stream, fps)
@@ -165,6 +200,11 @@ class UplinkVideoSource:
             self._demux(container, stream, fps)
             return not self._live and not self._stop.is_set()
         finally:
+            if self._transcoder is not None:
+                for encoded in self._transcoder.flush():
+                    self._dispatch(encoded)
+                    if self.decoder is not None:
+                        self.decoder.push(encoded)
             container.close()
 
     def _demux(self, container, stream, fps: float) -> None:
@@ -198,15 +238,24 @@ class UplinkVideoSource:
                 capture_ts = time.time()
                 tel = _empty_telemetry()
             self._latest_tel = tel
-            rp = RingPacket(seq=self._seq.next(), pts=pkt.pts, dts=pkt.dts, capture_ts=capture_ts,
+            rp = RingPacket(seq=0 if self._transcoder is not None else self._seq.next(),
+                            pts=pkt.pts, dts=pkt.dts, capture_ts=capture_ts,
                             key=bool(pkt.is_keyframe), data=bytes(pkt), telemetry=tel)
-            self.ring.add(rp)
-            for listener in self._listeners:
-                listener(rp)
-            self.decoder.push(rp)
+            if self._transcoder is not None:
+                for encoded in self._transcoder.process(rp):
+                    self._dispatch(encoded)
+                    self.decoder.push(encoded)
+            else:
+                self._dispatch(rp)
+                self.decoder.push(rp)
             self._frame_index += 1
             window_frames += 1
             now = time.monotonic()
             if now - window_start >= 2.0:
                 self.source_fps = window_frames / (now - window_start)
                 window_start, window_frames = now, 0
+
+    def _dispatch(self, pkt: RingPacket) -> None:
+        self.ring.add(pkt)
+        for listener in self._listeners:
+            listener(pkt)

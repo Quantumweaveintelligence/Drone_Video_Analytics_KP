@@ -71,6 +71,39 @@ def test_test_connection_rejects_arbitrary_urls(core) -> None:
     assert r.status_code == 422
 
 
+@pytest.mark.parametrize(
+    ("upstream_status", "expected_status"),
+    [(401, "online"), (405, "online"), (404, "unreachable")],
+)
+def test_test_connection_checks_ingest_api_not_dashboard_shell(core, monkeypatch, upstream_status, expected_status) -> None:
+    mod, client = core
+
+    class FakeResponse:
+        status_code = upstream_status
+
+    class FakeAsyncClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, url):
+            assert url == "https://pod-80.proxy.runpod.net/ingest/frame"
+            return FakeResponse()
+
+    monkeypatch.setattr(mod.httpx, "AsyncClient", FakeAsyncClient)
+    response = client.post("/api/edge/transmission/test-connection", headers=HDR,
+                           json={"url": "https://pod-80.proxy.runpod.net"})
+    assert response.status_code == 200
+    assert response.json()["status"] == expected_status
+    if upstream_status == 404:
+        assert "frame route was not found" in response.json()["error"]
+
+
 def test_ingest_status_proxy_validates_drone_id(core) -> None:
     _, client = core
     assert client.get("/api/ingest-server/status/..", headers=HDR).status_code in (404, 422)

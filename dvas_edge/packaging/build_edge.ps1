@@ -10,7 +10,9 @@
 
 param(
     [string]$PythonVersion = "3.11.9",
-    [string]$AppVersion    = "1.0.0",
+    [string]$AppVersion    = "2.0.2",
+    [string]$SigningCertThumbprint = $env:DVAS_SIGNING_CERT_THUMBPRINT,
+    [string]$TimestampUrl = "http://timestamp.digicert.com",
     [switch]$SkipFrontend,
     [switch]$SkipInstaller
 )
@@ -194,11 +196,38 @@ if (-not $SkipInstaller) {
     $iscc = $isccPaths | Where-Object { Test-Path $_ } | Select-Object -First 1
     if ($iscc) {
         Write-Host "  Found Inno Setup at: $iscc"
+        $compileArgs = @("/DAppVersion=$AppVersion")
+        $thumbprint = ($SigningCertThumbprint -replace '\s', '').ToUpperInvariant()
+        if ($thumbprint) {
+            $signTool = Get-Command signtool.exe -ErrorAction SilentlyContinue
+            if (-not $signTool) {
+                $kitsRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
+                $signTool = Get-ChildItem -LiteralPath $kitsRoot -Filter signtool.exe -File -Recurse -ErrorAction SilentlyContinue |
+                    Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+                    Sort-Object FullName -Descending | Select-Object -First 1
+            }
+            if (-not $signTool) { throw "Signing certificate was configured, but signtool.exe was not found." }
+            $signToolPath = if ($signTool.Source) { $signTool.Source } else { $signTool.FullName }
+            $env:PATH = "$(Split-Path -Parent $signToolPath);$env:PATH"
+            Write-Host "  Signing packaged executable and library files..." -ForegroundColor Yellow
+            $signableFiles = Get-ChildItem -LiteralPath $DistDir -Recurse -File |
+                Where-Object { $_.Extension -in @('.exe', '.dll', '.pyd') }
+            foreach ($file in $signableFiles) {
+                Invoke-Native { & $signToolPath sign /sha1 $thumbprint /fd SHA256 /tr $TimestampUrl /td SHA256 $file.FullName } "Sign $($file.Name)"
+            }
+            $compileArgs += "/DSigningThumbprint=$thumbprint", "/DTimestampUrl=$TimestampUrl"
+        } else {
+            Write-Warning "No trusted signing certificate is configured. The installer will be unsigned and Smart App Control may block it."
+        }
         Write-Host "  Compiling installer..." -ForegroundColor Yellow
         $issFile = Join-Path $ScriptDir "dvas_edge_installer.iss"
-        & $iscc $issFile
+        & $iscc @compileArgs $issFile
+        if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed (exit $LASTEXITCODE)" }
         $exeOutput = Join-Path (Join-Path $ScriptDir "output") "DVAS_Edge_Setup_$AppVersion.exe"
         if (Test-Path $exeOutput) {
+            if ($thumbprint) {
+                Invoke-Native { & $signToolPath sign /sha1 $thumbprint /fd SHA256 /tr $TimestampUrl /td SHA256 $exeOutput } "Sign installer"
+            }
             $exeSize = [math]::Round((Get-Item $exeOutput).Length / 1MB, 1)
             Write-Host "  Installer generated: $exeOutput ($exeSize MB)" -ForegroundColor Green
         }

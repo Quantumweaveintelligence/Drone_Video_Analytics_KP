@@ -36,6 +36,11 @@ export default function Settings() {
       bypass_target_fps: 10,
       jpeg_quality: 80,
       max_resolution: '1080p',
+      packet_spool_max_mb: 2048,
+      transcode_enabled: true,
+      video_encoder: 'auto',
+      video_max_kbps: 8000,
+      video_max_width: 1920,
       concurrency_semaphore: 10,
     },
     storage: {
@@ -204,6 +209,11 @@ export default function Settings() {
         bypass_target_fps: 10,
         jpeg_quality: 80,
         max_resolution: '1080p',
+        packet_spool_max_mb: 2048,
+        transcode_enabled: true,
+        video_encoder: 'auto',
+        video_max_kbps: 8000,
+        video_max_width: 1920,
         concurrency_semaphore: 10,
       },
       storage: {
@@ -498,6 +508,94 @@ export default function Settings() {
                   <p className="text-[10px] text-slate-500 mt-1">
                     Prevents huge 4K drone streams from saturating field wireless uplink links.
                   </p>
+                </div>
+
+                {/* Bounded video replay spool */}
+                <div>
+                  <label className="block text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-2">
+                    Video Replay Disk Cap (MB)
+                  </label>
+                  <input
+                    type="number"
+                    min="64"
+                    max="8192"
+                    step="64"
+                    value={settings.transmission.packet_spool_max_mb}
+                    onChange={e => setSettings({
+                      ...settings,
+                      transmission: { ...settings.transmission, packet_spool_max_mb: Math.max(64, Math.min(8192, parseInt(e.target.value, 10) || 64)) }
+                    })}
+                    className="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 outline-none px-3 py-2 text-xs text-slate-200 rounded font-mono"
+                  />
+                  <p className="text-[10px] text-slate-500 mt-1">
+                    Caps compressed packets kept for reconnect replay. Default 2048 MB; each dropped packet is counted and logged when the cap is full.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-2">
+                      H.264 Transcoding
+                    </label>
+                    <select
+                      value={settings.transmission.transcode_enabled ? 'enabled' : 'disabled'}
+                      onChange={e => setSettings({ ...settings, transmission: {
+                        ...settings.transmission, transcode_enabled: e.target.value === 'enabled'
+                      } })}
+                      className="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 outline-none px-3 py-2 text-xs text-slate-200 rounded font-mono"
+                    >
+                      <option value="enabled">Enabled for HEVC and sources above bitrate cap</option>
+                      <option value="disabled">Disabled (H.264 copy only)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-2">
+                      H.264 Encoder
+                    </label>
+                    <select
+                      value={settings.transmission.video_encoder}
+                      onChange={e => setSettings({ ...settings, transmission: {
+                        ...settings.transmission, video_encoder: e.target.value
+                      } })}
+                      className="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 outline-none px-3 py-2 text-xs text-slate-200 rounded font-mono"
+                    >
+                      <option value="auto">Auto (hardware probe, then libx264)</option>
+                      <option value="h264_nvenc">NVIDIA NVENC</option>
+                      <option value="h264_qsv">Intel Quick Sync</option>
+                      <option value="h264_amf">AMD AMF</option>
+                      <option value="libx264">CPU libx264</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-2">
+                      Video Bitrate Cap (kbps)
+                    </label>
+                    <input
+                      type="number" min="250" max="100000" step="250"
+                      value={settings.transmission.video_max_kbps}
+                      onChange={e => setSettings({ ...settings, transmission: {
+                        ...settings.transmission, video_max_kbps: Math.max(250, Math.min(100000, parseInt(e.target.value, 10) || 250))
+                      } })}
+                      className="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 outline-none px-3 py-2 text-xs text-slate-200 rounded font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-2">
+                      Transcode Width Cap
+                    </label>
+                    <select
+                      value={settings.transmission.video_max_width}
+                      onChange={e => setSettings({ ...settings, transmission: {
+                        ...settings.transmission, video_max_width: parseInt(e.target.value, 10)
+                      } })}
+                      className="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 outline-none px-3 py-2 text-xs text-slate-200 rounded font-mono"
+                    >
+                      <option value="1280">1280 px</option>
+                      <option value="1920">1920 px (default)</option>
+                      <option value="2560">2560 px</option>
+                      <option value="3840">3840 px</option>
+                    </select>
+                  </div>
                 </div>
 
                 {/* Concurrency Semaphore */}
