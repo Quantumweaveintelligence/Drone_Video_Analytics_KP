@@ -463,7 +463,17 @@ New service `dvas_ingest/video_gateway/` (FastAPI + asyncio). It is a supervisor
 - a user outside the drone's access, or a free slot, is refused (403) and learns nothing about the
   stream.
 
-### R2 status on the pod (2026-11-11): video plays, but looks choppy from Kerala
+### R2 status on the pod (2026-11-11, final): **smooth live video verified** (image `20261111-8584b2c`)
+
+- Multi-Drone Grid plays the H.264 sub-stream smoothly from Kerala (operator check);
+  `nginx_live.log`: player sockets `101`, `listed=1` (RunPod's proxy passes Host
+  `100.65.x.x:<port>`, so the public-origin list is what admits them). A `403` after a mission
+  ends is expected: the slot is free and `/api/live/authorize` refuses it.
+- Sub-stream encoder on the pod: `h264_nvenc` (with `NVIDIA_DRIVER_CAPABILITIES=compute,utility,video`).
+- Same run: 4 × 4K, 2400 / 2400 frames per drone, 20 fps, ≤ 0.6 s behind live.
+- Still to record: badge numbers (sub vs. selected 4K tile) and glass-to-glass latency.
+
+#### History of the R2 debugging (kept for reference)
 
 **Root cause found (2026-11-11, later):** the tiles never played H.264. go2rtc refuses a
 WebSocket whose `Origin` differs from its `Host` (HTTP 403), and behind nginx the `Host` is
