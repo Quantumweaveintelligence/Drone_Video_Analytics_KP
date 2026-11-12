@@ -20,6 +20,7 @@ def fast(monkeypatch):
     monkeypatch.setattr(fs, "RESOLVE_EVERY_S", 0.0)
     monkeypatch.setattr(fs, "REORDER_MS", 0)
     monkeypatch.setattr(fs, "SHED_AFTER_S", 1.5)
+    monkeypatch.setattr(fs, "SHED_WARMUP_S", 0.0)
 
 
 class Clock:
@@ -31,10 +32,14 @@ class Clock:
 
 
 async def frames(c, key, seqs, age_s):
-    """Frames received age_s seconds ago (rx_ts_ms, as the video decoder writes them)."""
+    """Frames that entered the stream age_s seconds ago (the entry id's time, which the
+    service's wait is measured from); rx_ts_ms as the video decoder writes it."""
     rx = int((time.time() - age_s) * 1000)
+    last = await c.xrevrange(key, count=1)
+    ms = max(rx, int(last[0][0].decode().split("-")[0]) if last else 0)
     for q in seqs:
-        await c.xadd(key, {"frame": b"x", "frame_seq": str(q), "rx_ts_ms": str(rx), "ts": str(rx)})
+        await c.xadd(key, {"frame": b"x", "frame_seq": str(q), "rx_ts_ms": str(rx), "ts": str(rx)},
+                     id=f"{ms}-*")
 
 
 async def take(s, drone="D"):
@@ -130,4 +135,34 @@ def test_a_new_mission_starts_unshed_and_the_old_cadence_range_stays_with_its_st
         recs = [{k.decode(): v.decode() for k, v in e[1].items()} for e in await c.xrange(fs.SHED_LOG_KEY)]
         cad = [r for r in recs if r["reason"] == "cadence"]
         assert cad and all(r["stream"] == key1 and int(r["to_seq"]) >= int(r["from_seq"]) for r in cad)
+    run(t)
+
+
+def test_the_wait_counts_from_the_analytics_stream_not_from_the_server_receiving_it():
+    """The decoder's own delay (received 3 s ago, published just now) is not the service
+    falling behind: nothing is shed."""
+    async def t(c):
+        key = await mission(c, "D", "M1")
+        rx = int((time.time() - 3.0) * 1000)
+        for q in range(1, 11):
+            await c.xadd(key, {"frame": b"x", "frame_seq": str(q), "rx_ts_ms": str(rx), "ts": str(rx)})
+        s = sampler(c, clock=Clock())
+        got = [int((await take(s))["frame_seq"]) for _ in range(10)]
+        assert got == list(range(1, 11)) and s.shed_level("D") == 0
+    run(t)
+
+
+def test_no_frames_are_dropped_while_the_service_warms_up(monkeypatch):
+    monkeypatch.setattr(fs, "SHED_WARMUP_S", 10.0)
+    async def t(c):
+        key = await mission(c, "D", "M1")
+        await frames(c, key, range(1, 101), age_s=5.0)
+        clock = Clock()
+        s = sampler(c, clock=clock)
+        assert int((await take(s))["frame_seq"]) == 1 and s.shed_level("D") == 1
+        clock.t += 3.5                                           # would drop-oldest after warm-up
+        assert int((await take(s))["frame_seq"]) == 2 and s.shed_level("D") == 1
+        clock.t += 7.0                                           # warmed up, still 5 s behind
+        f = await take(s)
+        assert f["_gap"] == "1" and s.shed_level("D") == 2
     run(t)

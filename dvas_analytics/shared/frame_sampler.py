@@ -70,6 +70,7 @@ SHED_JUMP_AFTER_S = 3.0        # level 1 this long (or > 2 × SHED_AFTER_S behin
 SHED_RECOVER_S = 0.5           # at most this far behind …
 SHED_RECOVER_HOLD_S = 10.0     # … for this long → one level down
 SHED_TRACK_RESET_S = 1.0       # a jump over more time than this restarts the drone's trackers
+SHED_WARMUP_S = 10.0           # a drone's first seconds in a service (models warming up): no drops
 SHED_LOG_KEY = "dvas:analytics_shed"
 SHED_LOG_MAXLEN = 10000
 CAP_REFRESH_S = 2.0
@@ -258,6 +259,7 @@ class ShedState:
     pending: Optional[dict] = None       # cadence-shed range not yet logged
     priority_until: float = 0.0
     stream: str = ""                     # the mission stream this state belongs to
+    since: Optional[float] = None        # first frame of this stream seen by this service
 
 
 @dataclass
@@ -768,6 +770,15 @@ class FrameSampler:
     # ── Overload shedding (v2 R6.3) ──────────────────────────────────────────
     @staticmethod
     def _behind_s(fields: dict) -> Optional[float]:
+        """How long the frame has waited for this service: from when it entered the analytics
+        stream (the entry id's time), which is what shedding can win back. The video decoder's
+        own delay before that is not counted — no shedding here can reduce it, and counting it
+        kept services shedding at a light load (pod run 12 Nov: 4 drones, 8 of 27 cores, level 3).
+        Entries without a time id: from when the server received the frame."""
+        eid = str(fields.get("entry_id") or "")
+        ms = eid.split("-", 1)[0]
+        if ms.isdigit() and int(ms) > 0:
+            return max(0.0, time.time() - int(ms) / 1000.0)
         ts_ms = fields.get("rx_ts_ms") or fields.get("ts")
         try:
             t = float(ts_ms) / 1000.0 if ts_ms else 0.0
@@ -822,10 +833,15 @@ class FrameSampler:
             s = self._shed[d] = ShedState(priority_until=s.priority_until)
         s.stream = stream or s.stream
         now = self._clock()
+        if s.since is None:
+            s.since = now
+        warming = now - s.since < SHED_WARMUP_S
         if behind > SHED_AFTER_S:
             s.ok_since = None
             if s.level == 0:
                 self._set_level(d, s, 1, behind)
+            elif warming:
+                pass                                         # secondary stages off only, no drops
             elif ((s.level == 1 and (now - s.level_since >= SHED_JUMP_AFTER_S or behind > 2 * SHED_AFTER_S))
                   or (s.level >= 2 and now - s.last_jump >= SHED_JUMP_AFTER_S)):
                 fields = await self._shed_jump(client, d, s, fields, behind)

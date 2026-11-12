@@ -806,8 +806,14 @@ connected on the pod; drones go offline through the slower telemetry-pump fallba
 - When a service is enabled mid-mission it starts at the live position (no backlog from before).
 
 #### R6.3 Overload shedding for `every` services (`DVAS_SHED_AFTER_S=1.5`)
-Measured on the server clock (`rx_ts_ms` of the frame being read vs. now), with hysteresis:
-enter a level when behind > threshold, leave it after ≤ 0.5 s behind for 10 s.
+Measured as how long the frame has waited for this service since it entered the analytics
+stream (the entry id's time vs. now), with hysteresis: enter a level when the wait > threshold,
+leave it after ≤ 0.5 s for 10 s. A drone's first 10 s in a service (models warming up) shed
+secondary stages only, never frames.
+- *Pod run 12 Nov (image b2dd142):* measured from `rx_ts_ms` (when ingest received the frame)
+  the wait included the decoder's own delay, which shedding cannot win back: with 4 drones
+  (8 of 27 cores) person and intrusion entered level 3 at start-up and never left it — ≈ 3 fps
+  analysed of 20 published. Changed to the stream wait plus the warm-up.
 1. **Level 1 — shed secondary stages** (> 1.5 s): skip person whole-body Re-ID embeddings, face
    Re-ID clustering, face crop enhancement, anomaly secondary-model passes. **Kept even then:**
    detection, tracking, ArcFace watchlist matching on detected faces, plate OCR, alert
