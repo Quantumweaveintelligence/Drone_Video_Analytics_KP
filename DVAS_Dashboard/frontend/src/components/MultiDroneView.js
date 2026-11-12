@@ -54,6 +54,7 @@ import { useJpegPoller } from "@/hooks/useJpegPoller";
 import { useLiveVideo } from "@/hooks/useLiveVideo";
 import LiveVideoStats from "@/components/LiveVideoStats";
 import { useAnalyticsStates } from "@/hooks/useAnalyticsStates";
+import { useTileSlots } from "@/hooks/useTileSlots";
 import {
   useCrowdReadings,
   usePersonCount,
@@ -563,6 +564,57 @@ function DroneFeedCard({ drone, isSelected, hasSelection, onSelect, onPurge, can
             <span className="mono text-[10px] truncate" style={{ color: "var(--dvas-text)" }}>{drone.jurisdiction || "—"}</span>
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   OFFLINE TILE (v2 R7): a free place in the fixed grid. Makes no requests.
+   ───────────────────────────────────────────── */
+// Tiles the grid always shows; drones take the lowest free one (hooks/useTileSlots.js)
+const GRID_TILES = 20;
+
+function OfflineTileCard({ index, lastId, dimmed }) {
+  const label = `TILE ${String(index + 1).padStart(2, "0")}`;
+  return (
+    <div
+      className={`relative flex flex-col rounded-xl border border-slate-700/40 overflow-hidden h-full transition-all duration-500 ${dimmed ? "opacity-40" : ""}`}
+      style={{ background: "var(--dvas-surface)" }}
+      data-testid={`multidrone-tile-offline-${index + 1}`}
+    >
+      <div className="relative aspect-video bg-[#060e1a] overflow-hidden flex-shrink-0">
+        {[
+          "top-2 left-2 border-l-2 border-t-2",
+          "top-2 right-2 border-r-2 border-t-2",
+          "bottom-2 left-2 border-l-2 border-b-2",
+          "bottom-2 right-2 border-r-2 border-b-2",
+        ].map((cls, i) => (
+          <div key={i} className={`absolute w-4 h-4 ${cls} border-slate-600/40`} />
+        ))}
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2">
+          <WifiOff size={22} className="text-slate-500/60" />
+          <span className="mono text-[10px] text-slate-500">NO STREAM</span>
+        </div>
+        <div className="absolute top-3 left-3 z-10">
+          <div
+            className="mono text-[11px] font-bold px-2 py-0.5 rounded"
+            style={{ background: "rgba(6,14,26,0.82)", color: "#64748b", border: "1px solid rgba(100,116,139,0.3)" }}
+          >
+            {label}
+          </div>
+        </div>
+        <div className="absolute top-3 right-3 z-10">
+          <StatusPill status="offline" />
+        </div>
+      </div>
+      <div className="px-3 py-2.5 flex flex-col gap-1 flex-1 justify-center">
+        <span className="mono text-[8px] uppercase tracking-wider" style={{ color: "var(--dvas-text-dim)" }}>
+          Last drone
+        </span>
+        <span className="mono text-[10px] truncate" style={{ color: "var(--dvas-text-muted)" }}>
+          {lastId || "—"}
+        </span>
       </div>
     </div>
   );
@@ -1431,6 +1483,8 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
     if (ao !== bo) return ao - bo;
     return (a.id || "").localeCompare(b.id || "");
   });
+  // v2 R7: a fixed grid of GRID_TILES; each drone keeps its tile while it has one
+  const tiles = useTileSlots(drones, GRID_TILES);
   // v2 R6.4: live / degraded / shedding per live tile
   const analyticsStates = useAnalyticsStates(
     drones.filter((d) => d.status === "live" || d.status === "degraded").map((d) => d.id));
@@ -1493,20 +1547,20 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
 
       {/* ── 2. Drone Cards Grid (tiled CSS grid format) ── */}
       <div className="flex-1 overflow-y-auto dvas-scrollbar min-h-[60vh] xl:min-h-[500px]">
-        {drones.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-64 border border-dashed rounded-xl border-slate-700/60 p-8 text-center text-slate-500">
-            <Radio size={36} className="text-slate-600 mb-2 animate-pulse" />
-            <div className="text-sm font-semibold text-slate-400">No Active Mission Feeds</div>
-            <div className="text-xs text-slate-500 mt-1">Awaiting live telemetry or video stream from edge units...</div>
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 transition-all duration-500 ease-in-out h-full content-start pb-4">
-          {drones.map((d) => {
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4 transition-all duration-500 ease-in-out h-full content-start pb-4">
+          {tiles.map(({ index, drone: d, lastId }) => {
+            if (!d) {
+              return (
+                <div key={`tile-${index}`} className="col-span-1">
+                  <OfflineTileCard index={index} lastId={lastId} dimmed={!!selectedDroneId} />
+                </div>
+              );
+            }
             const isSelected = selectedDroneId === d.id;
-            
+
             return (
-              <div 
-                key={d.id} 
+              <div
+                key={d.id}
                 className={`transition-all duration-500 ease-in-out ${
                   isSelected 
                     ? "col-span-1 md:col-span-2 lg:col-span-2 xl:col-span-2 row-span-1 md:row-span-2" 
@@ -1526,7 +1580,6 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
             );
           })}
         </div>
-        )}
       </div>
 
 

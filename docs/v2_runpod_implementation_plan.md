@@ -863,6 +863,41 @@ intrusion / anomaly alerts fire at the same times at 20 fps as before; live vide
 within ~1.5–3 s of live, shed ranges are marked, live video stays at the source rate, and the
 recording is complete.
 
+### Phase R7 — Multi-Drone View: a fixed 20-tile grid (requested 2026-11-12)
+
+Today the Multi-Drone View shows a tile only after a drone's stream starts ("No Active Mission
+Feeds" until then), and tiles re-sort whenever a drone joins or changes state.
+
+**Requirement:**
+- The page always shows **20 tiles**. With no streams, all 20 are `OFFLINE`.
+- When a drone starts streaming it takes the **lowest free tile**, turns `LIVE` and plays its feed;
+  the other tiles stay `OFFLINE`.
+- A drone **keeps its tile** for as long as it has one (live → degraded → draining): no re-sorting,
+  so a tile an operator is watching never jumps. When its stream is gone the tile returns to
+  `OFFLINE` and shows the last drone that used it.
+- More than 20 drones at once: the extra drones get extra tiles after the 20 (a live feed is never
+  hidden).
+
+**Must not change (all existing behaviour stays):**
+- Which drones get a live tile: the same rule as today (`isGridDrone`: an ingest stream and status
+  live / degraded / draining), the same jurisdiction filtering from the backend.
+- A live tile is the same `DroneFeedCard`: H.264 live video (720p sub-stream in the grid, the
+  source when selected), the JPEG fallback, the stats badge, the analytics state badge
+  (`DEGRADED` / `SHEDDING`, R6.4), draining frames left, purge, selection (2 × 2) and the
+  analytics row / event timeline for the selected drone.
+- An `OFFLINE` tile makes **no requests** (no video, no JPEG polling, no analytics state), so the
+  20 tiles add no load on the pod.
+- The header counters count drones, not tiles.
+
+**Capacity note:** ingest accepts `DVAS_MAX_LIVE_STREAMS` (8) uplinks and go2rtc has 16 slots
+(+ `_sub`), so today at most 8 tiles can be live. Filling all 20 needs 20 go2rtc slots and the cap
+raised to 20 — part of scaling to 20 drones (R5), after the GPU decode work.
+
+**Tests:** with no streams 20 `OFFLINE` tiles and no feed requests; a drone that starts streaming
+takes tile 1, a second tile 2; when the first ends, tile 1 returns to `OFFLINE` and tile 2 does
+not move; a third drone then takes tile 1; selecting, purging, the stats and analytics badges work
+as before.
+
 ## 5. Flags summary
 
 | Flag | Default (v2) | Phase |
@@ -897,6 +932,7 @@ recording is complete.
 | Frame order / identity | Late = 0, Lost = 0, `seq` without duplicates across a reconnect |
 | Evidence | §3 rules tests pass; every alert has its crop + source frame; recording hash chain verifies |
 | Fallback | Old edge on `/ingest/frame` works; every flag off → v1 behaviour |
+| Multi-Drone View (R7) | 20 tiles always; drones take the lowest free tile and keep it; offline tiles make no requests |
 | Real edge (`edge-exe-v2`) | The §7 real-edge requirement passes: 30 fps received, live tile plays, analytics ≥ 20 fps, for a 4K and a 1080p camera |
 
 ## 7. Coordination with the edge developer
