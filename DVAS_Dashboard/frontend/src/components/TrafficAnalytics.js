@@ -1524,7 +1524,7 @@ function MissionHistory() {
     </div>
   );
 }
-export default function TrafficAnalytics({ drones, droneId: propDroneId = '', onNavigateTab }) {
+export default function TrafficAnalytics({ drones, droneId: propDroneId = '', onNavigateTab, initialFeedMode = '' }) {
   const { streams, loading: dronesLoading } = useActiveStreams();
   const activeDrones = (streams && streams.length > 0
     ? streams.map(s => ({
@@ -1549,7 +1549,7 @@ export default function TrafficAnalytics({ drones, droneId: propDroneId = '', on
 
   const [activeDrone, setActiveDrone] = useState(propDroneId || null);
   const [activeMissionId, setActiveMissionId] = useState(null); // current mission_id for selected drone
-  const [feedMode, setFeedMode]       = useState('vehicle');
+  const [feedMode, setFeedMode]       = useState(initialFeedMode || 'vehicle');
   const [serviceStatus, setServiceStatus] = useState({ vehicle: false, anpr: false });
   const [serviceHealth, setServiceHealth] = useState({ vehicle: null, anpr: null });
   const [streamError, setStreamError] = useState(null);
@@ -1560,6 +1560,11 @@ export default function TrafficAnalytics({ drones, droneId: propDroneId = '', on
   useEffect(() => {
     if (propDroneId) setActiveDrone(propDroneId);
   }, [propDroneId]);
+
+  // R8: a link from the Multi-Drone View services panel picks the feed (vehicle / ANPR)
+  useEffect(() => {
+    if (initialFeedMode) setFeedMode(initialFeedMode);
+  }, [initialFeedMode]);
 
   // Auto-select first active drone once telemetry loads (only when the page did not pick one)
   useEffect(() => {

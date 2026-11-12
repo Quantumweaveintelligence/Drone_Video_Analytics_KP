@@ -898,6 +898,75 @@ takes tile 1, a second tile 2; when the first ends, tile 1 returns to `OFFLINE` 
 not move; a third drone then takes tile 1; selecting, purging, the stats and analytics badges work
 as before.
 
+### Phase R8 — Multi-Drone View: analytics services panel beside the selected feed (requested 2026-11-12)
+
+When an operator selects a **live** tile (the tile grows to 2 × 2), a panel appears **beside that
+tile** listing every analytics service. Services selected in **Detection Models** are highlighted;
+clicking one opens that service's page with **this drone's annotated feed**.
+
+**Decisions (agreed 2026-11-12):**
+- A service that is **not selected** in Detection Models is shown greyed and is **not clickable**.
+  Its tooltip says it is off; for roles that may change the model set (`MODEL_ADMIN_ROLES`:
+  control room officer, senior officer, system administrator) it has a link to Detection Models.
+- The panel **floats beside the tile** (a glass card attached to its side). It flips to the left
+  when there is no room on the right, and below the tile on narrow screens. It closes when the tile
+  is deselected, the stream ends, or Esc is pressed.
+- A click opens the page **in the same browser tab**; Back returns to the Multi-Drone View.
+
+**Services, and where each one opens** (keys from `AVAILABLE_MODELS` in `backend/routers/infra.py`):
+
+| Service (Detection Models) | Opens | Annotated feed shown there |
+|---|---|---|
+| Person Detection (`person`) | `/command/person` | `/api/analytics/person/annotated` |
+| Face Detection (`face`) | `/command/person` (faces run inside the person service) | person annotated feed + face gallery |
+| Vehicle Detection & Tracking (`vehicle`) | `/command/traffic`, Vehicle tab, feed mode `vehicle` | `/api/analytics/vehicle/annotated` |
+| Number-Plate ANPR (`plate`) | `/command/traffic`, Vehicle tab, feed mode `anpr` | `/api/analytics/anpr/annotated` |
+| CSRNet Crowd Density (`crowd`) | `/command/crowd` | `/api/analytics/crowd/annotated` |
+| GeoTrax Intrusion (`intrusion`) | `/command/intrusion` | `/api/analytics/intrusion/annotated` |
+| SeaDrone Maritime (`vessel`) | `/command/traffic`, Vessel tab | vessel annotated feed |
+| Anomaly (`anomaly`) | `/command/anomaly` | anomaly annotated feed |
+
+**Panel design:**
+- A header with the drone id, a `LIVE` pill and the mission id; a close button.
+- One row per service: its icon (the same lucide icons as Detection Models), its name and a status
+  chip.
+  - Selected: an accent colour per service family, a soft glow and a hover lift, plus a "→ open"
+    affordance.
+  - Not selected: muted grey, a lock icon and `OFF`.
+- For a selected service, the chip shows this drone's measured state from
+  `/api/analytics/drone-states` (already polled for the tile badge, R6.4): `LIVE` (green),
+  `DEGRADED` (amber) or `SHEDDING` (orange), with fps when known. If the service is selected but
+  has no state yet, the chip says `STARTING`. Service names map model key → service (`plate` →
+  `anpr`, `face` → `person`).
+- Styling: the existing `--dvas-*` tokens (dark and light themes), backdrop blur, rounded-xl,
+  a 150 ms fade-and-slide in. Rows are keyboard-reachable (Tab / Enter) with ARIA labels; a disabled
+  row has `aria-disabled`.
+
+**How it works:**
+- Selected services come from `GET /api/models` → `active`. It is read once when the panel opens
+  and every 15 s while it is open (same period as the Detection Models page). It is **not** polled
+  when no tile is selected, so the panel adds no load in normal use.
+- Routing: set the command context's `selectedDrone` to the drone, then navigate to
+  `/command/<page>?drone=<id>` (plus `&view=vehicle|anpr|vessel` for the Traffic page). Each
+  page uses `?drone=` as its first selection, so the link also works after a reload. The Traffic page
+  reads `view` to pick its tab and feed mode. The pages that auto-pick a live drone (Traffic,
+  Vessel, Anomaly, Intrusion) must keep the requested drone while it is live, and fall back to
+  their own choice only when it is not.
+
+**Must not change:** the R7 grid (20 tiles, fixed slots, no requests from offline tiles), the
+selected tile's source-resolution video, the analytics row and event timeline, purge, the tile
+badges, and every analytics page's existing behaviour when it is opened from the sidebar (no
+`?drone=`). The only backend change: `/analytics/drone-states` also returns the measured `fps` per
+service and drone (from the same governor document); `/models` is unchanged.
+
+**Tests:**
+- Jest: a pure `serviceEntries(active, droneState)` gives selected / not-selected / state per
+  service; key → route mapping; the Traffic page picks its tab and mode from `view`.
+- Pod: select a live tile; the panel lists 8 services with the Detection Models selection
+  highlighted. Each enabled service opens its page on that drone's annotated feed; a disabled one
+  does not navigate. Back returns to the grid. Deselecting or ending the stream closes the panel. No
+  `/models` requests are made while nothing is selected.
+
 ## 5. Flags summary
 
 | Flag | Default (v2) | Phase |
@@ -933,6 +1002,7 @@ as before.
 | Evidence | §3 rules tests pass; every alert has its crop + source frame; recording hash chain verifies |
 | Fallback | Old edge on `/ingest/frame` works; every flag off → v1 behaviour |
 | Multi-Drone View (R7) | 20 tiles always; drones take the lowest free tile and keep it; offline tiles make no requests |
+| Services panel (R8) | Selecting a live tile shows all services, with the Detection Models selection highlighted; a click opens that service's page on this drone's annotated feed; disabled services do not navigate |
 | Real edge (`edge-exe-v2`) | The §7 real-edge requirement passes: 30 fps received, live tile plays, analytics ≥ 20 fps, for a 4K and a 1080p camera |
 
 ## 7. Coordination with the edge developer

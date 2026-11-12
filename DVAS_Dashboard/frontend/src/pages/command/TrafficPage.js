@@ -1,14 +1,22 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import TrafficAnalytics from "@/components/TrafficAnalytics";
 import VesselAnalytics from "@/components/VesselAnalytics";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useCommand } from "@/context/CommandContext";
+import { useRequestedDrone } from "@/hooks/useRequestedDrone";
 import { Car, Ship } from "lucide-react";
 
 export default function TrafficPage() {
-  const { user, drones, selectedDrone } = useCommand();
+  const { user, drones } = useCommand();
   const navigate = useNavigate();
-  const [activeTab, setActiveTab] = useState("vehicle");
+  // R8: the Multi-Drone View links here with ?drone=<id>&view=vehicle|anpr|vessel
+  const selectedDrone = useRequestedDrone();
+  const [params] = useSearchParams();
+  const view = params.get("view") || "";
+  const [activeTab, setActiveTab] = useState(view === "vessel" ? "vessel" : "vehicle");
+  useEffect(() => {
+    if (view) setActiveTab(view === "vessel" ? "vessel" : "vehicle");
+  }, [view]);
   const activeId = selectedDrone || drones[0]?.id || "";
   const shared = { drones, droneId: activeId, user, onNavigateTab: (tab) => navigate(`/command/${tab}`) };
 
@@ -45,7 +53,7 @@ export default function TrafficPage() {
       </div>
 
       {activeTab === "vehicle" ? (
-        <TrafficAnalytics {...shared} />
+        <TrafficAnalytics {...shared} initialFeedMode={view === "anpr" ? "anpr" : view === "vehicle" ? "vehicle" : ""} />
       ) : (
         <VesselAnalytics {...shared} />
       )}

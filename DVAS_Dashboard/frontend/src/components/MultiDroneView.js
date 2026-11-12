@@ -55,6 +55,7 @@ import { useLiveVideo } from "@/hooks/useLiveVideo";
 import LiveVideoStats from "@/components/LiveVideoStats";
 import { useAnalyticsStates } from "@/hooks/useAnalyticsStates";
 import { useTileSlots } from "@/hooks/useTileSlots";
+import ServicesPanel from "@/components/command/ServicesPanel";
 import {
   useCrowdReadings,
   usePersonCount,
@@ -1504,6 +1505,8 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
     : [];
 
   const [selectedDroneId, setSelectedDroneId] = useState(null);
+  // v2 R8: the selected tile's element, so the services panel can sit beside it
+  const [selectedTileEl, setSelectedTileEl] = useState(null);
   const [playingEvent, setPlayingEvent] = useState(null);
   const [galleryType, setGalleryType] = useState(null); // 'persons' | 'faces' | null
   const [purgeConfirm, setPurgeConfirm] = useState(null);
@@ -1528,6 +1531,10 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
     setSelectedDroneId(droneId);
     if (droneId && onSelectDrone) onSelectDrone(droneId);
   }, [onSelectDrone]);
+
+  const selectedLive = drones.find(
+    (d) => d.id === selectedDroneId && (d.status === "live" || d.status === "degraded")) || null;
+  const closeServices = useCallback(() => handleSelectDrone(null), [handleSelectDrone]);
 
   // Clock tick for "X min ago" labels
   const [, setTick] = useState(0);
@@ -1561,6 +1568,7 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
             return (
               <div
                 key={d.id}
+                ref={isSelected ? setSelectedTileEl : undefined}
                 className={`transition-all duration-500 ease-in-out ${
                   isSelected 
                     ? "col-span-1 md:col-span-2 lg:col-span-2 xl:col-span-2 row-span-1 md:row-span-2" 
@@ -1582,6 +1590,17 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
         </div>
       </div>
 
+
+      {/* v2 R8: analytics services beside the selected tile, while its stream is live */}
+      {selectedLive && (
+        <ServicesPanel
+          drone={selectedLive}
+          anchorEl={selectedTileEl}
+          analytics={analyticsStates[selectedLive.id]}
+          user={currentUser}
+          onClose={closeServices}
+        />
+      )}
 
       {/* ── 3. Analytics Row (5 panels horizontal) ── */}
       <AnalyticsRow

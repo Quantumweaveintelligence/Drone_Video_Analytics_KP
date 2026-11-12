@@ -15,7 +15,8 @@ GOV = {"services": {
 def test_worst_state_per_drone_with_the_reason_per_service():
     s = drone_analytics_states(GOV, ["DRN-1", "DRN-2", "DRN-3"])
     assert s["DRN-1"]["state"] == "shedding"
-    assert s["DRN-1"]["services"]["person"] == {"state": "shedding", "behind_s": 4.2, "frames_shed": 98, "cadence": 2}
+    assert s["DRN-1"]["services"]["person"] == {"state": "shedding", "behind_s": 4.2, "frames_shed": 98, "cadence": 2,
+                                                  "fps": 20.0}
     assert s["DRN-1"]["services"]["vehicle"]["state"] == "degraded"
     assert s["DRN-2"]["state"] == "live" and s["DRN-3"] == {"state": "live", "services": {}}
 

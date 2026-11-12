@@ -6,7 +6,7 @@
  *   degraded  a service is behind and skips its secondary stages (still every frame)
  *   shedding  a service drops the oldest frames or analyses every 2nd / 4th frame
  * GET /api/analytics/drone-states?ids=… every 3 s → {drone_id: {state, services: {svc: {state,
- * behind_s, frames_shed, cadence}}}}. Live video is never affected by these states.
+ * behind_s, frames_shed, cadence, fps}}}}. Live video is never affected by these states.
  */
 
 import { useEffect, useState } from "react";

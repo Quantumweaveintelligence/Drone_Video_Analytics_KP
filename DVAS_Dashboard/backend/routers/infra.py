@@ -458,6 +458,8 @@ def drone_analytics_states(gov: dict, drone_ids: List[str]) -> dict:
                 "behind_s": None if st.get("lag_ms") is None else round(float(st["lag_ms"]) / 1000.0, 1),
                 "frames_shed": int(st.get("frames_shed") or 0),
                 "cadence": int(st.get("cadence") or 1),
+                # measured analysed fps for this drone (v2 R8 services panel)
+                "fps": None if st.get("fps") is None else round(float(st["fps"]), 1),
             }
             if _STATE_RANK[state] > _STATE_RANK[out[d]["state"]]:
                 out[d]["state"] = state
