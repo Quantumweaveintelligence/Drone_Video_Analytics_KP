@@ -5,7 +5,9 @@ Run from dvas_analytics/:  python -m pytest person/tests -q
 import threading
 import types
 
+import numpy as np
 import pytest
+import torch
 
 from person import analyzer as pa
 from shared import gpu_profile
@@ -82,3 +84,50 @@ def test_face_model_calls_are_serialised(monkeypatch):
         return []
     monkeypatch.setattr(pa, "detect_faces_on_tiles", fake_tiles)
     assert an.detect_faces(None) == [] and held == [True]
+
+
+class TileModel:
+    """Fake face model: one box per tile wherever the tile has a bright pixel, so the
+    result depends only on the tile's pixels. Records how many tiles each call got."""
+
+    def __init__(self):
+        self.calls = []
+
+    def predict(self, crops, **kw):
+        self.calls.append(len(crops))
+        out = []
+        for c in crops:
+            ys, xs = np.nonzero(c.max(axis=2) > 200)
+            data = (torch.tensor([[xs.min(), ys.min(), xs.max() + 1, ys.max() + 1, 0.9, 0]], dtype=torch.float32)
+                    if len(xs) else torch.zeros((0, 6)))
+            out.append(types.SimpleNamespace(boxes=types.SimpleNamespace(data=data)))
+        return out
+
+
+def _frame(spots):
+    f = np.zeros((1080, 1920, 3), np.uint8)
+    for x, y in spots:
+        f[y:y + 40, x:x + 30] = 255
+    return f
+
+
+def test_round_faces_match_each_frame_on_its_own(monkeypatch):
+    """v2 R6.7: the tiles of all drones in shared batches give each drone the same faces."""
+    monkeypatch.setattr(gpu_profile, "predict_kwargs", lambda: {"half": False})
+    frames = {"A": _frame([(100, 100), (900, 500)]), "B": _frame([(1500, 900)]), "C": _frame([])}
+    alone = {k: pa.detect_faces_on_tiles(TileModel(), f, device="cpu") for k, f in frames.items()}
+    model = TileModel()
+    together = pa.detect_faces_round(model, frames, device="cpu", batch=128)
+    assert together == alone
+    assert len(alone["A"]) == 2 and len(alone["B"]) == 1 and alone["C"] == []
+    assert model.calls == [24]                       # 3 frames x 8 tiles in one call
+
+
+def test_round_batch_follows_gpu(monkeypatch):
+    monkeypatch.delenv("PERSON_FACE_ROUND_BATCH", raising=False)
+    monkeypatch.setattr(gpu_profile, "detect", lambda: types.SimpleNamespace(tier="large"))
+    assert pa.face_round_batch() == 128
+    monkeypatch.setattr(gpu_profile, "detect", lambda: types.SimpleNamespace(tier="small"))
+    assert pa.face_round_batch() == pa.FACE_TILE_BATCH
+    monkeypatch.setenv("PERSON_FACE_ROUND_BATCH", "64")
+    assert pa.face_round_batch() == 64

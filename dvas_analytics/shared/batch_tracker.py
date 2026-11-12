@@ -17,12 +17,48 @@ import math
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
 from shared import gpu_profile
 from shared.frame_sampler import chunks, is_late
 
 log = logging.getLogger(__name__)
+
+# v2 R6.7: the per-drone tracker updates of a round run in parallel threads (each drone has
+# its own tracker; BoT-SORT's optical flow runs in OpenCV, which releases the GIL). The
+# same updates as before, in the same per-drone order; only drones overlap each other.
+# 1 = one drone after another (the previous behaviour).
+try:
+    TRACK_THREADS = max(1, int(os.getenv("DVAS_TRACK_THREADS", "8")))
+except ValueError:
+    TRACK_THREADS = 8
+_track_pool: Optional[ThreadPoolExecutor] = None
+_ID_LOCK = threading.Lock()
+_ids_locked = False
+
+
+def _lock_track_ids() -> None:
+    """Ultralytics hands out track ids from a process-wide counter (`_count += 1; return
+    _count`); two drones updating at once could get the same id. Make it atomic, once."""
+    global _ids_locked
+    if _ids_locked:
+        return
+    from ultralytics.trackers.basetrack import BaseTrack  # noqa: PLC0415
+
+    def next_id() -> int:
+        with _ID_LOCK:
+            BaseTrack._count += 1
+            return BaseTrack._count
+    BaseTrack.next_id = staticmethod(next_id)
+    _ids_locked = True
+
+
+def _pool() -> ThreadPoolExecutor:
+    global _track_pool
+    if _track_pool is None:
+        _track_pool = ThreadPoolExecutor(TRACK_THREADS, thread_name_prefix="tracker")
+    return _track_pool
 
 
 def _make_tracker(tracker_yaml: str):
@@ -222,14 +258,20 @@ class BatchTracker:
         t0 = time.perf_counter()
         results = self.predict_batch(frames, **kw)
         detect_ms = (time.perf_counter() - t0) * 1000 / max(1, len(frames))
-        out = {}
         with self._lock:
-            for d, r in results.items():
+            trackers = {d: self._tracker_for(d) for d in results}   # created one at a time
+
+            def step(d):
                 t1 = time.perf_counter()
-                tracker = self._tracker_for(d)
-                out[d] = _match_without_update(tracker, r) if is_late(frames[d]) else _update(tracker, r)
+                r = results[d]
+                res = _match_without_update(trackers[d], r) if is_late(frames[d]) else _update(trackers[d], r)
                 TIMINGS[d] = {"detect": detect_ms, "track": (time.perf_counter() - t1) * 1000}
-        return out
+                return d, res
+
+            if TRACK_THREADS > 1 and len(results) > 1:
+                _lock_track_ids()
+                return dict(_pool().map(step, list(results)))
+            return dict(step(d) for d in results)
 
     def warmup(self, imgsz: int, batch_sizes=None, **kw) -> float:
         if os.getenv("DVAS_WARMUP", "1") == "0":

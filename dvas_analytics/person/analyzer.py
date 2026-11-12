@@ -55,6 +55,9 @@ FACE_PARALLEL    = os.getenv("PERSON_FACE_PARALLEL", "1") != "0"
 # DIRECT: GPU tiles go straight through the model and Ultralytics' own NMS. predict() would
 #   copy every tile back to the host only to read its shape (~19 ms per 4K frame on the pod).
 FACE_DIRECT      = os.getenv("PERSON_FACE_DIRECT", "1") != "0"
+# ROUND (v2 R6.7): the face tiles of all drones of a round go through the face model
+#   together instead of one drone after another (fewer, fuller GPU calls).
+FACE_ROUND       = os.getenv("PERSON_FACE_ROUND", "1") != "0"
 # After a CUDA failure the analyzer runs on the CPU; it retries the GPU after this long
 GPU_RETRY_S      = _env_int("PERSON_GPU_RETRY_S", 60, 10, 3600)
 
@@ -171,6 +174,19 @@ def _tile_dets_direct(model: YOLO, crops: torch.Tensor, tile: int):
     return dets
 
 
+def face_round_batch() -> int:
+    """Tiles per GPU call when the face tiles of a whole round (all drones) run together
+    (v2 R6.7). PERSON_FACE_ROUND_BATCH=<n> fixes it; "auto" (default): 128 on the large
+    GPUs (4 drones x 28 4K tiles in one call), else PERSON_FACE_TILE_BATCH."""
+    raw = os.getenv("PERSON_FACE_ROUND_BATCH", "auto").strip().lower()
+    if raw not in ("", "auto"):
+        try:
+            return max(1, min(512, int(raw)))
+        except ValueError:
+            log.warning("PERSON_FACE_ROUND_BATCH=%r is not a number; using auto", raw)
+    return 128 if gpu_profile.detect().tier in ("large", "xlarge") else FACE_TILE_BATCH
+
+
 def detect_faces_on_tiles(
     model: YOLO,
     frame: np.ndarray,
@@ -179,44 +195,72 @@ def detect_faces_on_tiles(
     overlap: int = FACE_TILE_OVERLAP,
 ) -> List[Tuple[int, int, int, int, float]]:
     """Face detection at native resolution on overlapping tiles. Returns (x1, y1, x2, y2, conf)."""
+    return detect_faces_round(model, {"_": frame}, device, tile, overlap, FACE_TILE_BATCH)["_"]
+
+
+def detect_faces_round(
+    model: YOLO,
+    frames: Dict[str, np.ndarray],
+    device=0,
+    tile: int = FACE_TILE,
+    overlap: int = FACE_TILE_OVERLAP,
+    batch: int = FACE_TILE_BATCH,
+) -> Dict[str, List[Tuple[int, int, int, int, float]]]:
+    """Face tiles of several frames (one per drone) → {key: faces}. The tiles of all frames
+    go through the face model together, `batch` tiles per call; every tile is detected
+    exactly as on its own (same pixels, model, thresholds, per-tile NMS), and the merge
+    (NMS across tiles, partial duplicates) stays per frame. One frame with the tile batch
+    is the single-frame path unchanged."""
     # FP16 on GPUs that support it (no effect on CPU)
     half = device != "cpu" and gpu_profile.predict_kwargs()["half"]
-    h_img, w_img = frame.shape[:2]
-    windows = face_tiles(h_img, w_img, tile, overlap)
-    all_boxes, all_confidences = [], []
-    src = None
-    if (FACE_GPU_TILES and device != "cpu" and tile % 32 == 0
-            and all(x2 - x1 == tile and y2 - y1 == tile for (x1, y1, x2, y2) in windows)):
-        src = torch.from_numpy(np.ascontiguousarray(frame)).to(
-            f"cuda:{device}" if isinstance(device, int) else device)
+    gpu_jobs, cpu_jobs = [], []          # (key, window, uploaded frame or None)
+    for key, frame in frames.items():
+        h_img, w_img = frame.shape[:2]
+        windows = face_tiles(h_img, w_img, tile, overlap)
+        src = None
+        if (FACE_GPU_TILES and device != "cpu" and tile % 32 == 0
+                and all(x2 - x1 == tile and y2 - y1 == tile for (x1, y1, x2, y2) in windows)):
+            src = torch.from_numpy(np.ascontiguousarray(frame)).to(
+                f"cuda:{device}" if isinstance(device, int) else device)
+        (gpu_jobs if src is not None else cpu_jobs).extend((key, w, src) for w in windows)
 
-    for i in range(0, len(windows), FACE_TILE_BATCH):
-        part = windows[i:i + FACE_TILE_BATCH]
-        if src is not None:
-            # BCHW RGB in 0..1, converted exactly as Ultralytics does for numpy input
-            # (uint8 → half/float, then / 255); tensors skip its letterbox and BGR flip.
-            crops = torch.stack([src[y1:y2, x1:x2] for (x1, y1, x2, y2) in part])
-            crops = crops.flip(-1).permute(0, 3, 1, 2).contiguous()
-            crops = (crops.half() if half else crops.float()) / 255
-        else:
-            crops = [frame[y1:y2, x1:x2] for (x1, y1, x2, y2) in part]
-        dets = _tile_dets_direct(model, crops, tile) if src is not None else None
-        if dets is None:
-            results = model.predict(
-                crops, device=device, imgsz=tile,
-                conf=CONF_FACE, verbose=False, agnostic_nms=True, half=half,
-            )
-            dets = [res.boxes.data if res.boxes is not None else torch.zeros((0, 6)) for res in results]
-        for (x1, y1, _, _), d in zip(part, dets):
-            if len(d) == 0:
-                continue
-            d = d.float().cpu().numpy()
-            xyxy, confs = d[:, :4], d[:, 4]
-            for (bx1, by1, bx2, by2), conf in zip(xyxy, confs):
-                gx1 = int(bx1 + x1); gy1 = int(by1 + y1)
-                gx2 = int(bx2 + x1); gy2 = int(by2 + y1)
-                all_boxes.append([gx1, gy1, gx2 - gx1, gy2 - gy1])
-                all_confidences.append(float(conf))
+    tile_dets = {key: [] for key in frames}      # key → [(x1, y1, (n, 6) dets)]
+    for jobs, on_gpu in ((gpu_jobs, True), (cpu_jobs, False)):
+        for i in range(0, len(jobs), batch):
+            part = jobs[i:i + batch]
+            if on_gpu:
+                # BCHW RGB in 0..1, converted exactly as Ultralytics does for numpy input
+                # (uint8 → half/float, then / 255); tensors skip its letterbox and BGR flip.
+                crops = torch.stack([src[y1:y2, x1:x2] for _, (x1, y1, x2, y2), src in part])
+                crops = crops.flip(-1).permute(0, 3, 1, 2).contiguous()
+                crops = (crops.half() if half else crops.float()) / 255
+                dets = _tile_dets_direct(model, crops, tile)
+            else:
+                crops = [frames[key][y1:y2, x1:x2] for key, (x1, y1, x2, y2), _ in part]
+                dets = None
+            if dets is None:
+                results = model.predict(
+                    crops, device=device, imgsz=tile,
+                    conf=CONF_FACE, verbose=False, agnostic_nms=True, half=half,
+                )
+                dets = [res.boxes.data if res.boxes is not None else torch.zeros((0, 6)) for res in results]
+            for (key, (x1, y1, _, _), _), d in zip(part, dets):
+                if len(d):
+                    tile_dets[key].append((x1, y1, d))
+    return {key: _merge_tile_faces(tile_dets[key]) for key in frames}
+
+
+def _merge_tile_faces(tile_dets) -> List[Tuple[int, int, int, int, float]]:
+    """Per-tile boxes of one frame → frame faces: NMS across tiles, then partial duplicates."""
+    all_boxes, all_confidences = [], []
+    for x1, y1, d in tile_dets:
+        d = d.float().cpu().numpy()
+        xyxy, confs = d[:, :4], d[:, 4]
+        for (bx1, by1, bx2, by2), conf in zip(xyxy, confs):
+            gx1 = int(bx1 + x1); gy1 = int(by1 + y1)
+            gx2 = int(bx2 + x1); gy2 = int(by2 + y1)
+            all_boxes.append([gx1, gy1, gx2 - gx1, gy2 - gy1])
+            all_confidences.append(float(conf))
 
     if not all_boxes:
         return []
@@ -252,6 +296,16 @@ def _drop_contained(boxes: List[Tuple[int, int, int, int, float]], ratio: float 
         if not inside:
             keep.append(a)
     return keep
+
+
+class _DroneShare:
+    """One drone's part of a round's face job, used like that drone's own Future."""
+
+    def __init__(self, job: Future, drone_id: str):
+        self.job, self.drone_id = job, drone_id
+
+    def result(self):
+        return self.job.result()[self.drone_id]
 
 
 class PersonFaceAnalyzer:
@@ -328,6 +382,21 @@ class PersonFaceAnalyzer:
         else:
             boxes = self.detect_faces(frame_bgr)
         return boxes, (time.perf_counter() - t) * 1000
+
+    def _faces_round_timed(self, frames: Dict[str, np.ndarray]) -> Dict[str, tuple]:
+        """Face tiles of every drone of a round in shared GPU batches (v2 R6.7):
+        {drone: (faces, ms)}, ms = the round's face time split evenly over its drones."""
+        t = time.perf_counter()
+        with self.face_lock:
+            if self._face_stream is not None and self.device != "cpu":
+                with torch.cuda.stream(self._face_stream):   # .cpu() of the results syncs the stream
+                    faces = detect_faces_round(self.face_model, frames, device=self.device,
+                                               batch=face_round_batch())
+            else:
+                faces = detect_faces_round(self.face_model, frames, device=self.device,
+                                           batch=face_round_batch())
+        ms = (time.perf_counter() - t) * 1000 / max(1, len(frames))
+        return {d: (boxes, ms) for d, boxes in faces.items()}
 
     def detect_faces_direct(self, img_bgr, conf: float = 0.15) -> List[Tuple[int, int, int, int, float]]:
         """Whole-image face detection (enrolment fallback), serialised on the face model."""
@@ -413,7 +482,11 @@ class PersonFaceAnalyzer:
         tracked: Dict[str, object] = {}
         face_jobs: Dict[str, Future] = {}
         if FACE_PARALLEL and self.face_model and self.device != "cpu":
-            face_jobs = {d: self._face_pool.submit(self._faces_timed, fr) for d, fr in frames.items()}
+            if FACE_ROUND and len(frames) > 1:
+                job = self._face_pool.submit(self._faces_round_timed, dict(frames))
+                face_jobs = {d: _DroneShare(job, d) for d in frames}
+            else:
+                face_jobs = {d: self._face_pool.submit(self._faces_timed, fr) for d, fr in frames.items()}
 
         # ── Person detection + tracking (batched across drones) ─────────────
         if self.person_model and self.tracker:

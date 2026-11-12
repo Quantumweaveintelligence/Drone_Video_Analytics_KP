@@ -47,6 +47,7 @@ def main():
     ap.add_argument("--frames", type=int, default=20)
     ap.add_argument("--drone", default="", help="use the newest frame of this drone's stream")
     ap.add_argument("--profile", action="store_true", default=True)
+    ap.add_argument("--round", type=int, default=4, help="drones in the multi-drone round test (R6.7)")
     a = ap.parse_args()
 
     import cv2
@@ -137,6 +138,18 @@ def main():
             lambda: an.analyze_batch({"bench": frame}, save_crops=True), a.frames)))
     pa.FACE_PARALLEL = parallel
     print("   (a round must stay under 50 ms for 20 fps)")
+    # v2 R6.7: one round of several drones, before (trackers and face tiles one drone after
+    # another) and after (trackers in parallel threads, face tiles of all drones together)
+    if a.round > 1:
+        from shared import batch_tracker as btm
+        rnd = {f"bench{i}": frame.copy() for i in range(a.round)}
+        threads, face_round = btm.TRACK_THREADS, pa.FACE_ROUND
+        for label, t, fr in (("one at a time", 1, False), ("parallel     ", threads, True)):
+            btm.TRACK_THREADS, pa.FACE_ROUND = t, fr
+            med, worst = timed(lambda: an.analyze_batch(rnd, save_crops=True), a.frames)
+            print("round of %d, %s %8.1f / %.1f  -> %.1f fps per drone" % (a.round, label, med, worst, 1000 / med))
+        btm.TRACK_THREADS, pa.FACE_ROUND = threads, face_round
+        print("   (face tiles per GPU call in a round: %d)" % pa.face_round_batch())
     print("device after run:", an.device_info())
 
     # C3: FP16 vs FP32 face recall on this GPU (plan Phase 1 item 7)

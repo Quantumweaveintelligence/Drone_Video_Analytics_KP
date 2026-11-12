@@ -783,6 +783,7 @@ intrusion / anomaly rules, which count **consecutive frames** (`intrusion/state_
 | R6.2 no feed without services | decoder skips decoding while no service publishes stats; resumes at the next keyframe at live (`DVAS_DECODE_ONLY_WITH_SERVICES`) | nothing published, mission still drains |
 | R6.3 shedding | sampler levels 1–3 with recovery; `_gap` on jumps, tracker reset over 1 s; ranges → `dvas:analytics_shed` → backend writes `analytics_shed` audit rows (consumer group, ack after write). Person: Re-ID clustering waits while shed; a watchlist hit marks priority. **Not shed** (evidence rules): face super-resolution, face crops, ArcFace / ResNet embeddings, person crops | live drone untouched; level 1 → drop-oldest with logged range; cadence + recovery; audit row per range, retried on failure |
 | R6.4 states | Models page: `degraded` / `shedding` + frames shed; tiles: `DEGRADED` / `SHEDDING` badge (`GET /api/analytics/drone-states`) | backend view tests; frontend builds |
+| R6.8 person round in parallel | per-drone tracker updates in parallel threads (`DVAS_TRACK_THREADS`, atomic track ids); face tiles of all drones of a round in shared GPU batches (`PERSON_FACE_ROUND`, `PERSON_FACE_ROUND_BATCH`); `bench_person.py --round 4` | real BoT-SORT on 4 drones: same boxes and track histories as one at a time, ids unique across drones; round faces equal each frame's own faces |
 | R6.6 GPU JPEG decode, R6.7 backfill | not started | — |
 
 Temporal votes (e.g. fall: 5 of 8 frames) stay counts of observations: at a lower rate they wait
@@ -853,6 +854,27 @@ secondary stages only, never frames.
 #### R6.7 Optional — backfill of shed ranges (`DVAS_BACKFILL=0`)
 - When the system is idle, analyse the recorded `analytics_shed` ranges from the recording with a
   separate tracker; results marked `late`. Off by default; enable if missed coverage matters.
+
+#### R6.8 Person: the round's per-drone work in parallel (pod run 12 Nov, image 1a25bf4)
+4 × 4K drones on the L40S pod: person analysed ≈ 2.9 fps per drone (level 3 the whole run) with
+the GPU at 2–34 % and 15 of 31 CPU cores in use. `bench_person.py` per 4K frame: decode 33 ms
+(already parallel and prefetched per round, B2), person detection 15 ms, **tracking 25 ms**
+(BoT-SORT optical flow, CPU), **face tiles 18 ms** (28 tiles). The round ran the trackers one drone
+after another under the predictor lock and the face tiles one drone after another on a single
+thread: ≈ 4 × (25 + 18) ms per round. Nothing about what is detected changes:
+1. **Tracker updates in parallel** (`DVAS_TRACK_THREADS`, default 8; 1 = before): each drone has
+   its own tracker and OpenCV releases the GIL. Ultralytics' global track-id counter is made
+   atomic so ids stay unique across drones.
+2. **Face tiles of the whole round together** (`PERSON_FACE_ROUND=1`): the tiles of all drones go
+   through the face model in shared calls (`PERSON_FACE_ROUND_BATCH`, auto: 128 on large GPUs,
+   i.e. 4 × 28 4K tiles in one call). Every tile is detected as on its own; the merge stays per
+   frame.
+3. Decode is already parallel; moving it to the GPU is R6.6.
+- Expected: a 4-drone round from ≈ 250 ms to ≈ 60–80 ms (≈ 12–16 fps per drone); 20 fps also
+  needs R6.6. `bench_person.py --round 4` prints the round before and after.
+- Still to explain from the profile: pageable device→host copies (23 ms of GPU time per frame)
+  and `cudaFree` (18 ms CPU) — likely allocator churn; and the image pairs a torch 2.8 nightly
+  with torchvision 0.22 (Ultralytics warns) — pin matching releases.
 
 **Tests (R6):** a service held at 5 fps enters level 1 → 2 → 3 within seconds, its PEL stays
 small, every shed range is in the audit log, and it returns to `LIVE` after the load ends; a
@@ -988,6 +1010,7 @@ service and drone (from the same governor document); `/models` is unchanged.
 | `DVAS_SHED_AFTER_S` | 1.5 | R6 |
 | `INTRUSION_CONFIRM_S` (replaces frame counts) | today's frames ÷ 20 | R6 |
 | `DVAS_GPU_JPEG_DECODE` | 0 → 1 after the identical-output test | R6 |
+| `DVAS_TRACK_THREADS` / `PERSON_FACE_ROUND` / `PERSON_FACE_ROUND_BATCH` | 8 / 1 / auto (128 on large GPUs) | R6.8 |
 | `DVAS_BACKFILL` | 0 | R6 |
 
 ## 6. v2 acceptance (all on the pod, from Kerala)
