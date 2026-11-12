@@ -61,8 +61,13 @@ def groups(r: redis.Redis, sid: str) -> dict:
     return out
 
 
+# Services that analyse only the newest frame (crowd, vessel by default, R6.1): their low fps is
+# by design, so they are not "the slowest service" of a drone.
+NEWEST: set = set()
+
+
 def svc_drones(r: redis.Redis) -> dict:
-    """{service: {drone: {"fps", "shed_level"}}} from the services' published stats."""
+    """{service: {drone: {"fps", "shed_level", "stages"}}} from the services' published stats."""
     out = {}
     for key in r.scan_iter("dvas:svc_stats:*"):
         try:
@@ -71,14 +76,18 @@ def svc_drones(r: redis.Redis) -> dict:
             continue
         if time.time() - float(d.get("updated_at") or 0) > 10:
             continue                                     # stopped service
-        out[d.get("service") or s(key).rsplit(":", 1)[-1]] = d.get("drones") or {}
+        svc = d.get("service") or s(key).rsplit(":", 1)[-1]
+        out[svc] = d.get("drones") or {}
+        if d.get("mode") == "newest":
+            NEWEST.add(svc)
     return out
 
 
 def slowest(stats: dict, drone: str):
-    """(fps, service, shed level) of the service that analysed the fewest frames of this drone."""
+    """(fps, service, shed level) of the every-frame service that analysed the fewest frames of
+    this drone (newest-frame services are left out: they skip frames by design)."""
     rows = [(float(v[drone].get("fps") or 0), svc, int(v[drone].get("shed_level") or 0))
-            for svc, v in stats.items() if drone in v]
+            for svc, v in stats.items() if drone in v and svc not in NEWEST]
     return min(rows) if rows else None
 
 
@@ -159,6 +168,8 @@ def main() -> int:
     fps_samples = {d: [] for d, _ in drones}
     an_samples = {d: [] for d, _ in drones}
     max_shed: dict = {}
+    svc_fps: dict = {}          # service → drone → analysed fps samples while receiving
+    svc_stages: dict = {}       # service → last stage ms (EMA) of any drone
     worst_backlog: dict = {}
     quota = cpu_quota()
     print(f"CPU limit of this pod: {quota:.0f} cores" if quota else "CPU: no pod limit found")
@@ -185,11 +196,17 @@ def main() -> int:
             an = f"{slow[0]:4.1f}" if slow else "   -"
             mark = f"L{slow[2]}" if slow and slow[2] else "  "
             if h.get("status") == "receiving":
+                for svc, v in stats.items():
+                    if drone in v:
+                        svc_fps.setdefault(svc, {}).setdefault(drone, []).append(float(v[drone].get("fps") or 0))
+                        lvl = int(v[drone].get("shed_level") or 0)
+                        if lvl:
+                            max_shed[svc] = max(max_shed.get(svc, 0), lvl)
+                        if v[drone].get("stages"):
+                            svc_stages[svc] = v[drone]["stages"]
                 fps_samples[drone].append(fps)
                 if slow:
                     an_samples[drone].append(slow[0])
-                    if slow[2]:
-                        max_shed[slow[1]] = max(max_shed.get(slow[1], 0), slow[2])
             worst_behind[drone] = max(worst_behind[drone], behind)
             cells.append(f"{fps:4.1f}/{an}{mark}{behind:4.1f}s")
             for g, n in groups(r, sid).items():
@@ -206,13 +223,19 @@ def main() -> int:
         time.sleep(2)
 
     print("\n== result")
-    print(f"{'drone':<12} {'published fps':>14} {'analysed fps (slowest service)':>31} "
+    print(f"{'drone':<12} {'published fps':>14} {'analysed fps (slowest every-frame service)':>43} "
           f"{'max behind live':>16} {'frames':>8}")
     med = lambda v: sorted(v)[len(v) // 2] if v else 0.0  # noqa: E731
     for drone, sid in drones:
         n = s(r.hget(f"mission:video:{sid}", "analytics_seq")) or "-"
-        print(f"{drone:<12} {med(fps_samples[drone]):>14.1f} {med(an_samples[drone]):>31.1f} "
+        print(f"{drone:<12} {med(fps_samples[drone]):>14.1f} {med(an_samples[drone]):>43.1f} "
               f"{worst_behind[drone]:>15.1f}s {n:>8}")
+    print("\nanalysed fps per service (median over the run, per drone; newest = newest frame only):")
+    for svc in sorted(svc_fps):
+        per = [med(v) for v in svc_fps[svc].values()]
+        stages = " ".join(f"{k} {float(ms):.0f}" for k, ms in (svc_stages.get(svc) or {}).items())
+        print(f"  {svc:<10} {'newest' if svc in NEWEST else 'every ':<7} "
+              f"{' '.join(f'{x:5.1f}' for x in per)}" + (f"   stages ms: {stages}" if stages else ""))
     print(f"\nCPU: up to {worst_cpu:.1f} cores used" + (f" of the pod's {quota:.0f}" if quota else ""))
     if max_shed:
         print("\nshedding (highest level per service; 1 secondary off, 2 drop-oldest, 3 lower cadence):")

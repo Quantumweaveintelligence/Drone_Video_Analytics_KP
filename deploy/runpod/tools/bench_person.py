@@ -148,6 +148,15 @@ def main():
             btm.TRACK_THREADS, pa.FACE_ROUND = t, fr
             med, worst = timed(lambda: an.analyze_batch(rnd, save_crops=True), a.frames)
             print("round of %d, %s %8.1f / %.1f  -> %.1f fps per drone" % (a.round, label, med, worst, 1000 / med))
+            # where the round's time goes (each part alone, same settings)
+            det = timed(lambda: an.tracker.predict_batch(rnd, **kw), a.frames)[0]
+            trk = timed(lambda: an.tracker.track_batch(rnd, **kw), a.frames)[0]
+            if fr:
+                fac = timed(lambda: an._faces_round_timed(rnd), a.frames)[0]
+            else:
+                fac = timed(lambda: [an._faces_timed(f) for f in rnd.values()], a.frames)[0]
+            print("   person detect %.1f | tracking %.1f | face tiles %.1f (faces run beside person)"
+                  % (det, trk - det, fac))
         btm.TRACK_THREADS, pa.FACE_ROUND = threads, face_round
         print("   (face tiles per GPU call in a round: %d)" % pa.face_round_batch())
     print("device after run:", an.device_info())
