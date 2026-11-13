@@ -721,6 +721,7 @@ Every step is measured on the pod before and after, with the stage split (A4) an
      | 4 × 4K (2026-11-11) | 20.0–20.2 | 0.6 s | none (backlog 0) |
      | 4 × 1080p (2026-11-11) | 20.0–20.2 | 0.6 s | none (backlog 0) |
      | 8 × 1080p | _to measure_ | | |
+     | 20 × 4K video only (2026-11-13, image `130ae29`, 15 min) | — (no service) | received 29.9–30.0 fps | — |
 
      All 600 / 600 analytics frames per drone. Person bench on the same image: person round
      36.7 ms (parallel), face tiles 12.4 ms with `PERSON_FACE_DIRECT` (45 ms via `predict()`),
@@ -1040,7 +1041,7 @@ service and drone (from the same governor document); `/models` is unchanged.
   does not navigate. Back returns to the grid. Deselecting or ending the stream closes the panel. No
   `/models` requests are made while nothing is selected.
 
-### Phase R9 — 20 concurrent feeds (planned 2026-11-13; step 1 done)
+### Phase R9 — 20 concurrent feeds (planned 2026-11-13; steps 1–2 passed on 13 Nov, video only)
 
 Today at most 8 feeds can be live at once, and nothing above 7–8 has been tested. The plan had
 only the R7 capacity note. Live video and analytics are separate limits and are sized separately.
@@ -1167,7 +1168,35 @@ the dashboard stamps each poll with its arrival time (its own clock) and judges 
 `seen_age_s` + time since that poll — one clock each, any skew is harmless (jest: a 15 s offset
 keeps a fresh drone live). **Also:** the Multi-Drone View logs every tile status change to the
 console (`[grid] DRN-…: live → offline (ingest …, seen … s ago, …)`). To be confirmed on the pod
-(compare `date -u` there with the viewer PC's clock).
+(compare `date -u` there with the viewer PC's clock). **Confirmed:** the viewer PC was 16 s ahead
+of the pod (HTTP `Date` 09:53:32 vs PC 09:53:48 UTC); with image 130ae29 the tiles stayed up.
+
+**Step 2 passed (13 Nov, image 130ae29, every analytics service off, `DVAS_MAX_LIVE_STREAMS=20`
+set in the pod's environment):**
+
+| Run | Admitted / live slots | Received fps per drone (median) | Relay restarts / skips | Longest ingest stall | CPU (of 27) |
+|---|---|---|---|---|---|
+| 8 × 4K, 2 min | 8 / 8 | 29.7–29.8 | 0 / 0 (40 streams) | 0.04 s | ≈ 3 |
+| 20 × 4K, 2 min | 20 / 20 | 29.7–29.9 | 0 / 0 | 0.15 s | ≈ 19 |
+| **20 × 4K, 15 min (soak)** | 20 / 20 for the whole run | **29.9–30.0** | 0 / 0 (main and 720p sub-stream) | 0.16 s | 18.5–19.5, GPU memory flat |
+
+- The CPU figure includes the 20 test senders, which run on the pod itself.
+- About once a minute all 20 drones dipped together to ≈ 23 fps for one 5 s sample and caught up
+  at ≈ 34–35 fps; medians stayed at 29.9, no frame lost, no ingest stall at those moments — most
+  likely the bench senders (on the pod, reloading the clip at each loop). The edge team's real
+  test (below) will show whether it remains.
+- Soak length: 15 minutes was agreed instead of 30 (the acceptance row below is changed).
+  Recordings grow ≈ 20 MB/s at 20 × 8 Mbps (≈ 18 GB per 15 min); check free space first.
+
+**Still open for R9:**
+- `DVAS_MAX_LIVE_STREAMS` default is still 8 (20 only via the pod's environment).
+- nginx allows **4** video WebSockets per token (`limit_conn video_conn 4`): one account cannot
+  stream 20 drones. Blocks the edge team's real-footage test.
+- Real-footage test with 20 drones from one laptop: requirements for the edge test tool in
+  `docs/edge_multi_drone_test_tool_requirements.md` (server prerequisites P1–P6, acceptance
+  T1–T6).
+- Step 3 (NVDEC decode for analytics) only if needed; step 5 (analytics at 8–20 drones) after the
+  R4 / R6 speed-ups.
 
 ## 5. Flags summary
 
@@ -1206,7 +1235,7 @@ console (`[grid] DRN-…: live → offline (ingest …, seen … s ago, …)`). 
 | Evidence | §3 rules tests pass; every alert has its crop + source frame; recording hash chain verifies |
 | Fallback | Old edge on `/ingest/frame` works; every flag off → v1 behaviour |
 | Multi-Drone View (R7) | 20 tiles always; drones take the lowest free tile and keep it; offline tiles make no requests |
-| 20 concurrent feeds (R9) | 20 feeds admitted and live at source fps for 30 min (video only); the analytics capacity per GPU recorded |
+| 20 concurrent feeds (R9) | 20 feeds admitted and live at source fps for 15 min (video only) — **passed 13 Nov with bench clips**; the same with real footage from the edge test tool; the analytics capacity per GPU recorded |
 | Services panel (R8) | Selecting a live tile shows all services, with the Detection Models selection highlighted; a click opens that service's page on this drone's annotated feed; disabled services do not navigate |
 | Real edge (`edge-exe-v2`) | The §7 real-edge requirement passes: 30 fps received, live tile plays, analytics ≥ 20 fps, for a 4K and a 1080p camera |
 
