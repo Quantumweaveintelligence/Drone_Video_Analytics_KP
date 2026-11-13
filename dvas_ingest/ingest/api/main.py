@@ -1578,12 +1578,21 @@ async def video_live_info(drone_id: str, sub: int = 0) -> dict:
     slot = h.get("live_slot")
     if not slot or h.get("status") != "receiving" or sid not in _video_conns:
         raise HTTPException(404, "No live video for this drone")
-    src = slot
+    src, pending = slot, False
     if sub and video_relay.SUBSTREAM:
         await _qm._client.set(f"live:sub_want:{slot}", sid, ex=LIVE_SUB_WANT_S)
-        src = f"{slot}_sub"
+        relay = getattr(_video_conns.get(sid), "relay", None)
+        if relay is not None:
+            relay.want_now()
+        # R9: hand out the sub-stream only once it is publishing — a player connecting before
+        # gets go2rtc's "streams: unknown error" and backs off (tiles went off and on). Until
+        # then the tile plays the main stream and asks again shortly (sub_pending).
+        if relay is not None and relay.sub_ready():
+            src = f"{slot}_sub"
+        else:
+            pending = True
     return {"drone_id": drone_id, "mission_id": h.get("mission_id"), "sid": sid, "src": src, "main_src": slot,
-            "sub": src != slot,
+            "sub": src != slot, "sub_pending": pending,
             "width": int(_f(h.get("width"))), "height": int(_f(h.get("height"))), "fps": _f(h.get("fps")),
             "analytics_fps": _f(h.get("pub_fps")), "behind_live_s": _f(h.get("behind_live_s"))}
 

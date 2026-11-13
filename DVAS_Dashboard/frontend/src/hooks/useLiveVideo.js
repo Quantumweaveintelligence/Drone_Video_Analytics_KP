@@ -33,6 +33,7 @@ const CODECS = ["avc1.640029", "avc1.64002A", "avc1.640033", "avc1.42E01E", "avc
                 "hvc1.1.6.L153.B0", "mp4a.40.2", "mp4a.40.5", "flac", "opus"];
 const LOOKUP_RETRY_MS = 15000;
 const SUB_REFRESH_MS = 20000;    // repeat the ?sub=1 lookup while playing (server keeps 45 s)
+const SUB_PENDING_MS = 3000;     // R9: the sub-stream is starting — play the main stream, ask again soon
 const RECONNECT_MS = [1000, 2000, 4000, 8000];
 const STALL_MS = 8000;           // no video data for this long → reconnect
 const RECONNECT_GRACE_MS = 10000; // keep the last frame this long before showing "connecting"
@@ -101,6 +102,7 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
     let timer = null;
     let watchdog = null;
     let refresher = null;
+    let pendingSub = false;          // asked for the sub-stream, the server has not started it yet
     let graceTimer = null;
     let lastData = 0;
     let failures = 0;
@@ -295,6 +297,7 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
         }
         const data = await res.json();
         if (cancelled) return;
+        pendingSub = !!data.sub_pending;
         setInfo(data);
         setState((s) => (s === "playing" || s === "reconnecting" ? s : "connecting"));
         connect(data.ws_path);
@@ -306,17 +309,25 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
       }
     }
 
-    // ?sub=1 keeps the server's transcode alive; a changed slot (new mission) reconnects
+    // ?sub=1 keeps the server's transcode alive; a changed slot (new mission) reconnects.
+    // R9: the server hands out the sub-stream only once it publishes (sub_pending until then),
+    // so the tile plays the main stream first and switches over a few seconds later.
     if (sub) {
-      refresher = setInterval(async () => {
-        if (cancelled || !ws) return;
-        try {
-          const res = await authFetch(lookupUrl());
-          if (!res.ok || cancelled) return;
-          const data = await res.json();
-          if (!cancelled && data.ws_path && data.ws_path !== currentPath) connect(data.ws_path);
-        } catch { /* the watchdog handles a dead stream */ }
-      }, SUB_REFRESH_MS);
+      const refresh = async () => {
+        if (cancelled) return;
+        if (ws) {
+          try {
+            const res = await authFetch(lookupUrl());
+            if (res.ok && !cancelled) {
+              const data = await res.json();
+              pendingSub = !!data.sub_pending;
+              if (!cancelled && data.ws_path && data.ws_path !== currentPath) connect(data.ws_path);
+            }
+          } catch { /* the watchdog handles a dead stream */ }
+        }
+        if (!cancelled) refresher = setTimeout(refresh, pendingSub ? SUB_PENDING_MS : SUB_REFRESH_MS);
+      };
+      refresher = setTimeout(refresh, SUB_PENDING_MS);
     }
 
     const onPlaying = () => {
@@ -334,7 +345,7 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
       cancelled = true;
       clearTimeout(timer);
       clearTimeout(graceTimer);
-      clearInterval(refresher);
+      clearTimeout(refresher);
       v?.removeEventListener("playing", onPlaying);
       teardown();
     };

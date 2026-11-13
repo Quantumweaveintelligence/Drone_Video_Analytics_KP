@@ -1116,6 +1116,20 @@ order (same files and hashes as before, tested); a slow disk only back-pressures
 once 32 MB wait. **Added:** ingest measures its event-loop lag (`ingest:loop_lag`, logged over
 1 s); `bench_capacity.py` prints stalls per sample and the longest.
 
+**Pod run 13 Nov (image 2fc3137):** the ingest stall is gone (rx 29.5–30 fps steady, longest
+event-loop stall 0.17 s), but grid tiles still went off and on. Every console error was for a
+`liveNN_sub` stream: `server: mse: streams: unknown error` and socket closes. **Cause:** ingest
+handed out `liveNN_sub` the moment a tile asked, while the sub-stream started only at the
+relay's next 2 s check, the next keyframe and ffmpeg / NVENC start-up — go2rtc answers a viewer
+of a stream with no publisher with that error; the player backed off 1, 2, 4 s and showed the
+tile as unavailable after 3 failures. **Fixed:** the lookup returns the sub-stream only once its
+ffmpeg has been fed for `DVAS_LIVE_SUB_READY_S` (2 s); until then the main stream with
+`sub_pending`, and the player asks again every 3 s (20 s once on the sub-stream); the ask also
+starts the sub-stream at once instead of at the next 2 s check. **Also:** the sub-stream decoded
+4K on the CPU (≈ 1.5 cores per watched tile, ≈ 12 of 27 cores for 8 tiles) — it now decodes and
+scales on the GPU (`-hwaccel cuda`, `scale_cuda`, NVENC), probed at start-up with a fallback to
+CPU decode (`DVAS_LIVE_SUB_HWDEC=0` forces CPU).
+
 ## 5. Flags summary
 
 | Flag | Default (v2) | Phase |

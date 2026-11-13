@@ -462,9 +462,14 @@ def test_grid_substream_runs_only_while_asked_for(client, valkey, clips, tmp_pat
         plain = client.get(f"/ingest/video/live/{DRONE}").json()
         assert plain["src"] == "live01" and plain["sub"] is False
         assert valkey.get("live:sub_want:live01") is None            # nobody asked: no transcode
+        # R9: asked, but not publishing yet → the main stream, and ask again soon
+        info = client.get(f"/ingest/video/live/{DRONE}?sub=1").json()
+        assert info["src"] == "live01" and info["sub"] is False and info["sub_pending"] is True
+        assert 0 < valkey.ttl("live:sub_want:live01") <= main.LIVE_SUB_WANT_S
+        monkeypatch.setattr(main.video_relay.LiveRelay, "sub_ready", lambda self: True)
         info = client.get(f"/ingest/video/live/{DRONE}?sub=1").json()
         assert info["src"] == "live01_sub" and info["main_src"] == "live01" and info["sub"] is True
-        assert 0 < valkey.ttl("live:sub_want:live01") <= main.LIVE_SUB_WANT_S
+        assert info["sub_pending"] is False
         assert client.get("/ingest/video/slot/live01_sub").json()["drone_id"] == DRONE   # authorize path
         send_clip(ws, clips["plain"])
         msg = ws.receive()
@@ -667,3 +672,38 @@ def test_a_write_error_still_ends_the_connection(monkeypatch, tmp_path):
         with pytest.raises(OSError):
             await r.data(b"\0" * 188)
     asyncio.run(run())
+
+
+def test_substream_is_ready_only_after_it_has_been_fed(monkeypatch):
+    """v2 R9: its address goes out only once ffmpeg publishes (go2rtc errors before that)."""
+    import video_relay
+    r = video_relay.Relay("live03_sub", transcode=True)
+    monkeypatch.setattr(r, "_alive", lambda: True)
+    assert not r.ready()                                   # running, nothing fed yet
+    r._fed_at = time.monotonic()
+    assert not r.ready()                                   # fed just now
+    r._fed_at = time.monotonic() - video_relay.SUB_READY_S - 0.1
+    assert r.ready()
+    lr = video_relay.LiveRelay("live03", want_sub=None)
+    lr._next_check = time.monotonic() + 100
+    lr.want_now()
+    assert lr._next_check == 0.0 and not lr.sub_ready()
+
+
+def test_substream_decodes_on_the_gpu_when_it_can(monkeypatch):
+    import video_relay
+    seen = []
+
+    async def fake_exec(*args, **kw):
+        seen.append(args)
+        raise RuntimeError("stop here")
+    monkeypatch.setattr(video_relay.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(video_relay, "_sub_encoder", "h264_nvenc")
+    for gpu in (True, False):
+        monkeypatch.setattr(video_relay, "_sub_gpu_decode", gpu)
+        with pytest.raises(RuntimeError):
+            asyncio.run(video_relay.Relay("live04_sub", transcode=True)._spawn())
+    gpu_args, cpu_args = seen
+    assert "-hwaccel" in gpu_args and f"scale_cuda=-2:{video_relay.SUB_HEIGHT}" in gpu_args
+    assert "-hwaccel" not in cpu_args and f"scale=-2:{video_relay.SUB_HEIGHT}" in cpu_args
+    assert gpu_args.index("-hwaccel") < gpu_args.index("-i")             # an input option
