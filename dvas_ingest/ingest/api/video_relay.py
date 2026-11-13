@@ -33,9 +33,16 @@ SUB_CHECK_S = 2.0                   # how often the relay re-reads whether anyon
 MAX_BUFFER = 4 * 1024 * 1024        # bytes waiting for ffmpeg before the relay skips to a keyframe
 RESTART_MIN_S = 2.0
 SKIP_LOG_S = 10.0                   # at most one "behind, skipped to a keyframe" line per relay per 10 s
-# A sub-stream counts as ready (its address is handed to players) once ffmpeg has been fed this
-# long: go2rtc answers "streams: unknown error" to a player that connects before the publisher.
-SUB_READY_S = float(os.getenv("DVAS_LIVE_SUB_READY_S", "2.0") or 2.0)
+# go2rtc answers a player that connects before a stream's publisher with "mse: streams: unknown
+# error" and sends nothing more. A relay counts as ready (its address goes out) once ffmpeg reports
+# written frames (-progress), plus this margin. Measured in the image (13 Nov): with ffmpeg's
+# default probing (5 s / 5 MB of input) a stream was playable only 4-6 s after the first bytes.
+READY_MARGIN_S = float(os.getenv("DVAS_LIVE_READY_MARGIN_S", "0.3") or 0.3)
+# Probe just enough input to know the stream (its first chunk starts at a keyframe with SPS/PPS)
+PROBE_ARGS = ["-probesize", "2000000", "-analyzeduration", "1000000"]
+# A grid tile waits this long for its sub-stream before it falls back to the source stream
+# (8 tiles decoding 4K at once in one browser broke its decoder on 13 Nov)
+SUB_WAIT_S = float(os.getenv("DVAS_LIVE_SUB_WAIT_S", "10") or 10)
 
 
 def _encoder_args(encoder: str) -> list:
@@ -48,38 +55,58 @@ def _encoder_args(encoder: str) -> list:
 
 
 _sub_encoder: Optional[str] = None
-_sub_gpu_decode: Optional[bool] = None
+# How the sub-stream decodes and scales (R9): "cuda_scale" = decode + scale on the GPU,
+# "cuda_decode" = decode on the GPU, scale on the CPU, "cpu" = both on the CPU (≈ 1.5 cores per
+# watched 4K tile). Chosen once by trying them in that order on a short sample.
+_sub_hw_mode: Optional[str] = None
 
 
-async def _try(args: list, timeout: float = 20.0) -> bool:
+async def _try(args: list, timeout: float = 20.0) -> tuple:
+    """(ok, last error lines) of one ffmpeg run."""
     try:
         p = await asyncio.create_subprocess_exec(
             FFMPEG, "-hide_banner", "-v", "error", *args,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-        return await asyncio.wait_for(p.wait(), timeout) == 0
-    except Exception:
-        return False
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        _, err = await asyncio.wait_for(p.communicate(), timeout)
+        return p.returncode == 0, " | ".join(err.decode(errors="replace").strip().splitlines()[-3:])
+    except Exception as exc:
+        return False, repr(exc)
 
 
-async def _probe_gpu_decode() -> bool:
-    """R9: the whole sub-stream on the GPU (CUDA decode + scale_cuda + NVENC) — decoding 4K on
-    the CPU cost ≈ 1.5 cores per watched tile. Tried once on a short H.264 sample."""
+def sub_size(src_w: int = 0, src_h: int = 0) -> tuple:
+    """Sub-stream size: SUB_HEIGHT high, even width keeping the source's aspect (16:9 if unknown)."""
+    if src_w > 0 and src_h > 0:
+        return max(2, round(src_w * SUB_HEIGHT / src_h / 2) * 2), SUB_HEIGHT
+    return round(SUB_HEIGHT * 16 / 9 / 2) * 2, SUB_HEIGHT
+
+
+def _hw_args(mode: str, w: int, h: int) -> tuple:
+    """(input options, filter) for a decode mode."""
+    if mode == "cuda_scale":
+        return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"], f"scale_cuda={w}:{h}"
+    if mode == "cuda_decode":
+        return ["-hwaccel", "cuda"], f"scale={w}:{h}"
+    return [], f"scale={w}:{h}"
+
+
+async def _probe_sub_hw() -> str:
     import tempfile  # noqa: PLC0415
     with tempfile.TemporaryDirectory() as d:
         sample = os.path.join(d, "probe.ts")
-        if not await _try(["-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30", "-t", "1",
-                           "-c:v", "libx264", "-preset", "ultrafast", "-g", "15", "-f", "mpegts", sample]):
-            return False
-        return await _try([*_gpu_input_args(), "-f", "mpegts", "-i", sample,
-                           "-vf", _gpu_scale(), *_encoder_args("h264_nvenc"), "-f", "null", "-"])
-
-
-def _gpu_input_args() -> list:
-    return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-
-
-def _gpu_scale() -> str:
-    return f"scale_cuda=-2:{SUB_HEIGHT}"
+        ok, err = await _try(["-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30", "-t", "1",
+                              "-c:v", "libx264", "-preset", "ultrafast", "-g", "15", "-f", "mpegts", sample])
+        if not ok:
+            log.warning("video relay: GPU decode probe could not make its sample: %s", err)
+            return "cpu"
+        w, h = sub_size(1920, 1080)
+        for mode in ("cuda_scale", "cuda_decode"):
+            hw_in, vf = _hw_args(mode, w, h)
+            ok, err = await _try([*hw_in, "-f", "mpegts", "-i", sample, "-vf", vf,
+                                  *_encoder_args("h264_nvenc"), "-f", "null", "-"])
+            if ok:
+                return mode
+            log.warning("video relay: sub-stream %s not available here: %s", mode, err or "no error output")
+    return "cpu"
 
 
 async def sub_encoder() -> str:
@@ -98,25 +125,27 @@ async def sub_encoder() -> str:
                     _sub_encoder = "h264_nvenc"
             except Exception:
                 pass
-        await sub_gpu_decode()
-        log.info("video relay: grid sub-stream encoder %s, decode %s (%dp, %d kbps)", _sub_encoder,
-                 "GPU (cuda + scale_cuda)" if _sub_gpu_decode else "CPU", SUB_HEIGHT, SUB_KBPS)
+        mode = await sub_hw_mode()
+        log.info("video relay: grid sub-stream encoder %s, decode/scale %s (%dp, %d kbps)", _sub_encoder,
+                 {"cuda_scale": "GPU decode + GPU scale", "cuda_decode": "GPU decode + CPU scale"}.get(mode, "CPU"),
+                 SUB_HEIGHT, SUB_KBPS)
     return _sub_encoder
 
 
-async def sub_gpu_decode() -> bool:
-    """True when the sub-stream can decode and scale on the GPU (DVAS_LIVE_SUB_HWDEC=0: never)."""
-    global _sub_gpu_decode
-    if _sub_gpu_decode is None:
-        _sub_gpu_decode = (os.getenv("DVAS_LIVE_SUB_HWDEC", "1") != "0"
-                           and _sub_encoder == "h264_nvenc" and await _probe_gpu_decode())
-    return _sub_gpu_decode
+async def sub_hw_mode() -> str:
+    """How the sub-stream decodes / scales (DVAS_LIVE_SUB_HWDEC=0: always on the CPU)."""
+    global _sub_hw_mode
+    if _sub_hw_mode is None:
+        _sub_hw_mode = ("cpu" if os.getenv("DVAS_LIVE_SUB_HWDEC", "1") == "0" or _sub_encoder != "h264_nvenc"
+                        else await _probe_sub_hw())
+    return _sub_hw_mode
 
 
 class Relay:
-    def __init__(self, stream_name: str, transcode: bool = False):
+    def __init__(self, stream_name: str, transcode: bool = False, src_size: tuple = (0, 0)):
         self.name = stream_name
         self.transcode = transcode
+        self.src_size = src_size
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._started_at = 0.0
         self._wait_key = True             # (re)start only at a keyframe
@@ -130,31 +159,49 @@ class Relay:
         self._stderr: collections.deque = collections.deque(maxlen=8)
         self._stderr_task: Optional[asyncio.Task] = None
         self._fed_at: Optional[float] = None    # first bytes handed to the current ffmpeg
+        self._out_at: Optional[float] = None    # first frames written to go2rtc (ffmpeg -progress)
+        self._progress_task: Optional[asyncio.Task] = None
 
     def ready(self) -> bool:
-        """ffmpeg runs and has been fed long enough to be publishing into go2rtc."""
-        return (self._alive() and self._fed_at is not None
-                and time.monotonic() - self._fed_at >= SUB_READY_S)
+        """ffmpeg runs and is publishing into go2rtc (it reported written frames)."""
+        return (self._alive() and self._out_at is not None
+                and time.monotonic() - self._out_at >= READY_MARGIN_S)
 
     async def _spawn(self) -> None:
         self._started_at = time.monotonic()
-        self._fed_at = None
+        self._fed_at = self._out_at = None
         hw_in, codec = [], ["-c", "copy"]
         if self.transcode:
             enc = await sub_encoder()
-            if await sub_gpu_decode():
-                hw_in, codec = _gpu_input_args(), ["-vf", _gpu_scale(), *_encoder_args(enc)]
-            else:
-                codec = ["-vf", f"scale=-2:{SUB_HEIGHT}", *_encoder_args(enc)]
+            hw_in, vf = _hw_args(await sub_hw_mode(), *sub_size(*self.src_size))
+            codec = ["-vf", vf, *_encoder_args(enc)]
         self._proc = await asyncio.create_subprocess_exec(
             FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin",
-            *hw_in, "-fflags", "+genpts+nobuffer", "-f", "mpegts", "-i", "pipe:0",
+            "-progress", "pipe:1", "-stats_period", "0.5",
+            *hw_in, *PROBE_ARGS, "-fflags", "+genpts+nobuffer", "-f", "mpegts", "-i", "pipe:0",
             "-map", "0:v:0", *codec, "-f", "rtsp", "-rtsp_transport", "tcp",
             f"{RTSP_BASE}/{self.name}",
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE)
         self._stderr.clear()
         self._stderr_task = asyncio.create_task(self._drain_stderr(self._proc))
+        self._progress_task = asyncio.create_task(self._watch_progress(self._proc))
+
+    async def _watch_progress(self, proc) -> None:
+        """ffmpeg -progress: the first frame=N > 0 means it is publishing into go2rtc."""
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    return
+                if self._out_at is None and line.startswith(b"frame="):
+                    try:
+                        if int(line[6:].strip() or 0) > 0:
+                            self._out_at = time.monotonic()
+                    except ValueError:
+                        pass
+        except Exception:
+            return
 
     async def _drain_stderr(self, proc) -> None:
         """Keep ffmpeg's last error lines (read continuously so its pipe never fills)."""
@@ -246,13 +293,16 @@ class LiveRelay:
     """A mission's live outputs: the copied stream (always) and the 720p grid sub-stream
     (only while want_sub() says a viewer wants it)."""
 
-    def __init__(self, slot: str, want_sub: Optional[Callable[[], Awaitable[bool]]] = None):
+    def __init__(self, slot: str, want_sub: Optional[Callable[[], Awaitable[bool]]] = None,
+                 src_size: tuple = (0, 0)):
         self.slot = slot
+        self.src_size = src_size
         self.main = Relay(slot)
         self.sub: Optional[Relay] = None
         self._want = want_sub if SUBSTREAM else None
         self._next_check = 0.0
         self._sub_on = False
+        self._sub_asked_at: Optional[float] = None   # a viewer asked; the sub-stream is not up yet
 
     async def feed(self, chunk: bytes, starts_key: bool) -> None:
         await self.main.feed(chunk, starts_key)
@@ -268,17 +318,30 @@ class LiveRelay:
             if not self._sub_on and self.sub is not None:
                 await self.sub.close()
                 self.sub = None
+                self._sub_asked_at = None
         if self._sub_on:
             if self.sub is None:
-                self.sub = Relay(f"{self.slot}_sub", transcode=True)
+                self.sub = Relay(f"{self.slot}_sub", transcode=True, src_size=self.src_size)
             await self.sub.feed(chunk, starts_key)
 
     def want_now(self) -> None:
         """A viewer just asked for the sub-stream: check at the next chunk, not in up to 2 s."""
         self._next_check = 0.0
+        if self.sub_ready():
+            self._sub_asked_at = None
+        elif self._sub_asked_at is None:
+            self._sub_asked_at = time.monotonic()
 
     def sub_ready(self) -> bool:
         return self.sub is not None and self.sub.ready()
+
+    def sub_starting(self) -> bool:
+        """Asked for less than SUB_WAIT_S ago and not up yet: the viewer should wait for it."""
+        return (not self.sub_ready() and self._sub_asked_at is not None
+                and time.monotonic() - self._sub_asked_at < SUB_WAIT_S)
+
+    def main_ready(self) -> bool:
+        return self.main.ready()
 
     def stats(self) -> dict:
         """Counters for the mission's video hash (R9): main relay and grid sub-stream."""

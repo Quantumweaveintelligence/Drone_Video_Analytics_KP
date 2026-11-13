@@ -674,20 +674,52 @@ def test_a_write_error_still_ends_the_connection(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
-def test_substream_is_ready_only_after_it_has_been_fed(monkeypatch):
-    """v2 R9: its address goes out only once ffmpeg publishes (go2rtc errors before that)."""
+def test_a_stream_is_ready_only_once_ffmpeg_reports_written_frames(monkeypatch):
+    """v2 R9: go2rtc answers a player that connects before the publisher with "mse: streams:
+    unknown error"; ffmpeg's -progress frame count tells when it publishes."""
     import video_relay
     r = video_relay.Relay("live03_sub", transcode=True)
     monkeypatch.setattr(r, "_alive", lambda: True)
-    assert not r.ready()                                   # running, nothing fed yet
-    r._fed_at = time.monotonic()
-    assert not r.ready()                                   # fed just now
-    r._fed_at = time.monotonic() - video_relay.SUB_READY_S - 0.1
+    assert not r.ready()                                   # running, nothing written yet
+
+    class Proc:                                            # ffmpeg -progress output on stdout
+        def __init__(self, lines):
+            self.stdout = asyncio.StreamReader()
+            for ln in lines:
+                self.stdout.feed_data(ln)
+            self.stdout.feed_eof()
+
+    async def watch(lines):
+        await r._watch_progress(Proc(lines))
+    asyncio.run(watch([b"frame=0\n", b"fps=0.00\n", b"progress=continue\n"]))
+    assert r._out_at is None                               # probing, nothing written
+    asyncio.run(watch([b"frame=0\n", b"frame=12\n", b"progress=continue\n"]))
+    assert r._out_at is not None and not r.ready()         # just started publishing
+    r._out_at = time.monotonic() - video_relay.READY_MARGIN_S - 0.1
     assert r.ready()
+
+
+def test_a_grid_tile_waits_for_its_substream_then_falls_back(monkeypatch):
+    import video_relay
+    clock = [1000.0]
+    monkeypatch.setattr(video_relay.time, "monotonic", lambda: clock[0])
     lr = video_relay.LiveRelay("live03", want_sub=None)
-    lr._next_check = time.monotonic() + 100
+    lr._next_check = clock[0] + 100
     lr.want_now()
     assert lr._next_check == 0.0 and not lr.sub_ready()
+    assert lr.sub_starting()                               # just asked: wait for it
+    clock[0] += video_relay.SUB_WAIT_S + 1
+    lr.want_now()
+    assert not lr.sub_starting()                           # not up in time: play the source stream
+
+
+def test_substream_size_keeps_the_aspect():
+    import video_relay
+    h = video_relay.SUB_HEIGHT
+    assert video_relay.sub_size(3840, 2160) == (1280, h) and video_relay.sub_size(1920, 1080) == (1280, h)
+    w, _ = video_relay.sub_size(4000, 3000)                # 4:3
+    assert w % 2 == 0 and abs(w / h - 4 / 3) < 0.01
+    assert video_relay.sub_size() == (1280, h)             # unknown: 16:9
 
 
 def test_substream_decodes_on_the_gpu_when_it_can(monkeypatch):
@@ -699,11 +731,15 @@ def test_substream_decodes_on_the_gpu_when_it_can(monkeypatch):
         raise RuntimeError("stop here")
     monkeypatch.setattr(video_relay.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(video_relay, "_sub_encoder", "h264_nvenc")
-    for gpu in (True, False):
-        monkeypatch.setattr(video_relay, "_sub_gpu_decode", gpu)
+    for mode in ("cuda_scale", "cuda_decode", "cpu"):
+        monkeypatch.setattr(video_relay, "_sub_hw_mode", mode)
         with pytest.raises(RuntimeError):
-            asyncio.run(video_relay.Relay("live04_sub", transcode=True)._spawn())
-    gpu_args, cpu_args = seen
-    assert "-hwaccel" in gpu_args and f"scale_cuda=-2:{video_relay.SUB_HEIGHT}" in gpu_args
-    assert "-hwaccel" not in cpu_args and f"scale=-2:{video_relay.SUB_HEIGHT}" in cpu_args
-    assert gpu_args.index("-hwaccel") < gpu_args.index("-i")             # an input option
+            asyncio.run(video_relay.Relay("live04_sub", transcode=True, src_size=(3840, 2160))._spawn())
+    gpu, dec, cpu = seen
+    assert "-hwaccel" in gpu and "scale_cuda=1280:720" in gpu and "cuda" in gpu
+    assert "-hwaccel" in dec and "scale=1280:720" in dec and "-hwaccel_output_format" not in dec
+    assert "-hwaccel" not in cpu and "scale=1280:720" in cpu
+    for args in seen:
+        i = args.index("-i")
+        assert args.index("-probesize") < i and args.index("-analyzeduration") < i   # quick start
+        assert "-progress" in args                                                 # readiness

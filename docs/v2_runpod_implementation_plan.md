@@ -1130,6 +1130,30 @@ starts the sub-stream at once instead of at the next 2 s check. **Also:** the su
 scales on the GPU (`-hwaccel cuda`, `scale_cuda`, NVENC), probed at start-up with a fallback to
 CPU decode (`DVAS_LIVE_SUB_HWDEC=0` forces CPU).
 
+**Pod run 13 Nov (image 2b2bc38) and a reproduction in the image:** the `streams: unknown error`
+lines were gone but tiles still dropped (sockets refused / 1006, one Firefox decode error), and
+the GPU decode probe had failed (`decode CPU`, ≈ 13 cores for 8 tiles). Reproduced with the real
+`video_relay` + go2rtc 1.9.14 + a WebSocket MSE client in the production image: **a relay's
+ffmpeg published into go2rtc only 4–6 s (copy) / 6–8 s (sub-stream) after its first bytes** —
+ffmpeg probes 5 s / 5 MB of input before writing — and go2rtc answers a viewer that comes earlier
+with "mse: streams: unknown error" and then sends nothing. So the 2 s "ready" rule above was
+wrong, and at a mission's start every tile hit that window: the player backed off 1-2-4 s and
+after 3 failures marked the tile unavailable for 30 s. **Fixed (verified in the reproduction,
+1080p and 4K at 8 Mbps: both streams publish ≈ 2.6–2.8 s after the first bytes, a viewer
+connecting then gets video at once):**
+- every relay ffmpeg probes ≤ 1 s / 2 MB (`-analyzeduration`, `-probesize`) and reports its
+  progress (`-progress`); a stream is **ready** once ffmpeg has written frames;
+- ingest hands out a stream only when ready (`starting` until then) — the player waits and asks
+  again every second instead of connecting; a go2rtc `streams` error is treated the same way,
+  never counted towards "unavailable";
+- a grid tile waits for its 720p sub-stream (it publishes ≈ 0.3 s after the main one) instead
+  of decoding the 4K source meanwhile — 8 tiles decoding 4K at once in one browser is the likely
+  cause of the decode error; only if the sub-stream is not up within `DVAS_LIVE_SUB_WAIT_S`
+  (10 s) does the tile play the source;
+- the sub-stream's GPU path is probed in two variants — GPU decode + `scale_cuda`, then GPU
+  decode + CPU scale — at an explicit output size from the drone's resolution (not `-2`), and
+  a failed probe now logs ffmpeg's error.
+
 ## 5. Flags summary
 
 | Flag | Default (v2) | Phase |

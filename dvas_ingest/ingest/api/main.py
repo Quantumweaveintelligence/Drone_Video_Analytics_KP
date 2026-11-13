@@ -1481,6 +1481,7 @@ if VIDEO_INGEST:
             conn.live_slot = await _live_slot_acquire(sid) if video_relay.ENABLED else None
             relay = video_relay.LiveRelay(
                 conn.live_slot, want_sub=lambda slot=conn.live_slot: _qm._client.exists(f"live:sub_want:{slot}"),
+                src_size=(int(_f(hello.get("width"))), int(_f(hello.get("height")))),
             ) if conn.live_slot else None
             conn.relay = relay
             await _qm._client.hset(vkey, mapping={
@@ -1579,20 +1580,24 @@ async def video_live_info(drone_id: str, sub: int = 0) -> dict:
     if not slot or h.get("status") != "receiving" or sid not in _video_conns:
         raise HTTPException(404, "No live video for this drone")
     src, pending = slot, False
+    relay = getattr(_video_conns.get(sid), "relay", None)
+    # R9: a stream's address goes out only once its relay publishes into go2rtc — a player that
+    # connects earlier gets "mse: streams: unknown error" and nothing more. `starting`: the main
+    # stream is not up yet (the first ≈ 1 s of a mission): the player asks again shortly.
+    starting = relay is None or not relay.main_ready()
     if sub and video_relay.SUBSTREAM:
         await _qm._client.set(f"live:sub_want:{slot}", sid, ex=LIVE_SUB_WANT_S)
-        relay = getattr(_video_conns.get(sid), "relay", None)
         if relay is not None:
             relay.want_now()
-        # R9: hand out the sub-stream only once it is publishing — a player connecting before
-        # gets go2rtc's "streams: unknown error" and backs off (tiles went off and on). Until
-        # then the tile plays the main stream and asks again shortly (sub_pending).
         if relay is not None and relay.sub_ready():
             src = f"{slot}_sub"
         else:
+            # the sub-stream publishes ≈ 0.3 s after the main one: wait for it (starting); only
+            # if it is not up within SUB_WAIT_S play the source stream meanwhile (sub_pending)
             pending = True
+            starting = starting or relay is None or relay.sub_starting()
     return {"drone_id": drone_id, "mission_id": h.get("mission_id"), "sid": sid, "src": src, "main_src": slot,
-            "sub": src != slot, "sub_pending": pending,
+            "sub": src != slot, "sub_pending": pending, "starting": starting and src == slot,
             "width": int(_f(h.get("width"))), "height": int(_f(h.get("height"))), "fps": _f(h.get("fps")),
             "analytics_fps": _f(h.get("pub_fps")), "behind_live_s": _f(h.get("behind_live_s"))}
 

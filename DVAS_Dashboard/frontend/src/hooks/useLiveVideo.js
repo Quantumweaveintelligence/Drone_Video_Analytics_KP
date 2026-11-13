@@ -34,6 +34,8 @@ const CODECS = ["avc1.640029", "avc1.64002A", "avc1.640033", "avc1.42E01E", "avc
 const LOOKUP_RETRY_MS = 15000;
 const SUB_REFRESH_MS = 20000;    // repeat the ?sub=1 lookup while playing (server keeps 45 s)
 const SUB_PENDING_MS = 3000;     // R9: the sub-stream is starting — play the main stream, ask again soon
+const STARTING_MS = 1000;        // R9: the stream is not published yet — ask again, nothing failed
+const MAX_STARTING = 30;         // … for at most this many tries, then count as a failure
 const RECONNECT_MS = [1000, 2000, 4000, 8000];
 const STALL_MS = 8000;           // no video data for this long → reconnect
 const RECONNECT_GRACE_MS = 10000; // keep the last frame this long before showing "connecting"
@@ -106,6 +108,7 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
     let graceTimer = null;
     let lastData = 0;
     let failures = 0;
+    let startingTries = 0;          // consecutive "not published yet" answers (R9)
     let everPlayed = false;
     let currentPath = null;
     const counters = { bytes: 0, reconnects: 0, seeks: 0, reason: "" };
@@ -213,6 +216,21 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
       }
     };
 
+    // R9: go2rtc has no publisher for the stream yet (mission just started, sub-stream starting).
+    // Not a failure: keep the last frame, ask again in a second.
+    function notYet() {
+      startingTries += 1;
+      if (startingTries > MAX_STARTING) {
+        startingTries = 0;
+        reconnect("stream never started");
+        return;
+      }
+      teardown(everPlayed);
+      if (cancelled) return;
+      setState((s) => (s === "playing" ? "reconnecting" : s === "reconnecting" ? s : "connecting"));
+      later(lookup, STARTING_MS);
+    }
+
     // reason (R9): why the tile reconnected — shown in the debug overlay and the console
     function reconnect(reason = "") {
       const keep = everPlayed;
@@ -252,7 +270,12 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
         if (typeof ev.data === "string") {
           let msg;
           try { msg = JSON.parse(ev.data); } catch { return; }
-          if (msg.type === "error") { reconnect(`server: ${msg.value || "error"}`); return; }
+          if (msg.type === "error") {
+            // "mse: streams: …": nobody publishes this stream yet — wait, it is not a failure
+            if (/streams/.test(msg.value || "")) { notYet(); return; }
+            reconnect(`server: ${msg.value || "error"}`);
+            return;
+          }
           if (msg.type !== "mse" || ms) return;
           ms = new MS();
           ms.addEventListener("sourceopen", () => {
@@ -298,6 +321,7 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
         const data = await res.json();
         if (cancelled) return;
         pendingSub = !!data.sub_pending;
+        if (data.starting) { notYet(); return; }      // published in a moment: do not connect yet
         setInfo(data);
         setState((s) => (s === "playing" || s === "reconnecting" ? s : "connecting"));
         connect(data.ws_path);
@@ -321,7 +345,7 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
             if (res.ok && !cancelled) {
               const data = await res.json();
               pendingSub = !!data.sub_pending;
-              if (!cancelled && data.ws_path && data.ws_path !== currentPath) connect(data.ws_path);
+              if (!cancelled && !data.starting && data.ws_path && data.ws_path !== currentPath) connect(data.ws_path);
             }
           } catch { /* the watchdog handles a dead stream */ }
         }
@@ -333,6 +357,7 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
     const onPlaying = () => {
       everPlayed = true;
       failures = 0;
+      startingTries = 0;
       clearTimeout(graceTimer);
       setState("playing");
     };

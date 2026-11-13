@@ -52,6 +52,7 @@ async def live_drone(drone_id: str, sub: bool = False, user: dict = Depends(_any
         "ws_path": f"/live/api/ws?src={src}",
         "sub": bool(info.get("sub")),
         "sub_pending": bool(info.get("sub_pending")),   # asked for the sub-stream, not up yet (R9)
+        "starting": bool(info.get("starting")),         # the stream is not published yet (R9)
         "width": info.get("width"), "height": info.get("height"), "fps": info.get("fps"),
         "analytics_fps": info.get("analytics_fps"), "behind_live_s": info.get("behind_live_s"),
     }
