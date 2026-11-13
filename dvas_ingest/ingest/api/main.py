@@ -2539,6 +2539,7 @@ async def get_active_streams():
                 "stream_key":      key_str,
                 "frame_count":     frame_count,
                 "frames_received": frame_count,
+                "seen_age_s":      _seen_age_s(last_seen_str),     # on this server's clock (R9)
                 "messages_ready":  remaining,
                 "status":          stream_status,
                 "mission_status":  mission_stat,
@@ -2571,16 +2572,23 @@ async def get_active_streams():
 
 
 
-def _recently_seen(last_seen_str: Optional[str]) -> bool:
-    """A frame within the last 15 s — strong live signal."""
+def _seen_age_s(last_seen_str: Optional[str]) -> Optional[float]:
+    """Seconds since last_seen on this server's clock (None: unknown). v2 R9: the dashboard used
+    to compare last_seen with the viewer's own clock; a viewer clock ≈ 15 s off made every
+    drone flip live / offline on each poll (all tiles blanked and came back, over and over)."""
     if not last_seen_str:
-        return False
+        return None
     try:
         last_seen_dt = datetime.datetime.strptime(last_seen_str, "%Y-%m-%dT%H:%M:%S.%fZ")
-        age_sec = (datetime.datetime.utcnow() - last_seen_dt).total_seconds()
-        return 0.0 <= age_sec < 15.0
+        return round((datetime.datetime.utcnow() - last_seen_dt).total_seconds(), 1)
     except Exception:
-        return False
+        return None
+
+
+def _recently_seen(last_seen_str: Optional[str]) -> bool:
+    """A frame within the last 15 s — strong live signal."""
+    age_sec = _seen_age_s(last_seen_str)
+    return age_sec is not None and 0.0 <= age_sec < 15.0
 
 
 async def _active_streams_mission_mode() -> dict:
@@ -2643,6 +2651,7 @@ async def _active_streams_mission_mode() -> dict:
             "frame_count":     frame_count,
             "frames_received": frame_count,
             "video_live":      _video_uplink_open(drone_id),
+            "seen_age_s":      _seen_age_s(last_seen_str),     # on this server's clock (R9)
             "messages_ready":  v["remaining"],
             "status":          stream_status,
             "mission_status":  mission_stat,

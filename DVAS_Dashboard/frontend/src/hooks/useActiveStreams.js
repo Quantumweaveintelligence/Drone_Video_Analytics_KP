@@ -21,10 +21,22 @@ import { useDvasSocket } from "@/lib/useDvasSocket";
 const POLL_INTERVAL = 5000;   // 5 s — ingest status changes infrequently
 const STALE_THRESHOLD = 20000; // 20 s — last_seen older than this → treat as stale
 
-/** True if ISO timestamp is recent enough to be considered "live" */
-function isRecentlySeen(lastSeen) {
-  if (!lastSeen) return false;
-  const diff = Date.now() - new Date(lastSeen).getTime();
+/**
+ * True if ingest saw the drone recently enough to be "live".
+ * v2 R9: measured on ONE clock. Ingest reports seen_age_s on its own clock; the poll stamps
+ * _rx_at on the browser's; the age now is seen_age_s + the time since that poll. Comparing
+ * last_seen (server clock) with Date.now() (viewer clock) made every tile flip live / offline
+ * on each poll when the two clocks were ≈ 15 s apart. last_seen is only the fallback (older
+ * ingest, the backend's /ingest/status fallback).
+ */
+export function isStreamRecent(stream, now = Date.now()) {
+  if (!stream) return false;
+  if (typeof stream.seen_age_s === "number" && typeof stream._rx_at === "number") {
+    const age = stream.seen_age_s * 1000 + Math.max(0, now - stream._rx_at);
+    return age >= 0 && age < STALE_THRESHOLD;
+  }
+  if (!stream.last_seen) return false;
+  const diff = now - new Date(stream.last_seen).getTime();
   return diff >= 0 && diff < STALE_THRESHOLD;
 }
 
@@ -54,7 +66,7 @@ export function resolveDroneStatus(stream, fallbackStatus = "offline") {
   if (stream._offline) return "offline";                // drone_offline pushed over the WebSocket
 
   if (stream.status === "draining") return "draining";  // draining takes priority
-  const recent = isRecentlySeen(stream.last_seen);
+  const recent = isStreamRecent(stream);
   const frames = stream.frame_count ?? stream.frames_received ?? 0;
   // v2 R9: a drone streaming video with no analytics service selected has no analytics
   // frames (R6.2) but is live — its video uplink is open
@@ -78,7 +90,8 @@ export function useActiveStreams() {
 
       // Normalise — endpoint may return { drones: [...], count: N }
       const raw = Array.isArray(data) ? data : (data?.drones ?? []);
-      setStreams(raw);
+      const rxAt = Date.now();                       // browser clock, for isStreamRecent
+      setStreams(raw.map((s) => ({ ...s, _rx_at: rxAt })));
       setFetched(true);
       setError(null);
     } catch (e) {
@@ -136,7 +149,7 @@ export function useActiveStreams() {
     (id) => {
       const s = streamMap.get(id);
       const frames = s?.frame_count ?? s?.frames_received ?? 0;
-      return !!s && isRecentlySeen(s.last_seen) && s.status !== "offline" && frames > 0;
+      return !!s && isStreamRecent(s) && s.status !== "offline" && frames > 0;
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [streams]
@@ -226,8 +239,8 @@ export function useActiveStreams() {
       // Sort: active live streams ALWAYS first → draining → degraded → offline; within tier: by id
       const statusOrder = { live: 0, draining: 1, degraded: 2, offline: 3 };
       enriched.sort((a, b) => {
-        const aLiveStream = streamMap.has(a.id) && isRecentlySeen(streamMap.get(a.id)?.last_seen);
-        const bLiveStream = streamMap.has(b.id) && isRecentlySeen(streamMap.get(b.id)?.last_seen);
+        const aLiveStream = streamMap.has(a.id) && isStreamRecent(streamMap.get(a.id));
+        const bLiveStream = streamMap.has(b.id) && isStreamRecent(streamMap.get(b.id));
         if (aLiveStream && !bLiveStream) return -1;
         if (!aLiveStream && bLiveStream) return 1;
 

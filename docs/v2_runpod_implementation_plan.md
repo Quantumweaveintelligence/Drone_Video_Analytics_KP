@@ -1154,6 +1154,21 @@ connecting then gets video at once):**
   decode + CPU scale — at an explicit output size from the drone's resolution (not `-2`), and
   a failed probe now logs ffmpeg's error.
 
+**Pod run 13 Nov (image 27805a1): every tile still blanked and came back, all at once, over and
+over** — with no `[live] reconnect` line, sockets closed by the page while connecting, and every
+tile polling JPEG frames (live video not playing) every ≈ 5 s. Ingest was healthy (29.8 fps, 0
+relay restarts, longest loop stall 0.02 s). The common factor is the dashboard's grid status:
+`useActiveStreams` decided "recently seen" by comparing ingest's `last_seen` (pod clock) with
+`Date.now()` (the viewer's clock), 20 s allowed. With the two clocks ≈ 15 s apart (a new pod is
+usually a new host), each drone crosses that line between 5 s polls: every tile goes offline
+(player torn down mid-connect), the next poll brings it back, and the ≈ 3 s live start never
+completes. **Fixed:** ingest reports `seen_age_s` (on its own clock) in `/ingest/streams/active`;
+the dashboard stamps each poll with its arrival time (its own clock) and judges recency as
+`seen_age_s` + time since that poll — one clock each, any skew is harmless (jest: a 15 s offset
+keeps a fresh drone live). **Also:** the Multi-Drone View logs every tile status change to the
+console (`[grid] DRN-…: live → offline (ingest …, seen … s ago, …)`). To be confirmed on the pod
+(compare `date -u` there with the viewer PC's clock).
+
 ## 5. Flags summary
 
 | Flag | Default (v2) | Phase |

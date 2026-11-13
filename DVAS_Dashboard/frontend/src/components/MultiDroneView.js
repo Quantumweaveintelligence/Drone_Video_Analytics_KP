@@ -1486,6 +1486,25 @@ export default function MultiDroneView({ drones: liveDrones, alerts: liveAlerts,
   });
   // v2 R7: a fixed grid of GRID_TILES; each drone keeps its tile while it has one
   const tiles = useTileSlots(drones, GRID_TILES);
+  // R9 diagnostics: a tile that leaves the grid or stops being live tears its player down —
+  // log every change with the stream's numbers, so a drop-out says why in the console
+  const prevStatus = useRef({});
+  const statusKey = drones.map((d) => `${d.id}:${d.status}`).join(",");
+  useEffect(() => {
+    const now = {};
+    for (const d of drones) now[d.id] = d.status;
+    for (const id of new Set([...Object.keys(prevStatus.current), ...Object.keys(now)])) {
+      const was = prevStatus.current[id];
+      if (was !== now[id] && was !== undefined) {
+        const st = streams.find((x) => x.drone_id === id) || {};
+        console.info(`[grid] ${id}: ${was} → ${now[id] || "no tile"}`
+          + ` (ingest ${st.status ?? "-"}, seen ${st.seen_age_s ?? "?"} s ago, video_live ${st.video_live ?? "-"},`
+          + ` frames ${st.frame_count ?? "-"})`);
+      }
+    }
+    prevStatus.current = now;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statusKey]);
   // v2 R6.4: live / degraded / shedding per live tile
   const analyticsStates = useAnalyticsStates(
     drones.filter((d) => d.status === "live" || d.status === "degraded").map((d) => d.id));

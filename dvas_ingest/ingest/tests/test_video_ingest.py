@@ -743,3 +743,13 @@ def test_substream_decodes_on_the_gpu_when_it_can(monkeypatch):
         i = args.index("-i")
         assert args.index("-probesize") < i and args.index("-analyzeduration") < i   # quick start
         assert "-progress" in args                                                 # readiness
+
+
+def test_seen_age_is_measured_on_the_server_clock():
+    """v2 R9: the dashboard gets the age, not a timestamp to compare with the viewer's clock."""
+    import datetime as _dt
+    ts = (_dt.datetime.utcnow() - _dt.timedelta(seconds=7)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    assert 6.5 <= main._seen_age_s(ts) <= 8.0
+    assert main._seen_age_s(None) is None and main._seen_age_s("garbage") is None
+    assert main._recently_seen(ts) and not main._recently_seen(
+        (_dt.datetime.utcnow() - _dt.timedelta(seconds=20)).strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
