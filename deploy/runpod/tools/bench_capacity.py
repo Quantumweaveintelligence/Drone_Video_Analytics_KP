@@ -166,7 +166,9 @@ def main() -> int:
     # More than 6 drones (R9): one summary per sample instead of a column per drone
     compact = len(drones) > 6
     if compact:
-        print("  t    recv  slots  pub fps min/med  an fps min/med  worst behind   most backlog (frames)   GPU")
+        # rx = video frames ingest received (works with every service off); pub = frames the
+        # decoder published for analytics (0 when no service is selected, R6.2)
+        print("  t    recv  slots  rx fps min/med  pub fps min/med  an fps min/med  worst behind   most backlog (frames)   GPU")
     else:
         print("  t    " + "  ".join(f"{d[-2:]}: pub/ an  behind" for d, _ in drones) + "   most backlog (frames)   GPU")
     worst_behind = {d: 0.0 for d, _ in drones}
@@ -174,6 +176,8 @@ def main() -> int:
     an_samples = {d: [] for d, _ in drones}
     max_shed: dict = {}
     svc_fps: dict = {}          # service → drone → analysed fps samples while receiving
+    rx_prev: dict = {}          # drone → (last_seq_rx, time) at the previous sample
+    rx_samples = {d: [] for d, _ in drones}
     svc_stages: dict = {}       # service → last stage ms (EMA) of any drone
     worst_backlog: dict = {}
     quota = cpu_quota()
@@ -190,7 +194,7 @@ def main() -> int:
         worst_cpu = max(worst_cpu, cores)
         cpu_txt = f"CPU {cores:4.1f}" + (f"/{quota:.0f}" if quota else "") + (f" thr {thr:.0%}" if thr > 0.005 else "")
         cells, backlog = [], {}
-        recv, slots, pubs, ans, behinds = 0, 0, [], [], []
+        recv, slots, pubs, ans, behinds, rxs = 0, 0, [], [], [], []
         stats = svc_drones(r)
         for drone, sid in drones:
             h = {s(k): s(v) for k, v in r.hgetall(f"mission:video:{sid}").items()}
@@ -207,6 +211,12 @@ def main() -> int:
                     ans.append(slow[0])
             if h.get("live_slot"):
                 slots += 1
+            seq_rx, t_rx = float(h.get("last_seq_rx") or 0), time.time()
+            if drone in rx_prev and h.get("status") == "receiving":
+                rx = max(0.0, (seq_rx - rx_prev[drone][0]) / max(0.1, t_rx - rx_prev[drone][1]))
+                rxs.append(rx)
+                rx_samples[drone].append(rx)
+            rx_prev[drone] = (seq_rx, t_rx)
             an = f"{slow[0]:4.1f}" if slow else "   -"
             mark = f"L{slow[2]}" if slow and slow[2] else "  "
             if h.get("status") == "receiving":
@@ -229,7 +239,7 @@ def main() -> int:
         slow = max(backlog.items(), key=lambda kv: kv[1]) if backlog else ("-", 0)
         if compact:
             mm = lambda v: (f"{min(v):5.1f}/{sorted(v)[len(v) // 2]:5.1f}" if v else "    -/    -")  # noqa: E731
-            print(f"{time.time() - t0:5.0f}  {recv:>3}/{len(drones):<3} {slots:>4}   {mm(pubs):>15}  {mm(ans):>14}"
+            print(f"{time.time() - t0:5.0f}  {recv:>3}/{len(drones):<3} {slots:>4}  {mm(rxs):>14}  {mm(pubs):>15}  {mm(ans):>14}"
                   f"  {max(behinds, default=0.0):10.1f}s   {slow[0]:>10} ({slow[1]:>4})   {gpu_util()}   {cpu_txt}")
         else:
             print(f"{time.time() - t0:5.0f}  " + "  ".join(cells) + f"   {slow[0]:>10} ({slow[1]:>4})   {gpu_util()}   {cpu_txt}")
@@ -242,12 +252,12 @@ def main() -> int:
         time.sleep(2)
 
     print("\n== result")
-    print(f"{'drone':<12} {'published fps':>14} {'analysed fps (slowest every-frame service)':>43} "
+    print(f"{'drone':<12} {'received fps':>13} {'published fps':>14} {'analysed fps (slowest every-frame service)':>43} "
           f"{'max behind live':>16} {'frames':>8}")
     med = lambda v: sorted(v)[len(v) // 2] if v else 0.0  # noqa: E731
     for drone, sid in drones:
         n = s(r.hget(f"mission:video:{sid}", "analytics_seq")) or "-"
-        print(f"{drone:<12} {med(fps_samples[drone]):>14.1f} {med(an_samples[drone]):>43.1f} "
+        print(f"{drone:<12} {med(rx_samples[drone]):>13.1f} {med(fps_samples[drone]):>14.1f} {med(an_samples[drone]):>43.1f} "
               f"{worst_behind[drone]:>15.1f}s {n:>8}")
     print("\nanalysed fps per service (median over the run, per drone; newest = newest frame only):")
     for svc in sorted(svc_fps):

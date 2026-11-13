@@ -150,6 +150,15 @@ def frame_bytes(fields: dict) -> Optional[bytes]:
 
 # Per-process decode time per drone, for the stage split (plan A4)
 DECODE_MS: Dict[str, float] = {}
+# Per-frame work a service wants done in the decode workers, in parallel and ahead of the round
+# (v2 R4.9 / R6.9): name → fn(img, drone_id). Each must only read the frame and keep its result
+# itself; a failure never costs the frame. PREP_MS: drone → {name: ms of its last run}.
+_PREPARERS: Dict[str, Callable] = {}
+PREP_MS: Dict[str, Dict[str, float]] = {}
+
+
+def add_frame_preparer(name: str, fn: Callable) -> None:
+    _PREPARERS[name] = fn
 _LateFrame = None
 
 
@@ -184,16 +193,30 @@ def decode_frame(fields: dict):
         DECODE_MS[fields["drone_id"]] = (time.perf_counter() - t) * 1000
     if img is not None and fields.get("_late") == "1":
         img = img.view(_late_cls())
-    elif img is not None:
-        # BoT-SORT services: the frame-only part of the camera motion, here in the decode
-        # worker instead of in the round (v2 R4.9); never costs the frame if it fails
-        bt = sys.modules.get("shared.batch_tracker")
-        if bt is not None:
-            try:
-                bt.prepare_frame(img, fields.get("drone_id") or "")
-            except Exception as exc:
-                log.debug("camera-motion preparation failed: %s", exc)
+    if img is not None:
+        _prepare(img, fields.get("drone_id") or "")
     return img
+
+
+def _prepare(img, drone_id: str) -> None:
+    """Frame-only work done here in the decode worker instead of in the round; never costs
+    the frame if it fails. BoT-SORT services: the camera-motion part (v2 R4.9, skips late
+    frames itself); plus whatever the service registered (add_frame_preparer)."""
+    bt = sys.modules.get("shared.batch_tracker")
+    if bt is not None:
+        try:
+            bt.prepare_frame(img, drone_id)
+        except Exception as exc:
+            log.debug("camera-motion preparation failed: %s", exc)
+    for name, fn in list(_PREPARERS.items()):
+        t = time.perf_counter()
+        try:
+            fn(img, drone_id)
+        except Exception as exc:
+            log.debug("frame preparation %s failed: %s", name, exc)
+            continue
+        if drone_id:
+            PREP_MS.setdefault(drone_id, {})[name] = (time.perf_counter() - t) * 1000
 
 
 def _decode_quietly(fields: dict):
@@ -950,7 +973,7 @@ class FrameSampler:
         if total_ms is not None:
             st.total_ms = DroneStats._ema(st.total_ms, float(total_ms))
         # Automatic stages: decode (decode_frame) and detect/track (BatchTracker), if used
-        auto = {"decode": DECODE_MS.get(drone_id)}
+        auto = {"decode": DECODE_MS.get(drone_id), **PREP_MS.get(drone_id, {})}
         bt = sys.modules.get("shared.batch_tracker")
         if bt is not None:
             auto.update(bt.stage_ms(drone_id))

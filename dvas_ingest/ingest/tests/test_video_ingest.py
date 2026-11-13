@@ -550,3 +550,15 @@ def test_every_live_slot_is_declared_in_go2rtc():
     assert len(main.LIVE_SLOTS) == 32
     for name in main.LIVE_SLOTS:
         assert name in declared and f"{name}_sub" in declared, name
+
+
+def test_open_video_uplink_marks_the_drone_live(monkeypatch):
+    """v2 R9: with no analytics service selected nothing reaches the analytics stream, so the
+    dashboard needs the uplink itself to show the drone live."""
+    class Conn:
+        def __init__(self, drone_id, stopping=False):
+            self.drone_id, self.stopping = drone_id, stopping
+    monkeypatch.setattr(main, "_video_conns", {"s1": Conn("DRN-1"), "s2": Conn("DRN-2", stopping=True)})
+    assert main._video_uplink_open("DRN-1") is True
+    assert main._video_uplink_open("DRN-2") is False          # closing
+    assert main._video_uplink_open("DRN-3") is False

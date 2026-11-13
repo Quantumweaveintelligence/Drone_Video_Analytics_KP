@@ -49,14 +49,16 @@ export function framesLeft(drone) {
 }
 
 /** Determine stream status: live vs draining vs offline */
-function resolveDroneStatus(stream, fallbackStatus = "offline") {
+export function resolveDroneStatus(stream, fallbackStatus = "offline") {
   if (!stream) return fallbackStatus;
   if (stream._offline) return "offline";                // drone_offline pushed over the WebSocket
 
   if (stream.status === "draining") return "draining";  // draining takes priority
   const recent = isRecentlySeen(stream.last_seen);
   const frames = stream.frame_count ?? stream.frames_received ?? 0;
-  if (recent && frames > 0) return "live";
+  // v2 R9: a drone streaming video with no analytics service selected has no analytics
+  // frames (R6.2) but is live — its video uplink is open
+  if (recent && (frames > 0 || stream.video_live)) return "live";
   if ((stream.messages_ready ?? 0) > 0 || frames > 0) return "draining";
   return "offline";
 }

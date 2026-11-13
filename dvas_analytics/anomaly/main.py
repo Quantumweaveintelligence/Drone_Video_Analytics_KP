@@ -43,8 +43,9 @@ from shared.db import write_confirmed_event
 from shared.evidence import bbox_xyxy, evidence_block, frame_context, model_info
 from shared import gpu_profile
 from shared.annotated_hub import AnnotatedHub, install_stream_route
-from shared.frame_sampler import FrameSampler, frame_bytes
+from shared.frame_sampler import FrameSampler, add_frame_preparer, frame_bytes
 from analyzer import AnomalyAnalyzer, analyze_round, release_shared_detectors
+from motion import camera_motion
 
 logging.basicConfig(
     level=cfg.LOG_LEVEL,
@@ -505,6 +506,9 @@ async def startup_event():
     await get_pool()
     await minio.ensure_bucket(BUCKET_ANOMALY)
     cpu_budget.apply("anomaly")  # torch / OpenCV threads (R4.4)
+    # ORB features of each frame in the decode workers, ahead of the round (R6.9); the
+    # analyzers' CameraMotionEstimator(max_features=800) picks them up
+    add_frame_preparer("orb_prep", lambda img, _drone: camera_motion.prepare(img, 800))
     gpu_profile.apply_torch_settings()      # FP16 / cuDNN autotune before any model loads
     # Start stream consumer loop automatically
     _stream_running = True

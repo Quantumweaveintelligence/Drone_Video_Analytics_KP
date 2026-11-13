@@ -665,7 +665,7 @@ Every step is measured on the pod before and after, with the stage split (A4) an
    - Any value can be overridden per service through env.
    - **Done (2026-11-13, not yet measured on the pod):** `dvas-init.sh` keeps 30 % of the quota
      (min 4) for video decode, ingest, backend and the databases, and splits the rest by weight
-     (27 cores → person 5, ANPR 3, anomaly 3, vehicle 3, intrusion 2, vessel 2, crowd 1);
+     (27 cores → person 5, ANPR 3, anomaly 3, vehicle 3, intrusion 2, vessel 2, crowd 2);
      `shared/cpu_budget.py` sets torch and OpenCV at each service's start. OpenCV used to size its
      pool from the visible cores (31 per process). onnxruntime (ArcFace, 2) and Paddle (ANPR OCR,
      4) keep their fixed counts for now.
@@ -916,6 +916,17 @@ not one frame's cost. Known so far:
 - Services run with `OMP_NUM_THREADS` = quota ÷ 8 (dvas-init.sh), but OpenCV's own pool is not
   limited the same way — to be checked (7 services × 31 OpenCV threads on 31 cores).
 
+- **Pod run 13 Nov (image 4e6fb1e, 2 × 4K, all 7):** anomaly `motion` 84, `pipeline` 1, `persist`
+  10, `round` 124, `wait_writes` 0 ms — camera motion is the cost. **Done:** ORB keypoints and
+  descriptors (frame-only) are computed in the sampler's decode workers (`orb_prep`, via the
+  sampler's new `add_frame_preparer`); `estimate_motion` only matches against the previous frame.
+  Same ORB settings on the same pixels: identical motion (matrix, inliers, accumulated homography).
+- Same run, R4.4 + R4.9 effect: per-frame totals person 118 → 67, vehicle 119 → 65, ANPR 91 → 65
+  ms; tracking 44 → 13, 47 → 19, 34 → 16 ms (`gmc_prep` 14–16 ms now in the decode workers). Fps
+  per drone unchanged (4.2–4.5): every service stayed at level 3, whose cadence step-down caps it
+  near 5 fps; the next level needs ≈ 50 ms per frame for 2 drones. Decode (47–68 ms) is now the
+  largest stage. Crowd at 1 thread: model 90 → 256 ms → floor raised to 2 threads.
+
 **Tests (R6):** a service held at 5 fps enters level 1 → 2 → 3 within seconds, its PEL stays
 small, every shed range is in the audit log, and it returns to `LIVE` after the load ends; a
 `latest` service never delays the feed; with no service enabled the decoder publishes nothing;
@@ -1073,6 +1084,14 @@ only the R7 capacity note. Live video and analytics are separate limits and are 
 
 **Accuracy:** steps 1, 2 and 4 do not touch analytics; step 3 ships only with the accuracy guard;
 step 5 only measures.
+
+**Pod run 13 Nov (image 4e6fb1e), step 2 at 8 × 4K:** all 8 received and holding live slots,
+≈ 2 of 27 CPU cores — but **no tile in the Multi-Drone View**. Cause: the dashboard's status rule
+needed analytics frames (`frame_count > 0`), and with no service selected the decoder publishes
+none (R6.2) — the same would hide a real drone streaming with no service selected. **Fixed:**
+ingest reports `video_live` (an open uplink) in `/ingest/streams/active`, and the dashboard
+treats a recently seen drone with an open uplink as live. `bench_capacity.py` also reports
+received video fps (rx), which works with every service off.
 
 ## 5. Flags summary
 

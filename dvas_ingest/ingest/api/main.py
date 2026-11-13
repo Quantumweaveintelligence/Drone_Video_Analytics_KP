@@ -1226,6 +1226,13 @@ LIVE_SUB_WANT_S = 45
 _DEL_IF_EQUAL = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0"
 
 
+def _video_uplink_open(drone_id: str) -> bool:
+    """The drone has an open video uplink (R9). With no analytics service selected nothing is
+    published to its analytics stream (R6.2), so frame_count stays 0 while video arrives; the
+    dashboard uses this to still show the drone live."""
+    return any(c.drone_id == drone_id and not c.stopping for c in _video_conns.values())
+
+
 async def _live_slot_acquire(sid: str) -> Optional[str]:
     client = _qm._client
     for name in LIVE_SLOTS:
@@ -2591,6 +2598,7 @@ async def _active_streams_mission_mode() -> dict:
             "stream_key":      v["stream_key"],
             "frame_count":     frame_count,
             "frames_received": frame_count,
+            "video_live":      _video_uplink_open(drone_id),
             "messages_ready":  v["remaining"],
             "status":          stream_status,
             "mission_status":  mission_stat,

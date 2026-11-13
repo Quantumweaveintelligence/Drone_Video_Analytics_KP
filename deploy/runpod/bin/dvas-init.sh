@@ -109,11 +109,12 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$OMP_NUM_THREADS}" OPENBLAS_NUM_THREA
 log "CPU quota ${DVAS_CPUS} vCPU → ${OMP_NUM_THREADS} compute threads per process"
 # v2 R4.4: each analyzer gets a share of the quota by weight for its torch / OpenCV pools
 # (shared/cpu_budget.py), after a reserve for video decode, ingest, backend and the databases.
-# Weights ×2: person 6, ANPR 4, anomaly 4, vehicle 3, intrusion 2, vessel 2, crowd 1 (sum 22).
+# Weights ×2: person 6, ANPR 4, anomaly 4, vehicle 3, intrusion 2, vessel 2, crowd 1 (sum 22);
+# at least 2 each (crowd at 1 thread: its model stage went 90 → 256 ms on 13 Nov).
 # Any DVAS_THREADS_<SVC> set in the pod's env wins.
 reserve=$(( DVAS_CPUS * 3 / 10 )); [ "$reserve" -ge 4 ] || reserve=4
 pool=$(( DVAS_CPUS - reserve )); [ "$pool" -ge 7 ] || pool=7
-for sw in PERSON:6:2 ANPR:4:2 ANOMALY:4:2 VEHICLE:3:2 INTRUSION:2:2 VESSEL:2:2 CROWD:1:1; do
+for sw in PERSON:6:2 ANPR:4:2 ANOMALY:4:2 VEHICLE:3:2 INTRUSION:2:2 VESSEL:2:2 CROWD:1:2; do
   IFS=: read -r svc w lo <<< "$sw"
   var="DVAS_THREADS_${svc}"
   n=$(( (pool * w + 11) / 22 )); [ "$n" -ge "$lo" ] || n=$lo

@@ -165,3 +165,16 @@ def test_prepared_data_is_freed_with_the_frame(monkeypatch):
     del f
     gc.collect()
     assert key not in bt._PREPARED
+
+
+def test_registered_preparers_run_in_decode_and_never_cost_the_frame(monkeypatch):
+    import cv2
+    from shared import frame_sampler as fs
+    seen = []
+    monkeypatch.setattr(fs, "_PREPARERS", {})
+    fs.add_frame_preparer("ok", lambda img, d: seen.append((img.shape, d)))
+    fs.add_frame_preparer("broken", lambda img, d: 1 / 0)
+    ok, jpeg = cv2.imencode(".jpg", _textured(0))
+    img = fs.decode_frame({"drone_id": "DRN-9", "frame": jpeg.tobytes()})
+    assert img is not None and seen == [(img.shape, "DRN-9")]
+    assert "ok" in fs.PREP_MS["DRN-9"] and "broken" not in fs.PREP_MS["DRN-9"]

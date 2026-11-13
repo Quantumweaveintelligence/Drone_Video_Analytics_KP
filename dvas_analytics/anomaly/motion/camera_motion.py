@@ -5,9 +5,48 @@ to decouple drone flight from true ground-relative movement.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+import threading
+import weakref
+from typing import Dict, Optional, Tuple
 import cv2
 import numpy as np
+
+
+def _make_orb(max_features: int):
+    return cv2.ORB_create(
+        nfeatures=max_features,
+        scaleFactor=1.2,
+        nlevels=8,
+        edgeThreshold=31,
+        firstLevel=0,
+        WTA_K=2,
+        scoreType=cv2.ORB_HARRIS_SCORE,
+        patchSize=31,
+        fastThreshold=20,
+    )
+
+
+# v2 R6.9: ORB keypoints and descriptors depend on the frame alone (≈ 84 ms per 4K frame on
+# the pod, in the round). The sampler's decode workers compute them ahead of the round
+# (prepare, registered by the service); estimate_motion then only matches against the previous
+# frame. Same ORB settings on the same pixels → the same features and the same motion.
+_PREPARED: Dict[int, tuple] = {}            # id(frame) → (max_features, gray, keypoints, descriptors)
+_local = threading.local()                  # one ORB detector per decode thread
+
+
+def prepare(frame: np.ndarray, max_features: int = 800) -> None:
+    """Grey image, ORB keypoints and descriptors of this frame, kept until the frame is freed."""
+    if frame is None or getattr(frame, "ndim", 0) not in (2, 3):
+        return
+    orbs = getattr(_local, "orbs", None)
+    if orbs is None:
+        orbs = _local.orbs = {}
+    orb = orbs.get(max_features) or orbs.setdefault(max_features, _make_orb(max_features))
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+    kp, des = orb.detectAndCompute(gray, None)
+    key = id(frame)
+    _PREPARED[key] = (max_features, gray, kp, des)
+    weakref.finalize(frame, _PREPARED.pop, key, None)
 
 
 @dataclass
@@ -39,17 +78,7 @@ class CameraMotionEstimator:
         self.ransac_reproj_thresh = ransac_reproj_thresh
 
         # Initialize ORB detector
-        self.orb = cv2.ORB_create(
-            nfeatures=self.max_features,
-            scaleFactor=1.2,
-            nlevels=8,
-            edgeThreshold=31,
-            firstLevel=0,
-            WTA_K=2,
-            scoreType=cv2.ORB_HARRIS_SCORE,
-            patchSize=31,
-            fastThreshold=20,
-        )
+        self.orb = _make_orb(self.max_features)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
         self.prev_gray: Optional[np.ndarray] = None
@@ -71,9 +100,12 @@ class CameraMotionEstimator:
         :param frame: Current BGR or Grayscale frame
         :return: MotionTransformation containing matrix and motion components
         """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
-
-        kp, des = self.orb.detectAndCompute(gray, None)
+        prepared = _PREPARED.get(id(frame))
+        if prepared is not None and prepared[0] == self.max_features:
+            _, gray, kp, des = prepared              # computed in the decode worker
+        else:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+            kp, des = self.orb.detectAndCompute(gray, None)
 
         if self.prev_gray is None or self.prev_des is None or des is None or len(des) < self.min_inliers:
             self.prev_gray = gray
