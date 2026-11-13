@@ -107,6 +107,19 @@ export DVAS_CPUS OMP_NUM_THREADS="${OMP_NUM_THREADS:-$threads}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$OMP_NUM_THREADS}" OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-$OMP_NUM_THREADS}" \
        NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-$OMP_NUM_THREADS}"
 log "CPU quota ${DVAS_CPUS} vCPU → ${OMP_NUM_THREADS} compute threads per process"
+# v2 R4.4: each analyzer gets a share of the quota by weight for its torch / OpenCV pools
+# (shared/cpu_budget.py), after a reserve for video decode, ingest, backend and the databases.
+# Weights ×2: person 6, ANPR 4, anomaly 4, vehicle 3, intrusion 2, vessel 2, crowd 1 (sum 22).
+# Any DVAS_THREADS_<SVC> set in the pod's env wins.
+reserve=$(( DVAS_CPUS * 3 / 10 )); [ "$reserve" -ge 4 ] || reserve=4
+pool=$(( DVAS_CPUS - reserve )); [ "$pool" -ge 7 ] || pool=7
+for sw in PERSON:6:2 ANPR:4:2 ANOMALY:4:2 VEHICLE:3:2 INTRUSION:2:2 VESSEL:2:2 CROWD:1:1; do
+  IFS=: read -r svc w lo <<< "$sw"
+  var="DVAS_THREADS_${svc}"
+  n=$(( (pool * w + 11) / 22 )); [ "$n" -ge "$lo" ] || n=$lo
+  export "${var}=${!var:-$n}"
+done
+log "analyzer threads: person ${DVAS_THREADS_PERSON} anpr ${DVAS_THREADS_ANPR} anomaly ${DVAS_THREADS_ANOMALY} vehicle ${DVAS_THREADS_VEHICLE} intrusion ${DVAS_THREADS_INTRUSION} vessel ${DVAS_THREADS_VESSEL} crowd ${DVAS_THREADS_CROWD} (of ${DVAS_CPUS})"
 
 # Snapshot for interactive tools (dvas-ctl over SSH); root-only
 ( umask 077; export -p | grep -E 'declare -x (DVAS_|PUBLIC_BASE_URL|SECURE_COOKIES|[A-Z_]*_URL=|KC_|MINIO_|KEYCLOAK_|DRONE_IDS|KNOWN_DRONES)' > /run/dvas/runtime.env || true )

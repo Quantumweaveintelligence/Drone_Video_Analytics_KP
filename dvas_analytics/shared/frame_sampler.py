@@ -184,6 +184,15 @@ def decode_frame(fields: dict):
         DECODE_MS[fields["drone_id"]] = (time.perf_counter() - t) * 1000
     if img is not None and fields.get("_late") == "1":
         img = img.view(_late_cls())
+    elif img is not None:
+        # BoT-SORT services: the frame-only part of the camera motion, here in the decode
+        # worker instead of in the round (v2 R4.9); never costs the frame if it fails
+        bt = sys.modules.get("shared.batch_tracker")
+        if bt is not None:
+            try:
+                bt.prepare_frame(img, fields.get("drone_id") or "")
+            except Exception as exc:
+                log.debug("camera-motion preparation failed: %s", exc)
     return img
 
 

@@ -163,7 +163,12 @@ def main() -> int:
         time.sleep(0.5)                                  # stagger the keyframes a little
 
     print(f"\n{a.drones} drone(s) × {a.size} @ 30 fps for {loops * 30} s — sampling every 5 s")
-    print("  t    " + "  ".join(f"{d[-2:]}: pub/ an  behind" for d, _ in drones) + "   most backlog (frames)   GPU")
+    # More than 6 drones (R9): one summary per sample instead of a column per drone
+    compact = len(drones) > 6
+    if compact:
+        print("  t    recv  slots  pub fps min/med  an fps min/med  worst behind   most backlog (frames)   GPU")
+    else:
+        print("  t    " + "  ".join(f"{d[-2:]}: pub/ an  behind" for d, _ in drones) + "   most backlog (frames)   GPU")
     worst_behind = {d: 0.0 for d, _ in drones}
     fps_samples = {d: [] for d, _ in drones}
     an_samples = {d: [] for d, _ in drones}
@@ -185,6 +190,7 @@ def main() -> int:
         worst_cpu = max(worst_cpu, cores)
         cpu_txt = f"CPU {cores:4.1f}" + (f"/{quota:.0f}" if quota else "") + (f" thr {thr:.0%}" if thr > 0.005 else "")
         cells, backlog = [], {}
+        recv, slots, pubs, ans, behinds = 0, 0, [], [], []
         stats = svc_drones(r)
         for drone, sid in drones:
             h = {s(k): s(v) for k, v in r.hgetall(f"mission:video:{sid}").items()}
@@ -193,6 +199,14 @@ def main() -> int:
                 continue
             fps, behind = float(h.get("pub_fps") or 0), float(h.get("behind_live_s") or 0)
             slow = slowest(stats, drone)
+            if h.get("status") == "receiving":
+                recv += 1
+                pubs.append(fps)
+                behinds.append(behind)
+                if slow:
+                    ans.append(slow[0])
+            if h.get("live_slot"):
+                slots += 1
             an = f"{slow[0]:4.1f}" if slow else "   -"
             mark = f"L{slow[2]}" if slow and slow[2] else "  "
             if h.get("status") == "receiving":
@@ -213,7 +227,12 @@ def main() -> int:
                 backlog[g] = max(backlog.get(g, 0), n)
                 worst_backlog[g] = max(worst_backlog.get(g, 0), n)
         slow = max(backlog.items(), key=lambda kv: kv[1]) if backlog else ("-", 0)
-        print(f"{time.time() - t0:5.0f}  " + "  ".join(cells) + f"   {slow[0]:>10} ({slow[1]:>4})   {gpu_util()}   {cpu_txt}")
+        if compact:
+            mm = lambda v: (f"{min(v):5.1f}/{sorted(v)[len(v) // 2]:5.1f}" if v else "    -/    -")  # noqa: E731
+            print(f"{time.time() - t0:5.0f}  {recv:>3}/{len(drones):<3} {slots:>4}   {mm(pubs):>15}  {mm(ans):>14}"
+                  f"  {max(behinds, default=0.0):10.1f}s   {slow[0]:>10} ({slow[1]:>4})   {gpu_util()}   {cpu_txt}")
+        else:
+            print(f"{time.time() - t0:5.0f}  " + "  ".join(cells) + f"   {slow[0]:>10} ({slow[1]:>4})   {gpu_util()}   {cpu_txt}")
 
     print("\n== waiting for analytics to finish the backlog …")
     deadline = time.time() + 300

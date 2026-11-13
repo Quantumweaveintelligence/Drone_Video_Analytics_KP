@@ -44,7 +44,7 @@ from shared.redis_client import (
     close_client, publish_analytics_result, publish_confirmed_event, xread_frames,
     scan_active_stream_drones,
 )
-from shared import minio_client as minio
+from shared import cpu_budget, minio_client as minio
 from shared import gpu_profile, persist_gate
 from shared.frame_sampler import FrameSampler
 from shared.annotated_hub import AnnotatedHub, install_stream_route, scale_items, to_display
@@ -134,6 +134,7 @@ async def startup():
     for drone_id in cfg.DRONE_IDS:
         await ensure_drone(drone_id)
     await minio.ensure_all_buckets()
+    cpu_budget.apply("person")  # torch / OpenCV threads (R4.4)
     gpu_profile.apply_torch_settings()      # FP16 / cuDNN autotune for the detected GPU
     analyzer = PersonFaceAnalyzer(PERSON_MODEL, FACE_MODEL)
     resnet_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

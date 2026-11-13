@@ -33,7 +33,7 @@ from shared.redis_client import (
     close_client, publish_analytics_result, publish_confirmed_event,
     scan_active_stream_drones, get_client, get_latest_stream_frame,
 )
-from shared import minio_client as minio
+from shared import cpu_budget, minio_client as minio
 from shared import gpu_profile
 from shared.batch_tracker import BatchTracker
 from shared.annotated_hub import AnnotatedHub, install_stream_route
@@ -164,6 +164,7 @@ async def startup():
         _live_detections[drone_id] = []
 
     # Load YOLOv8s model
+    cpu_budget.apply("intrusion")  # torch / OpenCV threads (R4.4)
     gpu_profile.apply_torch_settings()      # FP16 / cuDNN autotune for the detected GPU
     log.info("Loading YOLO model: %s", INTRUSION_MODEL)
     yolo_model = YOLO(INTRUSION_MODEL)

@@ -12,6 +12,7 @@ own track callback performs, so results keep `boxes.id` like `.track()`.
 """
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import os
@@ -111,7 +112,15 @@ TIMINGS: Dict[str, Dict[str, float]] = {}
 
 
 def stage_ms(key: str) -> Dict[str, float]:
-    return dict(TIMINGS.get(key, {}))
+    out = dict(TIMINGS.get(key, {}))
+    if key in PREP_MS:
+        out["gmc_prep"] = PREP_MS[key]       # in the decode workers, off the round (R4.9)
+    return out
+
+
+def gmc_downscale(width: int) -> int:
+    """BoT-SORT's GMC downscale for a frame this wide (Ultralytics' default 2 when off)."""
+    return max(2, math.ceil(width / GMC_TARGET_PX)) if GMC_TARGET_PX and width else 2
 
 
 def _size_gmc(tracker, img) -> None:
@@ -120,8 +129,86 @@ def _size_gmc(tracker, img) -> None:
         return
     width = img.shape[1] if hasattr(img, "shape") else 0
     if width:
-        gmc.downscale = max(2, math.ceil(width / GMC_TARGET_PX))
+        gmc.downscale = gmc_downscale(width)
     tracker._dvas_gmc_sized = True
+
+
+# v2 R4.9: BoT-SORT's camera motion (sparse optical flow) spends most of its time on parts that
+# depend on the frame alone — grey, downscale and goodFeaturesToTrack (≈ 19 of ≈ 26 ms at 4K).
+# The sampler's decode workers prepare them in parallel, ahead of the round (prepare_frame);
+# in the round the tracker only runs the optical flow against the previous frame and fits the
+# motion. Same OpenCV calls on the same pixels → the same warp as Ultralytics' own path
+# (tests/test_parallel_tracking.py). DVAS_GMC_PREPARE=0: the tracker does all of it, as before.
+PREPARE_GMC = os.getenv("DVAS_GMC_PREPARE", "1") != "0"
+_PREPARED: Dict[int, tuple] = {}            # id(frame) → (downscale, small grey, keypoints)
+PREP_MS: Dict[str, float] = {}               # drone → ms of its last preparation
+_feature_params: Optional[dict] = None
+
+
+def _gmc_feature_params() -> dict:
+    global _feature_params
+    if _feature_params is None:
+        from ultralytics.trackers.utils.gmc import GMC  # noqa: PLC0415
+        _feature_params = dict(GMC(method="sparseOptFlow").feature_params)
+    return _feature_params
+
+
+def prepare_frame(img, drone_id: str = "") -> None:
+    """Frame-only part of the camera motion for this frame, kept until the frame is freed.
+    Called by the sampler's decode workers; a no-op unless this process tracks with BoT-SORT."""
+    if not (PREPARE_GMC and _INSTANCES) or img is None or getattr(img, "ndim", 0) != 3 or is_late(img):
+        return
+    import cv2  # noqa: PLC0415
+    import weakref  # noqa: PLC0415
+    t = time.perf_counter()
+    h, w = img.shape[:2]
+    ds = gmc_downscale(w)
+    small = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if ds > 1.0:
+        small = cv2.resize(small, (w // ds, h // ds))
+    kp = cv2.goodFeaturesToTrack(small, mask=None, **_gmc_feature_params())
+    key = id(img)
+    _PREPARED[key] = (ds, small, kp)
+    weakref.finalize(img, _PREPARED.pop, key, None)
+    if drone_id:
+        PREP_MS[drone_id] = (time.perf_counter() - t) * 1000
+
+
+def _prepared_for(tracker, img):
+    gmc = getattr(tracker, "gmc", None)
+    if gmc is None or getattr(gmc, "method", None) != "sparseOptFlow":
+        return None
+    p = _PREPARED.get(id(img))
+    return p if p is not None and p[0] == gmc.downscale else None
+
+
+def _apply_prepared(gmc, small, keypoints):
+    """The rest of Ultralytics' GMC.apply_sparseoptflow (8.3), from the prepared frame."""
+    import cv2  # noqa: PLC0415
+    import numpy as np  # noqa: PLC0415
+    H = np.eye(2, 3)
+    if not gmc.initializedFirstFrame or gmc.prevKeyPoints is None:
+        gmc.prevFrame = small.copy()
+        gmc.prevKeyPoints = copy.copy(keypoints)
+        gmc.initializedFirstFrame = True
+        return H
+    matched, status, _ = cv2.calcOpticalFlowPyrLK(gmc.prevFrame, small, gmc.prevKeyPoints, None)
+    prev_pts, curr_pts = [], []
+    for i in range(len(status)):
+        if status[i]:
+            prev_pts.append(gmc.prevKeyPoints[i])
+            curr_pts.append(matched[i])
+    prev_pts, curr_pts = np.array(prev_pts), np.array(curr_pts)
+    if prev_pts.shape[0] > 4 and prev_pts.shape[0] == curr_pts.shape[0]:
+        H, _ = cv2.estimateAffinePartial2D(prev_pts, curr_pts, cv2.RANSAC)
+        if gmc.downscale > 1.0:
+            H[0, 2] *= gmc.downscale
+            H[1, 2] *= gmc.downscale
+    else:
+        log.debug("GMC: not enough matching points")
+    gmc.prevFrame = small.copy()
+    gmc.prevKeyPoints = copy.copy(keypoints)
+    return H
 
 
 def _match_without_update(tracker, result):
@@ -158,10 +245,23 @@ def _match_without_update(tracker, result):
     return out
 
 
-def _update(tracker, result):
-    """Apply one tracker step to an Ultralytics Results (in place, like track())."""
-    import torch  # noqa: PLC0415
+def _update(tracker, result, frame=None):
+    """Apply one tracker step to an Ultralytics Results (in place, like track()).
+    `frame`: the array the sampler decoded (its camera-motion part may be prepared)."""
     _size_gmc(tracker, result.orig_img)
+    prepared = _prepared_for(tracker, frame) if frame is not None else None
+    if prepared is None:
+        return _update_now(tracker, result)
+    gmc = tracker.gmc
+    gmc.apply = lambda raw, dets=None: _apply_prepared(gmc, prepared[1], prepared[2])
+    try:
+        return _update_now(tracker, result)
+    finally:
+        del gmc.apply                       # back to the class method
+
+
+def _update_now(tracker, result):
+    import torch  # noqa: PLC0415
     det = result.boxes.cpu().numpy()
     if _UPDATE_TAKES_FEATS.get(type(tracker)) is None:
         import inspect  # noqa: PLC0415
@@ -264,7 +364,8 @@ class BatchTracker:
             def step(d):
                 t1 = time.perf_counter()
                 r = results[d]
-                res = _match_without_update(trackers[d], r) if is_late(frames[d]) else _update(trackers[d], r)
+                res = (_match_without_update(trackers[d], r) if is_late(frames[d])
+                       else _update(trackers[d], r, frames[d]))
                 TIMINGS[d] = {"detect": detect_ms, "track": (time.perf_counter() - t1) * 1000}
                 return d, res
 

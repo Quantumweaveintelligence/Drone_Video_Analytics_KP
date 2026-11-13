@@ -19,6 +19,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 
 sys.path.insert(0, "/analytics")
+from shared import cpu_budget
 from shared.auth import install_service_guard
 from shared.config import cfg, get_drone_aliases
 from shared.db import (
@@ -97,6 +98,7 @@ def _is_cuda_failure(exc: BaseException) -> bool:
 @app.on_event("startup")
 async def startup():
     global analyzer, _stream_running, _stream_task
+    cpu_budget.apply("crowd")  # torch / OpenCV threads (R4.4)
     await get_pool()
     for drone_id in cfg.DRONE_IDS:
         await ensure_drone(drone_id)

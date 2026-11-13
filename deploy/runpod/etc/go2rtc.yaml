@@ -5,7 +5,9 @@
 # play it through nginx /live/api/ws (MSE over WebSocket, behind auth_request).
 # go2rtc only accepts pushes to streams that exist, so the slots are declared here and the
 # API never needs to create streams: it is bound to localhost and limited to /api/ws.
-# Each slot has a liveNN_sub twin for the grid's 720p sub-stream.
+# Each slot has a liveNN_sub twin for the grid's 720p sub-stream. 32 slots for up to 20 live
+# feeds (plan R9): a freed slot rests 90 s before reuse (LIVE_SLOT_COOLDOWN_S), so reconnects
+# and back-to-back missions still find one. Keep in step with LIVE_SLOTS in ingest.
 # ════════════════════════════════════════════════════════════════════════════
 api:
   listen: "127.0.0.1:1984"
@@ -38,6 +40,22 @@ streams:
   live14:
   live15:
   live16:
+  live17:
+  live18:
+  live19:
+  live20:
+  live21:
+  live22:
+  live23:
+  live24:
+  live25:
+  live26:
+  live27:
+  live28:
+  live29:
+  live30:
+  live31:
+  live32:
   # 720p grid sub-streams, pushed by ingest only while a grid tile watches (video_relay.LiveRelay)
   live01_sub:
   live02_sub:
@@ -55,3 +73,19 @@ streams:
   live14_sub:
   live15_sub:
   live16_sub:
+  live17_sub:
+  live18_sub:
+  live19_sub:
+  live20_sub:
+  live21_sub:
+  live22_sub:
+  live23_sub:
+  live24_sub:
+  live25_sub:
+  live26_sub:
+  live27_sub:
+  live28_sub:
+  live29_sub:
+  live30_sub:
+  live31_sub:
+  live32_sub:

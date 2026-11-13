@@ -36,7 +36,7 @@ from shared.redis_client import (
     close_client, get_client, publish_analytics_result,
     scan_active_stream_drones, get_latest_stream_frame
 )
-from shared import minio_client as minio
+from shared import cpu_budget, minio_client as minio
 from shared import gpu_profile
 from shared.annotated_hub import AnnotatedHub, install_stream_route, to_display
 from shared.frame_sampler import FrameSampler, frame_bytes as _frame_jpeg
@@ -513,6 +513,7 @@ async def _stream_loop():
 async def startup():
     global engine, _stream_task, _stream_running
     log.info("Initializing SeaDrone YOLOv8s Maritime Perception Engine with weights: %s", VESSEL_MODEL_PATH)
+    cpu_budget.apply("vessel")  # torch / OpenCV threads (R4.4)
     gpu_profile.apply_torch_settings()      # FP16 / cuDNN autotune for the detected GPU
     engine = MaritimePerceptionEngine(
         weights_path=VESSEL_MODEL_PATH,

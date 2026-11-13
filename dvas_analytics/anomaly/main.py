@@ -38,7 +38,7 @@ from shared.redis_client import (
     publish_confirmed_event,
     scan_active_stream_drones, get_latest_stream_frame
 )
-from shared import minio_client as minio
+from shared import cpu_budget, minio_client as minio
 from shared.db import write_confirmed_event
 from shared.evidence import bbox_xyxy, evidence_block, frame_context, model_info
 from shared import gpu_profile
@@ -382,8 +382,9 @@ async def _persist_anomaly_frame(
 
 async def _persist_round(items: list) -> None:
     """Persist one round in drone order; the per-drone order across rounds is kept by the loop."""
-    for drone_id, f, analyzer, frame_ts, mission_id, result, t_start in items:
+    for drone_id, f, analyzer, frame_ts, mission_id, result, t_start, stages in items:
         annotated_bgr, triggered_alerts, tracks_summary, detect_ms = result
+        t_p = time.perf_counter()
         try:
             await _persist_anomaly_frame(drone_id, f, analyzer, frame_ts, mission_id,
                                          annotated_bgr, triggered_alerts, tracks_summary)
@@ -392,7 +393,11 @@ async def _persist_round(items: list) -> None:
         t_elapsed = time.monotonic() - t_start
         if t_elapsed > 0:
             _fps_tracker[drone_id].append(1.0 / t_elapsed)
-        _sampler.record(drone_id, infer_ms=detect_ms, total_ms=t_elapsed * 1000)
+        # total = from the round's start to this drone's writes done (includes the other
+        # drones of the round); the stages say where the time goes (v2 R6.9)
+        _sampler.record(drone_id, infer_ms=detect_ms, total_ms=t_elapsed * 1000,
+                        model=detect_ms, persist=(time.perf_counter() - t_p) * 1000,
+                        **stages)
 
 
 def _frame_time(analyzer, f: dict) -> float:
@@ -453,17 +458,26 @@ async def _stream_loop():
                     meta.append((drone_id, f, analyzer, datetime.now(timezone.utc), mission_id))
 
                 # Camera motion per drone, one batched detector pass, then per-drone pipeline
+                t_round = time.perf_counter()
                 results = await asyncio.to_thread(
                     analyze_round, items, gpu_profile.detect().max_batch
                 )
+                round_ms = (time.perf_counter() - t_round) * 1000
+                # this round's timings per drone (the next round replaces analyzer.stage_ms)
+                stages = [{**(getattr(an, "stage_ms", None) or {}), "round": round_ms}
+                          for _d, _f, an, *_rest in meta]
                 _sampler.record_batch(len(items))
 
                 # Persist the previous round before queuing this one (keeps per-drone order);
                 # it ran concurrently with the inference above.
+                t_wait = time.perf_counter()
                 if pending:
                     await asyncio.shield(pending)   # a stream stop must not cut a round half-written
+                wait_ms = (time.perf_counter() - t_wait) * 1000
+                for st in stages:
+                    st["wait_writes"] = wait_ms
                 pending = asyncio.create_task(_persist_round(
-                    [(*m, r, t_start) for m, r in zip(meta, results)]
+                    [(*m, r, t_start, st) for m, r, st in zip(meta, results, stages)]
                 ))
             except asyncio.CancelledError:
                 raise
@@ -490,6 +504,7 @@ async def startup_event():
     log.info("Starting DVAS Anomaly Analytics Service...")
     await get_pool()
     await minio.ensure_bucket(BUCKET_ANOMALY)
+    cpu_budget.apply("anomaly")  # torch / OpenCV threads (R4.4)
     gpu_profile.apply_torch_settings()      # FP16 / cuDNN autotune before any model loads
     # Start stream consumer loop automatically
     _stream_running = True

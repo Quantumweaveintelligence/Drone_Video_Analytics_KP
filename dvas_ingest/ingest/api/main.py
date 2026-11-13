@@ -1214,7 +1214,9 @@ _video_conns: dict[str, _VideoConn] = {}      # sid → open connection
 
 # go2rtc accepts pushes only into streams declared in its config (etc/go2rtc.yaml): a fixed
 # pool of slots, mapped to missions in Valkey (live:slot:<name> = sid) while they stream.
-LIVE_SLOTS = [f"live{n:02d}" for n in range(1, 17)]
+# 32 slots for up to 20 live feeds (plan R9): with the cooldown below, a freed slot rests 90 s,
+# so reconnecting drones and back-to-back missions still find a free one.
+LIVE_SLOTS = [f"live{n:02d}" for n in range(1, 33)]
 # A freed slot is not reused for this long: nginx closes a viewer's socket after 30 s without
 # video, so no viewer of the last mission can still be attached when another mission gets it.
 LIVE_SLOT_COOLDOWN_S = 90

@@ -537,3 +537,16 @@ def test_a_silent_connection_is_closed_after_the_idle_timeout(monkeypatch):
     with pytest.raises(main._VideoClose) as exc:
         asyncio.run(main._video_receive(conn, {}, None, None, "vkey"))
     assert exc.value.error == "idle"
+
+
+def test_every_live_slot_is_declared_in_go2rtc():
+    """v2 R9: go2rtc accepts pushes only to declared streams; ingest must not hand out a slot
+    (or its grid sub-stream twin) that go2rtc.yaml lacks. 32 slots for up to 20 live feeds."""
+    import re
+    path = os.path.join(os.path.dirname(__file__), "..", "..", "..", "deploy", "runpod", "etc", "go2rtc.yaml")
+    if not os.path.exists(path):
+        pytest.skip("deploy/ not next to the ingest sources")
+    declared = set(re.findall(r"^  (live\d{2}(?:_sub)?):\s*$", open(path).read(), re.M))
+    assert len(main.LIVE_SLOTS) == 32
+    for name in main.LIVE_SLOTS:
+        assert name in declared and f"{name}_sub" in declared, name

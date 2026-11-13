@@ -2,7 +2,7 @@
 Live drone video (RunPod v2 plan R2).
 
 The edge streams H.264 to ingest, which relays it into one of go2rtc's stream slots
-(live01 … live16) while the mission streams. Browsers play it through nginx
+(live01 … live32) while the mission streams. Browsers play it through nginx
 `/live/api/ws?src=<slot>` (MSE over WebSocket); nginx asks `/api/live/authorize` first
 (auth_request) on every connection.
 

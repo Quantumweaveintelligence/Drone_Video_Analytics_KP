@@ -478,8 +478,11 @@ def analyze_round(
     # Step 1 per drone (needs the previous frame of the same drone)
     for i, (an, frame, _meta, _ts) in enumerate(items):
         t0s[i] = time.time()
+        t_m = time.perf_counter()
         with an.lock:
             motions[i] = an.motion_estimator.estimate_motion(frame)
+        # stage timings of this drone's last frame, published by the service (v2 R6.9)
+        an.stage_ms = {"motion": (time.perf_counter() - t_m) * 1000}
 
     # Step 2 batched per shared detector
     by_det: Dict[int, List[int]] = {}
@@ -504,8 +507,10 @@ def analyze_round(
     # Steps 3–9 per drone
     out = []
     for i, (an, frame, meta, ts) in enumerate(items):
+        t_p = time.perf_counter()
         annotated, alerts, summary = an.process_detections(
             frame, dets[i] or [], meta, ts, motion=motions[i], t0=t0s[i],
         )
+        an.stage_ms["pipeline"] = (time.perf_counter() - t_p) * 1000
         out.append((annotated, alerts, summary, det_ms[i]))
     return out

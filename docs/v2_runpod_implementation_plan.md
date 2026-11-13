@@ -663,6 +663,12 @@ Every step is measured on the pod before and after, with the stage split (A4) an
    - Each service applies it to `torch.set_num_threads`, `cv2.setNumThreads`, onnxruntime
      `intra_op_num_threads` and Paddle `cpu_threads`.
    - Any value can be overridden per service through env.
+   - **Done (2026-11-13, not yet measured on the pod):** `dvas-init.sh` keeps 30 % of the quota
+     (min 4) for video decode, ingest, backend and the databases, and splits the rest by weight
+     (27 cores → person 5, ANPR 3, anomaly 3, vehicle 3, intrusion 2, vessel 2, crowd 1);
+     `shared/cpu_budget.py` sets torch and OpenCV at each service's start. OpenCV used to size its
+     pool from the visible cores (31 per process). onnxruntime (ArcFace, 2) and Paddle (ANPR OCR,
+     4) keep their fixed counts for now.
 5. **Multi-frame catch-up** (Phase 3 B6): when a drone has a backlog, process up to K consecutive
    frames per round as one GPU batch; the tracker is still updated in frame order.
 6. **ANPR OCR on the GPU** (Phase 3 B4). This needs the plate test set; it ships only if correct
@@ -674,7 +680,24 @@ Every step is measured on the pod before and after, with the stage split (A4) an
    anomaly; Perimeter = intrusion + person; Coast = vessel. Only enabled services read the stream.
    This is the cheapest way to stay at 20 fps with several drones.
 
+9. **Camera motion off the round** (`DVAS_GMC_PREPARE=1`, added 2026-11-13). BoT-SORT's camera
+   motion (sparse optical flow, in person, vehicle, ANPR and intrusion) was measured at ≈ 26 ms per
+   4K frame (3 threads): grey + downscale 4 ms and `goodFeaturesToTrack` 15 ms depend on the frame
+   alone; only the optical flow against the previous frame and the motion fit (7 ms) need the
+   tracker's state. The frame-only part now runs in the sampler's decode workers (in parallel,
+   while the previous round is on the GPU); the tracker runs only the rest. Same OpenCV calls on
+   the same pixels: the warp equals Ultralytics' own, and real BoT-SORT tracks are identical
+   (boxes, ids, scores) with and without it. Published as the `gmc_prep` stage. **Done, not yet
+   measured on the pod.** Still duplicated across the four services (each prepares its own); a
+   single shared computation per frame is the next step if `gmc_prep` shows up as a CPU cost.
+   Anomaly's camera motion (ORB on the full 4K frame, R6.9) is separate and not changed yet.
+
 **Done when**, on the L40S:
+- **Target set 2026-11-13: all 7 services enabled at once**, every every-frame service ≥ 20 fps
+  per drone for 30 minutes, lag ≤ 1 s, with **no change to accuracy** (every speed-up is either
+  identical by construction or passes its accuracy guard). Measured on 13 Nov before R4.4 / R4.9
+  (2 × 4K, all 7): intrusion 6–10, ANPR 4.9, person 4.6, vehicle 4.6, anomaly 3.0 fps — each
+  service's per-frame cost (≈ 100–120 ms) has to come down to ≈ 25 ms per drone frame;
 - with 2 drones at 1080p and vehicle + ANPR + person + intrusion enabled, every service holds ≥ 20
   fps for 30 minutes, lag ≤ 1 s, and the stage split shows the GPU as the largest share;
 - with 1 drone at 4K (source resolution, the default), person holds ≥ 20 fps. If it does not, the
@@ -876,6 +899,23 @@ thread: ≈ 4 × (25 + 18) ms per round. Nothing about what is detected changes:
   and `cudaFree` (18 ms CPU) — likely allocator churn; and the image pairs a torch 2.8 nightly
   with torchvision 0.22 (Ultralytics warns) — pin matching releases.
 
+#### R6.9 Anomaly: where its 457 ms goes (pod run 13 Nov, image 1794185)
+4 × 4K, all 7 services: anomaly analysed 1.6 fps per drone at level 3; its stats showed decode
+35, model 11, total 457 ms. `total` is measured from the round's start until that drone's writes
+are done, so it covers the whole 4-drone round plus waiting for the previous round's writes —
+not one frame's cost. Known so far:
+- Camera motion (step 1) is ORB with 800 features on the **full 4K frame**, one drone after
+  another: ≈ 31 ms per frame on an idle 12-core machine, ≈ 125 ms per 4-drone round.
+- Steps 3–9 (tracking, behaviour, rules, drawing) run per drone in Python; per-track database
+  upserts run one by one without the B1 track gate the other services use (no cost in the bench
+  clip, which has almost no objects, but real scenes have many tracks).
+- The service now publishes `motion`, `model`, `pipeline`, `persist`, `round` and `wait_writes`
+  per drone, so the next run shows the split. Candidate fixes once measured: camera motion on a
+  downscaled frame (same homography, scaled back), in the decode workers like R6.8's follow-up;
+  the B1 track gate for routine track upserts.
+- Services run with `OMP_NUM_THREADS` = quota ÷ 8 (dvas-init.sh), but OpenCV's own pool is not
+  limited the same way — to be checked (7 services × 31 OpenCV threads on 31 cores).
+
 **Tests (R6):** a service held at 5 fps enters level 1 → 2 → 3 within seconds, its PEL stays
 small, every shed range is in the audit log, and it returns to `LIVE` after the load ends; a
 `latest` service never delays the feed; with no service enabled the decoder publishes nothing;
@@ -913,7 +953,7 @@ Feeds" until then), and tiles re-sort whenever a drone joins or changes state.
 
 **Capacity note:** ingest accepts `DVAS_MAX_LIVE_STREAMS` (8) uplinks and go2rtc has 16 slots
 (+ `_sub`), so today at most 8 tiles can be live. Filling all 20 needs 20 go2rtc slots and the cap
-raised to 20 — part of scaling to 20 drones (R5), after the GPU decode work.
+raised to 20 — see R9 (20 concurrent feeds).
 
 **Tests:** with no streams 20 `OFFLINE` tiles and no feed requests; a drone that starts streaming
 takes tile 1, a second tile 2; when the first ends, tile 1 returns to `OFFLINE` and tile 2 does
@@ -989,6 +1029,51 @@ service and drone (from the same governor document); `/models` is unchanged.
   does not navigate. Back returns to the grid. Deselecting or ending the stream closes the panel. No
   `/models` requests are made while nothing is selected.
 
+### Phase R9 — 20 concurrent feeds (planned 2026-11-13; step 1 done)
+
+Today at most 8 feeds can be live at once, and nothing above 7–8 has been tested. The plan had
+only the R7 capacity note. Live video and analytics are separate limits and are sized separately.
+
+**Limits today:**
+
+| Layer | Now | For 20 feeds |
+|---|---|---|
+| Ingest admission | `DVAS_MAX_LIVE_STREAMS=8` (`too_many_streams` above it) | 20 (setting) |
+| go2rtc live slots | 16 + 16 `_sub` twins (`etc/go2rtc.yaml`) | **32 + 32 (done)**: a freed slot rests 90 s (`LIVE_SLOT_COOLDOWN_S`), so exactly 20 would leave reconnects without one |
+| nginx | 4 video connections per client token | unchanged: real drones have their own tokens; the bench goes straight to ingest |
+| Analytics decode | each feed decoded on the CPU and re-encoded as JPEG for the analytics stream | 20 × 4K at 20 fps does not fit 27–31 cores → NVDEC (R6.6 item 2) or the shared frame bus (R5.4) |
+| Grid sub-stream | one 720p encode per watched tile (NVENC, else libx264) | 20 encodes: fine on NVENC, too heavy on CPU |
+| Analytics | 2 × 4K with all 7 services already sheds (R6.8 / R6.9) | see step 5 |
+
+**Steps:**
+1. **Caps and slots.** **Done 2026-11-13:** ingest `LIVE_SLOTS` and `go2rtc.yaml` declare
+   `live01`…`live32` and their `_sub` twins (a test keeps the two in step); the R7 grid already
+   shows 20 tiles. `DVAS_MAX_LIVE_STREAMS` stays 8 by default; the test sets it to 20 in the
+   pod's env, and the default becomes 20 once step 2 passes. Check Valkey memory with 20 missions
+   (the analytics stream is bounded to ≈ 5 s per mission). `bench_capacity.py` prints one summary
+   per sample above 6 drones (receiving, live slots held, min/median published and analysed fps,
+   worst lag).
+2. **Live video only** (no service enabled, so R6.2 publishes no analytics frames): bench 8 → 12 →
+   16 → 20 drones at 1080p and at 4K. Record per feed: CPU (decoder, recorder, sub-stream), decoder
+   lag, `pub_fps`, live tile fps and glass-to-glass in the dashboard, uplink bandwidth
+   (20 × 8–12 Mbps). Done when 20 feeds hold source fps with no `too_many_streams` and no tile
+   drop-outs for 30 min.
+3. **Analytics feed decode** — when step 2 with a service enabled shows the decoder as the limit:
+   NVDEC in `video-decoder` (needs `NVIDIA_DRIVER_CAPABILITIES` with `video`), JPEG encode on the
+   GPU, or the R5.4 frame bus. Accuracy guard: same detections on a recorded clip before and after.
+4. **Grid at 20.** 20 tiles watched at once: 20 sub-stream encodes on NVENC; confirm the
+   encoder session count and the browser's decode load (20 × 720p MSE players) on a control-room
+   PC.
+5. **Analytics with analytics on:** bench with the full service set at 8, 12, 16 and 20 drones,
+   after the R4 / R6 speed-ups. Record per service the fps it holds and confirm R6 shedding keeps
+   live video at the source rate and evidence complete. 20 drones × 7 services × 20 fps is ≈ 2,800
+   frame analyses per second: one L40S will not do that even after R4. Record the measured
+   capacity per GPU here so the decision can be made between more GPUs / pods (not in this plan
+   yet), per-mission service sets (R4.8), or a lower analytics rate per drone.
+
+**Accuracy:** steps 1, 2 and 4 do not touch analytics; step 3 ships only with the accuracy guard;
+step 5 only measures.
+
 ## 5. Flags summary
 
 | Flag | Default (v2) | Phase |
@@ -1004,7 +1089,8 @@ service and drone (from the same governor document); `/models` is unchanged.
 | `DVAS_SHARED_DETS` / `DVAS_DETS_WAIT_MS` | 1 / 150 | R4 |
 | `DVAS_STAGE_PIPELINE` | 1 | R4 |
 | `DVAS_TRT` | 0 → 1 per model after the guard | R4 |
-| `DVAS_THREADS_<SVC>` | computed | R4 |
+| `DVAS_GMC_PREPARE` | 1 | R4.9 |
+| `DVAS_THREADS_<SVC>` | computed by weight from the quota (dvas-init.sh) | R4.4 |
 | `DVAS_FRAME_BUS` | `jpeg` | R5 |
 | `DVAS_FEED_MODE_<SVC>` | `latest` for crowd, vessel; `every` for the others | R6 |
 | `DVAS_SHED_AFTER_S` | 1.5 | R6 |
@@ -1025,6 +1111,7 @@ service and drone (from the same governor document); `/models` is unchanged.
 | Evidence | §3 rules tests pass; every alert has its crop + source frame; recording hash chain verifies |
 | Fallback | Old edge on `/ingest/frame` works; every flag off → v1 behaviour |
 | Multi-Drone View (R7) | 20 tiles always; drones take the lowest free tile and keep it; offline tiles make no requests |
+| 20 concurrent feeds (R9) | 20 feeds admitted and live at source fps for 30 min (video only); the analytics capacity per GPU recorded |
 | Services panel (R8) | Selecting a live tile shows all services, with the Detection Models selection highlighted; a click opens that service's page on this drone's annotated feed; disabled services do not navigate |
 | Real edge (`edge-exe-v2`) | The §7 real-edge requirement passes: 30 fps received, live tile plays, analytics ≥ 20 fps, for a 4K and a 1080p camera |
 
