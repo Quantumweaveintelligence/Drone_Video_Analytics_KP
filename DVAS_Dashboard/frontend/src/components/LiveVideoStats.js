@@ -2,7 +2,7 @@
  * LiveVideoStats — the live player's numbers on a video tile (useLiveVideo stats).
  * Shown only with the debug switch (localStorage dvas.liveDebug = "1", or ?livedebug=1).
  * fps low with dropped rising → the browser cannot decode it; kbps low and "behind" swinging
- * → the network; reconnects / seeks rising → the stream keeps breaking.
+ * → the network; reconnects / seeks rising → the stream keeps breaking (the last reason is shown).
  */
 export default function LiveVideoStats({ stats, sub }) {
   if (!stats) return null;
@@ -11,6 +11,7 @@ export default function LiveVideoStats({ stats, sub }) {
       {stats.res}{sub ? " sub" : ""} · {stats.fps} fps · drop {stats.dropped}
       <br />
       {stats.kbps} kbps · behind {stats.behind}s · ×{stats.rate} · rc {stats.reconnects} · seek {stats.seeks}
+      {stats.reason ? <><br />last reconnect: {stats.reason}</> : null}
     </div>
   );
 }

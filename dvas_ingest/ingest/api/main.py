@@ -1177,6 +1177,7 @@ class _VideoConn:
         self.dup = 0
         self.last_seq = 0
         self.live_slot: Optional[str] = None       # go2rtc stream this mission is relayed to
+        self.relay = None                          # its video_relay.LiveRelay (R9 counters)
         self.pending_meta: Optional[dict] = None   # newest frame meta not yet in the live state
         self.win_frames = 0
         self.win_bytes = 0
@@ -1453,6 +1454,7 @@ if VIDEO_INGEST:
             relay = video_relay.LiveRelay(
                 conn.live_slot, want_sub=lambda slot=conn.live_slot: _qm._client.exists(f"live:sub_want:{slot}"),
             ) if conn.live_slot else None
+            conn.relay = relay
             await _qm._client.hset(vkey, mapping={
                 "status": "receiving", "conn": conn_no, "drone_id": drone_id, "mission_id": mission_id,
                 "width": int(_f(hello.get("width"))), "height": int(_f(hello.get("height"))),
@@ -1608,7 +1610,9 @@ async def _video_ticker(conn: _VideoConn, claims: dict, rec, vkey: str) -> None:
             if saved_seq != conn.last_seq:
                 await _qm._client.hset(vkey, mapping={
                     "last_seq_rx": conn.last_seq, "rx_ts_last": repr(time.time()),
-                    "cur_seg": rec.idx or 0, "bytes": rec.total_bytes})
+                    "cur_seg": rec.idx or 0, "bytes": rec.total_bytes,
+                    # live relay health (R9): restarts / keyframe skips of the copy and the sub-stream
+                    **(conn.relay.stats() if conn.relay is not None else {})})
                 saved_seq = conn.last_seq
             if now - last_stats >= VIDEO_STATS_EVERY_S:
                 stats = await _video_stats(conn, conn.win_frames, conn.win_bytes, now - win_start)

@@ -178,6 +178,7 @@ def main() -> int:
     svc_fps: dict = {}          # service → drone → analysed fps samples while receiving
     rx_prev: dict = {}          # drone → (last_seq_rx, time) at the previous sample
     rx_samples = {d: [] for d, _ in drones}
+    relay_last: dict = {}       # drone → the mission's live relay counters at the last sample (R9)
     svc_stages: dict = {}       # service → last stage ms (EMA) of any drone
     worst_backlog: dict = {}
     quota = cpu_quota()
@@ -211,6 +212,8 @@ def main() -> int:
                     ans.append(slow[0])
             if h.get("live_slot"):
                 slots += 1
+            if any(k.startswith(("relay_", "sub_")) for k in h):
+                relay_last[drone] = {k: int(float(v)) for k, v in h.items() if k.startswith(("relay_", "sub_"))}
             seq_rx, t_rx = float(h.get("last_seq_rx") or 0), time.time()
             if drone in rx_prev and h.get("status") == "receiving":
                 rx = max(0.0, (seq_rx - rx_prev[drone][0]) / max(0.1, t_rx - rx_prev[drone][1]))
@@ -265,6 +268,16 @@ def main() -> int:
         stages = " ".join(f"{k} {float(ms):.0f}" for k, ms in (svc_stages.get(svc) or {}).items())
         print(f"  {svc:<10} {'newest' if svc in NEWEST else 'every ':<7} "
               f"{' '.join(f'{x:5.1f}' for x in per)}" + (f"   stages ms: {stages}" if stages else ""))
+    print("\nlive relay into go2rtc (restarts / keyframe skips / KB dropped; sub = grid 720p sub-stream):")
+    for drone, _ in drones:
+        c = relay_last.get(drone)
+        if not c:
+            print(f"  {drone:<12} -")
+            continue
+        sub = (f"   sub {c.get('sub_restarts', 0)} / {c.get('sub_skips', 0)} / {c.get('sub_dropped_kb', 0)}"
+               if "sub_restarts" in c else "   sub not running")
+        print(f"  {drone:<12} main {c.get('relay_restarts', 0)} / {c.get('relay_skips', 0)} / "
+              f"{c.get('relay_dropped_kb', 0)}{sub}")
     print(f"\nCPU: up to {worst_cpu:.1f} cores used" + (f" of the pod's {quota:.0f}" if quota else ""))
     if max_shed:
         print("\nshedding (highest level per service; 1 secondary off, 2 drop-oldest, 3 lower cadence):")

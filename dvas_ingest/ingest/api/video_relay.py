@@ -15,6 +15,7 @@ NVENC, else libx264 ultrafast. Nobody watching a grid tile → no transcode.
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import os
 import time
@@ -31,6 +32,7 @@ SUB_KBPS = int(os.getenv("DVAS_LIVE_SUB_KBPS", "1500") or 1500)
 SUB_CHECK_S = 2.0                   # how often the relay re-reads whether anyone wants the sub-stream
 MAX_BUFFER = 4 * 1024 * 1024        # bytes waiting for ffmpeg before the relay skips to a keyframe
 RESTART_MIN_S = 2.0
+SKIP_LOG_S = 10.0                   # at most one "behind, skipped to a keyframe" line per relay per 10 s
 
 
 def _encoder_args(encoder: str) -> list:
@@ -74,6 +76,13 @@ class Relay:
         self._wait_key = True             # (re)start only at a keyframe
         self.dropped_bytes = 0
         self.restarts = 0
+        # R9 diagnostics: why a live tile drops — ffmpeg exits (with its last error lines) and
+        # skips to a keyframe because ffmpeg / go2rtc fell behind
+        self.skips = 0
+        self._skips_logged = 0
+        self._skip_log_at = 0.0
+        self._stderr: collections.deque = collections.deque(maxlen=8)
+        self._stderr_task: Optional[asyncio.Task] = None
 
     async def _spawn(self) -> None:
         self._started_at = time.monotonic()
@@ -85,7 +94,40 @@ class Relay:
             "-map", "0:v:0", *codec, "-f", "rtsp", "-rtsp_transport", "tcp",
             f"{RTSP_BASE}/{self.name}",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL)
+            stderr=asyncio.subprocess.PIPE)
+        self._stderr.clear()
+        self._stderr_task = asyncio.create_task(self._drain_stderr(self._proc))
+
+    async def _drain_stderr(self, proc) -> None:
+        """Keep ffmpeg's last error lines (read continuously so its pipe never fills)."""
+        try:
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    return
+                self._stderr.append(line.decode(errors="replace").strip()[:200])
+        except Exception:
+            return
+
+    def _note_exit(self) -> None:
+        p = self._proc
+        log.warning("video relay %s: ffmpeg exited (code %s) after %.0f s — %s", self.name,
+                    p.returncode if p else "?", time.monotonic() - self._started_at,
+                    " | ".join(self._stderr) or "no error output")
+
+    def _note_skip(self, n_bytes: int) -> None:
+        self.skips += 1
+        self.dropped_bytes += n_bytes
+        now = time.monotonic()
+        if now - self._skip_log_at >= SKIP_LOG_S:
+            log.warning("video relay %s: ffmpeg/go2rtc behind (> %d MB queued), skipped to the next "
+                        "keyframe %d time(s) since the last report, %d KB dropped in total",
+                        self.name, MAX_BUFFER // (1024 * 1024), self.skips - self._skips_logged,
+                        self.dropped_bytes // 1024)
+            self._skip_log_at, self._skips_logged = now, self.skips
+
+    def stats(self) -> dict:
+        return {"restarts": self.restarts, "skips": self.skips, "dropped_kb": self.dropped_bytes // 1024}
 
     def _alive(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
@@ -97,6 +139,7 @@ class Relay:
         if not self._alive():
             if self._proc is not None and self._proc.returncode is not None:
                 self.restarts += 1
+                self._note_exit()
                 self._proc = None
                 self._wait_key = True
             if not starts_key or time.monotonic() - self._started_at < RESTART_MIN_S:
@@ -118,7 +161,7 @@ class Relay:
         try:
             if stdin.transport.get_write_buffer_size() > MAX_BUFFER:
                 self._wait_key = True                # ffmpeg / go2rtc too slow: skip to a keyframe
-                self.dropped_bytes += len(chunk)
+                self._note_skip(len(chunk))
                 return
             stdin.write(chunk)
         except (BrokenPipeError, ConnectionResetError, RuntimeError, AttributeError):
@@ -169,6 +212,13 @@ class LiveRelay:
             if self.sub is None:
                 self.sub = Relay(f"{self.slot}_sub", transcode=True)
             await self.sub.feed(chunk, starts_key)
+
+    def stats(self) -> dict:
+        """Counters for the mission's video hash (R9): main relay and grid sub-stream."""
+        out = {f"relay_{k}": v for k, v in self.main.stats().items()}
+        if self.sub is not None:
+            out.update({f"sub_{k}": v for k, v in self.sub.stats().items()})
+        return out
 
     async def close(self) -> None:
         await self.main.close()

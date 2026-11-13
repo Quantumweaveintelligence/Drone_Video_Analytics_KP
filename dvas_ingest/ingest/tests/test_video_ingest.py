@@ -562,3 +562,21 @@ def test_open_video_uplink_marks_the_drone_live(monkeypatch):
     assert main._video_uplink_open("DRN-1") is True
     assert main._video_uplink_open("DRN-2") is False          # closing
     assert main._video_uplink_open("DRN-3") is False
+
+
+def test_relay_counts_and_reports_skips_and_exits(caplog):
+    """v2 R9: the live relay's restarts / keyframe skips are logged and published per mission."""
+    import logging
+    import video_relay
+    lr = video_relay.LiveRelay("live05")
+    with caplog.at_level(logging.WARNING, logger="video_relay"):
+        lr.main._note_skip(4096)
+        lr.main._note_skip(4096)                          # within 10 s: counted, not logged again
+    assert lr.stats() == {"relay_restarts": 0, "relay_skips": 2, "relay_dropped_kb": 8}
+    assert sum("skipped to the next keyframe" in r.message for r in caplog.records) == 1
+    lr.sub = video_relay.Relay("live05_sub", transcode=True)
+    lr.sub._stderr.append("Error writing trailer")
+    with caplog.at_level(logging.WARNING, logger="video_relay"):
+        lr.sub._note_exit()
+    assert "Error writing trailer" in caplog.records[-1].message
+    assert lr.stats()["sub_skips"] == 0 and "sub_restarts" in lr.stats()

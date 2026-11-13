@@ -106,7 +106,7 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
     let failures = 0;
     let everPlayed = false;
     let currentPath = null;
-    const counters = { bytes: 0, reconnects: 0, seeks: 0 };
+    const counters = { bytes: 0, reconnects: 0, seeks: 0, reason: "" };
     let sample = null;                                // previous stats sample
 
     const later = (fn, ms_) => {
@@ -158,7 +158,7 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
         if (e && e.name === "QuotaExceededError" && v && sb.buffered.length) {
           try { sb.remove(sb.buffered.start(0), Math.max(sb.buffered.start(0) + 0.1, v.currentTime - 2)); } catch { /* ignore */ }
         } else {
-          reconnect();
+          reconnect("append failed");
         }
       }
     };
@@ -176,7 +176,7 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
       const v = videoRef.current;
       if (!v || !sb) return;
       if (Date.now() - lastData > STALL_MS) {
-        reconnect();
+        reconnect(`no video for ${STALL_MS / 1000} s`);
         return;
       }
       const lag = behindLive();
@@ -201,6 +201,7 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
             behind: Math.round(lag * 100) / 100,
             kbps: Math.round(((counters.bytes - sample.bytes) * 8) / dt / 1000),
             reconnects: counters.reconnects,
+            reason: counters.reason,
             seeks: counters.seeks,
             rate: Math.round(v.playbackRate * 100) / 100,
             res: `${v.videoWidth}x${v.videoHeight}`,
@@ -210,12 +211,15 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
       }
     };
 
-    function reconnect() {
+    // reason (R9): why the tile reconnected — shown in the debug overlay and the console
+    function reconnect(reason = "") {
       const keep = everPlayed;
       teardown(keep);
       if (cancelled) return;
       failures += 1;
       counters.reconnects += 1;
+      counters.reason = reason;
+      console.info(`[live] ${droneId}${sub ? " sub" : ""}: reconnect #${counters.reconnects} — ${reason || "unknown"}`);
       if (!everPlayed && failures >= 3) {
         setState("unavailable");
         failures = 0;
@@ -246,7 +250,7 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
         if (typeof ev.data === "string") {
           let msg;
           try { msg = JSON.parse(ev.data); } catch { return; }
-          if (msg.type === "error") { reconnect(); return; }
+          if (msg.type === "error") { reconnect(`server: ${msg.value || "error"}`); return; }
           if (msg.type !== "mse" || ms) return;
           ms = new MS();
           ms.addEventListener("sourceopen", () => {
@@ -256,7 +260,7 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
               sb.addEventListener("updateend", pump);
               pump();
             } catch {
-              reconnect();
+              reconnect("codec not supported");
             }
           }, { once: true });
           const v = videoRef.current;
@@ -272,7 +276,7 @@ export function useLiveVideo(droneId, enabled = true, options = {}) {
         queue.push(ev.data);
         pump();
       };
-      ws.onclose = () => reconnect();
+      ws.onclose = (ev) => reconnect(`socket closed (${ev.code})`);
       ws.onerror = () => {};
       watchdog = setInterval(keepLive, 1000);
     };

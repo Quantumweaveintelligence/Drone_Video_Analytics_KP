@@ -1093,6 +1093,17 @@ ingest reports `video_live` (an open uplink) in `/ingest/streams/active`, and th
 treats a recently seen drone with an open uplink as live. `bench_capacity.py` also reports
 received video fps (rx), which works with every service off.
 
+**Live tiles "coming and going" (13 Nov, 2 × 4K with all 7 services, image 29be83c):** ingest
+received 29.9 fps and logged one connection per drone (the uplink never dropped); go2rtc logs
+only at `info`. The relay into go2rtc restarted ffmpeg and skipped to keyframes silently.
+**Added:** relay exits are logged with ffmpeg's last error lines, keyframe skips (ffmpeg / go2rtc
+> 4 MB behind) at most once per 10 s, and both are published per mission (`relay_*`, `sub_*` in
+`mission:video:<sid>`, printed by `bench_capacity.py`); the player records why it reconnected
+(stall, socket closed, server error, append / codec failure) in the `?livedebug=1` overlay and
+the browser console. Suspect, to confirm with these: the grid's 720p sub-stream decodes the 4K
+stream on the CPU (only the encode is NVENC), ≈ 1.5–2 cores per watched tile, while the pod was
+at 26.8 / 27 cores and throttled — a fix would be `-hwaccel cuda` for that decode.
+
 ## 5. Flags summary
 
 | Flag | Default (v2) | Phase |
