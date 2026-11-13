@@ -580,3 +580,90 @@ def test_relay_counts_and_reports_skips_and_exits(caplog):
         lr.sub._note_exit()
     assert "Error writing trailer" in caplog.records[-1].message
     assert lr.stats()["sub_skips"] == 0 and "sub_restarts" in lr.stats()
+
+
+def _rec_inputs():
+    """Two segments' worth of meta + TS chunks (keyframe every 30 frames, 10 s segments)."""
+    out = []
+    for i in range(1, 400):
+        key = i % 30 == 1
+        out.append(("meta", {"seq": i, "pts_ms": (i - 1) * 33.3, "key": key, "capture_ts": 1.0 + i / 30}, 100.0 + i))
+        out.append(("data", bytes([i % 251]) * 188 * 3))
+    return out
+
+
+def _tree(root):
+    import json as _j
+    files = {}
+    for p in sorted(root.rglob("*")):
+        if p.is_file():
+            raw = p.read_bytes()
+            if p.name == "manifest.jsonl":   # closed_at is a wall-clock time
+                raw = b"\n".join(_j.dumps({k: v for k, v in _j.loads(l).items() if k != "closed_at"}).encode()
+                                 for l in raw.splitlines())
+            files[str(p.relative_to(root))] = raw
+    return files
+
+
+def test_threaded_recorder_writes_exactly_what_the_synchronous_one_did(monkeypatch, tmp_path):
+    """v2 R9: recording writes moved off ingest's event loop — same files, same hashes."""
+    monkeypatch.setattr(vs, "RECORD_ROOT", tmp_path / "sync")
+    rec = vs.SegmentRecorder("MSN-A", 1)
+    for kind, *args in _rec_inputs():
+        rec.meta(*args) if kind == "meta" else rec.data(*args)
+    rec.close()
+
+    monkeypatch.setattr(vs, "RECORD_ROOT", tmp_path / "thread")
+
+    async def run():
+        r = vs.RecorderThread(vs.SegmentRecorder("MSN-A", 1))
+        for kind, *args in _rec_inputs():
+            await (r.meta(*args) if kind == "meta" else r.data(*args))
+        assert r.total_bytes == 399 * 188 * 3
+        await r.close()
+    asyncio.run(run())
+    a, b = _tree(tmp_path / "sync"), _tree(tmp_path / "thread")
+    assert len(a) >= 5 and a == b
+
+
+def test_a_slow_disk_does_not_block_the_event_loop(monkeypatch, tmp_path):
+    monkeypatch.setattr(vs, "RECORD_ROOT", tmp_path / "rec")
+
+    async def run():
+        r = vs.RecorderThread(vs.SegmentRecorder("MSN-B", 1))
+        real = r.rec.data
+        r.rec.data = lambda chunk: (time.sleep(0.3), real(chunk))    # a write that blocks 300 ms
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+        t = asyncio.create_task(ticker())
+        start = time.monotonic()
+        await r.meta({"seq": 1, "pts_ms": 0.0, "key": True}, 1.0)
+        for _ in range(5):
+            await r.data(b"\0" * 188)                 # handed over at once
+        handed = time.monotonic() - start
+        await r.close()                               # waits for the 5 slow writes
+        t.cancel()
+        return handed, ticks
+    handed, ticks = asyncio.run(run())
+    assert handed < 0.1 and ticks >= 50               # the loop kept running during 1.5 s of writes
+
+
+def test_a_write_error_still_ends_the_connection(monkeypatch, tmp_path):
+    monkeypatch.setattr(vs, "RECORD_ROOT", tmp_path / "rec")
+
+    async def run():
+        r = vs.RecorderThread(vs.SegmentRecorder("MSN-C", 1))
+
+        def boom(chunk):
+            raise OSError("No space left on device")
+        r.rec.data = boom
+        await r.data(b"\0" * 188)
+        await asyncio.sleep(0.05)
+        with pytest.raises(OSError):
+            await r.data(b"\0" * 188)
+    asyncio.run(run())

@@ -186,6 +186,7 @@ def main() -> int:
     t0 = time.time()
     cpu_prev, cpu_t = cpu_counters(), time.time()
     worst_cpu = 0.0
+    worst_lag = 0
     while any(p.poll() is None for p in procs):
         time.sleep(5)
         cpu_now, now = cpu_counters(), time.time()
@@ -194,6 +195,15 @@ def main() -> int:
         cpu_prev, cpu_t = cpu_now, now
         worst_cpu = max(worst_cpu, cores)
         cpu_txt = f"CPU {cores:4.1f}" + (f"/{quota:.0f}" if quota else "") + (f" thr {thr:.0%}" if thr > 0.005 else "")
+        # R9: ingest's event loop carries every feed; a stall there stops them all at once
+        try:
+            lag = json.loads(s(r.get("ingest:loop_lag")) or "{}").get("max_ms")
+        except ValueError:
+            lag = None
+        if lag is not None:
+            worst_lag = max(worst_lag, int(lag))
+            if lag >= 200:
+                cpu_txt += f"  ingest stall {lag / 1000:.1f}s"
         cells, backlog = [], {}
         recv, slots, pubs, ans, behinds, rxs = 0, 0, [], [], [], []
         stats = svc_drones(r)
@@ -278,6 +288,7 @@ def main() -> int:
                if "sub_restarts" in c else "   sub not running")
         print(f"  {drone:<12} main {c.get('relay_restarts', 0)} / {c.get('relay_skips', 0)} / "
               f"{c.get('relay_dropped_kb', 0)}{sub}")
+    print(f"\ningest event loop: longest stall {worst_lag / 1000:.2f} s (every feed waits while it is blocked)")
     print(f"\nCPU: up to {worst_cpu:.1f} cores used" + (f" of the pod's {quota:.0f}" if quota else ""))
     if max_shed:
         print("\nshedding (highest level per service; 1 secondary off, 2 drop-oldest, 3 lower cadence):")

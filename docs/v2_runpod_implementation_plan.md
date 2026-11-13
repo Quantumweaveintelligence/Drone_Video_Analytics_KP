@@ -1104,6 +1104,18 @@ the browser console. Suspect, to confirm with these: the grid's 720p sub-stream 
 stream on the CPU (only the encode is NVENC), ≈ 1.5–2 cores per watched tile, while the pod was
 at 26.8 / 27 cores and throttled — a fix would be `-hwaccel cuda` for that decode.
 
+**Pod run 13 Nov (image d1bcda8) — the cause:** the relay was clean (main 0 restarts / 0 skips;
+the sub-stream's ≈ 500 KB is its start-up wait for a keyframe), so the sub-stream suspicion was
+wrong. Instead, about once a minute **every** feed stalled at the same moment: 8 × 4K received
+fps fell to 10–12 for a sample and then burst to 46–50 (min = median), CPU dropped, and the
+2-drone run dipped on the same ≈ 61 s period. Ingest wrote every TS chunk to the recording
+(write + flush) **on its event loop**, and recordings are on the pod's network volume: a blocked
+write there stops the one loop that carries every feed (receive, relay, tiles). **Fixed:**
+`video_store.RecorderThread` runs each connection's recording writes in its own thread, in
+order (same files and hashes as before, tested); a slow disk only back-pressures that sender
+once 32 MB wait. **Added:** ingest measures its event-loop lag (`ingest:loop_lag`, logged over
+1 s); `bench_capacity.py` prints stalls per sample and the longest.
+
 ## 5. Flags summary
 
 | Flag | Default (v2) | Phase |

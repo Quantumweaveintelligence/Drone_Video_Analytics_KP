@@ -740,6 +740,31 @@ async def _resolve_drone_stream(drone_id: str, for_live: bool = False) -> Option
     return None
 
 
+# ── Event-loop lag (v2 R9) ────────────────────────────────────────────────────
+# Every feed goes through this one event loop; anything that blocks it stalls them all.
+# Measured as how late a 250 ms sleep wakes up; the worst of each 5 s window is kept in Valkey
+# (ingest:loop_lag, read by bench_capacity) and anything over 1 s is logged.
+LOOP_LAG_KEY = "ingest:loop_lag"
+
+
+async def _watch_loop_lag() -> None:
+    worst, window_start = 0.0, time.monotonic()
+    while True:
+        t = time.monotonic()
+        await asyncio.sleep(0.25)
+        lag = time.monotonic() - t - 0.25
+        worst = max(worst, lag)
+        if lag > 1.0:
+            log.warning("ingest event loop blocked for %.1f s (every live feed stalled meanwhile)", lag)
+        if time.monotonic() - window_start >= 5.0:
+            try:
+                await _qm._client.set(LOOP_LAG_KEY, json.dumps(
+                    {"max_ms": round(worst * 1000), "at": round(time.time(), 1)}), ex=60)
+            except Exception:
+                pass
+            worst, window_start = 0.0, time.monotonic()
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -755,6 +780,7 @@ async def lifespan(app: FastAPI):
                 await _qm.declare_drone_queue(did)
         # mission mode: no stream before mission/start; analytics create their own groups
         asyncio.create_task(_auto_cleanup_consumed_streams())
+        asyncio.create_task(_watch_loop_lag())
         log.info("ingest_server_ready — redis_streams_declared stream_key_mode=%s",
                  _qmod.STREAM_KEY_MODE, extra={"drones": len(KNOWN_DRONES)})
 
@@ -1449,7 +1475,9 @@ if VIDEO_INGEST:
             h = await _video_hash(sid)
             conn_no = int(_f(h.get("conn"), 0)) + 1
             conn.last_seq = int(_f(h.get("last_seq_rx"), 0))
-            rec = await asyncio.to_thread(video_store.SegmentRecorder, sid, conn_no)
+            # writes in their own thread, off the event loop (R9: a slow volume stalled every feed)
+            rec = video_store.RecorderThread(
+                await asyncio.to_thread(video_store.SegmentRecorder, sid, conn_no))
             conn.live_slot = await _live_slot_acquire(sid) if video_relay.ENABLED else None
             relay = video_relay.LiveRelay(
                 conn.live_slot, want_sub=lambda slot=conn.live_slot: _qm._client.exists(f"live:sub_want:{slot}"),
@@ -1511,7 +1539,7 @@ async def _video_finish(ws: WebSocket, conn: Optional[_VideoConn], rec, relay) -
                 pass
         if rec is not None:
             try:
-                await asyncio.wait_for(asyncio.to_thread(rec.close), VIDEO_FINISH_TIMEOUT_S)
+                await asyncio.wait_for(rec.close(), VIDEO_FINISH_TIMEOUT_S)
             except Exception as exc:
                 log.error("video recording close failed sid=%s: %s", conn.sid if conn else "?", exc)
         if relay is not None:
@@ -1648,7 +1676,7 @@ async def _video_receive(conn: _VideoConn, claims: dict, rec, relay, vkey: str) 
             if len(data) > VIDEO_MAX_MSG or len(data) % 188:
                 raise _VideoClose(1009 if len(data) > VIDEO_MAX_MSG else 1003, "bad_chunk",
                                   "binary messages carry whole TS packets, at most 256 KiB")
-            rec.data(data)
+            await rec.data(data)
             if relay is not None:
                 await relay.feed(data, next_key)
             next_key = False
@@ -1680,9 +1708,7 @@ async def _video_receive(conn: _VideoConn, claims: dict, rec, relay, vkey: str) 
             rx = time.time()
             if m["key"]:
                 next_key = True
-                await asyncio.to_thread(rec.meta, m, rx)   # may close a segment (fsync)
-            else:
-                rec.meta(m, rx)
+            await rec.meta(m, rx)                      # in the recorder's thread (may close a segment)
             if m["seq"] <= conn.last_seq:
                 conn.dup += 1                          # resent after a reconnect: kept in the recording
                 continue

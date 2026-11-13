@@ -24,13 +24,16 @@ Shared state of a mission's video, Valkey HASH mission:video:{sid}:
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -264,3 +267,68 @@ class SegmentRecorder:
         self.prev_hash = chain
         self.idx = None
         self._ts = self._meta = None
+
+
+class RecorderThread:
+    """A SegmentRecorder whose writes run in one worker thread, in order, off the event loop.
+
+    v2 R9: ingest wrote every TS chunk (write + flush) on its event loop, and recordings live on
+    the pod's network volume. When a write there blocked, ingest's one event loop stopped and
+    every feed stalled together — receive, the live relay, the dashboard tiles (pod runs 13 Nov:
+    all drones' received fps dropped to 10–12 then burst to 46–50, about once a minute).
+    Now a slow disk only delays this connection, and only once more than MAX_PENDING bytes
+    wait for the disk (backpressure on this sender; the recording stays complete).
+    A write error is raised at the next call, as the synchronous writes did.
+    """
+
+    MAX_PENDING = 32 * 1024 * 1024
+
+    def __init__(self, rec: SegmentRecorder):
+        self.rec = rec
+        self.sid = rec.sid
+        self._pool = ThreadPoolExecutor(1, thread_name_prefix="recorder")
+        self._lock = threading.Lock()
+        self._pending = 0
+        self._last: Optional[asyncio.Future] = None
+        self._error: Optional[BaseException] = None
+        self.total_bytes = rec.total_bytes        # bytes handed over (written or about to be)
+
+    @property
+    def idx(self) -> Optional[int]:
+        return self.rec.idx
+
+    def _run(self, fn, n: int, *args) -> None:
+        try:
+            if self._error is None:
+                fn(*args)
+        except BaseException as exc:              # kept for the next call on the event loop
+            self._error = exc
+        finally:
+            with self._lock:
+                self._pending -= n
+
+    async def _submit(self, fn, n: int, *args) -> None:
+        if self._error is not None:
+            raise self._error
+        with self._lock:
+            self._pending += n
+            pending = self._pending
+        self._last = asyncio.get_running_loop().run_in_executor(self._pool, self._run, fn, n, *args)
+        if pending > self.MAX_PENDING:
+            await self._last                        # the disk is behind: wait for it (this sender only)
+
+    async def data(self, chunk: bytes) -> None:
+        self.total_bytes += len(chunk)
+        await self._submit(self.rec.data, len(chunk), chunk)
+
+    async def meta(self, item: dict, rx_ts: float) -> None:
+        await self._submit(self.rec.meta, 0, item, rx_ts)
+
+    async def close(self) -> None:
+        """Every queued write, then the segment close (fsync, manifest)."""
+        try:
+            await asyncio.get_running_loop().run_in_executor(self._pool, self.rec.close)
+        finally:
+            self._pool.shutdown(wait=False)
+        if self._error is not None:
+            raise self._error
