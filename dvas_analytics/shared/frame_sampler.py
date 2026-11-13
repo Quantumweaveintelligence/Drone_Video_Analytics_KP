@@ -134,6 +134,14 @@ def decode_fields(fields: dict, drone_id: str, entry_id: str) -> dict:
     return out
 
 
+def _percentiles(name: str, values) -> dict:
+    """{name_p50_ms, name_p95_ms} of a window of ms values (nothing until 5 samples)."""
+    v = sorted(values)
+    if len(v) < 5:
+        return {}
+    return {f"{name}_p50_ms": round(v[len(v) // 2]), f"{name}_p95_ms": round(v[min(len(v) - 1, int(len(v) * 0.95))])}
+
+
 def frame_bytes(fields: dict) -> Optional[bytes]:
     """JPEG bytes of an entry: raw `frame` first, then the legacy `jpeg_b64`."""
     raw = fields.get("frame")
@@ -304,6 +312,8 @@ class DroneStats:
     total_ms: Optional[float] = None    # EMA of whole per-frame handling
     lag_ms: Optional[float] = None      # ingest → analysis start of the last frame
     stages: Dict[str, float] = field(default_factory=dict)   # EMA ms per pipeline stage
+    # capture (drone clock, `capture_ts`) → result recorded, ms, last 300 frames (stress test)
+    e2e: Deque[float] = field(default_factory=lambda: deque(maxlen=300))
 
     @staticmethod
     def _ema(old: Optional[float], new: float, a: float = 0.2) -> float:
@@ -360,6 +370,9 @@ class FrameSampler:
         self._pel_done: set = set()          # stream keys whose own pending entries were re-read
         self._pel_pos: Dict[str, str] = {}   # stream key → last pending id re-read (restart)
         self._returned: List[Tuple[str, str]] = []   # (stream, id) handed out last round: ack next round
+        # capture_ts of the frames handed out per drone, oldest first; record() takes the oldest
+        # (a round is persisted while the next one runs, so up to 3 can be in flight)
+        self._capture: Dict[str, Deque[float]] = {}
         self._ack_now: Dict[str, List[str]] = {}     # entries finished without analysis (trimmed, dropped)
         self._last_seq: Dict[str, int] = {}  # last analysed frame_seq per drone (gap = lost)
         self._held: Dict[str, List[tuple]] = {}   # drone → [(seq, arrived_mono, fields)] re-order buffer
@@ -507,8 +520,16 @@ class FrameSampler:
         await self._ack_returned()
 
     def _remember(self, fields_list) -> None:
+        fields_list = [f for f in fields_list if isinstance(f, dict)]
         self._returned = [(f["_stream"], f["entry_id"]) for f in fields_list
-                          if isinstance(f, dict) and f.get("_stream") and f.get("entry_id")]
+                          if f.get("_stream") and f.get("entry_id")]
+        for f in fields_list:
+            try:
+                cap = float(f.get("capture_ts") or 0)
+            except (TypeError, ValueError):
+                continue
+            if cap > 0 and f.get("drone_id"):
+                self._capture.setdefault(f["drone_id"], deque(maxlen=3)).append(cap)
 
     def _finished(self, fields: dict) -> None:
         """A read entry that will not be handed out (dropped, undecodable): ack it."""
@@ -980,12 +1001,16 @@ class FrameSampler:
         for name, ms in {**auto, **stage_ms}.items():
             if ms is not None:
                 st.stages[name] = DroneStats._ema(st.stages.get(name), float(ms))
+        caps = self._capture.get(drone_id)
+        if caps:
+            st.e2e.append(max(0.0, (time.time() - caps.popleft()) * 1000))
 
     def record_batch(self, size: int) -> None:
         self._batch_sizes.append(size)
 
     def forget(self, drone_id: str) -> None:
         self.stats.pop(drone_id, None)
+        self._capture.pop(drone_id, None)
         key = self._streams.pop(drone_id, None) or stream_key(drone_id)
         self._pel_done.discard(key)
         self._groups_ok.discard(key)
@@ -1021,6 +1046,7 @@ class FrameSampler:
                 "shed_level": self._shed[d].level if d in self._shed else 0,
                 "frames_shed": self._shed[d].frames_shed if d in self._shed else 0,
                 "cadence": self._shed[d].cadence if d in self._shed else 1,
+                **_percentiles("e2e", st.e2e),
                 "stages": {**{k: round(v, 1) for k, v in st.stages.items()},
                            **({"model": round(st.infer_ms, 1)} if st.infer_ms is not None else {}),
                            **({"total": round(st.total_ms, 1)} if st.total_ms is not None else {})},

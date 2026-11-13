@@ -166,3 +166,18 @@ def test_no_frames_are_dropped_while_the_service_warms_up(monkeypatch):
         f = await take(s)
         assert f["_gap"] == "1" and s.shed_level("D") == 2
     run(t)
+
+
+def test_capture_to_result_delay_is_published():
+    """Stress test (13 Nov): capture → result p50 / p95 per drone in the published stats."""
+    import time as _t
+    s = fs.FrameSampler("person", "g", "c")
+    now = _t.time()
+    for i in range(20):
+        s._remember([{"drone_id": "D1", "capture_ts": now - 0.5, "_stream": "k", "entry_id": f"{i}-0"}])
+        s.record("D1", infer_ms=10, total_ms=20)
+    snap = s.snapshot()["drones"]["D1"]
+    assert 450 <= snap["e2e_p50_ms"] <= 1500 and snap["e2e_p95_ms"] >= snap["e2e_p50_ms"]
+    s2 = fs.FrameSampler("person", "g", "c")
+    s2.record("D2")                                         # no capture known: nothing published
+    assert "e2e_p95_ms" not in s2.snapshot()["drones"]["D2"]

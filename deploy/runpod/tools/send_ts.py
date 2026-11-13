@@ -111,9 +111,18 @@ async def stream(args) -> int:
     import httpx  # noqa: PLC0415
     import websockets  # noqa: PLC0415
     base = args.url.rstrip("/")
-    hdr = {"Authorization": f"Bearer {args.token}"}
+    def hdr() -> dict:
+        """A long run outlives a 5-minute token: --token-file is re-read for every call."""
+        token = args.token
+        if args.token_file:
+            try:
+                with open(args.token_file) as f:
+                    token = f.read().strip() or token
+            except OSError:
+                pass
+        return {"Authorization": f"Bearer {token}"}
     if not args.no_start:
-        r = httpx.post(f"{base}/ingest/mission/start", headers=hdr, timeout=20, verify=not args.insecure,
+        r = httpx.post(f"{base}/ingest/mission/start", headers=hdr(), timeout=20, verify=not args.insecure,
                        json={"drone_id": args.drone, "mission_id": args.mission, "mission_name": "v2 test"})
         print("mission/start", r.status_code, r.text[:200])
         if r.status_code >= 300:
@@ -126,9 +135,9 @@ async def stream(args) -> int:
         f"/ingest/video/ws?drone_id={args.drone}&mission_id={args.mission}"
     seq = 1
     try:
-        conn = websockets.connect(ws_url, additional_headers=hdr, max_size=None, ping_interval=15)
+        conn = websockets.connect(ws_url, additional_headers=hdr(), max_size=None, ping_interval=15)
     except TypeError:                                   # websockets < 13
-        conn = websockets.connect(ws_url, extra_headers=hdr, max_size=None, ping_interval=15)
+        conn = websockets.connect(ws_url, extra_headers=hdr(), max_size=None, ping_interval=15)
     async with conn as ws:
         await ws.send(json.dumps({"type": "hello", "v": 1, "drone_id": args.drone, "mission_id": args.mission,
                                   "laptop_id": "send_ts", "codec": "h264", "container": "mpegts",
@@ -137,7 +146,7 @@ async def stream(args) -> int:
         print("server:", ready)
         if ready.get("type") != "ready":
             if not args.no_start and not args.no_end:     # do not leave the test mission running
-                r = httpx.post(f"{base}/ingest/mission/end", headers=hdr, timeout=20, verify=not args.insecure,
+                r = httpx.post(f"{base}/ingest/mission/end", headers=hdr(), timeout=20, verify=not args.insecure,
                                json={"drone_id": args.drone, "mission_id": args.mission})
                 print("mission/end", r.status_code, r.text[:200])
             return 1
@@ -174,7 +183,7 @@ async def stream(args) -> int:
             rc = 1
         printer.cancel()
     if not args.no_end:
-        r = httpx.post(f"{base}/ingest/mission/end", headers=hdr, timeout=20, verify=not args.insecure,
+        r = httpx.post(f"{base}/ingest/mission/end", headers=hdr(), timeout=20, verify=not args.insecure,
                        json={"drone_id": args.drone, "mission_id": args.mission})
         print("mission/end", r.status_code, r.text[:200])
     return rc
@@ -183,7 +192,8 @@ async def stream(args) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", required=True)
-    ap.add_argument("--token", required=True)
+    ap.add_argument("--token", default="", help="operator token (or --token-file)")
+    ap.add_argument("--token-file", default="", help="read the token from this file before every call")
     ap.add_argument("--drone", required=True)
     ap.add_argument("--mission", required=True)
     ap.add_argument("--file", required=True)
