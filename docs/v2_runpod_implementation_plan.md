@@ -1198,6 +1198,25 @@ set in the pod's environment):**
 - Step 3 (NVDEC decode for analytics) only if needed; step 5 (analytics at 8–20 drones) after the
   R4 / R6 speed-ups.
 
+### Phase R10 — Storage: the volume filled up (found 2026-11-16)
+
+Pod 16 Nov: the 100 GB volume was at 104 % (MinIO 61 GB, recordings 44 GB). Ingest refuses new
+video above 90 % (close 1013 `disk_full`), so the real edge feeds could not stay connected —
+the "not 30 fps" report. The disk itself is fast (541 MB/s direct writes).
+
+- **R10.1 Duplicate person / face images (built 16 Nov).** Re-ID dedup only marked rows
+  `is_duplicate`; every crop stayed (`dvas-faces` 24 GB). `person/dup_images.py` now deletes the
+  duplicates' images once their mission is quiet (`DVAS_PURGE_DUP_AFTER_S`, 1 h, after the last
+  embedding, all rows clustered), every `DVAS_PURGE_DUP_EVERY_S` (300 s). Rows and embeddings stay
+  (counts, re-clustering, reverse face search — a match shows its cluster's image). An image an
+  identity or a shown row still names is never deleted; dedup never makes an image-less row the
+  shown copy. Watchlist alerts and evidence use their own uploads / the vault: untouched.
+  Existing missions are cleaned on the first passes after the image is deployed.
+- **R10.2 Sizing (open).** 20 × 4K at 8 Mbps records ≈ 72 GB per hour; 7-day retention needs
+  ≈ 12 TB at full load. For tests: `DVAS_RECORD_RETENTION_DAYS=0.1` (2.4 h). For production:
+  volume size vs. retention to be decided; `dvas-vehicles` (15 GB) and `dvas-plates` have no
+  dedup clean-up yet.
+
 ## 5. Flags summary
 
 | Flag | Default (v2) | Phase |
@@ -1222,6 +1241,7 @@ set in the pod's environment):**
 | `DVAS_GPU_JPEG_DECODE` | 0 → 1 after the identical-output test | R6 |
 | `DVAS_TRACK_THREADS` / `PERSON_FACE_ROUND` / `PERSON_FACE_ROUND_BATCH` | 8 / 1 / auto (128 on large GPUs) | R6.8 |
 | `DVAS_BACKFILL` | 0 | R6 |
+| `DVAS_PURGE_DUP_IMAGES` / `DVAS_PURGE_DUP_AFTER_S` / `DVAS_PURGE_DUP_EVERY_S` | 1 / 3600 / 300 | R10.1 |
 
 ## 6. v2 acceptance (all on the pod, from Kerala)
 

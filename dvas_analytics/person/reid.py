@@ -22,7 +22,9 @@ Now:
     executemany per mission, only for rows that changed.
 
 Duplicates: in each cluster the sharpest person crop (faces: the newest) is the one shown;
-the others are marked is_duplicate, as before.
+the others are marked is_duplicate, as before. Their images are deleted once the mission is
+quiet (person/dup_images.py); a row without an image is never chosen as the shown copy
+while its cluster has one with an image.
 """
 from __future__ import annotations
 
@@ -135,7 +137,7 @@ async def _full(pool, kind: str, table: str, mission_id, next_id: int) -> Tuple[
     ids = [r["id"] for r in rows]
     cids, next_id = stable_ids(labels, [r["cluster_id"] for r in rows], next_id)
     sharp = [float(r["sharpness_score"] or 0.0) for r in rows] if kind == "person" else None
-    dups, _ = find_duplicates_in_clusters(ids, cids, sharp)
+    dups, _ = find_duplicates_in_clusters(ids, cids, sharp, [bool(r["object_key"]) for r in rows])
     dup = set(dups)
     changes = [(cid, i in dup, i) for r, i, cid in zip(rows, ids, cids)
                if r["cluster_id"] != cid or bool(r["is_duplicate"]) != (i in dup)]
@@ -224,7 +226,8 @@ async def _incremental(pool, kind: str, table: str, mission_id, next_id: int) ->
         c = clusters[cid]
         sharp = float(r["sharpness_score"] or 0.0)
         # Shown copy: persons — the sharpest crop; faces — the newest (as in the full run)
-        better = c[2] is None or (sharp > c[3] if kind == "person" else True)
+        # (a shown copy without an image — deleted as a duplicate earlier — is always replaced)
+        better = c[2] is None or not c[4] or (sharp > c[3] if kind == "person" else True)
         if better:
             if c[2] is not None:
                 changes.append((cid, True, c[2]))            # the previous shown copy

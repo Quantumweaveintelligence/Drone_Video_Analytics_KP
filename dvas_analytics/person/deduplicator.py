@@ -129,11 +129,14 @@ def find_duplicates_in_clusters(
     ids: List[str],
     labels: List[int],
     sharpness_scores: Optional[List[float]] = None,
+    has_image: Optional[List[bool]] = None,
 ) -> Tuple[List[str], int]:
     """
     Given DB row IDs and cluster labels, find which IDs are duplicates.
     Returns (list_of_duplicate_ids, unique_count).
     The sharpest image in each cluster is kept; rest are duplicates.
+    has_image: rows whose image was deleted as a duplicate (person/dup_images.py) are kept
+    only when no member of the cluster still has one.
     """
     clusters: Dict[int, List[Tuple[int, str]]] = {}
     for idx, (row_id, label) in enumerate(zip(ids, labels)):
@@ -150,6 +153,8 @@ def find_duplicates_in_clusters(
             scored = sorted(members, key=lambda m: sharpness_scores[m[0]], reverse=True)
         else:
             scored = members
+        if has_image:
+            scored = sorted(scored, key=lambda m: not has_image[m[0]])   # stable: order kept otherwise
         for (_, row_id) in scored[1:]:
             duplicate_ids.append(row_id)
 
@@ -160,10 +165,12 @@ def get_identity_representatives(
     ids: List[str],
     labels: List[int],
     sharpness_scores: Optional[List[float]] = None,
+    has_image: Optional[List[bool]] = None,
 ) -> Dict[int, str]:
     """
     Return {cluster_id -> best_embedding_id} mapping.
-    The best representative per cluster is the sharpest image.
+    The best representative per cluster is the sharpest image (with has_image: the sharpest
+    one whose image still exists).
     """
     clusters: Dict[int, List[Tuple[int, str]]] = {}
     for idx, (row_id, label) in enumerate(zip(ids, labels)):
@@ -171,6 +178,8 @@ def get_identity_representatives(
 
     representatives: Dict[int, str] = {}
     for label, members in clusters.items():
+        if has_image and any(has_image[m[0]] for m in members):
+            members = [m for m in members if has_image[m[0]]]
         if sharpness_scores:
             best = max(members, key=lambda m: sharpness_scores[m[0]])
         else:

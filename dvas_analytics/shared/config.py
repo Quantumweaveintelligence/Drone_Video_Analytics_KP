@@ -60,6 +60,10 @@ class Config:
     REID_CLUSTER_MAX:      int   = int(os.getenv("REID_CLUSTER_MAX", "3000"))
     REID_DISTANCE_THRESHOLD: float = float(os.getenv("REID_DISTANCE_THRESHOLD", "0.25"))
     USE_PGVECTOR:          bool  = os.getenv("USE_PGVECTOR", "false").lower() == "true"
+    # Images of duplicate crops are deleted once their mission is quiet (person/dup_images.py)
+    DUP_PURGE:             bool  = os.getenv("DVAS_PURGE_DUP_IMAGES", "1").lower() not in ("0", "false", "no")
+    DUP_PURGE_AFTER_S:     float = float(os.getenv("DVAS_PURGE_DUP_AFTER_S", "3600"))
+    DUP_PURGE_EVERY_S:     float = float(os.getenv("DVAS_PURGE_DUP_EVERY_S", "300"))
 
     # ── Vehicle-ANPR Redis linkage ─────────────────────────────────────────
     VEHICLE_TRACK_KEY_PREFIX: str = os.getenv("VEHICLE_TRACK_KEY_PREFIX", "vehicle:track")

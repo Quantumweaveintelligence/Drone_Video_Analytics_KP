@@ -51,6 +51,7 @@ from shared.annotated_hub import AnnotatedHub, install_stream_route, scale_items
 from shared.evidence import evidence_block, frame_context, model_info
 from person.analyzer import PersonFaceAnalyzer
 from person import reid
+from person import dup_images
 from person.deduplicator import (
     cluster_embeddings, find_duplicates_in_clusters, load_resnet_model,
     extract_embedding_from_bytes, extract_embeddings_from_bytes, get_identity_representatives,
@@ -113,6 +114,7 @@ _dedup_progress: dict = {          # mission dedup progress tracking
 arcface_recognizer: Optional[ArcFaceRecognizer] = None
 watchlist_matcher:  Optional[WatchlistMatcher]  = None
 alert_deduplicator: Optional[AlertDeduplicator] = None
+_dup_purge_task: Optional[asyncio.Task] = None
 
 # Annotation toggle state — configurable per-drone via API
 _annotation_config: dict = {
@@ -167,6 +169,8 @@ async def startup():
     _stream_running = True
     _stream_task = asyncio.create_task(_stream_loop())
     log.info("Person stream loop auto-started for drones: %s", cfg.DRONE_IDS)
+    global _dup_purge_task
+    _dup_purge_task = asyncio.create_task(dup_images.loop())   # duplicate crops' images
 
 
 
@@ -1293,6 +1297,7 @@ async def _run_mission_dedup(mission_id: str):
         ids        = [str(r["id"]) for r in rows]
         embeddings = [list(r["embedding"]) for r in rows]
         sharpness_scores = [float(r.get("sharpness_score") or 0.0) for r in rows]
+        has_image = [bool(r.get("object_key")) for r in rows]   # duplicates' images are deleted
 
         _dedup_progress["progress_pct"] = 20  # starting clustering
         await upsert_dedup_run(
@@ -1302,7 +1307,7 @@ async def _run_mission_dedup(mission_id: str):
         labels = await asyncio.to_thread(cluster_embeddings, embeddings, cfg.REID_DISTANCE_THRESHOLD)
 
         _dedup_progress["progress_pct"] = 50  # clustering complete
-        duplicate_ids, unique_count = await asyncio.to_thread(find_duplicates_in_clusters, ids, labels, sharpness_scores)
+        duplicate_ids, unique_count = await asyncio.to_thread(find_duplicates_in_clusters, ids, labels, sharpness_scores, has_image)
         dup_set = set(duplicate_ids)
 
         _dedup_progress["progress_pct"] = 60  # updating DB
@@ -1317,7 +1322,7 @@ async def _run_mission_dedup(mission_id: str):
             total_embeddings=total, unique_found=unique_count,
             duplicates_removed=len(duplicate_ids), progress_pct=70.0,
         )
-        reps = get_identity_representatives(ids, labels, sharpness_scores)
+        reps = get_identity_representatives(ids, labels, sharpness_scores, has_image)
         processed = 0
         for cluster_id, rep_id in reps.items():
             rep_row = next((r for r in rows if str(r["id"]) == rep_id), None)
@@ -2129,6 +2134,19 @@ async def face_search(
     # Sort descending by similarity
     candidates.sort(key=lambda x: x["similarity"], reverse=True)
     top_matches = candidates[:min(limit, 100)]
+
+    # A duplicate whose image was deleted (person/dup_images.py) shows its cluster's image
+    for m in top_matches:
+        if not m.get("object_key") and m.get("cluster_id") is not None:
+            rep = await pool.fetchrow(
+                """SELECT object_key, person_object_key FROM face_embeddings
+                   WHERE mission_id IS NOT DISTINCT FROM $1 AND cluster_id = $2
+                     AND COALESCE(object_key, '') <> ''
+                   ORDER BY is_duplicate, created_at DESC LIMIT 1""",
+                m.get("mission_id"), m["cluster_id"])
+            if rep:
+                m["object_key"], m["person_object_key"] = rep["object_key"], rep["person_object_key"]
+                m["image_from_cluster"] = True
 
     # 5. Attach presigned URLs for thumbnails/crops
     for m in top_matches:
