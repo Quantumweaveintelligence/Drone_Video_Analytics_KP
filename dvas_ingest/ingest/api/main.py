@@ -1172,7 +1172,7 @@ async def ingest_frame(
 
 VIDEO_INGEST = os.getenv("DVAS_VIDEO_INGEST", "1").lower() in ("1", "true", "yes")
 VIDEO_MAX_KBPS = max(500, int(os.getenv("DVAS_VIDEO_MAX_KBPS", "12000") or 12000))
-VIDEO_MAX_STREAMS = max(1, int(os.getenv("DVAS_MAX_LIVE_STREAMS", "8") or 8))
+VIDEO_MAX_STREAMS = max(1, int(os.getenv("DVAS_MAX_LIVE_STREAMS", "20") or 20))
 VIDEO_MAX_MSG = 256 * 1024
 VIDEO_HELLO_TIMEOUT_S = 10.0
 VIDEO_IDLE_TIMEOUT_S = 120.0        # no message this long (pings do not count): the edge is gone; Cloudflare drops at 100 s

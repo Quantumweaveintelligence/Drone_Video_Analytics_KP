@@ -1041,7 +1041,7 @@ service and drone (from the same governor document); `/models` is unchanged.
   does not navigate. Back returns to the grid. Deselecting or ending the stream closes the panel. No
   `/models` requests are made while nothing is selected.
 
-### Phase R9 — 20 concurrent feeds (planned 2026-11-13; steps 1–2 passed on 13 Nov, video only)
+### Phase R9 — 20 concurrent feeds (planned 2026-11-13; **closed 2026-11-16**: 20 feeds passed, live-stream default 20)
 
 Today at most 8 feeds can be live at once, and nothing above 7–8 has been tested. The plan had
 only the R7 capacity note. Live video and analytics are separate limits and are sized separately.
@@ -1188,8 +1188,8 @@ set in the pod's environment):**
 - Soak length: 15 minutes was agreed instead of 30 (the acceptance row below is changed).
   Recordings grow ≈ 20 MB/s at 20 × 8 Mbps (≈ 18 GB per 15 min); check free space first.
 
-**Still open for R9:**
-- `DVAS_MAX_LIVE_STREAMS` default is still 8 (20 only via the pod's environment).
+**R9 closed (16 Nov).** The live-stream cap now defaults to 20. Left as they are, not R9 work:
+- `DVAS_MAX_LIVE_STREAMS` default 20 (ingest, `dvas-init.sh`; was 8).
 - nginx allows **4** video WebSockets per token (`limit_conn video_conn 4`): one account cannot
   stream 20 drones. Blocks the edge team's real-footage test.
 - Real-footage test with 20 drones from one laptop: requirements for the edge test tool in
@@ -1225,7 +1225,7 @@ the "not 30 fps" report. The disk itself is fast (541 MB/s direct writes).
 | `DVAS_ANALYTICS_FPS` | 20 | R1 |
 | `DVAS_ANALYTICS_MAX_WIDTH` | 0 = source resolution | R1 |
 | `DVAS_VIDEO_WINDOW_FRAMES` | 100 (≈ 5 s at 20 fps) | R1 |
-| `DVAS_VIDEO_MAX_KBPS` / `DVAS_MAX_LIVE_STREAMS` | 12000 / 8 | R1 |
+| `DVAS_VIDEO_MAX_KBPS` / `DVAS_MAX_LIVE_STREAMS` | 12000 / 20 | R1, R9 |
 | `DVAS_RECORD_VIDEO` / `DVAS_RECORD_RETENTION_DAYS` | 1 / 7 | R1 |
 | `DVAS_LIVE_SUBSTREAM` / `DVAS_LIVE_SUB_ENCODER` | 1 / auto (nvenc → libx264) | R2 |
 | `DVAS_HUD` / `DVAS_LIVE_LAZY_ANNOTATE` | 1 / 1 | R3 |

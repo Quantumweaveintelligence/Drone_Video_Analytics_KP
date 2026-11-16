@@ -23,7 +23,7 @@ The edge developer does not do these, but the test cannot pass without them.
 | ID | Requirement |
 |---|---|
 | P1 | The pod runs image `20261113-130ae29` or later. |
-| P2 | `DVAS_MAX_LIVE_STREAMS=20` is set in the pod's environment (default is 8; the 9th stream is refused with close code `1013 too_many_streams`). |
+| P2 | `DVAS_MAX_LIVE_STREAMS=20` is set in the pod's environment (default 20 since 16 Nov; above it a stream is refused with close code `1013 too_many_streams`). |
 | P3 | nginx allows ≥ 20 simultaneous video WebSockets per token. **Today it allows 4** (`limit_conn video_conn 4` in `deploy/runpod/etc/nginx.conf`); the 5th gets HTTP 429. Until this is raised, one account can stream only 4 drones. |
 | P4 | Free space on `/workspace` ≥ 1.2 × (sum of all stream bitrates × run time). 20 × 8 Mbps × 15 min ≈ 18 GB → at least 22 GB free. At 90 % full, recording stops by design. |
 | P5 | One operator account with the `drone-operator` role, used for all 20 missions. |

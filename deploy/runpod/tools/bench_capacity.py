@@ -12,7 +12,7 @@ largest backlog, and GPU utilisation. Uses its own drones DRN-CAP-01.. and ends 
 missions at the end.
 
 Talks to ingest directly (127.0.0.1:8000), not through nginx: nginx allows 4 uplinks per
-token. Ingest still caps video connections at DVAS_MAX_LIVE_STREAMS (default 8); drones over
+token. Ingest still caps video connections at DVAS_MAX_LIVE_STREAMS (default 20); drones over
 the cap are refused (their log tail is printed at the end).
 
 Per drone each sample shows what the decoder published (pub), what the slowest analytics
