@@ -81,6 +81,20 @@ def _scale_box(box, f: float):
     return box
 
 
+def drawn(items, keys=("bbox",)) -> list:
+    """Shallow copies with each box field replaced by its display twin draw_<key> when the
+    analyzer set one (the detector's box on this frame, batch_tracker.draw_boxes)."""
+    out = []
+    for it in items or []:
+        if any(it.get(f"draw_{k}") is not None for k in keys):
+            it = dict(it)
+            for k in keys:
+                if it.get(f"draw_{k}") is not None:
+                    it[k] = it[f"draw_{k}"]
+        out.append(it)
+    return out
+
+
 def scale_items(items, keys, f: float) -> list:
     """Shallow copies of detection dicts with the given box fields scaled by f."""
     if f == 1.0:

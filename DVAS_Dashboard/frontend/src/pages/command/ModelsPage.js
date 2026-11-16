@@ -28,6 +28,18 @@ const MODEL_ICONS = {
   anomaly: ShieldAlert,
 };
 
+// Mission presets (v2 plan R4.8): only the services a mission needs read the stream, the
+// cheapest way to keep every enabled service at 20 fps with several drones. A click only
+// selects the set; Deploy applies it as before (audited, streams started / stopped).
+export const MISSION_PRESETS = [
+  { key: "traffic",   label: "Traffic",     models: ["vehicle", "plate"] },
+  { key: "crowd",     label: "Crowd event", models: ["crowd", "person", "anomaly"] },
+  { key: "perimeter", label: "Perimeter",   models: ["intrusion", "person"] },
+  { key: "coast",     label: "Coast",       models: ["vessel"] },
+];
+
+const sameSet = (a, b) => a.length === b.length && a.every(k => b.includes(k));
+
 const actionColour = (a) => {
   if (!a) return "text-slate-500";
   if (a === "retained" || a === "already_running") return "text-emerald-400";
@@ -188,6 +200,28 @@ export default function ModelsPage() {
               <span>{refreshing ? "Refreshing…" : "Refresh"}</span>
             </button>
           </div>
+        </div>
+
+        <div className="px-4 pt-3 flex items-center gap-2 flex-wrap" data-testid="mission-presets">
+          <span className="dvas-label text-[10px] mr-1">Mission preset</span>
+          {MISSION_PRESETS.map(p => {
+            const on = sameSet(selected, p.models);
+            return (
+              <button
+                key={p.key}
+                type="button"
+                disabled={cfg.read_only}
+                onClick={() => setSelected(p.models.filter(k => cfg.available.some(m => m.key === k)))}
+                title={`Select ${p.models.join(" + ")} — then Deploy`}
+                data-testid={`preset-${p.key}`}
+                className={`px-2.5 py-1 rounded border text-[11px] mono transition-colors disabled:opacity-50 ${
+                  on ? "border-sky-500 bg-sky-500/15 text-sky-300" : "border-slate-700 text-slate-300 hover:border-slate-500"
+                }`}
+              >
+                {p.label}
+              </button>
+            );
+          })}
         </div>
 
         <div className="p-4 grid grid-cols-1 md:grid-cols-2 gap-3">

@@ -27,7 +27,7 @@ import inspect as _inspect
 _NMS_KW = set(_inspect.signature(_yolo_nms).parameters)
 
 from shared import gpu_profile
-from shared.batch_tracker import BatchTracker
+from shared.batch_tracker import BatchTracker, draw_boxes
 
 log = logging.getLogger(__name__)
 
@@ -477,9 +477,17 @@ class PersonFaceAnalyzer:
         """
         if not frames:
             return {}
+        return self.finish_batch(frames, self.infer_batch(frames), save_crops)
+
+    def infer_batch(self, frames: Dict[str, np.ndarray]):
+        """The model calls of a round (GPU stage, R4.2): the face tiles start on their own
+        stream / worker, then person detection runs batched across drones.
+        Returns (person detections or None, face jobs per drone, ms per frame)."""
+        if not frames:
+            return None
         self._maybe_back_to_gpu()
         t0 = time.perf_counter()
-        tracked: Dict[str, object] = {}
+        dets = None
         face_jobs: Dict[str, Future] = {}
         if FACE_PARALLEL and self.face_model and self.device != "cpu":
             if FACE_ROUND and len(frames) > 1:
@@ -488,21 +496,36 @@ class PersonFaceAnalyzer:
             else:
                 face_jobs = {d: self._face_pool.submit(self._faces_timed, fr) for d, fr in frames.items()}
 
-        # ── Person detection + tracking (batched across drones) ─────────────
+        # ── Person detection (batched across drones) ────────────────────────
         if self.person_model and self.tracker:
             try:
-                tracked = self.tracker.track_batch(frames, **self._track_kwargs())
+                dets = self.tracker.predict_batch(frames, **self._track_kwargs())
             except Exception as exc:
                 if "CUDA" in str(exc) and self.device != "cpu":
                     self._fall_back_to_cpu(exc)
                     # Retry on CPU
                     try:
-                        tracked = self.tracker.track_batch(frames, **self._track_kwargs())
+                        dets = self.tracker.predict_batch(frames, **self._track_kwargs())
                     except Exception as retry_exc:
                         log.warning("Person tracking CPU retry also failed: %s", retry_exc)
                 else:
                     log.warning("Person tracking error: %s", exc)
-        person_ms = (time.perf_counter() - t0) * 1000 / max(1, len(frames))
+        return dets, face_jobs, (time.perf_counter() - t0) * 1000 / max(1, len(frames))
+
+    def finish_batch(self, frames: Dict[str, np.ndarray], handle, save_crops: bool = True) -> Dict[str, dict]:
+        """Person tracking, face linking and crops of a round whose model calls are
+        `handle` (CPU stage, R4.2); each drone's tracker steps in frame order."""
+        if not frames or handle is None:
+            return {}
+        dets, face_jobs, detect_ms = handle
+        t0 = time.perf_counter()
+        tracked: Dict[str, object] = {}
+        if dets is not None:
+            try:
+                tracked = self.tracker.track_predicted(frames, dets, detect_ms)
+            except Exception as exc:
+                log.warning("Person tracking error: %s", exc)
+        person_ms = detect_ms + (time.perf_counter() - t0) * 1000 / max(1, len(frames))
 
         return {
             d: self._postprocess(d, frame, tracked.get(d), save_crops, person_ms, face_jobs.get(d))
@@ -534,7 +557,8 @@ class PersonFaceAnalyzer:
         # ── Person boxes (tracked) ───────────────────────────────────────────
         try:
             if result is not None and result.boxes:
-                for box in result.boxes:
+                drawn_xyxy = draw_boxes(result)
+                for bi, box in enumerate(result.boxes):
                     if box.id is not None:
                         tracker_id = int(box.id[0])
                     else:
@@ -553,6 +577,7 @@ class PersonFaceAnalyzer:
                     persons.append({
                         "tracker_id": tracker_id,
                         "bbox":       _bbox_dict(x1, y1, x2, y2),
+                        "draw_bbox":  _bbox_dict(*[float(v) for v in drawn_xyxy[bi]]),   # live view only
                         "confidence": round(conf, 4),
                         "crop_b64":   crop_b64,
                         "crop_bytes": crop_bytes,   # kept for MinIO upload

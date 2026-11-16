@@ -692,6 +692,48 @@ Every step is measured on the pod before and after, with the stage split (A4) an
    single shared computation per frame is the next step if `gmc_prep` shows up as a CPU cost.
    Anomaly's camera motion (ORB on the full 4K frame, R6.9) is separate and not changed yet.
 
+10. **Live-view boxes on the object (fixed 2026-11-16).** Operators saw boxes trail or run ahead of
+   moving objects. The drawn box was the tracker's Kalman estimate (`boxes.xyxy` after BoT-SORT),
+   not the detection on that frame. Measured on a drone clip (visdrone + BoT-SORT): 99th percentile
+   offset 8 % of the box size at 30 fps, 15 % at 7.5 fps, 23 % at 5 fps (services run 3–10 fps under
+   load). `batch_tracker.draw_boxes()` keeps each tracked box's matched detection; person, vehicle,
+   ANPR (vehicle + projected plate) and intrusion draw that (`draw_bbox`, `draw_vehicle_bbox`,
+   `draw_plate_bbox` in the result, display only). Every analytics value — tracked boxes, ids,
+   crops, speeds, zone checks, plate boxes — is unchanged (`shared/tests/test_draw_boxes.py`).
+
+**Built 2026-11-16 (identical results; not yet measured on the pod):**
+- **R4.2 pipelining** (`DVAS_STAGE_PIPELINE=1`, `shared/stage_pipeline.py`) in person, vehicle and
+  ANPR. Each analyzer's `analyze_batch` is split into `infer_batch` (model calls: person + face
+  tiles, visdrone) and `finish_batch` (tracker step, post-processing); `analyze_batch` = the two in
+  turn. Round N+1's `infer_batch` runs while round N's `finish_batch` runs; trackers have their
+  own lock (`BatchTracker.track_predicted`). Rounds are acknowledged only after their finish
+  (`FrameSampler.next_decoded_held` / `ack_held`); the round read ahead is re-read after a restart
+  and kept across a stream stop. Intrusion (per-frame state prepared on the event loop) and
+  anomaly (own tracker) are not pipelined.
+  Verified in the production image (`shared/tests/test_stage_pipeline.py`, 40 rounds × 2 drones of
+  drone footage): vehicle, ANPR (with OCR: 1226 plate reads) and person results equal round by
+  round, after renaming track ids per drone by first appearance — the id numbers already differ
+  between two non-pipelined runs (one counter, drones tracked in parallel threads).
+  The comparison fixes cuDNN's convolution algorithms: with autotune on (production), two
+  non-pipelined runs already differ in the last FP16 digits (confidence 0.5758 vs 0.5757), because
+  autotune picks algorithms by timing them — measured in the full suite, unrelated to pipelining.
+  Found while testing: vehicle speed (`speed_info.kph`) is computed from processing time
+  (`time.time()`), not the frames' capture times, so it changes between any two runs and with
+  analysis pace. Not changed (it would change values); worth a separate fix.
+- **R4.7 MPS** (`DVAS_CUDA_MPS=1`, off by default): `dvas-init.sh` starts
+  `nvidia-cuda-mps-control -d` (pipe `/run/dvas/mps-pipe`, log `/var/log/dvas/mps`). Checked
+  locally: the client runs through the MPS server and 60 frames of visdrone boxes hash identically
+  with and without it. To measure on the pod: total fps with all services, then a 2-hour run.
+- **R4.8 mission presets** on Detection Models: Traffic (vehicle + ANPR), Crowd event (crowd +
+  person + anomaly), Perimeter (intrusion + person), Coast (vessel). A click selects the set;
+  Deploy applies it as before (audited).
+
+**Accuracy rule for the remaining R4 items (operator, 2026-11-16): current accuracy must be 100 %
+unchanged.** Items 1 (ANPR reads its boxes from vehicle: ANPR detects on a 1280×720 resize,
+vehicle on the source frame — different detections), 3 (TensorRT FP16), 5 (batched catch-up) and
+6 (GPU OCR) change numbers, so they are not built. Items 2 (pipelining) and 7 (MPS) are identical
+by construction; 8 (presets) is UI only.
+
 **Done when**, on the L40S:
 - **Target set 2026-11-13: all 7 services enabled at once**, every every-frame service ≥ 20 fps
   per drone for 30 minutes, lag ≤ 1 s, with **no change to accuracy** (every speed-up is either
@@ -1230,7 +1272,7 @@ the "not 30 fps" report. The disk itself is fast (541 MB/s direct writes).
 | `DVAS_LIVE_SUBSTREAM` / `DVAS_LIVE_SUB_ENCODER` | 1 / auto (nvenc → libx264) | R2 |
 | `DVAS_HUD` / `DVAS_LIVE_LAZY_ANNOTATE` | 1 / 1 | R3 |
 | `DVAS_SHARED_DETS` / `DVAS_DETS_WAIT_MS` | 1 / 150 | R4 |
-| `DVAS_STAGE_PIPELINE` | 1 | R4 |
+| `DVAS_STAGE_PIPELINE` / `DVAS_CUDA_MPS` | 1 / 0 | R4.2 / R4.7 |
 | `DVAS_TRT` | 0 → 1 per model after the guard | R4 |
 | `DVAS_GMC_PREPARE` | 1 | R4.9 |
 | `DVAS_THREADS_<SVC>` | computed by weight from the quota (dvas-init.sh) | R4.4 |

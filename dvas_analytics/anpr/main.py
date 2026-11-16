@@ -38,7 +38,8 @@ from shared.redis_client import (
 from shared import cpu_budget, minio_client as minio
 from shared import gpu_profile, persist_gate
 from shared.frame_sampler import FrameSampler
-from shared.annotated_hub import AnnotatedHub, install_stream_route, scale_items, to_display
+from shared.stage_pipeline import StagePipeline
+from shared.annotated_hub import AnnotatedHub, drawn, install_stream_route, scale_items, to_display
 from shared.evidence import EventGate, bbox_xyxy, evidence_block, frame_context, model_info, upload_context
 from anpr.analyzer import ANPRAnalyzer
 from anpr.schema import ANPRFrameResult, WatchlistEntry, TheftAlert
@@ -70,6 +71,8 @@ WATCHLIST_REFRESH_S = 60.0   # picks up rows changed in the DB or expired
 _frames_processed = 0
 # Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
 _sampler = FrameSampler("anpr", "anpr-group", "anpr-analyzer")
+# Next round's model call while this round is tracked (R4.2); analyzer is set at startup
+_pipe = StagePipeline(_sampler, lambda frames: analyzer.infer_batch(frames))
 _gate = persist_gate.TrackGate()   # routine track / attribute rows (plan B1)
 # Live annotated video (MJPEG, ≤1920 px) for the dashboard
 _hub = AnnotatedHub("anpr")
@@ -178,6 +181,7 @@ def _live_anpr_jpeg(frame: np.ndarray, items: list, drone_id: str) -> bytes:
     """Live-view JPEG: overlay drawn on the ≤1920 px copy with boxes scaled to it, so
     labels keep their designed size when the drone sends 4K (detection is unaffected)."""
     small, f = to_display(frame)
+    items = drawn(items, ("vehicle_bbox", "plate_bbox"))   # the detector's box on this frame
     return _draw_anpr_annotations(small, scale_items(items, ("vehicle_bbox", "plate_bbox"), f), drone_id)
 
 
@@ -685,9 +689,10 @@ async def _stream_loop():
             try:
                 await _sampler.maybe_publish()
                 # Newest frame per drone; older ones are acked unread and counted as skipped
-                # Decoded in parallel; the next round decodes while this one is on the GPU (B2)
+                # Decoded in parallel; the next round decodes while this one is on the GPU (B2),
+                # and its model call runs while this one is tracked (R4.2)
                 decoded = {d: (f, frame, _frame_mission(f))
-                           for d, (f, frame) in (await _sampler.next_decoded(active_drones)).items()}
+                           for d, (f, frame) in (await _pipe.next(active_drones)).items()}
                 t_start = _time.perf_counter()
                 if not decoded:
                     continue
@@ -714,10 +719,11 @@ async def _stream_loop():
 
                 # One batched vehicle-detection call for all drones; tracking, plate
                 # detection and OCR stay per drone
-                results = await asyncio.to_thread(
-                    analyzer.analyze_batch,
+                missions = {d: m for d, (_, _, m) in decoded.items()}
+                results = await _pipe.finish(
                     {d: fr for d, (_, fr, _) in decoded.items()},
-                    {d: m for d, (_, _, m) in decoded.items()},
+                    lambda fr, h: analyzer.finish_batch(fr, h, missions),
+                    active_drones,
                 )
                 _sampler.record_batch(len(decoded))
                 # Persist the previous round before queuing this one (keeps per-drone order);
@@ -738,6 +744,7 @@ async def _stream_loop():
                         analyzer.to_device("cpu")
                     except Exception:
                         pass
+                    _pipe.reset_device()
                 else:
                     log.warning("ANPR stream error: %s", exc)
                 await asyncio.sleep(1)
@@ -748,6 +755,7 @@ async def _stream_loop():
             except Exception:
                 pass
         try:
+            await _pipe.stop()
             await _sampler.done()           # the last round is finished: acknowledge it
         except Exception:
             pass

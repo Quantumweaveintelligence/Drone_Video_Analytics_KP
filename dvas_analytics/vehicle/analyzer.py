@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
-from shared.batch_tracker import BatchTracker
+from shared.batch_tracker import BatchTracker, draw_boxes
 
 log = logging.getLogger(__name__)
 
@@ -159,17 +159,41 @@ class VehicleAnalyzer:
         px_per_meter: float = 0.1,
     ) -> Dict[str, dict]:
         """Newest frame of several drones → {drone_id: result}. One GPU batch, per-drone tracks."""
-        if not self.ready:
-            return {d: self._empty(d) for d in frames}
+        return self.finish_batch(frames, self.infer_batch(frames), save_crops, px_per_meter)
+
+    def infer_batch(self, frames: Dict[str, np.ndarray]):
+        """The model call of a round (GPU stage, R4.2): (detections per drone, ms per frame)."""
+        if not self.ready or not frames:
+            return None
         t0 = time.perf_counter()
         try:
-            tracked = self.tracker.track_batch(frames, **self._track_kwargs())
+            dets = self.tracker.predict_batch(frames, **self._track_kwargs())
         except Exception as exc:
             if "CUDA" in str(exc):
                 raise           # main.py moves the model to CPU and retries
             log.error("Vehicle frame inference error: %s", exc)
-            tracked = {}
-        infer_ms = (time.perf_counter() - t0) * 1000 / max(1, len(frames))
+            dets = None
+        return dets, (time.perf_counter() - t0) * 1000 / max(1, len(frames))
+
+    def finish_batch(
+        self,
+        frames: Dict[str, np.ndarray],
+        handle,
+        save_crops: bool = True,
+        px_per_meter: float = 0.1,
+    ) -> Dict[str, dict]:
+        """Tracker step and post-processing of a round whose model call is `handle` (CPU stage)."""
+        if not self.ready or handle is None:
+            return {d: self._empty(d) for d in frames}
+        dets, detect_ms = handle
+        t0 = time.perf_counter()
+        tracked = {}
+        if dets is not None:
+            try:
+                tracked = self.tracker.track_predicted(frames, dets, detect_ms)
+            except Exception as exc:
+                log.error("Vehicle frame inference error: %s", exc)
+        infer_ms = detect_ms + (time.perf_counter() - t0) * 1000 / max(1, len(frames))
         return {
             d: self._postprocess(d, frame, tracked.get(d), save_crops, px_per_meter, infer_ms)
             for d, frame in frames.items()
@@ -186,7 +210,8 @@ class VehicleAnalyzer:
 
             if results and results[0].boxes:
                 class_names = self.model.names
-                for box in results[0].boxes:
+                drawn_xyxy = draw_boxes(results[0])
+                for bi, box in enumerate(results[0].boxes):
                     if box.id is None:
                         continue
 
@@ -233,6 +258,7 @@ class VehicleAnalyzer:
                         "vehicle_type": vtype,
                         "confidence":  round(conf, 4),
                         "bbox":        [round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)],
+                        "draw_bbox":   [round(float(v), 2) for v in drawn_xyxy[bi]],   # live view only
                         "bbox_x":      round(bx, 2),
                         "bbox_y":      round(by, 2),
                         "bbox_w":      round(bw, 2),

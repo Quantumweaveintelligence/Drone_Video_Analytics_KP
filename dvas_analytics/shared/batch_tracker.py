@@ -242,6 +242,7 @@ def _match_without_update(tracker, result):
     data = out.boxes.data.cpu()
     ids = torch.tensor([[float(tid)] for _, tid in rows], dtype=data.dtype)
     out.update(boxes=torch.cat([data[:, :4], ids, data[:, 4:]], dim=1))
+    out.det_xyxy = data[:, :4].numpy().copy()      # the boxes are the detections here
     return out
 
 
@@ -276,7 +277,24 @@ def _update_now(tracker, result):
     idx = tracks[:, -1].astype(int)
     result = result[idx]
     result.update(boxes=torch.as_tensor(tracks[:, :-1]))
+    result.det_xyxy = det.xyxy[idx].copy()
     return result
+
+
+def draw_boxes(result):
+    """xyxy (pixels) per box of a tracked result, for drawing on its frame: the detector's
+    own box on this frame. boxes.xyxy is the tracker's Kalman estimate, which every analytics
+    step keeps using; drawn on the frame it sits behind or ahead of a moving object, more so
+    the lower the analysis rate (measured 16 Nov on a drone clip: 99th percentile 8 % of the
+    box size at 30 fps, 23 % at 5 fps). Untracked results: the boxes are the detections."""
+    import numpy as np  # noqa: PLC0415
+    boxes = result.boxes
+    if boxes is None:
+        return np.zeros((0, 4))
+    d = getattr(result, "det_xyxy", None)
+    if d is not None and len(d) == len(boxes):
+        return d
+    return boxes.xyxy.cpu().numpy()
 
 
 class BatchTracker:
@@ -288,6 +306,9 @@ class BatchTracker:
         self._trackers: Dict[str, object] = {}
         # Ultralytics predictors are not thread-safe; analyzers call from to_thread
         self._lock = threading.Lock()
+        # The trackers have their own lock, so one round's model call can run while the
+        # previous round's tracker step does (R4.2); tracker steps stay one at a time
+        self._track_lock = threading.Lock()
         self._last_device: Optional[str] = None
         _INSTANCES.add(self)
 
@@ -309,7 +330,7 @@ class BatchTracker:
         return t
 
     def reset(self, drone_id: Optional[str] = None) -> None:
-        with self._lock:
+        with self._track_lock:
             if drone_id is None:
                 self._trackers.clear()
             else:
@@ -358,7 +379,12 @@ class BatchTracker:
         t0 = time.perf_counter()
         results = self.predict_batch(frames, **kw)
         detect_ms = (time.perf_counter() - t0) * 1000 / max(1, len(frames))
-        with self._lock:
+        return self.track_predicted(frames, results, detect_ms)
+
+    def track_predicted(self, frames: Dict[str, object], results: Dict[str, object],
+                        detect_ms: float = 0.0) -> Dict[str, object]:
+        """The tracker half of track_batch, on results of predict_batch(frames)."""
+        with self._track_lock:
             trackers = {d: self._tracker_for(d) for d in results}   # created one at a time
 
             def step(d):

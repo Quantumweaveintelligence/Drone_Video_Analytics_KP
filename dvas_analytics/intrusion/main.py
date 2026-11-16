@@ -35,8 +35,8 @@ from shared.redis_client import (
 )
 from shared import cpu_budget, minio_client as minio
 from shared import gpu_profile
-from shared.batch_tracker import BatchTracker
-from shared.annotated_hub import AnnotatedHub, install_stream_route
+from shared.batch_tracker import BatchTracker, draw_boxes
+from shared.annotated_hub import AnnotatedHub, drawn, install_stream_route
 from shared.frame_sampler import FrameSampler, frame_bytes as _frame_jpeg
 from shared.evidence import EventGate, bbox_xyxy, evidence_block, frame_context, model_info
 
@@ -455,7 +455,8 @@ async def _persist_monitor(item: dict, results, annotator: IntrusionAnnotator) -
 
     if results and len(results) > 0 and results[0].boxes is not None:
         boxes = results[0].boxes
-        for box in boxes:
+        drawn_xyxy = draw_boxes(results[0])
+        for bi, box in enumerate(boxes):
             cls_id = int(box.cls[0].cpu().numpy())
             conf = float(box.conf[0].cpu().numpy())
             cls_name = CLASS_NAMES.get(cls_id, f"CLASS_{cls_id}").upper()
@@ -522,6 +523,7 @@ async def _persist_monitor(item: dict, results, annotator: IntrusionAnnotator) -
                 "class": cls_name,
                 "confidence": round(conf, 3),
                 "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                "draw_bbox": dict(zip(("x1", "y1", "x2", "y2"), (int(v) for v in drawn_xyxy[bi]))),
                 "ground_contact": [int(gc_px), int(gc_py)],
                 "geolocation": {"latitude": g_lat, "longitude": g_lon},
                 "intrusion_state": intrusion_state.value,
@@ -544,7 +546,7 @@ async def _persist_monitor(item: dict, results, annotator: IntrusionAnnotator) -
         annotator.draw_geofence(annotated, pixel_pts, vis_flags, gm.polygon)
 
         # Draw objects
-        annotator.draw_objects(annotated, frame_detections)
+        annotator.draw_objects(annotated, drawn(frame_detections))   # the detector's box on this frame
 
         # Draw HUD
         telemetry_dict = {

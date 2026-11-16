@@ -122,6 +122,25 @@ for sw in PERSON:6:2 ANPR:4:2 ANOMALY:4:2 VEHICLE:3:2 INTRUSION:2:2 VESSEL:2:2 C
 done
 log "analyzer threads: person ${DVAS_THREADS_PERSON} anpr ${DVAS_THREADS_ANPR} anomaly ${DVAS_THREADS_ANOMALY} vehicle ${DVAS_THREADS_VEHICLE} intrusion ${DVAS_THREADS_INTRUSION} vessel ${DVAS_THREADS_VESSEL} crowd ${DVAS_THREADS_CROWD} (of ${DVAS_CPUS})"
 
+# v2 R4.7: CUDA MPS — the analyzers' kernels share the GPU at the same time instead of the
+# driver time-slicing between processes. The same kernels run, so results are unchanged.
+# Off by default: keep it only if the total fps rises and a 2-hour run stays stable.
+export DVAS_CUDA_MPS="${DVAS_CUDA_MPS:-0}"
+if [ "$DVAS_CUDA_MPS" = "1" ]; then
+  if command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
+    export CUDA_MPS_PIPE_DIRECTORY=/run/dvas/mps-pipe CUDA_MPS_LOG_DIRECTORY=/var/log/dvas/mps
+    mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+    if nvidia-cuda-mps-control -d; then
+      log "CUDA MPS on (pipe $CUDA_MPS_PIPE_DIRECTORY)"
+    else
+      unset CUDA_MPS_PIPE_DIRECTORY CUDA_MPS_LOG_DIRECTORY
+      log "CUDA MPS could not start — running without it"
+    fi
+  else
+    log "CUDA MPS requested but nvidia-cuda-mps-control is missing (NVIDIA_DRIVER_CAPABILITIES needs compute) — off"
+  fi
+fi
+
 # Snapshot for interactive tools (dvas-ctl over SSH); root-only
 ( umask 077; export -p | grep -E 'declare -x (DVAS_|PUBLIC_BASE_URL|SECURE_COOKIES|[A-Z_]*_URL=|KC_|MINIO_|KEYCLOAK_|DRONE_IDS|KNOWN_DRONES)' > /run/dvas/runtime.env || true )
 

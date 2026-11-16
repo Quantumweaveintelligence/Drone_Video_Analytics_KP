@@ -24,7 +24,7 @@ import torch
 from ultralytics import YOLO
 
 from shared import gpu_profile
-from shared.batch_tracker import BatchTracker
+from shared.batch_tracker import BatchTracker, draw_boxes
 
 log = logging.getLogger(__name__)
 
@@ -681,27 +681,54 @@ class ANPRAnalyzer:
         plate detection / OCR then runs per drone exactly as for a single frame.
         CUDA errors propagate (main.py moves the models to CPU and retries).
         """
-        if not self.ready:
+        return self.finish_batch(frames, self.infer_batch(frames), mission_ids)
+
+    def infer_batch(self, frames: Dict[str, np.ndarray]):
+        """The vehicle model call of a round at 720p (GPU stage, R4.2):
+        (720p frames and scales per drone, detections or None on an error, ms per frame)."""
+        if not self.ready or not frames:
+            return None
+        prepared = {d: self._to_track_res(frame_orig) for d, frame_orig in frames.items()}
+        t0 = time.perf_counter()
+        try:
+            dets = self.tracker.predict_batch({d: p[0] for d, p in prepared.items()},
+                                              **self._track_kwargs())
+        except Exception as exc:
+            if "CUDA" in str(exc):
+                raise
+            log.warning("Vehicle tracking failed: %s", exc)
+            dets = None
+        return prepared, dets, (time.perf_counter() - t0) * 1000 / max(1, len(frames))
+
+    def finish_batch(
+        self,
+        frames: Dict[str, np.ndarray],
+        handle,
+        mission_ids: Optional[Dict[str, Optional[str]]] = None,
+    ) -> Dict[str, dict]:
+        """Tracking, plate detection and OCR of a round whose model call is `handle` (CPU stage)."""
+        if not self.ready or handle is None:
             return {d: self._empty(d) for d in frames}
+        prepared, dets, detect_ms = handle
         mission_ids = mission_ids or {}
         with self._lock:
-            prepared = {}
-            for d, frame_orig in frames.items():
+            for d in frames:
                 self._check_mission(d, mission_ids.get(d))
-                prepared[d] = self._to_track_res(frame_orig)
+            if dets is None:
+                return {d: self._empty(d) for d in frames}
 
-            # ── 1. Vehicle detection + tracking (720p), all drones in one batch ──
+            # ── 1. Vehicle tracking (720p), per drone ──
             t0 = time.perf_counter()
             try:
-                tracked = self.tracker.track_batch(
-                    {d: p[0] for d, p in prepared.items()}, **self._track_kwargs()
+                tracked = self.tracker.track_predicted(
+                    {d: p[0] for d, p in prepared.items()}, dets, detect_ms
                 )
             except Exception as exc:
                 if "CUDA" in str(exc):
                     raise
                 log.warning("Vehicle tracking failed: %s", exc)
                 return {d: self._empty(d) for d in frames}
-            infer_ms = (time.perf_counter() - t0) * 1000 / max(1, len(frames))
+            infer_ms = detect_ms + (time.perf_counter() - t0) * 1000 / max(1, len(frames))
 
             return {
                 d: self._postprocess(d, frames[d], *prepared[d], tracked.get(d), infer_ms)
@@ -732,7 +759,8 @@ class ANPRAnalyzer:
         theft_alerts = 0
 
         if results and results[0].boxes:
-            for box in results[0].boxes:
+            drawn_xyxy = draw_boxes(results[0])
+            for bi, box in enumerate(results[0].boxes):
                 if box.id is None:
                     continue
 
@@ -930,6 +958,22 @@ class ANPRAnalyzer:
                 elif rec.best_plate_bbox:
                     current_plate_bbox = rec.best_plate_bbox
 
+                # Live view only: the detector's box on this frame (the tracked box above is the
+                # tracker's estimate), and the plate projected onto it the same way
+                dx1, dy1, dx2, dy2 = clamp_box(*drawn_xyxy[bi].tolist(), TRACK_RESIZE_WIDTH, TRACK_RESIZE_HEIGHT)
+                draw_vehicle_bbox = [round(dx1 * scale_x, 2), round(dy1 * scale_y, 2),
+                                     round(dx2 * scale_x, 2), round(dy2 * scale_y, 2)]
+                draw_plate_bbox = current_plate_bbox
+                if rec.best_plate_rel_bbox and len(rec.best_plate_rel_bbox) == 4:
+                    qx1, qy1, qx2, qy2 = clamp_box(
+                        int(dx1 * scale_x) - VEHICLE_CROP_PAD, int(dy1 * scale_y) - VEHICLE_CROP_PAD,
+                        int(dx2 * scale_x) + VEHICLE_CROP_PAD, int(dy2 * scale_y) + VEHICLE_CROP_PAD,
+                        orig_w, orig_h)
+                    rx1, ry1, rx2, ry2 = rec.best_plate_rel_bbox
+                    qw, qh = max(0, qx2 - qx1), max(0, qy2 - qy1)
+                    draw_plate_bbox = [round(qx1 + rx1 * qw, 2), round(qy1 + ry1 * qh, 2),
+                                       round(qx1 + rx2 * qw, 2), round(qy1 + ry2 * qh, 2)]
+
                 plate_reads.append({
                     "tracker_id":        track_id,
                     "vehicle_type":      class_name,
@@ -943,6 +987,8 @@ class ANPRAnalyzer:
                     "plate_crop_b64":    rec.best_plate_crop_b64,
                     "vehicle_bbox":      veh_bbox_orig,
                     "plate_bbox":        current_plate_bbox,
+                    "draw_vehicle_bbox": draw_vehicle_bbox,   # live view only
+                    "draw_plate_bbox":   draw_plate_bbox,
                     "first_seen_frame":  rec.first_seen_frame,
                     "last_seen_frame":   rec.last_seen_frame,
                 })

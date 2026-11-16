@@ -47,7 +47,8 @@ from shared.redis_client import (
 from shared import cpu_budget, minio_client as minio
 from shared import gpu_profile, persist_gate
 from shared.frame_sampler import FrameSampler
-from shared.annotated_hub import AnnotatedHub, install_stream_route, scale_items, to_display
+from shared.stage_pipeline import StagePipeline
+from shared.annotated_hub import AnnotatedHub, drawn, install_stream_route, scale_items, to_display
 from shared.evidence import evidence_block, frame_context, model_info
 from person.analyzer import PersonFaceAnalyzer
 from person import reid
@@ -90,6 +91,8 @@ _frames_processed = 0
 _reid_last_run = 0.0
 # Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
 _sampler = FrameSampler("person", "person-group", "person-analyzer")
+# Next round's model calls while this round is tracked (R4.2); analyzer is set at startup
+_pipe = StagePipeline(_sampler, lambda frames: analyzer.infer_batch(frames))
 _gate = persist_gate.TrackGate()   # routine per-track writes (plan B1)
 # Live annotated video (MJPEG, ≤1920 px) for the dashboard
 _hub = AnnotatedHub("person")
@@ -314,7 +317,7 @@ def _render_person_live(frame, persons, faces, recognition_results, trails, ac) 
     """Annotated live-view JPEG: person/face boxes, watchlist markers and trails, drawn on
     the display-size copy so labels keep their size on 4K input."""
     annotated, f = to_display(frame)
-    persons = scale_items(persons, ("bbox",), f)
+    persons = scale_items(drawn(persons), ("bbox",), f)   # the detector's box on this frame
     faces = scale_items(faces, ("bbox",), f)
     trails = {t: [(int(x * f), int(y * f)) for x, y in pts] for t, pts in trails.items()}
 
@@ -622,7 +625,7 @@ async def _persist_person_frame(
     for p in result["persons"]:
         tid = p.get("tracker_id", 0)
         if tid > 0:
-            bb = p["bbox"]
+            bb = p.get("draw_bbox") or p["bbox"]      # trails are drawn: follow the drawn box
             # Center-bottom of bounding box (feet position on ground plane)
             pt = ((bb["x1"] + bb["x2"]) // 2, bb["y2"] - 2)
             _person_trajectories[drone_id][tid].append(pt)
@@ -885,8 +888,9 @@ async def _stream_loop():
                         "arcface": arcface_recognizer.status() if arcface_recognizer else None,
                     }
                 await _sampler.maybe_publish()
-                # Decoded in parallel; the next round decodes while this one is on the GPU (B2)
-                round_frames = await _sampler.next_decoded(active_drones)
+                # Decoded in parallel; the next round decodes while this one is on the GPU (B2),
+                # and its model calls run while this one is tracked (R4.2)
+                round_frames = await _pipe.next(active_drones)
                 if not round_frames:
                     continue
                 t_start = time.perf_counter()
@@ -911,8 +915,8 @@ async def _stream_loop():
 
                 # Run inference in worker thread pool so FastAPI event loop is never blocked.
                 # One batched person-detector call for the newest frame of every drone.
-                results = await asyncio.to_thread(
-                    analyzer.analyze_batch, {d: fr for d, (_, fr, _) in decoded.items()}, True
+                results = await _pipe.finish(
+                    {d: fr for d, (_, fr, _) in decoded.items()}, analyzer.finish_batch, active_drones
                 )
                 _sampler.record_batch(len(decoded))
                 # Persist the previous round before queuing this one (keeps per-drone
@@ -930,6 +934,7 @@ async def _stream_loop():
                 if "CUDA" in err_str and analyzer and hasattr(analyzer, '_fall_back_to_cpu'):
                     # Temporary: the analyzer retries the GPU after PERSON_GPU_RETRY_S
                     analyzer._fall_back_to_cpu(exc)
+                    _pipe.reset_device()
                 else:
                     log.warning("Person stream error: %s", exc)
                 await asyncio.sleep(1)
@@ -940,6 +945,7 @@ async def _stream_loop():
             except Exception:
                 pass
         try:
+            await _pipe.stop()
             await _sampler.done()           # the last round is finished: acknowledge it
         except Exception:
             pass

@@ -515,6 +515,20 @@ class FrameSampler:
         self._remember(out.values())
         return out
 
+    async def next_decoded_held(self, drones: List[str]) -> Tuple[Dict[str, Tuple[dict, object]], list]:
+        """next_decoded() whose round is acknowledged only by ack_held(token), not by the
+        next call nor by done() (stage pipelining, R4.2: a round read ahead is not finished
+        when the round before it is; after a restart it is re-read from the pending list)."""
+        got = await self.next_decoded(drones)
+        token, self._returned = self._returned, []
+        return got, token
+
+    async def ack_held(self, token: list) -> None:
+        """The round of next_decoded_held() is finished: acknowledge it."""
+        for key, eid in token or []:
+            self._ack_now.setdefault(key, []).append(eid)
+        await self._flush_acks()
+
     async def done(self) -> None:
         """The service stopped reading: acknowledge the frames it has finished."""
         await self._ack_returned()

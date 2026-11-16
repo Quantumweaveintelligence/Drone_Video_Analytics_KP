@@ -36,7 +36,8 @@ from shared.redis_client import (
 from shared import cpu_budget, minio_client as minio
 from shared import gpu_profile, persist_gate
 from shared.frame_sampler import FrameSampler
-from shared.annotated_hub import AnnotatedHub, install_stream_route, scale_items, to_display
+from shared.stage_pipeline import StagePipeline
+from shared.annotated_hub import AnnotatedHub, drawn, install_stream_route, scale_items, to_display
 from vehicle.analyzer import VehicleAnalyzer
 from vehicle.schema import VehicleFrameResult, VehicleStats
 
@@ -61,6 +62,8 @@ _stream_running = False
 _frames_processed = 0
 # Newest-frame reader, governor cap and live fps stats (RunPod plan 9.2 / 10)
 _sampler = FrameSampler("vehicle", "vehicle-group", "vehicle-analyzer")
+# Next round's model call while this round is tracked (R4.2); analyzer is set at startup
+_pipe = StagePipeline(_sampler, lambda frames: analyzer.infer_batch(frames))
 _gate = persist_gate.TrackGate()   # routine per-track writes (plan B1)
 # Live annotated video (MJPEG, ≤1920 px) for the dashboard
 _hub = AnnotatedHub("vehicle")
@@ -171,7 +174,7 @@ def _live_vehicle_jpeg(frame: np.ndarray, items: list, drone_id: str) -> bytes:
     """Live-view JPEG: overlay drawn on the ≤1920 px copy with boxes scaled to it, so
     labels keep their designed size when the drone sends 4K (detection is unaffected)."""
     small, f = to_display(frame)
-    return _draw_vehicle_annotations(small, scale_items(items, ("bbox",), f), drone_id)
+    return _draw_vehicle_annotations(small, scale_items(drawn(items), ("bbox",), f), drone_id)
 
 
 @app.on_event("startup")
@@ -443,13 +446,14 @@ async def _stream_loop():
                 await _flush_ended_tracks()     # also when no frames arrive
             try:
                 await _sampler.maybe_publish()
-                # Decoded in parallel; the next round decodes while this one is on the GPU (B2)
-                decoded = await _sampler.next_decoded(active_drones)
+                # Decoded in parallel; the next round decodes while this one is on the GPU (B2),
+                # and its model call runs while this one is tracked (R4.2)
+                decoded = await _pipe.next(active_drones)
                 t_start = _time.perf_counter()
                 if not decoded:
                     continue
-                results = await asyncio.to_thread(
-                    analyzer.analyze_batch, {d: fr for d, (_, fr) in decoded.items()}, True
+                results = await _pipe.finish(
+                    {d: fr for d, (_, fr) in decoded.items()}, analyzer.finish_batch, active_drones
                 )
                 _sampler.record_batch(len(decoded))
                 # Persist the previous round before queuing this one (keeps per-drone order);
@@ -469,6 +473,7 @@ async def _stream_loop():
                         analyzer.to_device("cpu")
                     except Exception:
                         pass
+                    _pipe.reset_device()
                 else:
                     log.warning("Vehicle stream error: %s", exc)
                 await asyncio.sleep(1)
@@ -479,6 +484,7 @@ async def _stream_loop():
             except Exception:
                 pass
         try:
+            await _pipe.stop()
             await _sampler.done()           # the last round is finished: acknowledge it
         except Exception:
             pass
