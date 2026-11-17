@@ -45,7 +45,8 @@ case "$cmd" in
   disk)
     df -h / 2>/dev/null
     [ -r /run/dvas/disk_guard.json ] && echo "disk guard: $(cat /run/dvas/disk_guard.json)"
-    echo "network volume used: $(du -sh /workspace 2>/dev/null | cut -f1) of ${DVAS_VOLUME_GB:-?} GB (df /workspace shows the whole RunPod cluster)"
+    echo "network volume used: $(du -sh /workspace 2>/dev/null | cut -f1) allocated, $(du -sh --apparent-size /workspace 2>/dev/null | cut -f1) of data, of ${DVAS_VOLUME_GB:-?} GB (df /workspace shows the whole RunPod cluster)"
+    echo "the guard counts: ${DVAS_DISK_MEASURE:-allocated} (DVAS_DISK_MEASURE=apparent once RunPod's volume usage matches the data figure)"
     du -sh "$VOL"/{pg,minio,backups,engines,recordings} /var/lib/postgresql/dvas 2>/dev/null || true ;;
   backup-now) "$BIN/backup-loop.sh" --once ;;
   *) sed -n '2,11p' "$0"; exit 2 ;;

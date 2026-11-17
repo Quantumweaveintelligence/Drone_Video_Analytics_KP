@@ -43,7 +43,11 @@ This is not a full overhaul. The work is limited to:
 | Analytics at 4K | **8–10 fps steady**, lag grew to 26 s per minute of flight. `dvas-ctl lag`: only `person-group` had pending frames — person + 28 face tiles per 4K frame sets the pace for every service |
 | CPU decode 4K / nvJPEG 4K | 146–164 fps / 0.3–0.7 ms — not a bottleneck |
 
-Follow-ups: make the disk guard measure apparent size (not MooseFS blocks).
+Follow-ups: make the disk guard measure apparent size (not MooseFS blocks). **16 Nov:** the guard
+now records both (`allocated_kb`, `apparent_kb` in `/run/dvas/disk_guard.json`, both in `dvas-ctl
+disk`) and enforces `DVAS_DISK_MEASURE` = `allocated` (default, unchanged) | `apparent`. Switch
+to `apparent` only after RunPod's own volume usage is seen to match the data figure — if RunPod's
+quota counts blocks, `apparent` would let the volume really fill.
 
 ### Status (2026-11-10): Stage 1 implemented on `runpod-v2`, not yet on the pod
 
@@ -858,6 +862,11 @@ for the same evidence over a longer time (conservative).
 Found on the way (not R6): the backend's `/ws/status` listener (A5, drone offline on stream end)
 uses the role-less `dvas-admin-service` token, which ingest rejects — it has likely never
 connected on the pod; drones go offline through the slower telemetry-pump fallback.
+**Fixed 16 Nov:** `/ws/status` (internal only — nginx forwards `/ingest/...` paths, not `/ws/`)
+also accepts service-account tokens of `DVAS_STATUS_SERVICE_CLIENTS` (default
+`dvas-admin-service`); signature and expiry are still verified, and any other role-less token is
+refused (`tests/test_status_auth.py`). On the pod: `grep "Listening to ingest /ws/status"` in the
+backend log.
 
 #### R6.1 Feed modes per service (`DVAS_FEED_MODE_<SVC>` = `every` | `latest`)
 - Defaults: `latest` for crowd and vessel; `every` for person, vehicle, ANPR, intrusion, anomaly.
@@ -1232,8 +1241,8 @@ set in the pod's environment):**
 
 **R9 closed (16 Nov).** The live-stream cap now defaults to 20. Left as they are, not R9 work:
 - `DVAS_MAX_LIVE_STREAMS` default 20 (ingest, `dvas-init.sh`; was 8).
-- nginx allows **4** video WebSockets per token (`limit_conn video_conn 4`): one account cannot
-  stream 20 drones. Blocks the edge team's real-footage test.
+- nginx allows **5** video WebSockets per token (`limit_conn video_conn 5`; was 4 until 17 Nov): one account cannot
+  stream more than 5 drones. Still blocks a 20-drone test from one account.
 - Real-footage test with 20 drones from one laptop: requirements for the edge test tool in
   `docs/edge_multi_drone_test_tool_requirements.md` (server prerequisites P1–P6, acceptance
   T1–T6).
@@ -1321,7 +1330,7 @@ that must be cleared before v2 is accepted with a real drone.
 
 | # | Risk | Effect if not handled | Owner and action | Test |
 |---|---|---|---|---|
-| E-1 | The edge sends each frame's TS bytes as **one** WebSocket message; a 4K H.264 keyframe is often > 256 KiB | Server closes with **1009 `bad_chunk`**; the edge reconnects, resends from the same keyframe, and loops — no live video | **Edge:** split each frame's bytes into messages of ≤ 256 KiB (multiples of 188), as §3 says. **RunPod:** make the limit configurable (`DVAS_VIDEO_MAX_MSG_KB`, default 256) so a field test is not blocked meanwhile | No `bad_chunk` in `/var/log/dvas/ingest.log` during a 4K stream |
+| E-1 | The edge sends each frame's TS bytes as **one** WebSocket message; a 4K H.264 keyframe is often > 256 KiB | Server closes with **1009 `bad_chunk`**; the edge reconnects, resends from the same keyframe, and loops — no live video | **Edge:** split each frame's bytes into messages of ≤ 256 KiB (multiples of 188), as §3 says. **RunPod (done 16 Nov):** the limit is configurable (`DVAS_VIDEO_MAX_MSG_KB`, default 256, up to 16384 — uvicorn's own WebSocket limit); for a field test with this edge release set e.g. 2048 | No `bad_chunk` in `/var/log/dvas/ingest.log` during a 4K stream |
 | E-2 | The edge forwards the camera stream as is (copy mode); a real 4K camera can exceed 15 Mbps (1.25 × `DVAS_VIDEO_MAX_KBPS`) | Server closes with **4413 `over_bitrate`** after 10 s | **RunPod:** set `DVAS_VIDEO_MAX_KBPS` from the cameras' measured bitrate (for the first test 40000). **Edge:** the transcoding ladder (later release) | No `over_bitrate` in the ingest log; `rx_kbps` in `stats` matches the camera |
 | E-3 | This edge release forwards only H.264; HEVC sources stay on the JPEG fallback | No live video for HEVC cameras (analytics still works via JPEG) | **Edge:** HEVC → H.264 transcoding (ladder). **Ops:** set the drone camera / RTMP output to H.264 for now | Edge log has no `video_uplink_codec_unsupported`; `codec=h264` in `mission:video:{sid}` |
 | E-4 | The 2026-11-10 database wipe removed drone registrations and assignments | `mission/start` or the uplink is refused (403 / 4403) | **Ops:** register the edge's drone ID and assign it to the operator account the edge logs in with | `mission/start` 201; `ready` received |

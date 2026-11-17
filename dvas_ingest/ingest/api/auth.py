@@ -14,6 +14,7 @@ Flow:
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Optional
 
@@ -80,8 +81,17 @@ _bearer = HTTPBearer(
 )
 
 
-async def validate_token_string(token: str) -> dict:
-    """Validate a raw JWT token string against Keycloak JWKS and verify role."""
+# Service clients (client_credentials) whose tokens may read /ws/status without a DVAS realm
+# role: the dashboard backend's stream-end listener (dvas-admin-service carries no DVAS role).
+STATUS_SERVICE_CLIENTS = frozenset(
+    c.strip() for c in os.getenv("DVAS_STATUS_SERVICE_CLIENTS", "dvas-admin-service").split(",") if c.strip()
+)
+
+
+async def validate_token_string(token: str, service_clients: frozenset = frozenset()) -> dict:
+    """Validate a raw JWT token string against Keycloak JWKS and verify role.
+    `service_clients`: client ids whose service-account tokens pass without a role (the
+    signature and expiry are still verified)."""
     try:
         jwks = await get_jwks()
         payload = jwt.decode(
@@ -99,6 +109,9 @@ async def validate_token_string(token: str) -> dict:
         )
 
     realm_roles: list[str] = payload.get("realm_access", {}).get("roles", [])
+    if (service_clients and payload.get("azp") in service_clients
+            and str(payload.get("preferred_username", "")).startswith("service-account-")):
+        return payload
     if not ALLOWED_ROLES.intersection(realm_roles):
         log.warning(
             "jwt_role_denied",

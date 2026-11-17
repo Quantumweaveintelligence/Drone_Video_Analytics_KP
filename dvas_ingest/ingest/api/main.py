@@ -61,6 +61,7 @@ from auth import (
     extract_username,
     validate_token,
     validate_token_flexible,
+    STATUS_SERVICE_CLIENTS,
     validate_token_string,
 )
 from config import (
@@ -1173,7 +1174,10 @@ async def ingest_frame(
 VIDEO_INGEST = os.getenv("DVAS_VIDEO_INGEST", "1").lower() in ("1", "true", "yes")
 VIDEO_MAX_KBPS = max(500, int(os.getenv("DVAS_VIDEO_MAX_KBPS", "12000") or 12000))
 VIDEO_MAX_STREAMS = max(1, int(os.getenv("DVAS_MAX_LIVE_STREAMS", "20") or 20))
-VIDEO_MAX_MSG = 256 * 1024
+# Largest binary message (§3: ≤ 256 KiB of whole TS packets). Configurable so an edge that sends a
+# 4K keyframe as one message (risk E-1) is not cut with 1009 meanwhile; uvicorn's own WebSocket
+# limit is 16 MiB, so larger values cannot take effect.
+VIDEO_MAX_MSG = min(16384, max(64, int(os.getenv("DVAS_VIDEO_MAX_MSG_KB", "256") or 256))) * 1024
 VIDEO_HELLO_TIMEOUT_S = 10.0
 VIDEO_IDLE_TIMEOUT_S = 120.0        # no message this long (pings do not count): the edge is gone; Cloudflare drops at 100 s
 VIDEO_FINISH_TIMEOUT_S = 60.0       # sealing the recording may take this long before we move on
@@ -1689,7 +1693,7 @@ async def _video_receive(conn: _VideoConn, claims: dict, rec, relay, vkey: str) 
         if data is not None:
             if len(data) > VIDEO_MAX_MSG or len(data) % 188:
                 raise _VideoClose(1009 if len(data) > VIDEO_MAX_MSG else 1003, "bad_chunk",
-                                  "binary messages carry whole TS packets, at most 256 KiB")
+                                  f"binary messages carry whole TS packets, at most {VIDEO_MAX_MSG // 1024} KiB")
             await rec.data(data)
             if relay is not None:
                 await relay.feed(data, next_key)
@@ -3036,7 +3040,8 @@ async def ws_status(ws: WebSocket) -> None:
         return
 
     try:
-        claims = await validate_token_string(token)
+        # the backend's stream-end listener uses its role-less service account (A5)
+        claims = await validate_token_string(token, STATUS_SERVICE_CLIENTS)
     except Exception as exc:
         log.warning("ws_auth_rejected: %s", exc)
         await ws.close(code=status.WS_1008_POLICY_VIOLATION)

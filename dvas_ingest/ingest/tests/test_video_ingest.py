@@ -496,6 +496,23 @@ def test_full_volume_refuses_new_video(client, valkey, tmp_path, monkeypatch):
         assert json.loads(ws.receive_text())["type"] == "ready"
 
 
+def test_message_size_limit_is_configurable(client, valkey, monkeypatch):
+    """DVAS_VIDEO_MAX_MSG_KB (risk E-1): a message over the limit is closed with 1009 bad_chunk."""
+    assert main.VIDEO_MAX_MSG == 256 * 1024                 # default: the §3 contract
+    monkeypatch.setattr(main, "VIDEO_MAX_MSG", 188 * 10)
+    assert start(client, DRONE, MISSION).status_code < 300
+    with client.websocket_connect(ws_url(), headers={"authorization": "Bearer sub:op-a"}) as ws:
+        ws.send_text(hello())
+        assert json.loads(ws.receive_text())["type"] == "ready"
+        ws.send_bytes(b"\x47" + bytes(188 * 11 - 1))      # 11 packets: over the limit
+        err, msg = None, ws.receive()
+        while msg.get("type") == "websocket.send":
+            doc = json.loads(msg["text"])
+            err = doc if doc.get("type") == "error" else err
+            msg = ws.receive()
+        assert msg.get("code") == 1009 and err["code"] == "bad_chunk" and "1 KiB" in err["detail"]
+
+
 def test_mission_end_after_bye_keeps_the_video_ended():
     """mission/end right after `bye` (while the recording is still being sealed) closes the
     connection again; the video must stay `ended`, not turn `paused`."""

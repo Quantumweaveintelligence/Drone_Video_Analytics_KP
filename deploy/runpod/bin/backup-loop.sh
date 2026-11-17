@@ -38,9 +38,19 @@ disk_guard() {
   # RunPod network volumes are one big MooseFS cluster: `df /workspace` shows the CLUSTER
   # (e.g. 534T, 71%), not your volume's size. With DVAS_VOLUME_GB set (template env, e.g. 20),
   # usage is measured with du against that size instead.
-  local pct used_kb
+  # du counts MooseFS allocated blocks, which can be far above the data (165 GB for ~16 GB of
+  # MinIO objects, 10 Nov); --apparent-size counts the bytes. Both are recorded; the guard uses
+  # DVAS_DISK_MEASURE = allocated (default) | apparent. Switch to apparent only once RunPod's
+  # own volume usage is seen to match it (`dvas-ctl disk` shows both).
+  local pct used_kb alloc_kb apparent_kb
   if [ -n "${DVAS_VOLUME_GB:-}" ]; then
-    used_kb="$(du -sk /workspace 2>/dev/null | cut -f1)"
+    alloc_kb="$(du -sk /workspace 2>/dev/null | cut -f1)"
+    apparent_kb="$(du -sk --apparent-size /workspace 2>/dev/null | cut -f1)"
+    if [ "${DVAS_DISK_MEASURE:-allocated}" = "apparent" ] && [ -n "$apparent_kb" ]; then
+      used_kb="$apparent_kb"
+    else
+      used_kb="$alloc_kb"
+    fi
     [ -n "$used_kb" ] || return 0
     pct=$(( used_kb * 100 / (DVAS_VOLUME_GB * 1024 * 1024) ))
   else
@@ -49,8 +59,9 @@ disk_guard() {
   [ -n "$pct" ] || return 0
   # Read by ingest before it accepts a video stream (v2 R1: recordings stop at 90 %)
   mkdir -p /run/dvas
-  printf '{"pct": %s, "used_kb": %s, "volume_gb": "%s", "at": %s}\n' \
-    "$pct" "${used_kb:-0}" "${DVAS_VOLUME_GB:-}" "$(date +%s)" > /run/dvas/disk_guard.json.tmp \
+  printf '{"pct": %s, "used_kb": %s, "allocated_kb": %s, "apparent_kb": %s, "measure": "%s", "volume_gb": "%s", "at": %s}\n' \
+    "$pct" "${used_kb:-0}" "${alloc_kb:-0}" "${apparent_kb:-0}" "${DVAS_DISK_MEASURE:-allocated}" \
+    "${DVAS_VOLUME_GB:-}" "$(date +%s)" > /run/dvas/disk_guard.json.tmp \
     && mv /run/dvas/disk_guard.json.tmp /run/dvas/disk_guard.json
   if [ "$pct" -ge "$DISK_WARN_PCT" ]; then
     log "WARNING: /workspace is ${pct}% full (threshold ${DISK_WARN_PCT}%) — check MinIO retention and old backups"
