@@ -736,7 +736,8 @@ Every step is measured on the pod before and after, with the stage split (A4) an
 unchanged.** Items 1 (ANPR reads its boxes from vehicle: ANPR detects on a 1280×720 resize,
 vehicle on the source frame — different detections), 3 (TensorRT FP16), 5 (batched catch-up) and
 6 (GPU OCR) change numbers, so they are not built. Items 2 (pipelining) and 7 (MPS) are identical
-by construction; 8 (presets) is UI only.
+by construction; 8 (presets) is UI only. **Replaced 2026-11-18:** items 1, 3, 5 and 6 move to
+R11.6 under the operator's "equal or better" rule, gated by the R11.1 accuracy test set.
 
 **Done when**, on the L40S:
 - **Target set 2026-11-13: all 7 services enabled at once**, every every-frame service ≥ 20 fps
@@ -1268,6 +1269,250 @@ the "not 30 fps" report. The disk itself is fast (541 MB/s direct writes).
   volume size vs. retention to be decided; `dvas-vehicles` (15 GB) and `dvas-plates` have no
   dedup clean-up yet.
 
+### Phase R11 — Analytics throughput: GPU-first, each frame's work done once (planned 2026-11-18)
+
+**Goal (operator, 18 Nov):** 20 drones analysed in one pod, every enabled `every` service at
+shedding level 0 at 20 fps. The pod may have more GPUs and more vCPUs per GPU (RunPod option);
+a B300 pod is an option to evaluate. Fast camera pans must keep their annotations.
+
+**Decisions (operator, 18 Nov):**
+- **Accuracy rule: equal or better.** Steps marked *identical* must give the same results (same
+  identity tests as R4.2). Steps marked *gated* change numbers slightly (TensorRT, GPU
+  preprocessing, NVDEC, raw frames, GPU OCR); each ships only if it is equal or better than today
+  on the R11.1 test set. This replaces the 16 Nov "100 % unchanged" rule (end of R4) for the gated
+  items R4.1, R4.3, R4.5 and R4.6, which move here.
+- **Shedding rule:** level 0 is normal; shedding is a safety valve (R11.2).
+- **Shared memory for frames:** allowed, sized to the pod (R11.3).
+
+#### R11.0 What the 17 Nov load test showed (1 × 1080p drone, image `20261117-87f8e09` or older)
+
+| | Idle | 1 drone, all 7 services |
+|---|---|---|
+| CPU cores (of 27) | 0.9 | 9.3 mean, 10.9 peak |
+| GPU busy (utilization.gpu) | 0 % | 21.6 % mean, 39 % p95 |
+| Analysed fps (20 published) | — | person 4.9, ANPR 5.3, vehicle 5.9, intrusion 8.7, anomaly 10.1 |
+| Shedding | — | level 3 in all five `every` services, also when each ran alone |
+
+Per-frame cost, each service alone (ms): person 146 (model 69), ANPR 102 (model 38), vehicle 101
+(model 44), anomaly 48 (model 21), vessel 153 (model 17), intrusion 18. **The GPU waits on the
+CPU:** at 100–145 ms per frame a service can analyse at most 7–10 fps, so it sheds at 20 fps
+published. The CPU time goes to work that is done once per service instead of once per frame:
+
+| Per frame, CPU | Times done | Cost (1080p) |
+|---|---|---|
+| JPEG decode of the same frame | 7 (one per service) + 1 encode in the decoder | 9–18 ms each |
+| BoT-SORT camera-motion features (`gmc_prep`) | 4 (vehicle, ANPR, person, intrusion) + ORB in anomaly | 7–24 ms each |
+| visdrone detection of the same frame | 2 (vehicle; ANPR on a 1280×720 resize) | ≈ 35–40 ms each |
+| Live-view draw + JPEG encode | 7, also with no viewer | ≈ 10 ms each |
+| Ultralytics letterbox / normalise / NMS on CPU, batch 1 per drone | every model call | inside "model" |
+| Tracker update (BoT-SORT), plate OCR (PaddleOCR forced to CPU) | per frame / per plate | 16–22 ms / — |
+
+**Fast pans:** at level 3 the trackers see frames 100–200 ms apart; on a fast pan objects move too
+far between them to be matched, each drop-oldest jump restarts the trackers, and the live view
+updates 5–10 times a second. Only lower per-frame cost removes this.
+
+**Reproduced locally (18 Nov):** the real `FrameSampler` against Valkey, a 1080p stream at 20 fps
+and a stand-in service: 18 ms per frame → 20 fps, level 0; 18 ms + a 2 s stall every 15 s →
+level 1 only, recovers; **100 ms per frame → level 3, cadence switching 2 ↔ 4, a drop-oldest jump
+every 15–20 s, 5–9 fps** — the pod's pattern. The sampler is not the limit.
+
+**Found 18 Nov on the pod:** the services ran with `DVAS_SHED_AFTER_S=0.3` (set in the pod's
+environment, not in `dvas.env`) instead of 1.5. Intrusion stepped to level 3 at 0.3–0.4 s behind,
+with drop-oldest jumps that dropped 0 frames. This explains level 3 in intrusion and anomaly; it
+does not explain the 100–145 ms per frame of person, vehicle and ANPR, which shed at 1.5 s too.
+R11.2 adds a floor (values under 1.0 s are refused with a warning) and stops a 0-frame jump from
+counting toward the cadence step-down.
+
+**Open from the run** (need the pod):
+- *Regression check:* on 10 Nov person alone held 20 fps on a 4K drone (round 50.6 ms, R4
+  status); on 17 Nov person alone took 146 ms per 1080p frame. Run `bench_person.py` on the
+  10 Nov image `20261110-f9a30a8` and on the current image with the same clip, before R11.3.
+- *Intrusion:* 18 ms measured per frame, yet 1.8 cores at 7 fps (≈ 250 ms of CPU per analysed
+  frame) and level 3 with GPU 0 % (standby, no geofence). The CPU is spent outside the timed
+  stages: profile with `py-spy record` (60 s, intrusion and person) during a 1-drone run.
+- *Audit:* the shed ranges of the run (`dvas:analytics_shed`) and the level changes from the
+  captured service logs (`/tmp/cap-mzlktuqp`).
+
+#### R11.1 Accuracy test set and harness (first; 3–4 days, needs labelled clips)
+
+Every *gated* step below is accepted or rejected by this harness; *identical* steps use the
+identity tests (R4.2 method).
+- **Clips:** recorded drone footage from the edge, 1080p and 4K, day and night, slow and **fast
+  pans**, crowds, traffic with readable plates, watchlist faces, a geofence crossing. 10–20 clips
+  of 1–3 min. Labels: boxes per class on sampled frames (every 10th), plate texts, face
+  identities, intrusion / anomaly events with times.
+- **Replay:** clips are streamed through the real path (ingest → decoder → services) at 20 fps
+  with shedding off (`DVAS_SHED_AFTER_S=0`), so every frame is analysed; results are read from
+  the services' published results / DB.
+- **Metrics:** detection precision and recall per class (IoU 0.5); tracking IDF1 and id switches
+  (fast-pan clips separately); plate exact-read rate; face top-1 match rate and false matches;
+  event times (intrusion, anomaly) within ± 0.5 s.
+- **Rule:** a gated step ships if no metric is worse than today beyond the run-to-run noise,
+  measured by running the current build twice (cuDNN autotune alone moves FP16 last digits).
+  The report is stored under `/workspace/dvas/bench/accuracy-<date>.md`.
+
+#### R11.2 Shedding policy and fixes (identical when not overloaded; 2 days)
+
+Findings from the 17 Nov run (questions from the operator review):
+- The trigger already uses the pod-side wait (entry time in the analytics stream), not the edge
+  capture time; the report's "delay p95" (capture → result) includes the edge-to-pod path and is
+  reporting only.
+- `frames_shed` is a per-process total, not per run: the sampler (and its shed state) lives as
+  long as the process, `/stream/stop` and `/stream/start` do not reset it, and a drop-oldest jump
+  counts every frame number skipped, including frames published while the service was stopped.
+  `bench_stress.py` reports the last total.
+- A stopped service does not hold the decoder (its stats key expires after 10 s; the decoder then
+  ignores its group). Its frozen backlog (e.g. "vehicle 55") is display only. On restart it
+  continues from that old position, keeps its old level and cadence, and gets no warm-up grace.
+- R6.3 says the tracker's prediction moves the boxes between cadence frames; in the code the
+  skipped frames are not analysed at all (no predicted boxes are published). Correct the text or
+  build it.
+
+Changes:
+1. **Reset on stream start:** shed state, cadence, warm-up and drop counters reset on
+   `/stream/start` and on a new mission stream; the group starts from the newest entry when its
+   position is older than `DVAS_SHED_AFTER_S` (logged as one `restart` range).
+2. **Per-run counts:** `bench_stress.py` / `bench_capacity.py` report `frames_shed` as the change
+   over the run; the snapshot also gets `shed_since` (when the counter started).
+3. **Order by accuracy cost** — sustained overload steps down the cadence; drop-oldest is for a
+   one-off stall:
+   - level 1 (secondary stages off) when the wait > threshold for `DVAS_SHED_ENTER_S` (2 s);
+   - level 3 cadence 2 when still over the threshold after 3 s at level 1;
+   - level 2 drop-oldest only when the wait > 2 × threshold (a stall), at any level; trackers
+     restart only if more than 1 s was skipped (as today);
+   - recovery unchanged: one step down after 10 s at ≤ 0.5 s.
+4. **Per-service limits** (`DVAS_SHED_MAX_CADENCE_<SVC>`): person (and face), ANPR and vehicle
+   at most cadence 2 (never every 4th frame); intrusion, anomaly at most 4. Crowd and vessel read
+   the newest frame already. Vehicle stays at 2 unless the R11.1 fast-pan test says otherwise.
+   When the limit is reached and the wait still grows, drop-oldest catches up (rule 3).
+5. **Per-service thresholds** scaled to frame cost: `DVAS_SHED_AFTER_S_<SVC>`, default
+   max(1.5 s, 10 × the service's median frame cost).
+6. Audit: level changes also go to `dvas:analytics_shed` (`reason=level`, from/to level, wait,
+   cadence), so one stream shows the whole sequence.
+
+Tests: the sampler experiment above as unit tests (fake clock): 18 ms → never sheds; 100 ms →
+cadence 2, no jumps when 2 is enough; a 4 s stall → one drop-oldest, then back to level 0;
+restart with an old group position → starts at the newest frame, level 0.
+
+#### R11.3 Decode once: shared frame ring (identical; 4–5 days; supersedes R5.4)
+
+- `video-decoder` decodes its own JPEG once (`cv2.imdecode`, the call every service uses today,
+  so the pixels are bit-identical) and writes the BGR frame into a per-stream ring in `/dev/shm`
+  (`/dev/shm/dvas/<sid>/`, `DVAS_FRAME_RING` slots, default 128 ≈ 6.4 s at 20 fps). The Valkey
+  entry keeps the JPEG (evidence, fallback, late readers) and adds `ring_slot` and `ring_gen`.
+- Services map the ring read-only (`numpy` on the shared file) and copy the slot into their own
+  buffer when the generation matches; otherwise they decode the JPEG as today. Same pixels either
+  way. The camera-motion features of R11.4 go into the same slot.
+- **Memory:** 6.2 MB per 1080p frame, 24.9 MB per 4K frame → 128 slots = 0.8 GB per 1080p
+  drone, 3.2 GB per 4K drone; 20 drones = 16 GB (1080p) to 64 GB (all 4K). `dvas-init.sh` sizes
+  the ring from `df /dev/shm` and the pod's RAM, logs it, and disables the ring (JPEG path) when
+  it does not fit. **Check on the pod:** `df -h /dev/shm` (containers often get 64 MB unless the
+  pod sets `--shm-size`) and `free -g`.
+- **Saves** 6 of 7 JPEG decodes per frame (≈ 60–110 ms CPU per 1080p frame with all services).
+- Identity test: every service's results with `DVAS_FRAME_RING=0` vs on, on the R4.2 clips.
+
+#### R11.4 Camera-motion features once per frame (identical; 2 days)
+
+- The frame-only part of BoT-SORT's camera motion (grey, downscale, `goodFeaturesToTrack`; R4.9's
+  `prepare_frame`) is computed once in the decoder and stored with the ring slot (downscaled grey
+  image + keypoints). Person, vehicle, ANPR and intrusion use it instead of preparing their own;
+  the optical flow against each tracker's previous frame stays per service (it depends on which
+  frames that service analysed). Same OpenCV calls on the same pixels → same warp.
+- Intrusion skips it for drones in standby (no geofence → no tracker).
+- Anomaly's ORB (R6.9) is separate: its downscaled variant is *gated* (R11.6).
+- **Saves** 3–4 × 7–15 ms CPU per 1080p frame.
+
+#### R11.5 Live view encodes only when watched (identical; 1 day)
+
+- `AnnotatedHub.put_frame` draws and encodes only while the service's MJPEG stream for that
+  drone has a viewer, or `/annotated/latest` was requested in the last 5 s. Evidence and alert
+  images are encoded as today (they do not use the hub).
+- **Saves** up to 7 × ≈ 10 ms CPU per frame when nobody watches a service's view.
+
+#### R11.6 GPU-first inference (gated; 6–8 days)
+
+Each item behind its own flag, measured, and accepted only by R11.1.
+1. **TensorRT FP16** for every YOLO model (was R4.3; `DVAS_TRT`): engines built on the pod per GPU
+   type (`/workspace/dvas/engines/<sm>-<trt>/`), dynamic batch (1–32). Ultralytics' published
+   figures: 2.8–5.9× lower model latency than PyTorch, FP16 within 0.1 mAP. INT8 is out (it
+   shifts confidences).
+2. **Preprocessing on the GPU:** letterbox, BGR→RGB, normalise as one CUDA step on the uploaded
+   frame; the model gets a tensor (no CPU letterbox). Boxes mapped back with Ultralytics'
+   `scale_boxes`. GPU resize is not bit-equal to `cv2.resize` (±1 values).
+3. **Shared vehicle detection for vehicle and ANPR** (was R4.1): ANPR detects on a 1280×720
+   resize, vehicle on the source frame, so this changes ANPR's boxes; one visdrone pass at the
+   source size serves both, each with its own threshold, classes and tracker.
+4. **Plate OCR on the GPU** (was R4.6) and **ArcFace through TensorRT** (ONNX Runtime TensorRT
+   provider): plate read rate and face matches must be ≥ today.
+5. **Anomaly camera motion on a downscaled frame** (R6.9 candidate).
+6. **Batched catch-up** (was R4.5): up to K frames of a drone per model call when it has a
+   backlog; the tracker still takes them in order.
+
+#### R11.7 Video decode and frames on the GPU (gated; 5–7 days)
+
+1. **NVDEC** in `video-decoder` (PyNvVideoCodec) instead of PyAV on CPU. The H.264 decode itself
+   is expected to be bit-exact (integer transform; to verify with per-frame MD5 against
+   libavcodec); the colour conversion to BGR on the GPU is not bit-equal to swscale.
+2. **Raw frames instead of the JPEG round trip:** the ring (R11.3) holds the decoded frame before
+   any JPEG; services see the camera's pixels, not a quality-90 copy. Expected equal or better;
+   R11.1 decides. The JPEG stays in the stream for evidence and fallback.
+3. **Frames on the GPU:** with R11.8 the decoded frame stays in GPU memory and the inference
+   worker reads it directly; the shared-memory ring keeps a CPU copy for the CPU stages that need
+   pixels (crops, evidence).
+
+#### R11.8 One inference worker per GPU; drones spread across GPUs (8–10 days)
+
+The pattern of DeepStream, Savant and Triton: decode once, batch frames from all streams, run all
+models in one place per GPU, pass pointers, not JPEGs.
+- **Inference worker** (one process per GPU, `CUDA_VISIBLE_DEVICES`): holds every enabled model
+  (TensorRT engines) and runs them on batches built from all drones of its GPU and all services
+  (dynamic batching, ≤ 5 ms wait). Services send `(stream, seq, model, params)` and receive
+  detections; their trackers, rules, evidence and DB work stay in the service processes (CPU),
+  one process per service per GPU.
+- **Drones to GPUs:** a drone is assigned to the GPU with the fewest drones when its mission
+  starts (`mission:gpu:{sid}`) and keeps it; its decoder, ring and worker are on that GPU.
+- **CUDA MPS** (R4.7) on for the per-GPU processes if it helps the measured total.
+- Identical to R11.6 numerically (same engines), so it needs only the R11.6 acceptance plus a
+  2-hour stability run.
+
+#### R11.9 Sizing for 20 drones (measured, 2 days)
+
+`bench_stress.py` gains a `--drones N --gpus G` capacity run with the R11 steps on: services ×
+fps per drone, CPU cores per drone, GPU busy per drone, VRAM, `/dev/shm` use. From it:
+GPUs = ⌈20 × GPU % per drone ÷ 70⌉ and vCPUs = 20 × cores per drone + reserve.
+- **Today's numbers do not scale:** 8.4 cores per drone at 5–10 fps would be ≈ 20–30 cores per
+  drone at 20 fps (400–600 cores for 20 drones). R11.3–R11.5 remove the duplicated CPU work;
+  R11.6–R11.8 move the rest of the per-pixel work to the GPU. The measured result decides the
+  pod shape.
+- **GPU choice:**
+  - RTX PRO 6000 Blackwell (current pod, 97,887 MiB): NVDEC and NVENC on the card. NVIDIA's
+    figure for RT-DETR-R50 + tracker at 1080p30 is 29 streams on one card (VSS 3.2); our 7 models
+    per frame are heavier, so plan for several cards and measure.
+  - B300: to evaluate. **Check before choosing:** data-centre Blackwell parts (B200) have NVDEC
+    but **no NVENC**, so the R2 grid sub-stream would fall back to libx264 on the CPU for 20
+    feeds (or stay off); the PyTorch / TensorRT builds in the image must support its compute
+    capability (CUDA 12.9 or later); RunPod's vCPU and RAM per B300.
+- NVIDIA reference points (light models): 148 × 1080p30 streams on an H100 at 2.6 % CPU
+  (DeepStream 7.1); 50 on an H100 with RT-DETR-R50 + tracker.
+
+#### Order and estimates
+
+| Step | Results | Effort | Expected gain |
+|---|---|---|---|
+| R11.0 regression check, profiles, audit | — | 1 day (pod) | explains person 50 → 146 ms and intrusion |
+| R11.2 shedding fixes | identical at level 0 | 2 days | no level 3 at start-up; truthful counts; cadence 2 instead of jumps for person / ANPR / vehicle |
+| R11.3 + R11.4 + R11.5 | identical | 7–8 days | ≈ 30–40 % less CPU per frame (estimate, from the 17 Nov stage times) |
+| R11.1 accuracy harness | — | 3–4 days | gate for everything below |
+| R11.6 GPU-first inference | gated | 6–8 days | model time ÷ 3–6 (TensorRT), CPU preprocessing gone |
+| R11.7 NVDEC + raw frames | gated | 5–7 days | decoder CPU per stream ÷ 5–10 (estimate) |
+| R11.8 inference worker per GPU | as R11.6 | 8–10 days | batching across drones and services; scales by adding GPUs |
+| R11.9 sizing run | — | 2 days | the pod shape for 20 drones |
+
+**Done when:** with the chosen pod, 20 drones (1080p, plus the agreed 4K share) with the agreed
+service set hold shedding level 0 at 20 fps for 30 minutes, `behind_live_s` ≤ 1 s, and R11.1
+shows every metric equal or better than the 18 Nov baseline; the fast-pan clips keep their
+tracks (id switches no worse than baseline).
+
 ## 5. Flags summary
 
 | Flag | Default (v2) | Phase |
@@ -1293,6 +1538,11 @@ the "not 30 fps" report. The disk itself is fast (541 MB/s direct writes).
 | `DVAS_TRACK_THREADS` / `PERSON_FACE_ROUND` / `PERSON_FACE_ROUND_BATCH` | 8 / 1 / auto (128 on large GPUs) | R6.8 |
 | `DVAS_BACKFILL` | 0 | R6 |
 | `DVAS_PURGE_DUP_IMAGES` / `DVAS_PURGE_DUP_AFTER_S` / `DVAS_PURGE_DUP_EVERY_S` | 1 / 3600 / 300 | R10.1 |
+| `DVAS_SHED_ENTER_S` / `DVAS_SHED_AFTER_S_<SVC>` / `DVAS_SHED_MAX_CADENCE_<SVC>` | 2 / max(1.5, 10 × frame cost) / 2 for person, ANPR, vehicle; 4 for the others | R11.2 |
+| `DVAS_FRAME_RING` | 128 slots (0 = JPEG path); sized down or off by `dvas-init.sh` when `/dev/shm` is small | R11.3 |
+| `DVAS_GMC_SHARED` / `DVAS_LIVE_ENCODE_ON_VIEW` | 1 / 1 | R11.4 / R11.5 |
+| `DVAS_GPU_PREPROCESS` / `DVAS_NVDEC` / `DVAS_RAW_FRAMES` | 0 → 1 after the R11.1 gate | R11.6 / R11.7 |
+| `DVAS_INFER_WORKER` | 0 → 1 after R11.6 | R11.8 |
 
 ## 6. v2 acceptance (all on the pod, from Kerala)
 
@@ -1308,6 +1558,7 @@ the "not 30 fps" report. The disk itself is fast (541 MB/s direct writes).
 | Multi-Drone View (R7) | 20 tiles always; drones take the lowest free tile and keep it; offline tiles make no requests |
 | 20 concurrent feeds (R9) | 20 feeds admitted and live at source fps for 15 min (video only) — **passed 13 Nov with bench clips**; the same with real footage from the edge test tool; the analytics capacity per GPU recorded |
 | Services panel (R8) | Selecting a live tile shows all services, with the Detection Models selection highlighted; a click opens that service's page on this drone's annotated feed; disabled services do not navigate |
+| Analytics throughput (R11) | 20 drones in one pod at shedding level 0, 20 fps per enabled service, `behind_live_s` ≤ 1 s for 30 min; R11.1 metrics equal or better than the 18 Nov baseline |
 | Real edge (`edge-exe-v2`) | The §7 real-edge requirement passes: 30 fps received, live tile plays, analytics ≥ 20 fps, for a 4K and a 1080p camera |
 
 ## 7. Coordination with the edge developer
@@ -1356,4 +1607,8 @@ that must be cleared before v2 is accepted with a real drone.
 | NVDEC/NVENC not exposed in the container | CPU H.264 decode is cheap. The sub-stream uses libx264 `ultrafast`, or stays off. |
 | go2rtc API exposure (it can add stream sources) | localhost only; nginx exposes only `/live/api/ws` behind `auth_request`. |
 | Person at 4K stays under 20 fps | No frame loss (disk-backed); results run behind live and the tile says so. TRT and pipelining continue; mission presets reduce load. |
+| A GPU step (TensorRT, GPU resize, NVDEC colour, raw frames, GPU OCR) moves detections | R11.1 test set gates every such step against run-to-run noise; each has its own flag and stays off if it fails. |
+| `/dev/shm` too small in the container for the frame ring (R11.3) | `dvas-init.sh` sizes the ring to what fits and logs it; with no room the JPEG path is used (as today). |
+| B300 (or another data-centre GPU) has no NVENC | Grid sub-stream on libx264 costs CPU for 20 feeds; decide the GPU type with R11.9, or keep the sub-stream off on such pods. |
+| One inference worker per GPU is a single point of failure (R11.8) | supervisord restarts it; services fall back to their own models while it is down (as with `DVAS_SHARED_DETS`). |
 | Recording disk fills (≈ 7–9 GB per 4K drone-hour) | 7-day retention, refusal of new missions at 90 % with an alert, never deleting un-analysed or legal-hold recordings. |
