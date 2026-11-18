@@ -5,6 +5,7 @@ All functions use a shared connection pool.
 """
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Set
@@ -38,7 +39,7 @@ async def get_pool() -> asyncpg.Pool:
             command_timeout=30,
             init=_init_conn,
         )
-        log.info("DB pool created: %s", cfg.DATABASE_URL)
+        log.info("DB pool created: %s", re.sub(r"(//[^:/@]+):[^@]*@", r"\1:***@", cfg.DATABASE_URL))
     return _pool
 
 

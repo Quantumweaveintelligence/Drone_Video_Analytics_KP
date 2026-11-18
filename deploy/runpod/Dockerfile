@@ -167,6 +167,12 @@ RUN /opt/venvs/ai/bin/python -m pip install --no-cache-dir "omegaconf>=2.3,<2.5"
 # reason as above — move into requirements/backend.txt at the next full venv rebuild.
 RUN /opt/venvs/backend/bin/python -m pip install --no-cache-dir "redis[hiredis]==5.0.8" && \
     /opt/venvs/backend/bin/python -c "import redis; print('backend redis', redis.__version__)"
+# Person Re-ID (person/deduplicator.py) loads torchvision's ResNet-50 ImageNet weights. Without
+# them in the image torch downloads them into /root/.cache at every pod start, and person fails
+# to start when the pod has no DNS yet (pod 18 Nov: FATAL, "Temporary failure in name resolution").
+ENV TORCH_HOME=/opt/dvas/torch
+RUN /opt/venvs/ai/bin/python -c "import torchvision.models as m; m.resnet50(weights=m.ResNet50_Weights.DEFAULT); print('resnet50 weights cached')" && \
+    ls -l /opt/dvas/torch/hub/checkpoints/
 
 # Application code (weights excluded by Dockerfile.dockerignore)
 COPY dvas_analytics/             /opt/dvas/dvas_analytics/
