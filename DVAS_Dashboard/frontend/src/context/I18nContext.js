@@ -7,8 +7,8 @@ import { createContext, useContext, useEffect, useState, useCallback } from "rea
 
 const en = {
   /* app chrome */
-  "app.title": "DVAS",
-  "app.subtitle": "Kerala Police",
+  "app.title": "SmartQEye",
+  "app.subtitle": "Drone Video Analytics",
 
   /* roles — 4-role model (field_supervisor → CRO, supervisory_officer → SR) */
   "role.drone_operator": "Drone Operator",
@@ -44,10 +44,10 @@ const en = {
 
   /* login */
   "login.secureAccess": "Secure Access",
-  "login.signIn": "Sign in to DVAS",
+  "login.signIn": "Sign in to SmartQEye",
   "login.email": "Email",
   "login.password": "Password",
-  "login.enter": "Enter DVAS",
+  "login.enter": "Enter SmartQEye",
   "login.busy": "Authenticating…",
   "login.systemName": "Drone Video Analytics System",
   "login.tagline": "Command · Control · Compliance",
@@ -230,8 +230,8 @@ const en = {
 };
 
 const ml = {
-  "app.title": "ഡിവിഎഎസ്",
-  "app.subtitle": "കേരള പോലീസ്",
+  "app.title": "SmartQEye",
+  "app.subtitle": "ഡ്രോൺ വീഡിയോ അനലിറ്റിക്സ്",
 
   "role.drone_operator": "ഡ്രോൺ ഓപ്പറേറ്റർ",
   "role.control_room_officer": "കൺട്രോൾ റൂം ഓഫീസർ",
@@ -274,10 +274,10 @@ const ml = {
   "auth.signOut": "സൈൻ ഔട്ട്",
 
   "login.secureAccess": "സുരക്ഷിത പ്രവേശനം",
-  "login.signIn": "ഡിവിഎഎസിലേക്ക് പ്രവേശിക്കുക",
+  "login.signIn": "SmartQEye-ലേക്ക് പ്രവേശിക്കുക",
   "login.email": "ഇമെയിൽ",
   "login.password": "പാസ്‌വേഡ്",
-  "login.enter": "ഡിവിഎഎസിലേക്ക് കയറുക",
+  "login.enter": "SmartQEye-ലേക്ക് കയറുക",
   "login.busy": "പ്രാമാണീകരിക്കുന്നു…",
   "login.systemName": "ഡ്രോൺ വീഡിയോ അനലിറ്റിക്സ് സിസ്റ്റം",
   "login.tagline": "കമാൻഡ് · കൺട്രോൾ · കംപ്ലയൻസ്",

@@ -1221,7 +1221,7 @@ function RetentionPolicyModal({ isOpen, onClose, policy }) {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <Clock size={18} style={{ color: 'var(--dvas-blue)' }} />
             <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--dvas-text)' }}>
-              Kerala Police DVAS · Statutory Retention Policy
+              SmartQEye · Statutory Retention Policy
             </div>
           </div>
           <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--dvas-text-dim)', cursor: 'pointer' }}>
@@ -1638,7 +1638,7 @@ function SavePresetModal({ isOpen, onClose, currentFilters, onSaved }) {
               onChange={(e) => setIsShared(e.target.checked)}
               style={{ width: 14, height: 14 }}
             />
-            Share preset across Kerala Police officers
+            Share preset with all officers
           </label>
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
             <button
@@ -2164,7 +2164,7 @@ export default function AuditLogPage() {
   return (
     <AppShell
       title="Audit Log Explorer"
-      subtitle="Kerala Police DVAS · Cryptographically Verified & Immutable Audit Trail (DPDPA 2023 & Indian Evidence Act §65B)"
+      subtitle="SmartQEye · Cryptographically Verified & Immutable Audit Trail (DPDPA 2023 & Indian Evidence Act §65B)"
     >
       {/* ── Statutory Print Stylesheet ── */}
       <style>{`

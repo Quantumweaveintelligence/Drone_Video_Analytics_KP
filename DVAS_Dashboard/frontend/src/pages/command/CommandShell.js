@@ -81,7 +81,7 @@ function CommandInner() {
           <span className="text-xs font-semibold">{fmtIST(new Date().toISOString())}</span>
         </h1>
         <div className="font-bold uppercase tracking-widest text-[11px]" style={{ color: "var(--dvas-accent)" }}>
-          Kerala Police Command Center
+          SmartQEye Command Center
         </div>
       </div>
 

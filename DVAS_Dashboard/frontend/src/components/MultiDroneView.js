@@ -1380,7 +1380,7 @@ function GlobalHeader({ drones, alerts, connected, onNavigateTab, jurisdiction }
             <Radio size={12} style={{ color: "var(--dvas-safe)" }} />
           </div>
           <div className="text-[11px] font-bold tracking-wide leading-tight" style={{ color: "var(--dvas-safe)" }}>
-            DVAS – Kerala Police
+            SmartQEye
           </div>
         </div>
         <div className="mono text-[8px] mt-0.5 pl-8" style={{ color: "var(--dvas-text-dim)" }}>

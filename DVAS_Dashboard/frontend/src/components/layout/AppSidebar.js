@@ -2,6 +2,7 @@ import React from "react";
 import { NavLink } from "react-router-dom";
 import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { useI18n } from "@/context/I18nContext";
+import { SmartQEyeLogo } from "@/components/brand/BrandLogo";
 
 export default function AppSidebar({ sections = [], collapsed, onToggleCollapse }) {
   const { t } = useI18n();
@@ -25,26 +26,18 @@ export default function AppSidebar({ sections = [], collapsed, onToggleCollapse 
         }`}
         style={{ borderColor: "var(--dvas-border)" }}
       >
-        <div className="w-10 h-10 shrink-0 flex items-center justify-center">
-          <img
-            src="/kerala-police-logo.png"
-            alt="Kerala Police Logo"
-            className="max-w-full max-h-full object-contain"
-          />
-        </div>
-        {!collapsed && (
+        {collapsed ? (
+          <div className="w-10 h-10 shrink-0 flex items-center justify-center">
+            <SmartQEyeLogo variant="mark" className="max-w-full max-h-full object-contain" />
+          </div>
+        ) : (
           <div className="min-w-0 flex flex-col justify-center">
-            <div
-              className="text-base font-extrabold tracking-tight truncate leading-tight font-sans"
-              style={{ color: "var(--dvas-text)" }}
-            >
-              {t("app.title", "DVAS")}
-            </div>
+            <SmartQEyeLogo variant="wordmark" className="h-6 w-auto max-w-full object-contain object-left" alt={t("app.title", "SmartQEye")} />
             <div
               className="text-[11px] font-semibold uppercase tracking-wider truncate mt-0.5"
               style={{ color: "var(--dvas-text-dim)" }}
             >
-              {t("app.subtitle", "Kerala Police")}
+              {t("app.subtitle", "Drone Video Analytics")}
             </div>
           </div>
         )}

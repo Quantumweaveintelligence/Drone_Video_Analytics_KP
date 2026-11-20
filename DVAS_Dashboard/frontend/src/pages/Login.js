@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useNavigate, Navigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import { useI18n } from "@/context/I18nContext";
+import { SmartQEyeLogo, QuantumWeaveLogo } from "@/components/brand/BrandLogo";
 import { ROLE_HOME, ROLE_LABELS } from "@/lib/api";
 import { Shield, Lock as LockKey, User, ChevronDown, Eye, EyeOff } from "lucide-react";
 
@@ -53,17 +54,10 @@ export default function Login() {
         {/* Left panel — branding */}
         <div className="hidden md:flex flex-col justify-between border border-slate-800 bg-slate-900/70 backdrop-blur p-8 min-h-[560px]">
           <div className="flex flex-col items-center justify-center flex-1 text-center my-auto">
-            <img src="/kerala-police-logo.png" alt="Kerala Police Logo" className="w-32 h-32 object-contain mb-6 drop-shadow-md" />
-            <div className="flex flex-col items-center leading-tight">
-              <div className="text-3xl lg:text-4xl font-extrabold tracking-normal text-slate-100 font-malayalam drop-shadow-sm">
-                കേരള പോലീസ്
-              </div>
-              <div className="text-2xl lg:text-3xl font-black tracking-wider uppercase text-slate-100 font-kerala-en mt-2 drop-shadow-sm">
-                KERALA POLICE
-              </div>
-            </div>
+            <SmartQEyeLogo variant="mark" className="w-40 h-auto object-contain mb-6 drop-shadow-md" alt="" />
+            <SmartQEyeLogo variant="wordmark" className="h-12 lg:h-14 w-auto object-contain drop-shadow-sm" />
             <div className="text-xl font-medium tracking-tight text-slate-300 mt-4">
-              Drone Video Analytics System
+              {t("login.systemName")}
             </div>
             <div className="dvas-label mt-6 max-w-sm">
               {t("login.tagline")}
@@ -74,21 +68,15 @@ export default function Login() {
         {/* Right — login form */}
         <div className="border border-slate-800 md:border-l-0 bg-slate-950/90 backdrop-blur p-8">
           <div className="md:hidden flex flex-col items-center mb-6 text-center">
-            <img src="/kerala-police-logo.png" alt="Kerala Police Logo" className="w-16 h-16 object-contain mb-3 drop-shadow-md" />
-            <div className="text-xl font-extrabold text-slate-100 font-malayalam leading-tight">
-              കേരള പോലീസ്
-            </div>
-            <div className="text-lg font-black tracking-wider uppercase text-slate-100 font-kerala-en mt-0.5">
-              KERALA POLICE
-            </div>
-            <div className="text-xs text-slate-400 mt-1">
-              Drone Video Analytics System
+            <SmartQEyeLogo variant="wordmark" className="h-9 w-auto object-contain" />
+            <div className="text-xs text-slate-400 mt-2">
+              {t("login.systemName")}
             </div>
           </div>
           <div className="dvas-label mb-1">{t("login.secureAccess")}</div>
           <h2 className="text-2xl font-semibold tracking-tight mb-2">{t("login.signIn")}</h2>
           <p className="text-xs text-slate-400 leading-relaxed mb-6">
-            Welcome to Kerala Police Drone Video Analytics System Platform login. Please enter your Email and Password to getting started.
+            Welcome to SmartQEye, the drone video analytics platform. Please enter your email and password to get started.
           </p>
 
           <form onSubmit={submit} className="space-y-4">
@@ -151,7 +139,11 @@ export default function Login() {
             </button>
           </form>
 
-
+          <div data-testid="login-powered-by" className="mt-8 pt-5 border-t border-slate-800 flex items-center justify-center gap-2.5">
+            <span className="text-[11px] text-slate-500 whitespace-nowrap">Powered by</span>
+            <QuantumWeaveLogo className="h-7 w-auto object-contain" />
+            <span className="text-xs font-semibold text-slate-300 whitespace-nowrap">QuantumWeave Intelligence</span>
+          </div>
         </div>
       </div>
     </div>
