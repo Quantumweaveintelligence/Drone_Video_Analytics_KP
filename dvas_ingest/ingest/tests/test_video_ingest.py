@@ -276,6 +276,44 @@ def test_decoder_feeds_sampled_frames_with_their_telemetry(client, valkey, clips
     assert h["decoder_done"] == "1" and h["last_entry_id"]
 
 
+@pytest.mark.skipif(vd.frame_ring is None, reason="frame ring off")
+def test_frame_ring_holds_exactly_the_pixels_of_each_frames_own_jpeg(client, valkey, clips):
+    """R11.3: a service reading the ring gets bit-for-bit what cv2.imdecode of the entry's
+    JPEG gives (the decode every service did before), and the JPEG is still in the stream."""
+    import numpy as np
+    assert start(client, DRONE, MISSION).status_code < 300
+    stream_clip(client, clips["bframes"])
+    reader = vd.frame_ring.RingReader()
+    checked = {"hit": 0, "same": 0, "plain": 0}
+    valkey.set("dvas:svc_stats:person", "{}", ex=30)
+
+    def step():
+        if not valkey.exists(KEY):
+            return
+        try:
+            valkey.xgroup_create(KEY, "person-group", id="0")
+        except Exception:
+            pass
+        for _k, es in valkey.xreadgroup("person-group", "c1", {KEY: ">"}, count=1000) or []:
+            for eid, raw in es:
+                f = {s(k): (v if s(k) == "frame" else s(v)) for k, v in raw.items()}
+                jpeg = cv2.imdecode(np.frombuffer(f["frame"], np.uint8), cv2.IMREAD_COLOR)
+                ring = reader.read(f)
+                if ring is None:
+                    checked["plain"] += 1
+                else:
+                    checked["hit"] += 1
+                    checked["same"] += int(np.array_equal(ring, jpeg))
+                valkey.xack(KEY, "person-group", eid)
+        valkey.set("dvas:svc_stats:person", "{}", ex=30)
+
+    run_decoder(consume=step)
+    step()
+    assert checked["hit"] >= 60 and checked["same"] == checked["hit"], checked
+    # a frame whose slot was overwritten (another gen) or that names no ring is refused
+    assert reader.read({"ring": "nope.ring", "ring_slot": "0", "ring_gen": "2", "frame_seq": "1"}) is None
+
+
 @pytest.mark.parametrize("offset", [True, False])
 def test_a_looped_clip_is_analysed_on_every_pass(client, valkey, clips, offset):
     # send_ts --loop: the second pass continues the PTS (offset=True, as the contract wants);

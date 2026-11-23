@@ -125,6 +125,14 @@ log "analyzer threads: person ${DVAS_THREADS_PERSON} anpr ${DVAS_THREADS_ANPR} a
 # v2 R4.7: CUDA MPS — the analyzers' kernels share the GPU at the same time instead of the
 # driver time-slicing between processes. The same kernels run, so results are unchanged.
 # Off by default: keep it only if the total fps rises and a 2-hour run stays stable.
+# v2 R11.3: shared decoded-frame ring in /dev/shm (slots per mission; 0 = off). The decoder
+# reserves each ring when the mission starts and falls back to the JPEG path when it does not fit.
+export DVAS_FRAME_RING="${DVAS_FRAME_RING:-128}"
+shm_free=$(df -Pk /dev/shm 2>/dev/null | awk 'NR==2 {printf "%.1f", $4/1048576}')
+log "frame ring: ${DVAS_FRAME_RING} slots per mission; /dev/shm ${shm_free:-?} GB free (1080p ≈ 0.8 GB, 4K ≈ 3.2 GB per drone)"
+if [ -n "${DVAS_SHED_AFTER_S:-}" ] && awk "BEGIN{exit !(${DVAS_SHED_AFTER_S} > 0 && ${DVAS_SHED_AFTER_S} < 1.0)}" 2>/dev/null; then
+  log "WARNING: DVAS_SHED_AFTER_S=${DVAS_SHED_AFTER_S} is below 1 s; the services use 1.5 s instead (R11.2). Remove it from the pod's environment."
+fi
 export DVAS_CUDA_MPS="${DVAS_CUDA_MPS:-0}"
 if [ "$DVAS_CUDA_MPS" = "1" ]; then
   if command -v nvidia-cuda-mps-control >/dev/null 2>&1; then

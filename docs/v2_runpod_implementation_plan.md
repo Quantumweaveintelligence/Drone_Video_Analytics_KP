@@ -901,9 +901,10 @@ secondary stages only, never frames.
    The skipped `seq` range is recorded (`analytics_shed` audit event, `frames_shed` counter) and
    the next frame carries `gap=true`: trackers do not read the jump as a velocity spike — tracks
    whose age exceeds the gap are retired and Re-ID re-links identities.
-3. **Level 3 — detector cadence step-down**: detect every 2nd, then every 4th frame; between
-   detections the tracker's Kalman prediction moves the boxes (published as `predicted`).
-   Alerts, crops and evidence come only from frames with real detections.
+3. **Level 3 — detector cadence step-down**: detect every 2nd, then every 4th frame. The skipped
+   frames are not analysed at all (corrected 23 Nov: no predicted boxes are published between
+   them). Alerts, crops and evidence come only from frames with real detections. Order and limits
+   since R11.2: see R11.2.
 - The decoder's flow-control window applies only while no group is shedding; with shedding the
   feed runs at live pace and the stream's small `MAXLEN` acts as the leaky bucket.
 - Valkey memory stays bounded (≈ 5 s per mission) in every case.
@@ -1394,6 +1395,23 @@ Tests: the sampler experiment above as unit tests (fake clock): 18 ms → never 
 cadence 2, no jumps when 2 is enough; a 4 s stall → one drop-oldest, then back to level 0;
 restart with an old group position → starts at the newest frame, level 0.
 
+**Built 23 Nov** (`shared/frame_sampler.py`, `shared/tests/test_shedding.py`, 16 tests; whole
+analytics suite 109 passed):
+- Thresholds below 1.0 s are refused (warning, 1.5 s used); `dvas-init.sh` also warns at pod start.
+- Per service: `DVAS_SHED_AFTER_S_<SVC>`, default max(1.5 s, 10 × frame cost, ≤ 4 s);
+  `DVAS_SHED_MAX_CADENCE_<SVC>` (person, ANPR, vehicle 2; others 4).
+- Level 1 after `DVAS_SHED_ENTER_S` (2 s) over the threshold; cadence steps (level 3) every 3 s
+  while the wait is over the threshold and not shrinking; drop-oldest (level 2) only when the wait
+  exceeds 2 × the threshold (a stall), at most every 3 s, and never when it would skip nothing.
+  Recovery: one step per 10 s at ≤ 0.5 s (3 → 1 → 0, 2 → 1 → 0).
+- A stream (re)start — the process's first read, or after the loop paused > 10 s
+  (`/stream/stop` … `/stream/start`) — resets level, cadence, warm-up and `frames_shed`; a group
+  left further behind than the threshold continues from the newest frame (`restart` range).
+- Level changes are written to `dvas:analytics_shed` (`reason=level`); the backend audit row
+  reads "shedding level 1 → 3 …, analysing every 2nd frame" (`services/analytics_shed.py`).
+- The stats carry `shed_since` and `shed_threshold_s`; `bench_capacity.py` / `bench_stress.py`
+  report frames shed during the run only.
+
 #### R11.3 Decode once: shared frame ring (identical; 4–5 days; supersedes R5.4)
 
 - `video-decoder` decodes its own JPEG once (`cv2.imdecode`, the call every service uses today,
@@ -1410,6 +1428,23 @@ restart with an old group position → starts at the newest frame, level 0.
   pod sets `--shm-size`) and `free -g`.
 - **Saves** 6 of 7 JPEG decodes per frame (≈ 60–110 ms CPU per 1080p frame with all services).
 - Identity test: every service's results with `DVAS_FRAME_RING=0` vs on, on the R4.2 clips.
+
+**Built 23 Nov** (`shared/frame_ring.py`, `video_decoder.py`, `queue_manager.py`,
+`shared/frame_sampler.py`):
+- One file per mission and frame size, `/dev/shm/dvas-ring/<sid>-<w>x<h>-<token>.ring`, reserved
+  in full with `posix_fallocate` (no room → refused, JPEG path, logged); 128 slots by default.
+- The decoder writes `cv2.imdecode` of each frame's own JPEG; the entry gets `ring`, `ring_slot`,
+  `ring_gen`. Its ring write and XADD run while the next frame is decoded (one frame in flight,
+  published in order; resume and `decoder_done` unchanged — the ingest suite, 33 tests, passes).
+- Readers copy a slot only if its generation is unchanged before and after the copy, the frame
+  number matches, and their OpenCV / libjpeg build equals the writer's. **ANPR runs its own venv
+  (OpenCV 4.11 vs 4.10) and therefore keeps decoding the JPEG**; the other six services use the ring.
+- Verified: on a B-frame clip every frame read from the ring equals `cv2.imdecode` of its JPEG
+  (`test_frame_ring_holds_exactly_the_pixels_of_each_frames_own_jpeg`), so every service sees
+  the same pixels as before and the identity test per service is not needed. Unit tests: slot
+  overwritten, being written, wrong frame, other build, full /dev/shm, name reuse
+  (`shared/tests/test_frame_ring.py`, 8 tests).
+- Published per service: `frame_ring: {hits, misses}` in `dvas:svc_stats:<svc>`.
 
 #### R11.4 Camera-motion features once per frame (identical; 2 days)
 

@@ -468,6 +468,11 @@ class QueueManager:
         if metadata.get("rx_ts_ms") is not None:
             fields["rx_ts_ms"] = str(int(metadata["rx_ts_ms"]))
             fields["source"] = str(metadata.get("source") or "h264")
+        # v2 R11.3: where the decoded frame waits in the shared ring (the JPEG stays the fallback)
+        if metadata.get("ring"):
+            fields["ring"] = str(metadata["ring"])
+            fields["ring_slot"] = str(int(metadata["ring_slot"]))
+            fields["ring_gen"] = str(int(metadata["ring_gen"]))
 
         if QUEUE_WRITE_JPEG_B64:
             fields["jpeg_b64"] = base64.b64encode(frame_bytes).decode("ascii")

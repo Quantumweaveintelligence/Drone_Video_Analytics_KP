@@ -27,6 +27,11 @@ No frame is lost when the analytics fall behind (decision 2026-11-10):
     seq (decode order, with gaps from the 30 → 20 fps sampling) is kept as edge_seq.
   * decoder_done=1 only after the last frame of an ended mission was published; ingest's
     drain waits for it, so a mission stream is never purged before the analytics saw it.
+  * Shared frame ring (v2 R11.3, DVAS_FRAME_RING slots, 0 = off): each frame decoded back from
+    its own JPEG is also written to /dev/shm (dvas_analytics/shared/frame_ring.py); services copy
+    it instead of decoding the JPEG — the same pixels. The JPEG stays in the stream. The ring
+    write and the XADD of frame N run while frame N+1 is decoded (one frame in flight, still
+    published in order).
 
 Also runs the recording retention (DVAS_RECORD_RETENTION_DAYS, default 7).
 """
@@ -42,6 +47,7 @@ import shutil
 import sys
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
@@ -72,6 +78,25 @@ DECODE_ONLY_WITH_SERVICES = os.getenv("DVAS_DECODE_ONLY_WITH_SERVICES", "1").low
 READERS_CHECK_S = 1.0
 RETENTION_EVERY_S = 3600.0
 SVC_STATS_KEY = "dvas:svc_stats:{service}"
+RING_SLOTS = int(_num_env("DVAS_FRAME_RING", 128, 0, 4096))      # 0 = off: services decode the JPEG
+
+
+def _load_frame_ring():
+    """dvas_analytics/shared/frame_ring.py — one file shared by writer and readers."""
+    import importlib.util  # noqa: PLC0415
+    here = Path(__file__).resolve()
+    for p in (os.getenv("DVAS_FRAME_RING_MODULE", ""), "/opt/dvas/dvas_analytics/shared/frame_ring.py",
+              str(here.parents[3] / "dvas_analytics" / "shared" / "frame_ring.py") if len(here.parents) > 3 else ""):
+        if p and os.path.isfile(p):
+            spec = importlib.util.spec_from_file_location("dvas_frame_ring", p)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    log.warning("frame ring module not found — services decode the JPEG (DVAS_FRAME_RING off)")
+    return None
+
+
+frame_ring = _load_frame_ring() if RING_SLOTS else None
 
 
 def _s(v) -> str:
@@ -314,6 +339,10 @@ class MissionDecoder(threading.Thread):
         self._resume_floor = 0
         self._readers = True
         self._readers_at = -1e9
+        self._ring = None                 # frame_ring.RingWriter for the current frame size
+        self._ring_off = frame_ring is None
+        self._ring_pool: Optional[ThreadPoolExecutor] = None
+        self._inflight = None             # the previous frame's publish (concurrent.futures.Future)
 
     # ── state ────────────────────────────────────────────────────────────────
     def _h(self) -> dict:
@@ -347,6 +376,12 @@ class MissionDecoder(threading.Thread):
                 self.r.hset(self.vkey, "decoder_error", str(exc)[:300])
             except Exception:
                 pass
+        finally:
+            if self._ring_pool is not None:
+                self._ring_pool.shutdown(wait=True)
+            if self._ring is not None:
+                self._ring.close()                    # readers still holding it keep their copy
+                self._ring = None
 
     def _run(self) -> None:
         h = self._h()
@@ -465,7 +500,13 @@ class MissionDecoder(threading.Thread):
             if metas.missing:
                 log.warning("decoder %s: %d frames without meta in run at segment %d",
                             self.sid, metas.missing, start)
+            self._wait_published()                    # the run's last frame is in the stream
         finally:
+            if self._inflight is not None and not self._inflight.done():
+                try:
+                    self._wait_published()            # never leave a frame half-published
+                except Exception as exc:
+                    log.debug("decoder %s: last publish: %s", self.sid, exc)
             if container is not None:
                 try:
                     container.close()
@@ -488,6 +529,7 @@ class MissionDecoder(threading.Thread):
         if not ok:
             log.error("decoder %s: JPEG encode failed at %.0f ms", self.sid, t_ms)
             return
+        self._wait_published()                        # frame N-1 is in the stream: seq / order hold
         m = m or {}
         tel = m.get("tel") or {}
         rx = float(m.get("rx_ts") or time.time())
@@ -499,9 +541,45 @@ class MissionDecoder(threading.Thread):
                 "pts_ms": round(t_ms, 3), "edge_seq": m.get("seq"), **tel}
         if not m:
             meta["meta_missing"] = True
-        fut = asyncio.run_coroutine_threadsafe(
-            self._publish_async(buf.tobytes(), meta, t_ms, int(m.get("seq") or 0), seg, rx), self.loop)
-        fut.result()
+        ring_job = self._ring_submit(w, h, self.aseq + 1, buf)
+        self._inflight = asyncio.run_coroutine_threadsafe(
+            self._publish_async(buf.tobytes(), meta, t_ms, int(m.get("seq") or 0), seg, rx, ring_job), self.loop)
+
+    def _wait_published(self) -> None:
+        """Block until the previous frame's publish finished (raises what it raised)."""
+        fut, self._inflight = self._inflight, None
+        if fut is not None:
+            fut.result()
+
+    # ── shared frame ring (R11.3) ────────────────────────────────────────────
+    def _ring_submit(self, w: int, h: int, seq: int, buf):
+        """Start writing frame `seq` (decoded back from its JPEG) into the ring; returns
+        (ring name, slot, Future of the gen) or None when the ring is off or does not fit."""
+        if self._ring_off:
+            return None
+        rw = self._ring
+        if rw is None or (rw.width, rw.height) != (w, h):
+            if rw is not None:
+                rw.close()
+                self._ring = None
+            try:
+                rw = self._ring = frame_ring.RingWriter(self.sid, w, h, RING_SLOTS)
+                log.info("decoder %s: frame ring %s (%d slots, %.2f GB)", self.sid, rw.name, rw.slots,
+                         rw.slots * rw.slot_size / 2**30)
+            except Exception as exc:
+                self._ring_off = True                 # for this mission: the JPEG path, as before
+                log.warning("decoder %s: no frame ring (%s) — services decode the JPEG", self.sid, exc)
+                return None
+            if self._ring_pool is None:
+                self._ring_pool = ThreadPoolExecutor(1, thread_name_prefix=f"ring-{self.sid[:8]}")
+        slot = (seq - 1) % rw.slots
+        return rw.name, slot, self._ring_pool.submit(self._ring_write, rw, slot, seq, buf)
+
+    @staticmethod
+    def _ring_write(rw, slot: int, seq: int, buf) -> Optional[int]:
+        import cv2  # noqa: PLC0415
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)     # the services' own decode of this JPEG
+        return rw.write(slot, seq, img)
 
     async def _window_used(self) -> int:
         try:
@@ -534,13 +612,22 @@ class MissionDecoder(threading.Thread):
         return self._readers
 
     async def _publish_async(self, jpeg: bytes, meta: dict, t_ms: float, edge_seq: int,
-                             seg: int, rx: float) -> None:
+                             seg: int, rx: float, ring_job=None) -> None:
         while not self.stop.is_set():
             if await self._window_used() < WINDOW:
                 break
             await asyncio.sleep(POLL_S)
         if self.stop.is_set():
             raise RuntimeError("stopped")
+        if ring_job is not None:
+            name, slot, job = ring_job
+            try:
+                gen = await asyncio.wrap_future(job)
+            except Exception as exc:
+                gen = None
+                log.debug("decoder %s: ring write failed: %s", self.sid, exc)
+            if gen:
+                meta = {**meta, "ring": name, "ring_slot": slot, "ring_gen": gen}
         entry = await self.qm.publish_frame(meta["drone_id"], jpeg, meta, stream_key=self.key,
                                             maxlen=WINDOW * 4)
         self.aseq += 1
@@ -582,6 +669,12 @@ class DecoderService:
         loop = asyncio.get_running_loop()
         log.info("video-decoder ready: %.0f fps, width cap %s, window %d frames, recordings %s",
                  ANALYTICS_FPS, MAX_WIDTH or "source", WINDOW, vs.RECORD_ROOT)
+        if frame_ring is not None:
+            removed = frame_ring.clear()
+            log.info("frame ring: %d slots per mission in %s%s", RING_SLOTS, frame_ring.ROOT,
+                     f" ({removed} old ring files removed)" if removed else "")
+        else:
+            log.info("frame ring off (DVAS_FRAME_RING=0 or module missing): services decode the JPEG")
         while True:
             try:
                 await self.scan(loop)
