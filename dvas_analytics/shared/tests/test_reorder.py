@@ -11,6 +11,12 @@ from shared import frame_sampler as fs
 from shared.frame_sampler import FrameSampler
 
 
+@pytest.fixture(autouse=True)
+def no_shedding(monkeypatch):
+    """Entry ids here are counters, not times: every frame would look hours late (R11.2)."""
+    monkeypatch.setattr(fs, "SHED_AFTER_S", 0.0)
+
+
 class Clock:
     def __init__(self):
         self.t = 100.0

@@ -20,13 +20,23 @@ XREADGROUP per drone:
     older ones are XACKed unread and counted as `skipped`. The video decoder never waits
     for a newest-mode service. DVAS_FEED_MODE_<SERVICE>=latest|every overrides a service's
     mode (latest = newest, every = ordered).
-  * Overload shedding (v2 R6.3, ordered mode): when a drone's frames are more than
-    DVAS_SHED_AFTER_S (1.5 s) behind live, the service sheds instead of queueing —
-    level 1: `shed_secondary(drone)` is True (services skip secondary stages unless a
-    priority event is marked); level 2: drop-oldest, the backlog is acknowledged unread and
-    analysis continues from the newest frame (`_gap` marks the jump; over 1 s the drone's
-    trackers restart); level 3: only every 2nd, then 4th frame is analysed. Back down one
-    level after 10 s at <= 0.5 s behind. Every shed range goes to the Valkey stream
+  * Overload shedding (v2 R6.3, R11.2; ordered mode): when a drone's frames wait more than
+    the service's threshold (DVAS_SHED_AFTER_S, 1.5 s; per service DVAS_SHED_AFTER_S_<SVC>,
+    at least 10 × the service's frame cost) the service sheds instead of queueing, cheapest
+    accuracy cost first:
+      level 1 — `shed_secondary(drone)` is True (services skip secondary stages unless a
+                priority event is marked), after DVAS_SHED_ENTER_S (2 s) over the threshold;
+      level 3 — sustained overload: only every 2nd frame is analysed (then every 4th), one
+                step per 3 s while the wait is still over the threshold and not shrinking,
+                never beyond DVAS_SHED_MAX_CADENCE_<SVC> (2 for person, ANPR, vehicle; 4 else);
+      level 2 — a stall (wait > 2 × threshold): drop-oldest, the backlog is acknowledged
+                unread and analysis continues from the newest frame (`_gap` marks the jump;
+                over 1 s the drone's trackers restart). A jump that would skip nothing is
+                not made.
+    Back down one step after 10 s at <= 0.5 s behind. A stream (re)start — first read of
+    the process, or after the loop paused for more than STREAM_PAUSE_S — starts the shed
+    state afresh, and a group left far behind continues from the newest frame (logged as
+    `restart`). Every shed range and level change goes to the Valkey stream
     `dvas:analytics_shed` (written to the audit log by the dashboard backend).
   * A per-drone rate cap (the governor's `dvas:fps_cap:<service>`, else
     DVAS_FPS_MAX) keeps one service from taking the whole GPU.
@@ -35,7 +45,9 @@ XREADGROUP per drone:
     Detection Models page.
 
 Frame bytes come from the raw `frame` field; `jpeg_b64` is only a fallback
-for entries written by an older ingest.
+for entries written by an older ingest. Video frames name a slot in the shared decoded-frame
+ring (v2 R11.3, shared/frame_ring.py): the slot holds exactly what decoding that JPEG gives, so
+it is copied instead; on any doubt the JPEG is decoded as before.
 
 Streams (plan Phase 2a): each mission has its own stream (shared/mission_streams.py).
 The drone id stays the key everywhere here; per drone the sampler reads its streams
@@ -56,7 +68,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
-from shared import mission_streams
+from shared import frame_ring, mission_streams
 
 log = logging.getLogger(__name__)
 
@@ -64,15 +76,42 @@ STATS_KEY = "dvas:svc_stats:{service}"
 CAP_KEY = "dvas:fps_cap:{service}"
 STATS_TTL_S = 10
 STATS_EVERY_S = 2.0
-# v2 R6.3 overload shedding (0 = off)
-SHED_AFTER_S = max(0.0, float(os.getenv("DVAS_SHED_AFTER_S", "1.5") or 0))
-SHED_JUMP_AFTER_S = 3.0        # level 1 this long (or > 2 × SHED_AFTER_S behind) → drop-oldest
+# v2 R6.3 / R11.2 overload shedding (0 = off)
+SHED_DEFAULT_S = 1.5
+SHED_MIN_S = 1.0               # below this a threshold is refused (pod 18 Nov: 0.3 s → level 3 at light load)
+
+
+def _shed_after(name: str, default: Optional[float]) -> Optional[float]:
+    raw = os.getenv(name, "")
+    if raw == "":
+        return default
+    try:
+        v = max(0.0, float(raw))
+    except ValueError:
+        logging.getLogger(__name__).warning("%s=%r is not a number — using %s", name, raw, default)
+        return default
+    if 0 < v < SHED_MIN_S:
+        logging.getLogger(__name__).warning(
+            "%s=%s is below %.1f s: services would shed at a light load — using %s s",
+            name, raw, SHED_MIN_S, SHED_DEFAULT_S)
+        return SHED_DEFAULT_S
+    return v
+
+
+SHED_AFTER_S = _shed_after("DVAS_SHED_AFTER_S", SHED_DEFAULT_S)
+SHED_ENTER_S = max(0.0, float(os.getenv("DVAS_SHED_ENTER_S", "2") or 0))   # over the threshold this long → level 1
+SHED_COST_FACTOR = 10.0        # a service's threshold is at least this many frame costs …
+SHED_COST_MAX_S = 4.0          # … up to this
+SHED_STEP_S = 3.0              # this long over the threshold at a cadence → the next cadence
+SHED_MAX_CADENCE = {"person": 2, "anpr": 2, "vehicle": 2}   # others: 4 (DVAS_SHED_MAX_CADENCE_<SVC>)
+SHED_JUMP_AFTER_S = 3.0        # at least this long between two drop-oldest jumps
 SHED_RECOVER_S = 0.5           # at most this far behind …
 SHED_RECOVER_HOLD_S = 10.0     # … for this long → one level down
 SHED_TRACK_RESET_S = 1.0       # a jump over more time than this restarts the drone's trackers
 SHED_WARMUP_S = 10.0           # a drone's first seconds in a service (models warming up): no drops
 SHED_LOG_KEY = "dvas:analytics_shed"
 SHED_LOG_MAXLEN = 10000
+STREAM_PAUSE_S = 10.0          # the loop did not read for this long: a stream (re)start
 CAP_REFRESH_S = 2.0
 READ_CHUNK = 32
 # Re-ordering (plan D1): the edge uploads several frames at once and retries failures, so
@@ -156,6 +195,9 @@ def frame_bytes(fields: dict) -> Optional[bytes]:
     return None
 
 
+# v2 R11.3: decoded frames from the video decoder's shared ring (DVAS_FRAME_RING=0: always decode)
+RING: Optional[frame_ring.RingReader] = (frame_ring.RingReader()
+                                         if os.getenv("DVAS_FRAME_RING", "128").strip() not in ("0", "") else None)
 # Per-process decode time per drone, for the stage split (plan A4)
 DECODE_MS: Dict[str, float] = {}
 # Per-frame work a service wants done in the decode workers, in parallel and ahead of the round
@@ -192,11 +234,13 @@ def decode_frame(fields: dict):
     """
     import cv2  # noqa: PLC0415
     import numpy as np  # noqa: PLC0415
-    data = frame_bytes(fields)
-    if not data:
-        return None
     t = time.perf_counter()
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    img = RING.read(fields) if RING is not None and fields.get("ring") else None
+    if img is None:
+        data = frame_bytes(fields)
+        if not data:
+            return None
+        img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if fields.get("drone_id"):
         DECODE_MS[fields["drone_id"]] = (time.perf_counter() - t) * 1000
     if img is not None and fields.get("_late") == "1":
@@ -288,18 +332,22 @@ class RateCap:
 
 @dataclass
 class ShedState:
-    """Overload state of one drone in one service (v2 R6.3)."""
+    """Overload state of one drone in one service (v2 R6.3, R11.2)."""
     level: int = 0                       # 0 live, 1 secondary stages off, 2 drop-oldest, 3 cadence
     level_since: float = 0.0
     ok_since: Optional[float] = None
+    over_since: Optional[float] = None   # continuously over the threshold since
+    step_at: float = 0.0                 # when the cadence last changed (or level 1 began)
+    step_behind: float = 0.0             # the wait then: a cadence step needs it not to shrink
     last_jump: float = -1e9
-    jumps: Deque[float] = field(default_factory=deque)
     cadence: int = 1                     # analyse every Nth frame (level 3)
     frames_shed: int = 0
     pending: Optional[dict] = None       # cadence-shed range not yet logged
     priority_until: float = 0.0
     stream: str = ""                     # the mission stream this state belongs to
     since: Optional[float] = None        # first frame of this stream seen by this service
+    fresh: bool = True                   # no frame seen since the stream (re)started
+    started_at: float = field(default_factory=time.time)   # wall time, for per-run counts
 
 
 @dataclass
@@ -385,6 +433,18 @@ class FrameSampler:
         self._queued: Dict[str, Optional[int]] = {}
         self._prefetch: Optional[asyncio.Task] = None   # the next round, read + decoded (B2)
         self._shed: Dict[str, ShedState] = {}
+        self._shed_base = _shed_after(f"DVAS_SHED_AFTER_S_{service.upper()}", SHED_AFTER_S)
+        try:
+            self._shed_max_cadence = max(1, int(os.getenv(f"DVAS_SHED_MAX_CADENCE_{service.upper()}", "")
+                                                or SHED_MAX_CADENCE.get(service, 4)))
+        except ValueError:
+            self._shed_max_cadence = SHED_MAX_CADENCE.get(service, 4)
+        self._shed_logs: List[dict] = []         # level changes waiting to be written
+        self._last_round_at: Optional[float] = None
+        if self.mode == "ordered" and self._shed_base:
+            log.info("[%s] shedding: threshold %.1f s (at least %d × frame cost), every %d%s frame at most",
+                     service, self._shed_base, SHED_COST_FACTOR, self._shed_max_cadence,
+                     "nd" if self._shed_max_cadence == 2 else "th")
         # Set by the service: {"device": "cuda"|"cpu", "cpu_fallback": bool, "cpu_reason": str, ...}
         self.device_info: Optional[dict] = None
 
@@ -569,6 +629,10 @@ class FrameSampler:
                 log.debug("[%s] xack on %s failed: %s", self.service, key, exc)
 
     async def _round(self, drones: List[str]) -> Dict[str, dict]:
+        now = self._clock()
+        if self._last_round_at is None or now - self._last_round_at > STREAM_PAUSE_S:
+            await self._restart_shed()
+        self._last_round_at = now
         await self._refresh_cap()
         self._reset_idle()
         if not drones:
@@ -727,7 +791,7 @@ class FrameSampler:
             fields = self._release(d, now)
             if fields is None:
                 continue
-            if self.mode == "ordered" and SHED_AFTER_S > 0:
+            if self.mode == "ordered" and self._shed_base:
                 fields = await self._shed_check(client, d, fields)
                 if fields is None:
                     continue
@@ -867,10 +931,22 @@ class FrameSampler:
         s = self._shed.get(drone_id)
         return bool(s and s.level >= 1 and self._clock() >= s.priority_until)
 
-    def _set_level(self, d: str, s: ShedState, level: int, behind: float) -> None:
-        if level != s.level:
+    def _threshold(self, d: str) -> float:
+        """The wait this service tolerates for the drone: the base threshold, raised to
+        SHED_COST_FACTOR frame costs for a slow service (capped at SHED_COST_MAX_S)."""
+        st = self.stats.get(d)
+        cost_s = (st.total_ms or 0.0) / 1000.0 if st else 0.0
+        return max(self._shed_base, min(SHED_COST_MAX_S, SHED_COST_FACTOR * cost_s))
+
+    def _set_level(self, d: str, s: ShedState, level: int, behind: float, cadence_changed: bool = False) -> None:
+        if level != s.level or cadence_changed:
+            every = f" (every {s.cadence}{'nd' if s.cadence == 2 else 'th'} frame)" if s.cadence > 1 else ""
             log.warning("[%s] %s: %.1f s behind live — shedding level %d → %d%s", self.service, d,
-                        behind, s.level, level, f" (every {s.cadence}th frame)" if s.cadence > 1 else "")
+                        behind, s.level, level, every)
+            self._shed_logs.append({"service": self.service, "drone_id": d, "stream": s.stream,
+                                    "reason": "level", "from_level": s.level, "to_level": level,
+                                    "cadence": s.cadence, "behind_s": round(behind, 2),
+                                    "at": round(time.time(), 3)})
         s.level, s.level_since = level, self._clock()
 
     async def _shed_log(self, client, rec: dict) -> None:
@@ -880,10 +956,28 @@ class FrameSampler:
         except Exception as exc:
             log.debug("[%s] shed log failed: %s", self.service, exc)
 
+    async def _flush_shed_logs(self, client) -> None:
+        todo, self._shed_logs = self._shed_logs, []
+        for rec in todo:
+            await self._shed_log(client, rec)
+
     async def _flush_cadence(self, client, d: str, s: ShedState) -> None:
         if s.pending:
             await self._shed_log(client, s.pending)
             s.pending = None
+
+    async def _restart_shed(self) -> None:
+        """The loop starts reading — process start, or again after a stream stop: every
+        drone's shed state starts afresh (level, cadence, warm-up, counts)."""
+        if not self._shed:
+            return
+        client = self._redis()
+        for d, s in list(self._shed.items()):
+            await self._flush_cadence(client, d, s)
+            if s.level:
+                log.info("[%s] %s: stream restart — shedding level %d → 0", self.service, d, s.level)
+            self._shed[d] = ShedState(priority_until=s.priority_until)
+        await self._flush_shed_logs(client)
 
     async def _shed_check(self, client, d: str, fields: dict) -> Optional[dict]:
         behind = self._behind_s(fields)
@@ -902,36 +996,52 @@ class FrameSampler:
         now = self._clock()
         if s.since is None:
             s.since = now
+        limit = self._threshold(d)
+        if s.fresh:
+            s.fresh = False
+            if behind > limit:
+                # Left behind by a stop or restart (an old queue position), not overloaded:
+                # continue from the newest frame
+                fields = await self._shed_jump(client, d, s, fields, behind, reason="restart")
+                if fields is None:
+                    return None
+                behind = self._behind_s(fields) or 0.0
         warming = now - s.since < SHED_WARMUP_S
-        if behind > SHED_AFTER_S:
+        if behind > limit:
             s.ok_since = None
-            if s.level == 0:
-                self._set_level(d, s, 1, behind)
-            elif warming:
-                pass                                         # secondary stages off only, no drops
-            elif ((s.level == 1 and (now - s.level_since >= SHED_JUMP_AFTER_S or behind > 2 * SHED_AFTER_S))
-                  or (s.level >= 2 and now - s.last_jump >= SHED_JUMP_AFTER_S)):
+            if s.over_since is None:
+                s.over_since = now
+            if behind > 2 * limit and not warming and now - s.last_jump >= SHED_JUMP_AFTER_S:
+                # A stall: drop the backlog and continue from the newest frame
                 fields = await self._shed_jump(client, d, s, fields, behind)
                 if fields is None:
                     return None
-                while s.jumps and now - s.jumps[0] > 20.0:
-                    s.jumps.popleft()
-                if len(s.jumps) >= 2 and s.cadence < 4:        # jumping again and again: step down
-                    s.cadence *= 2
-                    s.jumps.clear()
-                    self._set_level(d, s, 3, behind)
+            elif s.level == 0:
+                if now - s.over_since >= SHED_ENTER_S:
+                    self._set_level(d, s, 1, behind)
+                    s.step_at, s.step_behind = now, behind
+            elif (not warming and s.cadence < self._shed_max_cadence
+                  and now - s.step_at >= SHED_STEP_S and behind >= s.step_behind):
+                # Sustained overload, the wait not shrinking: analyse every 2nd (then 4th) frame
+                s.cadence *= 2
+                self._set_level(d, s, 3, behind, cadence_changed=True)
+                s.step_at, s.step_behind = now, behind
         elif behind <= SHED_RECOVER_S and s.level:
+            s.over_since = None
             if s.ok_since is None:
                 s.ok_since = now
             elif now - s.ok_since >= SHED_RECOVER_HOLD_S:
-                if s.cadence > 1:
+                cadence_changed = s.cadence > 1
+                if cadence_changed:
                     s.cadence //= 2
-                new = 3 if s.cadence > 1 else s.level - 1            # 3 → 2 → 1 → 0
+                new = 3 if s.cadence > 1 else (1 if s.level >= 2 else 0)   # 3 → 1 → 0, 2 → 1 → 0
                 await self._flush_cadence(client, d, s)
-                self._set_level(d, s, new, behind)
+                self._set_level(d, s, new, behind, cadence_changed=cadence_changed)
                 s.ok_since = now
+                s.step_at, s.step_behind = now, behind
         else:
             s.ok_since = None
+            s.over_since = None
         if s.cadence > 1:
             seq = _seq_of(fields)
             if seq is not None and seq % s.cadence:
@@ -944,41 +1054,50 @@ class FrameSampler:
                 s.pending = p
                 if p["frames"] >= 200:
                     await self._flush_cadence(client, d, s)
+                await self._flush_shed_logs(client)
                 return None
         elif s.pending:
             await self._flush_cadence(client, d, s)
+        await self._flush_shed_logs(client)
         if s.level:
             fields["_shed_level"] = str(s.level)
         return fields
 
-    async def _shed_jump(self, client, d: str, s: ShedState, fields: dict, behind: float) -> Optional[dict]:
-        """Drop-oldest: acknowledge the backlog unread and continue from the newest frame."""
+    async def _shed_jump(self, client, d: str, s: ShedState, fields: dict, behind: float,
+                         reason: str = "drop_oldest") -> Optional[dict]:
+        """Drop-oldest: acknowledge the backlog unread and continue from the newest frame.
+        Nothing happens when this frame already is the newest (nothing would be skipped)."""
         key = fields.get("_stream") or self._key(d)
+        latest = await client.xrevrange(key, max="+", min="-", count=1)
+        if not latest:
+            return fields
+        eid, raw = _s(latest[0][0]), latest[0][1]
+        new = decode_fields(raw, d, eid)
+        new["_stream"] = key
+        old_seq, new_seq = _seq_of(fields), _seq_of(new)
+        if eid == fields.get("entry_id") or (old_seq is not None and new_seq is not None and new_seq <= old_seq):
+            return fields
         for _seq, _at, f in self._held.pop(d, []):
             self._finished(f)
         self._finished(fields)
-        latest = await self._jump_to_newest(client, d)
-        if not latest:
-            return None
-        eid, raw = latest
-        new = decode_fields(raw, d, _s(eid))
-        new["_stream"] = key
-        old_seq, new_seq = _seq_of(fields), _seq_of(new)
+        await client.xgroup_setid(key, self.group, eid)
         n = (new_seq - old_seq) if (old_seq is not None and new_seq is not None) else 0
         if new_seq is not None:
             self._last_seq[d] = new_seq
         s.frames_shed += max(0, n)
-        s.last_jump = self._clock()
-        s.jumps.append(s.last_jump)
-        if s.level < 2:
-            self._set_level(d, s, 2, behind)
+        if reason == "drop_oldest":
+            s.last_jump = self._clock()
+            if s.level < 2:
+                self._set_level(d, s, 2, behind)
+            s.step_at, s.step_behind = self._clock(), 0.0
         new["_gap"] = "1"
-        rec = {"service": self.service, "drone_id": d, "stream": key, "reason": "drop_oldest",
+        rec = {"service": self.service, "drone_id": d, "stream": key, "reason": reason,
                "from_seq": old_seq if old_seq is not None else "", "to_seq": (new_seq - 1) if new_seq else "",
                "frames": max(0, n), "behind_s": round(behind, 2), "at": round(time.time(), 3)}
         await self._shed_log(client, rec)
-        log.warning("[%s] %s: %.1f s behind — dropped %d frames (seq %s..%s), continuing from the newest",
-                    self.service, d, behind, max(0, n), rec["from_seq"], rec["to_seq"])
+        log.warning("[%s] %s: %.1f s behind — %s: dropped %d frames (seq %s..%s), continuing from the newest",
+                    self.service, d, behind, "stream restart" if reason == "restart" else "stall",
+                    max(0, n), rec["from_seq"], rec["to_seq"])
         if behind > SHED_TRACK_RESET_S:
             self._reset_state(d)                         # tracks restart; Re-ID re-links identities
         return new
@@ -1059,6 +1178,8 @@ class FrameSampler:
                 "late": st.late,
                 "shed_level": self._shed[d].level if d in self._shed else 0,
                 "frames_shed": self._shed[d].frames_shed if d in self._shed else 0,
+                "shed_since": round(self._shed[d].started_at, 3) if d in self._shed else None,
+                "shed_threshold_s": round(self._threshold(d), 2) if self._shed_base else None,
                 "cadence": self._shed[d].cadence if d in self._shed else 1,
                 **_percentiles("e2e", st.e2e),
                 "stages": {**{k: round(v, 1) for k, v in st.stages.items()},
@@ -1073,6 +1194,7 @@ class FrameSampler:
             "cap_source": self.cap_source,
             "governed": self.governed,
             "mode": self.mode,
+            "frame_ring": ({"hits": RING.hits, "misses": RING.misses} if RING is not None else None),
             "stream_mode": self.stream_mode,
             "device_info": self.device_info,
             "gpu": gpu_profile.detect().as_dict(),

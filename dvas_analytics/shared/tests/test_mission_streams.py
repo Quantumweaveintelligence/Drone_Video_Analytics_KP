@@ -40,6 +40,7 @@ pytestmark = pytest.mark.skipif(not _reachable(), reason=f"no Valkey at {URL}")
 def fast(monkeypatch):
     monkeypatch.setattr(fs, "RESOLVE_EVERY_S", 0.0)
     monkeypatch.setattr(fs, "REORDER_MS", 0)
+    monkeypatch.setattr(fs, "SHED_AFTER_S", 0.0)     # entries here are hours old by design: no shedding
 
 
 def run(coro_fn):

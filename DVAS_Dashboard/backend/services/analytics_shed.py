@@ -28,10 +28,18 @@ def _s(v) -> str:
 
 
 def _details(rec: dict) -> str:
-    return (f"{rec.get('service', '?')} analytics shed {rec.get('frames', '?')} frames "
+    svc, drone, behind = rec.get("service", "?"), rec.get("drone_id", "?"), rec.get("behind_s", "?")
+    if rec.get("reason") == "level":
+        cad = int(rec.get("cadence") or 1)
+        every = f", analysing every {cad}{'nd' if cad == 2 else 'th'} frame" if cad > 1 else ""
+        return (f"{svc} analytics shedding level {rec.get('from_level', '?')} → {rec.get('to_level', '?')} "
+                f"for drone {drone} ({behind} s behind live{every}).")
+    how = {"drop_oldest": "stalled; dropped the oldest",
+           "restart": "stream restart far behind live; continued from the newest frame"}.get(
+        rec.get("reason"), "reduced cadence")
+    return (f"{svc} analytics shed {rec.get('frames', '?')} frames "
             f"(seq {rec.get('from_seq', '?')}–{rec.get('to_seq', '?')}) for drone "
-            f"{rec.get('drone_id', '?')}: {rec.get('behind_s', '?')} s behind live, "
-            f"{'dropped the oldest' if rec.get('reason') == 'drop_oldest' else 'reduced cadence'}. "
+            f"{drone}: {behind} s behind live, {how}. "
             f"The frames are in the mission's recording.")
 
 

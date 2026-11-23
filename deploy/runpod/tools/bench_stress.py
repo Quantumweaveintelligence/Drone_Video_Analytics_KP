@@ -188,7 +188,7 @@ def report(a, base, solos, full, calc) -> str:
     w("")
     w("Per engine, full run (fps analysed per drone; delay = capture → result, p95):")
     w("")
-    w("| Engine | Mode | fps per drone | Delay p95 ms | Frames shed | Highest shed level | ms per frame (in run) |")
+    w("| Engine | Mode | fps per drone | Delay p95 ms | Frames shed (this run) | Highest shed level | ms per frame (in run) |")
     w("|---|---|---|---|---|---|---|")
     for name, s in sorted((full.get("services") or {}).items()):
         fps = " / ".join(f"{v:g}" for v in s["fps_per_drone"].values())

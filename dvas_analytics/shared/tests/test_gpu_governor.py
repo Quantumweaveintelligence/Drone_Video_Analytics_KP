@@ -13,6 +13,13 @@ from gateway.governor import (
 )
 from shared import gpu_profile
 from shared.frame_sampler import FrameSampler, RateCap, frame_bytes
+from shared import frame_sampler
+
+
+@pytest.fixture(autouse=True)
+def no_shedding(monkeypatch):
+    """Entry ids here are counters, not times: every frame would look hours late (R11.2)."""
+    monkeypatch.setattr(frame_sampler, "SHED_AFTER_S", 0.0)
 
 
 class FakeClock:

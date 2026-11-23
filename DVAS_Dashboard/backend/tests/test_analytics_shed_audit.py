@@ -73,3 +73,14 @@ def test_a_failed_audit_write_is_retried_not_lost():
         assert await sa.process_batch(r, write, block_ms=10) == 1 and len(rows) == 1
         assert (await r.xpending(sa.STREAM, sa.GROUP))["pending"] == 0
     run(t)
+
+
+def test_level_changes_and_restarts_read_correctly():
+    from services.analytics_shed import _details
+    lvl = _details({"service": "person", "drone_id": "D1", "reason": "level", "from_level": "1",
+                    "to_level": "3", "cadence": "2", "behind_s": "1.9"})
+    assert "level 1 → 3" in lvl and "every 2nd frame" in lvl and "shed" in lvl
+    rs = _details({"service": "vehicle", "drone_id": "D1", "reason": "restart", "frames": "160",
+                   "from_seq": "1", "to_seq": "160", "behind_s": "8.1"})
+    assert "160 frames" in rs and "restart" in rs
+    assert "dropped the oldest" in _details({"reason": "drop_oldest", "frames": "3"})

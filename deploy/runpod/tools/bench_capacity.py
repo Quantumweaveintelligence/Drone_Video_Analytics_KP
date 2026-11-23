@@ -307,7 +307,9 @@ def run(a, clip_info: dict = None) -> dict:
     vram_peak: dict = {}        # program → peak VRAM MiB
     cpu_samples = []
     e2e_samples: dict = {}      # service → [p95 ms of a drone at a sample]
-    shed_last: dict = {}        # service → drone → frames shed so far
+    # frames shed during THIS run (R11.2): the services' counters run since their stream
+    # started (`shed_since`), so the run's share is last − first, summed over restarts
+    shed_run: dict = {}         # service → drone → [epoch since, first value, last value, earlier epochs]
     model_ms: dict = {}         # service → [model ms of a drone at a sample]
     total_ms: dict = {}         # service → [whole per-frame ms of a drone at a sample]
     bytes_first: dict = {}      # drone → (bytes received, time) at its first sample
@@ -387,7 +389,15 @@ def run(a, clip_info: dict = None) -> dict:
                         dv = v[drone]
                         if dv.get("e2e_p95_ms") is not None:
                             e2e_samples.setdefault(svc, []).append(float(dv["e2e_p95_ms"]))
-                        shed_last.setdefault(svc, {})[drone] = int(dv.get("frames_shed") or 0)
+                        n_shed, since = int(dv.get("frames_shed") or 0), dv.get("shed_since")
+                        r = shed_run.setdefault(svc, {}).get(drone)
+                        if r is None:
+                            shed_run[svc][drone] = [since, n_shed, n_shed, 0]
+                        elif since != r[0] or n_shed < r[2]:      # the counter restarted
+                            r[3] += r[2] - r[1]
+                            r[0], r[1], r[2] = since, 0, n_shed
+                        else:
+                            r[2] = n_shed
                         st_ms = dv.get("stages") or {}
                         if st_ms.get("model") is not None:
                             model_ms.setdefault(svc, []).append(float(st_ms["model"]))
@@ -478,7 +488,7 @@ def run(a, clip_info: dict = None) -> dict:
             "fps_per_drone": {d: round(med(v), 1) for d, v in svc_fps[svc].items()},
             "fps_median": round(med(per), 1),
             "shed_level_max": max_shed.get(svc, 0),
-            "frames_shed": sum((shed_last.get(svc) or {}).values()),
+            "frames_shed": sum(r[3] + r[2] - r[1] for r in (shed_run.get(svc) or {}).values()),
             "e2e_p95_ms": pct(e2e_samples.get(svc, []), 0.5),     # median of the drones' p95s
             "model_ms": pct(model_ms.get(svc, []), 0.5),
             "total_ms": pct(total_ms.get(svc, []), 0.5),
