@@ -81,6 +81,11 @@ CONF_THRESH = getattr(cfg, "VESSEL_CONFIDENCE", 0.50)
 PERSON_CONF_THRESH = getattr(cfg, "VESSEL_PERSON_CONFIDENCE", 0.20)
 STATIONARY_THRESH_PX = getattr(cfg, "VESSEL_STATIONARY_THRESHOLD_PX", 6.0)
 PROXIMITY_THRESH_PX = getattr(cfg, "VESSEL_PROXIMITY_THRESHOLD_PX", 90.0)
+# Proximity alerts: at most one per drone every COOLDOWN_S (the closest pair); the same
+# gathering (shares a vessel with the last alert) again only after REPEAT_S. Each alert
+# stores a full source frame and an evidence-vault copy, so per-pair alerts filled the volume.
+PROXIMITY_COOLDOWN_S = float(os.getenv("VESSEL_PROXIMITY_COOLDOWN_S", "30"))
+PROXIMITY_REPEAT_S = float(os.getenv("VESSEL_PROXIMITY_REPEAT_S", "300"))
 
 # ── Service State ─────────────────────────────────────────────────────────────
 engine: Optional[object] = None
@@ -109,8 +114,8 @@ _track_trajectories: Dict[str, Dict[int, deque]] = defaultdict(lambda: defaultdi
 _known_track_thumbnails: Dict[str, set] = defaultdict(set)
 _heatmap_points: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
 
-# Proximity cooldown: {(drone_id, trk1, trk2): last_alert_ts}
-_proximity_cooldown: Dict[Tuple[str, int, int], float] = {}
+# Last proximity alert per drone: {drone_id: (monotonic ts, track ids of that gathering)}
+_proximity_last: Dict[str, Tuple[float, frozenset]] = {}
 _ensured_drones: set = set()
 
 
@@ -159,26 +164,39 @@ def _analyze_trajectory(traj: deque) -> Tuple[str, bool]:
     return direction, False
 
 
-def _check_proximity_clusters(drone_id: str, objects: list) -> List[Tuple[dict, dict, float]]:
-    """Detect pairs of vessels in close proximity (< threshold px)."""
-    now = time.monotonic()
-    alerts = []
+def _check_proximity_clusters(drone_id: str, objects: list,
+                              now: Optional[float] = None) -> List[Tuple[dict, dict, float]]:
+    """The closest pair of vessels under PROXIMITY_THRESH_PX, as a one-item list, or [].
+
+    Pairs where both vessels are stationary (moored together) never alert. One alert per
+    drone per PROXIMITY_COOLDOWN_S; a gathering sharing a vessel with the last alert waits
+    PROXIMITY_REPEAT_S, so boats lying side by side do not alert all flight long.
+    """
+    now = time.monotonic() if now is None else now
+    close = []
     n = len(objects)
     for i in range(n):
         for j in range(i + 1, n):
             o1, o2 = objects[i], objects[j]
+            if o1.get("is_stationary") and o2.get("is_stationary"):
+                continue
             box1, box2 = o1["bbox_xywh"], o2["bbox_xywh"]
             c1 = (box1[0] + box1[2] / 2.0, box1[1] + box1[3] / 2.0)
             c2 = (box2[0] + box2[2] / 2.0, box2[1] + box2[3] / 2.0)
             dist = math.hypot(c1[0] - c2[0], c1[1] - c2[1])
-
             if dist < PROXIMITY_THRESH_PX:
-                t1, t2 = min(o1["track_id"], o2["track_id"]), max(o1["track_id"], o2["track_id"])
-                key = (drone_id, t1, t2)
-                if now - _proximity_cooldown.get(key, 0.0) > 30.0:
-                    _proximity_cooldown[key] = now
-                    alerts.append((o1, o2, dist))
-    return alerts
+                close.append((dist, o1, o2))
+    if not close:
+        return []
+    group = frozenset(t for _, a, b in close for t in (a["track_id"], b["track_id"]))
+    last_at, last_group = _proximity_last.get(drone_id, (None, frozenset()))
+    if last_at is not None:
+        wait = PROXIMITY_REPEAT_S if group & last_group else PROXIMITY_COOLDOWN_S
+        if now - last_at < wait:
+            return []
+    _proximity_last[drone_id] = (now, group)
+    dist, o1, o2 = min(close, key=lambda c: c[0])
+    return [(o1, o2, dist)]
 
 
 def _draw_hud_overlay(annotated: np.ndarray, drone_id: str, count: int, fps: float) -> bytes:
@@ -320,8 +338,8 @@ async def _persist_vessel_frame(drone_id: str, f: dict, frame: np.ndarray,
         })
 
     # 3. Proximity Clustering Alert Detection
-    # (cooldown 30 s per pair inside _check_proximity_clusters)
-    proximity_pairs = _check_proximity_clusters(drone_id, tracked_objects)
+    # (one per drone per cooldown, moored pairs skipped, inside _check_proximity_clusters)
+    proximity_pairs = _check_proximity_clusters(drone_id, enriched_objects)
     for (o1, o2, dist) in proximity_pairs:
         try:
             # Evidence: the source frame, hashed, uploaded before the event

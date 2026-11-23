@@ -33,7 +33,7 @@ def _env_s(name: str, default: float) -> float:
 
 
 TRACK_EVERY_S = _env_s("PERSIST_TRACK_EVERY_S", 2.0)
-CROP_EVERY_S = _env_s("PERSIST_CROP_EVERY_S", 1.0)
+CROP_EVERY_S = _env_s("PERSIST_CROP_EVERY_S", 10.0)   # 1 s filled the volume (22 GB of vehicle crops)
 ATTR_EVERY_S = _env_s("PERSIST_ATTR_EVERY_S", 5.0)
 # A track not seen for this long has ended (its final row and crop are written)
 TRACK_END_S = _env_s("PERSIST_TRACK_END_S", 3.0)

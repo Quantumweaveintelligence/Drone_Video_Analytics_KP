@@ -11,7 +11,7 @@
 #   recordings, bench reports, old database backups.
 # Kept: /workspace/dvas/secrets, the Keycloak database (users, passwords, roles), dashboard
 #   users / settings / model config, analytics presets, retention policies, drones, zones,
-#   watchlists, models (engines/).
+#   watchlists, models (engines/). Zones are deleted with their missions.
 set -euo pipefail
 YES=0; [ "${1:-}" = "--yes" ] && YES=1
 VOL=/workspace/dvas
@@ -19,7 +19,9 @@ CTL=/opt/dvas/deploy/bin/dvas-ctl
 SV="supervisorctl -c /etc/dvas/supervisord.conf"
 set -a; . "$VOL/secrets/dvas.env"; set +a
 
-KEEP_ANALYTICS="deploy_migrations analytics_presets retention_policies drones zones person_watchlist plate_watchlist watchlist_embeddings"
+# zones belong to a mission (mission_id NOT NULL) so they go with it; users stays because the
+# kept presets, retention policies and watchlists point at it
+KEEP_ANALYTICS="deploy_migrations users analytics_presets retention_policies drones person_watchlist plate_watchlist watchlist_embeddings"
 KEEP_DASHBOARD="deploy_migrations alembic_version users system_settings model_config drones audit_filter_presets"
 KEEP_BUCKETS="dvas-watchlist"
 
@@ -56,7 +58,10 @@ for spec in "dvas:$KEEP_ANALYTICS" "dvas_dashboard:$KEEP_DASHBOARD"; do
   db=${spec%%:*}; keep=${spec#*:}
   list=$(tables "$db" "$keep" | sed 's/.*/"&"/' | paste -sd,)
   # no CASCADE: if a kept table points at an emptied one, this fails and nothing is emptied
-  [ -n "$list" ] && psql_db "$db" -c "TRUNCATE $list RESTART IDENTITY" && echo "   $db emptied"
+  if [ -n "$list" ]; then
+    psql_db "$db" -c "TRUNCATE $list RESTART IDENTITY" && echo "   $db emptied" \
+      || echo "!! $db NOT emptied (error above) — the rest goes on; send this output"
+  fi
 done
 
 for b in $(mc ls wipe | awk '{print $NF}' | tr -d /); do

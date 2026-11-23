@@ -49,6 +49,19 @@ declare -A EXPIRY_DAYS=(
   [dvas-evidence]=0     # Section 65B evidence — never auto-expired
   [dvas-watchlist]=0    # reference images — never expired
 )
+# Test pods: DVAS_MINIO_EXPIRY_DAYS=N shortens every expiring bucket to N days (whole days, ≥1);
+# the evidence and watchlist buckets (0 = never) are not touched
+cap="${DVAS_MINIO_EXPIRY_DAYS:-}"
+if [ -n "$cap" ]; then
+  if [[ "$cap" =~ ^[1-9][0-9]*$ ]]; then
+    for b in "${!EXPIRY_DAYS[@]}"; do
+      [ "${EXPIRY_DAYS[$b]}" -gt "$cap" ] && EXPIRY_DAYS[$b]=$cap
+    done
+    log "MinIO: DVAS_MINIO_EXPIRY_DAYS=$cap — expiring buckets keep objects at most $cap days"
+  else
+    log "WARNING: DVAS_MINIO_EXPIRY_DAYS=$cap ignored (whole days, 1 or more)"
+  fi
+fi
 for b in "${!EXPIRY_DAYS[@]}"; do
   mc mb --ignore-existing "local/$b" >/dev/null
   mc anonymous set none "local/$b" >/dev/null

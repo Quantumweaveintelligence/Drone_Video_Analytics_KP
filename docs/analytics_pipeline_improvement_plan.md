@@ -120,7 +120,7 @@ evidence or reduce detections**.
    - **first sighting:** always uploaded, so every track has at least one image however short it is;
    - **better crop:** replaced whenever a better one appears (larger area, sharper by Laplacian
      variance, fully inside the frame) — not on a timer;
-   - **periodic trail:** one crop at most every `PERSIST_CROP_EVERY_S` (default **1 s**; set to 0
+   - **periodic trail:** one crop at most every `PERSIST_CROP_EVERY_S` (default **10 s** since 23 Nov — 1 s filled the pod volume; set to 0
      to keep every frame as today), so a route can still be reconstructed crop by crop;
    - **final crop** when the track ends;
    - **alert moment:** when a track is part of any alert/event, its crop **and** the source frame
