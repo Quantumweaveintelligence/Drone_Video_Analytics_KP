@@ -169,16 +169,20 @@ def main() -> int:
     t_next = time.time() + 1.0
     t_stop = time.time() + a.seconds
     last_print = 0.0
-    print(f"watching live drones for {a.seconds} s → {a.out}  (LOW = under {a.low:.0%} of the announced fps)")
+    print(f"watching live drones for {a.seconds} s → {a.out}  (LOW = under {a.low:.0%} of the announced fps)", flush=True)
     while time.time() < t_stop:
         time.sleep(max(0.0, t_next - time.time()))
         t_end, t_next = t_next, t_next + 1.0
+        no_rec = []
         for k in r.scan_iter("mission:video:*", count=200):
             sid = s(k).split("mission:video:", 1)[1]
             h = {s(x): s(y) for x, y in r.hgetall(k).items()}
-            if h.get("status") == "receiving" and sid not in missions and os.path.isdir(os.path.join(REC, sid)):
-                missions[sid] = Mission(sid, h)
-                print(f"  + {missions[sid].drone}: {missions[sid].size} @ {missions[sid].fps:g} fps announced")
+            if h.get("status") == "receiving" and sid not in missions:
+                if os.path.isdir(os.path.join(REC, sid)):
+                    missions[sid] = Mission(sid, h)
+                    print(f"  + {missions[sid].drone}: {missions[sid].size} @ {missions[sid].fps:g} fps announced", flush=True)
+                else:
+                    no_rec.append(h.get("drone_id") or sid[:8])
         lag = r.get("ingest:loop_lag")
         try:
             loop_ms = float(json.loads(lag)["max_ms"]) if lag else 0.0
@@ -189,7 +193,12 @@ def main() -> int:
             v = {s(x): s(y) for x, y in r.hgetall(f"mission:video:{sid}").items()}
             # the meta of a frame can land up to ~0.5 s after its bytes: close the second before last
             m.second(t_end - 1.0, v, loop_ms, a.low)
-        if time.time() - last_print >= 5 and missions:
+        if time.time() - last_print >= 5 and not missions:      # say why there is nothing yet
+            last_print = time.time()
+            why = (f"{', '.join(no_rec)} receiving but no recording folder in {REC} (DVAS_RECORD_VIDEO=0?)"
+                   if no_rec else "no drone is sending video (status receiving) yet")
+            print(time.strftime("%H:%M:%S"), "waiting —", why, flush=True)
+        elif time.time() - last_print >= 5:
             last_print = time.time()
             parts = []
             for m in missions.values():
@@ -200,6 +209,8 @@ def main() -> int:
             print(time.strftime("%H:%M:%S"), " | ".join(parts), flush=True)
 
     lines = [f"edge_fps_watch — {time.strftime('%Y-%m-%d %H:%M')}, {a.seconds} s, LOW = rx under {a.low:.0%} of the announced fps", ""]
+    if not missions:
+        lines.append("NO DRONE WAS WATCHED: none was sending video with a recording folder during the run.")
     for m in missions.values():
         rows = m.rows[2:-1]                                 # the first and last seconds are partial
         path = os.path.join(a.out, f"edge_fps_{m.drone}.csv")

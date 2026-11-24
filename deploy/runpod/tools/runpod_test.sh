@@ -5,7 +5,10 @@
 #   rt_check                    pod, image, settings, services, memory → $RT_DIR/check.txt
 #   rt_engines on|off [names]   switch analytics engines (all when no names): crowd person vehicle anpr intrusion vessel anomaly
 #   rt_flush                    clear frames and TEST recordings between runs (no mission may be live)
-#   rt_watch <label> [seconds]  edge frame-rate watch (edge_fps_watch.py) → $RT_DIR/<label>/
+#   rt_watch <label> [seconds]  edge frame-rate watch (edge_fps_watch.py) in the background → $RT_DIR/<label>/
+#   rt_watch_show <label>       its live lines until it ends, then its summary (Ctrl+C stops only the display)
+#   rt_stress [solo] [seconds]  bench_stress.py: baseline, each engine alone (solo s, 120), all engines (300)
+#   rt_stress_all [seconds]     bench_stress.py: all engines only (T3, T4)
 #   rt_snap <label>             diagnostics snapshot (stress_diag.sh + shed log + frame ring) → $RT_DIR/<label>/
 #   rt_restart_test [engine]    stop an engine 30 s, start it, show that its shedding restarted clean
 #   rt_pack                     everything in one .tgz to send back
@@ -20,7 +23,8 @@ set -a; . /workspace/dvas/secrets/dvas.env; set +a          # ANALYTICS_SERVICE_
 
 rt_check() {
   {
-    echo "== $(date -Is)  image commit: ${DVAS_GIT_SHA:-unknown}"
+    local sha=${DVAS_GIT_SHA:-$(tr '\0' '\n' < /proc/1/environ 2>/dev/null | sed -n 's/^DVAS_GIT_SHA=//p')}
+    echo "== $(date -Is)  image commit: ${sha:-unknown}"
     local p; p=$(pgrep -f "uvicorn intrusion.main:app" | head -1)
     echo "== shedding settings seen by the services (empty = defaults):"
     [ -n "$p" ] && tr '\0' '\n' < "/proc/$p/environ" | grep -E "^DVAS_(SHED|FRAME_RING|CUDA_MPS|THREADS)" || echo "   (intrusion not running)"
@@ -59,10 +63,27 @@ rt_flush() {
   /opt/dvas/deploy/bin/dvas-ctl lag; $RT_SV status | grep -E "analytics|video-decoder" | awk '{print "   " $1, $2}'
 }
 
-rt_watch() {
+rt_watch() {   # always in the background: no `> … &` to type (copies of it broke as &gt; &amp;)
   local label=${1:?usage: rt_watch <label> [seconds]} secs=${2:-300}
-  mkdir -p "$RT_DIR/$label"
-  $RT_PY "$RT_T/edge_fps_watch.py" --seconds "$secs" --out "$RT_DIR/$label"
+  local D="$RT_DIR/$label"; mkdir -p "$D"
+  nohup $RT_PY -u "$RT_T/edge_fps_watch.py" --seconds "$secs" --out "$D" > "$D/edge_watch.log" 2>&1 &
+  echo $! > "$D/edge_watch.pid"
+  echo "edge watch '$label' runs in the background for $secs s, until $(date -d "+$secs sec" +%H:%M:%S)"
+  echo "   see it: rt_watch_show $label      result: $D/edge_fps_summary.txt"
+}
+
+rt_watch_show() {
+  local label=${1:?usage: rt_watch_show <label>} D
+  D="$RT_DIR/$label"; [ -f "$D/edge_watch.log" ] || { echo "no watch '$label' — start it with rt_watch $label"; return 1; }
+  tail -n +1 -f --pid="$(cat "$D/edge_watch.pid" 2>/dev/null || echo 1)" "$D/edge_watch.log"
+}
+
+rt_stress() {
+  $RT_PY "$RT_T/bench_stress.py" --solo-seconds "${1:-120}" --seconds "${2:-300}"
+}
+
+rt_stress_all() {
+  $RT_PY "$RT_T/bench_stress.py" --skip-baseline --skip-solo --seconds "${1:-300}"
 }
 
 rt_snap() {
@@ -119,4 +140,4 @@ rt_pack() {
   ls -lh "$out"
 }
 
-echo "runpod_test helpers loaded — results go to $RT_DIR (rt_check, rt_engines, rt_flush, rt_watch, rt_snap, rt_restart_test, rt_pack)"
+echo "runpod_test helpers loaded — results go to $RT_DIR (rt_check, rt_engines, rt_flush, rt_watch, rt_watch_show, rt_stress, rt_stress_all, rt_snap, rt_restart_test, rt_pack)"

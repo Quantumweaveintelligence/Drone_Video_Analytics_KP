@@ -390,14 +390,14 @@ def run(a, clip_info: dict = None) -> dict:
                         if dv.get("e2e_p95_ms") is not None:
                             e2e_samples.setdefault(svc, []).append(float(dv["e2e_p95_ms"]))
                         n_shed, since = int(dv.get("frames_shed") or 0), dv.get("shed_since")
-                        r = shed_run.setdefault(svc, {}).get(drone)
-                        if r is None:
+                        sr = shed_run.setdefault(svc, {}).get(drone)    # not `r`: that is the Redis client
+                        if sr is None:
                             shed_run[svc][drone] = [since, n_shed, n_shed, 0]
-                        elif since != r[0] or n_shed < r[2]:      # the counter restarted
-                            r[3] += r[2] - r[1]
-                            r[0], r[1], r[2] = since, 0, n_shed
+                        elif since != sr[0] or n_shed < sr[2]:      # the counter restarted
+                            sr[3] += sr[2] - sr[1]
+                            sr[0], sr[1], sr[2] = since, 0, n_shed
                         else:
-                            r[2] = n_shed
+                            sr[2] = n_shed
                         st_ms = dv.get("stages") or {}
                         if st_ms.get("model") is not None:
                             model_ms.setdefault(svc, []).append(float(st_ms["model"]))
@@ -488,7 +488,7 @@ def run(a, clip_info: dict = None) -> dict:
             "fps_per_drone": {d: round(med(v), 1) for d, v in svc_fps[svc].items()},
             "fps_median": round(med(per), 1),
             "shed_level_max": max_shed.get(svc, 0),
-            "frames_shed": sum(r[3] + r[2] - r[1] for r in (shed_run.get(svc) or {}).values()),
+            "frames_shed": sum(sr[3] + sr[2] - sr[1] for sr in (shed_run.get(svc) or {}).values()),
             "e2e_p95_ms": pct(e2e_samples.get(svc, []), 0.5),     # median of the drones' p95s
             "model_ms": pct(model_ms.get(svc, []), 0.5),
             "total_ms": pct(total_ms.get(svc, []), 0.5),
