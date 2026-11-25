@@ -16,9 +16,14 @@ PY=/opt/venvs/ai/bin/python
 VC="valkey-cli -h 127.0.0.1"
 CTL=/opt/dvas/deploy/bin/dvas-ctl
 
-$CTL disk > "$D/disk.txt" 2>&1
-du -sh "$V"/minio/* > "$D/minio_buckets.txt" 2>&1
-$CTL lag > "$D/lag.txt" 2>&1
+step() { echo "   $(date +%H:%M:%S) $*" >&2; }
+# du on the network volume can take many minutes while MinIO writes crops: the disk guard's
+# last measure (backup loop, every few minutes) instead, and bucket sizes with a time limit
+step "disk"
+{ cat /run/dvas/disk_guard.json 2>/dev/null; echo; df -h / /dev/shm; } > "$D/disk.txt" 2>&1
+timeout 30 du -sh "$V"/minio/dvas-* > "$D/minio_buckets.txt" 2>&1 || echo "(du stopped after 30 s)" >> "$D/minio_buckets.txt"
+step "stats and lag"
+timeout 30 $CTL lag > "$D/lag.txt" 2>&1
 for s in person vehicle anpr intrusion anomaly crowd vessel; do
   echo "== $s"; $VC GET "dvas:svc_stats:$s"; echo
 done > "$D/svc_stats.json"
@@ -26,16 +31,18 @@ $VC GET ingest:loop_lag > "$D/ingest_loop_lag.txt"
 for k in $($VC --scan --pattern 'mission:video:*'); do
   echo "== $k"; $VC HGETALL "$k" | paste - -
 done > "$D/mission_video.txt"
+step "CPU per thread, GPU, logs"
 P=$(pgrep -f 'python video_decoder.py' | head -1)
 [ -n "$P" ] && top -H -b -n 3 -d 2 -p "$P" > "$D/decoder_threads.txt" 2>&1
 top -b -n 1 -o %CPU | head -45 > "$D/top.txt"
-nvidia-smi > "$D/nvidia-smi.txt" 2>&1
+timeout 20 nvidia-smi > "$D/nvidia-smi.txt" 2>&1
 grep -hE 'event loop blocked|disk_full|bad_chunk|over_bitrate|video_refused|write.*slow' /var/log/dvas/ingest.log | tail -200 > "$D/ingest_warnings.txt"
 tail -300 /var/log/dvas/video-decoder.log > "$D/video-decoder.log"
 for s in person vehicle anpr intrusion anomaly crowd vessel; do tail -300 "/var/log/dvas/$s.log" > "$D/$s.log" 2>/dev/null; done
 
 # What the edge sent, from the recording's per-frame meta (seq, capture_ts, pts_ms, rx_ts)
-$PY - "$V/recordings" > "$D/uplink.txt" 2>&1 <<'PYEOF'
+step "uplink from the recordings"
+timeout 60 $PY - "$V/recordings" > "$D/uplink.txt" 2>&1 <<'PYEOF'
 import glob, json, os, statistics as st, sys
 root = sys.argv[1]
 missions = sorted(glob.glob(f"{root}/*/"), key=os.path.getmtime)[-8:]
@@ -77,7 +84,8 @@ PYEOF
 # One recorded segment, decoded the way video-decoder does it: decode → BGR → JPEG
 SEG=$(ls -t "$V"/recordings/*/seg-*.ts 2>/dev/null | sed -n 2p)
 if [ -n "$SEG" ]; then
-  $PY - "$SEG" > "$D/decoder_cost.txt" 2>&1 <<'PYEOF'
+  step "decoder cost of one segment"
+  timeout 60 $PY - "$SEG" > "$D/decoder_cost.txt" 2>&1 <<'PYEOF'
 import sys, time, av, cv2
 q = 90
 try:

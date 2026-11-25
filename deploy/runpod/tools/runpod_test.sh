@@ -89,7 +89,8 @@ rt_stress_all() {
 rt_snap() {
   local label=${1:?usage: rt_snap <label>}
   local D="$RT_DIR/$label"; mkdir -p "$D"
-  bash "$RT_T/stress_diag.sh" "$label" >/dev/null 2>&1
+  echo "snapshot '$label' (about 30 s):"
+  bash "$RT_T/stress_diag.sh" "$label" >/dev/null
   $RT_PY - > "$D/services_now.txt" <<'PYEOF'
 import json, redis
 r = redis.Redis(host="127.0.0.1")

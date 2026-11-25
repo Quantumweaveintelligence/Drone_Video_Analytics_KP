@@ -465,10 +465,15 @@ async def _persist_anpr_frame(drone_id: str, f: dict, frame: np.ndarray, result:
                 tracker_id=tracker_id, mission_id=frame_mission_id
             )
         track_id = st.track_id
+        # The analyzer sends the track's BEST crops on every frame; store one only when it
+        # changed (each frame's copy filled 75 GB of the volume in a day).
         plate_image_key = None
         plate_obj = None
         plate_crop_b64  = plate.get("plate_crop_b64")
-        if plate_crop_b64:
+        last = st.uploaded.get("plate")
+        if plate_crop_b64 and last and last[0] == plate_crop_b64:
+            plate_image_key = last[1]
+        elif plate_crop_b64:
             plate_bytes_data = base64.b64decode(plate_crop_b64)
             plate_name_part = plate.get("plate_text") or f"veh_{tracker_id}"
             key = minio.make_key(
@@ -480,12 +485,17 @@ async def _persist_anpr_frame(drone_id: str, f: dict, frame: np.ndarray, result:
                 cfg.BUCKET_PLATES, key, plate_bytes_data, "image/jpeg", kind="plate_crop"
             )
             plate_image_key = plate_obj["key"] if plate_obj else None
+            if plate_image_key:
+                st.uploaded["plate"] = (plate_crop_b64, plate_image_key)
 
-        # Upload vehicle image if available
+        # Upload vehicle image if available (again only when the best crop changed)
         vehicle_image_key = None
         vehicle_obj = None
         veh_img_b64 = plate.get("vehicle_image_b64")
-        if veh_img_b64:
+        last = st.uploaded.get("vehicle")
+        if veh_img_b64 and last and last[0] == veh_img_b64:
+            vehicle_image_key = last[1]
+        elif veh_img_b64:
             veh_bytes_data = base64.b64decode(veh_img_b64)
             key = minio.make_key(
                 "vehicles", drone_id,
@@ -496,6 +506,8 @@ async def _persist_anpr_frame(drone_id: str, f: dict, frame: np.ndarray, result:
                 cfg.BUCKET_VEHICLES, key, veh_bytes_data, "image/jpeg", kind="vehicle_crop"
             )
             vehicle_image_key = vehicle_obj["key"] if vehicle_obj else None
+            if vehicle_image_key:
+                st.uploaded["vehicle"] = (veh_img_b64, vehicle_image_key)
 
         if plate_image_key or has_valid_plate:
             await write_plate_read(
@@ -520,7 +532,7 @@ async def _persist_anpr_frame(drone_id: str, f: dict, frame: np.ndarray, result:
                 mission_id=frame_mission_id,
             )
 
-        if (vehicle_image_key or plate_image_key) and track_id:
+        if (plate_obj or vehicle_obj) and track_id:
             pool = await get_pool()
             meta_updates = {}
             if vehicle_image_key: meta_updates["vehicle_image_key"] = vehicle_image_key

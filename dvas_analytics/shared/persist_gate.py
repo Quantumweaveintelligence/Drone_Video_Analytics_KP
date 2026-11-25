@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
@@ -53,6 +53,7 @@ class TrackState:
     mission_id: Optional[str] = None
     image_key: Optional[str] = None     # newest uploaded crop object
     pending: Optional[bytes] = None     # newest crop not uploaded (the final crop if it ends now)
+    uploaded: Dict[str, Tuple[Any, Optional[str]]] = field(default_factory=dict)  # role → (image, key) last stored
 
 
 def crop_score(frame, bbox) -> float:
